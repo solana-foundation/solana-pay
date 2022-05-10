@@ -31,7 +31,7 @@ Payment requests could be encoded as a deep link. The app prepares a payment req
 Learn how to integrate Solana Pay in your website, application or wallet.
 
 - [Merchant Integration](https://docs.solanapay.com/core/merchant-integration)
-- [Wallet Integration](https://docs.solanapay.com/core/wallet-integration)
+- [Wallet Integration](https://docs.solanapay.com/core/transfer-request/wallet-integration)
 - [API Reference](https://docs.solanapay.com/api/core)
 - [Brand Guidelines](https://solanapay.com/branding)
 - [Solana Pay Buttons](https://www.figma.com/community/file/1070341985720702755)
