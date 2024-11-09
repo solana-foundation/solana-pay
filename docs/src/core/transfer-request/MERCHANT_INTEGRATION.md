@@ -26,13 +26,13 @@ Install the packages and import them in your code.
 **npm**
 
 ```shell
-npm install @solana/pay @solana/web3.js bignumber.js --save
+npm install @solana/pay @solana/web3.js@1 bignumber.js --save
 ```
 
 **yarn**
 
 ```shell
-yarn add @solana/pay @solana/web3.js bignumber.js
+yarn add @solana/pay @solana/web3.js@1 bignumber.js
 ```
 
 ### 1.1 Import necessary modules
