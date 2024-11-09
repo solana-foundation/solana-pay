@@ -1,4 +1,4 @@
-import type { Commitment, Connection, PublicKey } from '@solana/web3.js';
+import type { GetLatestBlockhashConfig, Connection, PublicKey } from '@solana/web3.js';
 import { Transaction } from '@solana/web3.js';
 import fetch from 'cross-fetch';
 import { toUint8Array } from 'js-base64';
@@ -17,7 +17,7 @@ export class FetchTransactionError extends Error {
  * @param connection - A connection to the cluster.
  * @param account - Account that may sign the transaction.
  * @param link - `link` in the [Solana Pay spec](https://github.com/solana-labs/solana-pay/blob/master/SPEC.md#link).
- * @param options - Options for `getRecentBlockhash`.
+ * @param options - Options for `getLatestBlockhash`.
  *
  * @throws {FetchTransactionError}
  */
@@ -25,7 +25,7 @@ export async function fetchTransaction(
     connection: Connection,
     account: PublicKey,
     link: string | URL,
-    { commitment }: { commitment?: Commitment } = {}
+    { commitment }: GetLatestBlockhashConfig = {}
 ): Promise<Transaction> {
     const response = await fetch(String(link), {
         method: 'POST',
@@ -60,7 +60,7 @@ export async function fetchTransaction(
             } else if (publicKey.equals(account)) {
                 // If the only signature expected is for `account`, ignore the recent blockhash in the transaction.
                 if (signatures.length === 1) {
-                    transaction.recentBlockhash = (await connection.getRecentBlockhash(commitment)).blockhash;
+                    transaction.recentBlockhash = (await connection.getLatestBlockhash(commitment)).blockhash;
                 }
             } else {
                 throw new FetchTransactionError('missing signature');
@@ -69,7 +69,7 @@ export async function fetchTransaction(
     } else {
         // Ignore the fee payer and recent blockhash in the transaction and initialize them.
         transaction.feePayer = account;
-        transaction.recentBlockhash = (await connection.getRecentBlockhash(commitment)).blockhash;
+        transaction.recentBlockhash = (await connection.getLatestBlockhash(commitment)).blockhash;
     }
 
     return transaction;
