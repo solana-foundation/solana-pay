@@ -1,4 +1,11 @@
-import { createTransferCheckedInstruction, getAccount, getAssociatedTokenAddress, getMint } from '@solana/spl-token';
+import {
+    createTransferCheckedInstruction,
+    getAccount,
+    getAssociatedTokenAddress,
+    getMint,
+    TOKEN_2022_PROGRAM_ID,
+    TOKEN_PROGRAM_ID,
+} from '@solana/spl-token';
 import type { Commitment, Connection, PublicKey } from '@solana/web3.js';
 import { LAMPORTS_PER_SOL, SystemProgram, Transaction, TransactionInstruction } from '@solana/web3.js';
 import BigNumber from 'bignumber.js';
@@ -133,8 +140,14 @@ async function createSPLTokenInstruction(
     sender: PublicKey,
     connection: Connection
 ): Promise<TransactionInstruction> {
+    // Check if token owns the Token-2022 Program
+    const accountInfo = await connection.getParsedAccountInfo(splToken);
+    const accountOwner = accountInfo.value?.owner;
+    const tokenProgram =
+        accountOwner && accountOwner === TOKEN_2022_PROGRAM_ID ? TOKEN_2022_PROGRAM_ID : TOKEN_PROGRAM_ID;
+
     // Check that the token provided is an initialized mint
-    const mint = await getMint(connection, splToken);
+    const mint = await getMint(connection, splToken, undefined, tokenProgram);
     if (!mint.isInitialized) throw new CreateTransferError('mint not initialized');
 
     // Check that the amount provided doesn't have greater precision than the mint
@@ -144,14 +157,14 @@ async function createSPLTokenInstruction(
     amount = amount.times(TEN.pow(mint.decimals)).integerValue(BigNumber.ROUND_FLOOR);
 
     // Get the sender's ATA and check that the account exists and can send tokens
-    const senderATA = await getAssociatedTokenAddress(splToken, sender);
-    const senderAccount = await getAccount(connection, senderATA);
+    const senderATA = await getAssociatedTokenAddress(splToken, sender, undefined, tokenProgram);
+    const senderAccount = await getAccount(connection, senderATA, undefined, tokenProgram);
     if (!senderAccount.isInitialized) throw new CreateTransferError('sender not initialized');
     if (senderAccount.isFrozen) throw new CreateTransferError('sender frozen');
 
     // Get the recipient's ATA and check that the account exists and can receive tokens
-    const recipientATA = await getAssociatedTokenAddress(splToken, recipient);
-    const recipientAccount = await getAccount(connection, recipientATA);
+    const recipientATA = await getAssociatedTokenAddress(splToken, recipient, undefined, tokenProgram);
+    const recipientAccount = await getAccount(connection, recipientATA, undefined, tokenProgram);
     if (!recipientAccount.isInitialized) throw new CreateTransferError('recipient not initialized');
     if (recipientAccount.isFrozen) throw new CreateTransferError('recipient frozen');
 
@@ -160,5 +173,14 @@ async function createSPLTokenInstruction(
     if (tokens > senderAccount.amount) throw new CreateTransferError('insufficient funds');
 
     // Create an instruction to transfer SPL tokens, asserting the mint and decimals match
-    return createTransferCheckedInstruction(senderATA, splToken, recipientATA, sender, tokens, mint.decimals);
+    return createTransferCheckedInstruction(
+        senderATA,
+        splToken,
+        recipientATA,
+        sender,
+        tokens,
+        mint.decimals,
+        [],
+        tokenProgram
+    );
 }
