@@ -72,7 +72,7 @@ describe('parseURL', () => {
             expect(() => parseURL(url)).toThrow('protocol invalid');
         });
 
-        it('throws an error on invalid recepient', () => {
+        it('throws an error on invalid recipient', () => {
             const url = 'solana:0xffff';
             expect(() => parseURL(url)).toThrow('recipient invalid');
         });
