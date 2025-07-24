@@ -43,15 +43,20 @@ Here are some [Solana Pay hackathon ideas](https://www.figma.com/community/file/
 
 To get as many merchants accepting payments on Solana as possible we need to provide easy ways to set up Solana Pay on all eCommerce platforms.
 
-Solana Labs has started a reference implementation for Shopify which you can see [here](https://github.com/solana-labs/solana-pay/blob/shopify/shopify) to get a sense of how this might work.
-
-Here are some of the top eCommerce platforms that we're looking to integrate to:
+Here are some of the top eCommerce platforms that we're looking to integrate with:
 
 - WooCommerce
 - Magento
 - BigCommerce
 - Wix
 - Squarespace
+
+#### Reference Implementations
+
+Solana Labs and the community have the following reference implementations, which you can check out to get an idea of how to add Solana Pay to eCommerce platforms.
+
+- [Shopify](https://github.com/solana-labs/solana-pay/blob/shopify/shopify)
+- [WooCommerce](https://github.com/t4top/solana-pay-for-woocommerce)
 
 ### Other possible projects
 
