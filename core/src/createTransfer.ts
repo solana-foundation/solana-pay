@@ -6,7 +6,7 @@ import {
     TOKEN_2022_PROGRAM_ID,
     TOKEN_PROGRAM_ID,
 } from '@solana/spl-token';
-import type { Commitment, Connection, PublicKey } from '@solana/web3.js';
+import type { Commitment, Connection, GetLatestBlockhashConfig, PublicKey } from '@solana/web3.js';
 import { LAMPORTS_PER_SOL, SystemProgram, Transaction, TransactionInstruction } from '@solana/web3.js';
 import BigNumber from 'bignumber.js';
 import { MEMO_PROGRAM_ID, SOL_DECIMALS, TEN } from './constants.js';
@@ -41,7 +41,7 @@ export interface CreateTransferFields {
  * @param connection - A connection to the cluster.
  * @param sender - Account that will send the transfer.
  * @param fields - Fields of a Solana Pay transfer request URL.
- * @param options - Options for `getRecentBlockhash`.
+ * @param options - Options for `getLatestBlockhash`.
  *
  * @throws {CreateTransferError}
  */
@@ -49,7 +49,7 @@ export async function createTransfer(
     connection: Connection,
     sender: PublicKey,
     { recipient, amount, splToken, reference, memo }: CreateTransferFields,
-    { commitment }: { commitment?: Commitment } = {}
+    { commitment }: { commitment?: Commitment | GetLatestBlockhashConfig } = {}
 ): Promise<Transaction> {
     // Check that the sender and recipient accounts exist
     const senderInfo = await connection.getAccountInfo(sender);
@@ -77,7 +77,7 @@ export async function createTransfer(
     // Create the transaction
     const transaction = new Transaction();
     transaction.feePayer = sender;
-    transaction.recentBlockhash = (await connection.getRecentBlockhash(commitment)).blockhash;
+    transaction.recentBlockhash = (await connection.getLatestBlockhash(commitment)).blockhash;
 
     // If a memo is provided, add it to the transaction before adding the transfer instruction
     if (memo != null) {

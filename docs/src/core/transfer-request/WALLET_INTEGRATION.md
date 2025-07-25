@@ -16,13 +16,13 @@ Install the packages and import them in your code.
 **npm**
 
 ```shell=
-npm install @solana/pay @solana/web3.js --save
+npm install @solana/pay @solana/web3.js@1 --save
 ```
 
 **yarn**
 
 ```shell=
-yarn add @solana/pay @solana/web3.js
+yarn add @solana/pay @solana/web3.js@1
 ```
 
 ## 2. Parse payment request link

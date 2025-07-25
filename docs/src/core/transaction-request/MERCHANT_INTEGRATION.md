@@ -22,13 +22,13 @@ Install Solana Pay libraries to access the API from your application:
 **npm**
 
 ```shell
-npm install @solana/pay @solana/web3.js bignumber.js @solana/spl-token --save
+npm install @solana/pay @solana/web3.js@1 bignumber.js @solana/spl-token --save
 ```
 
 **yarn**
 
 ```shell
-yarn add @solana/pay @solana/web3.js bignumber.js @solana/spl-token
+yarn add @solana/pay @solana/web3.js@1 bignumber.js @solana/spl-token
 ```
 
 ### 1. Create the handler
