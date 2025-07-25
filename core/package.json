@@ -2,7 +2,7 @@
     "name": "@solana/pay",
     "version": "0.2.6",
     "author": "Solana Maintainers <maintainers@solana.foundation>",
-    "repository": "https://github.com/solana-labs/solana-pay",
+    "repository": "https://github.com/solana-foundation/solana-pay",
     "license": "Apache-2.0",
     "type": "module",
     "sideEffects": false,
