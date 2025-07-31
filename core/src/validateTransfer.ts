@@ -147,12 +147,14 @@ async function validateSPLTokenTransfer(
             throw new ValidateTransferError('invalid transfer');
 
         // Check that the expected reference keys exactly match the extra keys provided to the instruction.
-        const extraKeys = decodedInstruction.keys.multiSigners;
-        const length = extraKeys.length;
+        // Filter out any keys with isSigner=true from multiSigners to exclude owner accounts
+        const referenceKeys = decodedInstruction.keys.multiSigners.filter((signer) => !signer.isSigner);
+        const length = referenceKeys.length;
         if (length !== references.length) throw new ValidateTransferError('invalid references');
 
         for (let i = 0; i < length; i++) {
-            if (!extraKeys[i].pubkey.equals(references[i])) throw new ValidateTransferError(`invalid reference ${i}`);
+            if (!referenceKeys[i].pubkey.equals(references[i]))
+                throw new ValidateTransferError(`invalid reference ${i}`);
         }
     }
 
