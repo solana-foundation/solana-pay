@@ -32,7 +32,7 @@ export interface ValidateTransferFields {
     /** `recipient` in the [Solana Pay spec](https://github.com/solana-labs/solana-pay/blob/master/SPEC.md#recipient). */
     recipient: Recipient;
     /** `amount` in the [Solana Pay spec](https://github.com/solana-labs/solana-pay/blob/master/SPEC.md#amount). */
-    amount: Amount;
+    amount?: Amount;
     /** `spl-token` in the [Solana Pay spec](https://github.com/solana-labs/solana-pay/blob/master/SPEC.md#spl-token). */
     splToken?: SPLToken;
     /** `reference` in the [Solana Pay spec](https://github.com/solana-labs/solana-pay/blob/master/SPEC.md#reference). */
@@ -51,12 +51,38 @@ export interface ValidateTransferFields {
  *
  * @throws {ValidateTransferError}
  */
+
+export function validateTransfer(
+    connection: Connection,
+    signature: TransactionSignature,
+    { recipient, amount, splToken, reference, memo }: ValidateTransferFields & { amount: Amount },
+    options?: { commitment?: Finality }
+): Promise<TransactionResponse>;
+
+/**
+ * Check that a given transaction contains a valid Solana Pay transfer.
+ *
+ * @param connection - A connection to the cluster.
+ * @param signature - The signature of the transaction to validate.
+ * @param fields - Fields of a Solana Pay transfer request to validate.
+ * @param options - Options for `getTransaction`.
+ *
+ * @throws {ValidateTransferError}
+ */
+
+export function validateTransfer(
+    connection: Connection,
+    signature: TransactionSignature,
+    { recipient, amount, splToken, reference, memo }: ValidateTransferFields,
+    options?: { commitment?: Finality }
+): Promise<[transactionResponse: TransactionResponse, amount: Amount]>;
+
 export async function validateTransfer(
     connection: Connection,
     signature: TransactionSignature,
     { recipient, amount, splToken, reference, memo }: ValidateTransferFields,
     options?: { commitment?: Finality }
-): Promise<TransactionResponse> {
+): Promise<TransactionResponse | [TransactionResponse, Amount]> {
     const response = await connection.getTransaction(signature, options);
     if (!response) throw new ValidateTransferError('not found');
 
@@ -79,7 +105,10 @@ export async function validateTransfer(
     const [preAmount, postAmount] = splToken
         ? await validateSPLTokenTransfer(instruction, message, meta, recipient, splToken, reference)
         : await validateSystemTransfer(instruction, message, meta, recipient, reference);
-    if (postAmount.minus(preAmount).lt(amount)) throw new ValidateTransferError('amount not transferred');
+
+    const delta = postAmount.minus(preAmount);
+    if (delta.lt(amount ?? BigNumber(1).div(LAMPORTS_PER_SOL)))
+        throw new ValidateTransferError('amount not transferred');
 
     if (memo !== undefined) {
         // Memo instruction must be the second to last instruction
@@ -88,7 +117,9 @@ export async function validateTransfer(
         validateMemo(instruction, memo);
     }
 
-    return response;
+    if (amount) return response;
+
+    return [response, delta];
 }
 
 function validateMemo(instruction: TransactionInstruction, memo: string): void {
