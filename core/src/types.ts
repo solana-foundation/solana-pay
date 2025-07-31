@@ -25,5 +25,8 @@ export type Message = string;
 /** `memo` in the [Solana Pay spec](https://github.com/solana-labs/solana-pay/blob/master/SPEC.md#memo). */
 export type Memo = string;
 
+/** `redirect` in the [Solana Pay spec](https://github.com/solana-labs/solana-pay/blob/master/SPEC1.1.md#redirect). */
+export type Redirect = URL;
+
 /** `link` in the [Solana Pay spec](https://github.com/solana-labs/solana-pay/blob/master/SPEC.md#link). */
 export type Link = URL;
