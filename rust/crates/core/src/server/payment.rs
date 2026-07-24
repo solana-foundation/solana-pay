@@ -15,6 +15,8 @@ use crate::server::metering::{self, RequestProperties};
 use crate::server::session_stream::{self, SessionStreamContext};
 use crate::server::telemetry;
 
+const MAX_DELEGATED_MODEL_HINT_BODY_BYTES: usize = 10 * 1024 * 1024;
+
 /// Axum middleware that gates metered endpoints behind MPP payment.
 pub async fn payment_middleware<S: PaymentState>(
     axum::extract::State(state): axum::extract::State<S>,
@@ -92,11 +94,25 @@ async fn gate_adapter<S: PaymentState>(state: S, req: Request<Body>, next: Next)
         } => {
             let mut req = req;
             let mut delegated_session = None;
-            if let Some(sf) = session {
+            if let Some(mut sf) = session {
                 if sf.settlement.is_some() {
                     // Delegated sessions are settled from the completed
                     // response below. The client-voucher stream context waits
                     // for client commits and must not be installed here.
+                    if sf
+                        .settlement
+                        .as_deref()
+                        .is_some_and(|plan| plan.variant_hint.is_none())
+                    {
+                        let (restored, body_variant) = match request_body_variant_hint(req).await {
+                            Ok(result) => result,
+                            Err(response) => return response,
+                        };
+                        req = restored;
+                        if let Some(plan) = sf.settlement.as_deref_mut() {
+                            plan.variant_hint = body_variant;
+                        }
+                    }
                     delegated_session = Some(sf);
                 } else {
                     req.extensions_mut().insert(SessionStreamContext::new(
@@ -190,6 +206,37 @@ async fn gate_adapter<S: PaymentState>(state: S, req: Request<Body>, next: Next)
         }
         GateDecision::Passthrough => next.run(req).await,
     }
+}
+
+/// Read the model selected by OpenAI/Anthropic-compatible JSON requests and
+/// restore the body for the upstream handler. Native model routes already
+/// carry their variant in the path and never enter this path.
+async fn request_body_variant_hint(
+    request: Request<Body>,
+) -> Result<(Request<Body>, Option<String>), Response> {
+    let (parts, body) = request.into_parts();
+    let bytes = axum::body::to_bytes(body, MAX_DELEGATED_MODEL_HINT_BODY_BYTES)
+        .await
+        .map_err(|error| {
+            tracing::warn!(%error, "failed to read delegated session request model");
+            Response::builder()
+                .status(StatusCode::PAYLOAD_TOO_LARGE)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"error":"request_body_too_large"}"#))
+                .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+        })?;
+    let variant = request_model_variant_hint(&bytes);
+    Ok((Request::from_parts(parts, Body::from(bytes)), variant))
+}
+
+fn request_model_variant_hint(body: &[u8]) -> Option<String> {
+    serde_json::from_slice::<serde_json::Value>(body)
+        .ok()?
+        .get("model")?
+        .as_str()
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+        .map(str::to_string)
 }
 
 async fn settle_axum_delegated_response(
@@ -508,6 +555,21 @@ mod tests {
     fn extract_variant_hint_models_at_end() {
         // "models" is the last segment — no next segment
         assert_eq!(extract_variant_hint("v1/models"), None);
+    }
+
+    #[test]
+    fn request_model_variant_hint_reads_openai_compatible_model() {
+        assert_eq!(
+            request_model_variant_hint(br#"{"model":"qwen3.7-max","stream":true}"#),
+            Some("qwen3.7-max".to_string())
+        );
+    }
+
+    #[test]
+    fn request_model_variant_hint_rejects_missing_or_invalid_models() {
+        assert_eq!(request_model_variant_hint(br#"{"stream":true}"#), None);
+        assert_eq!(request_model_variant_hint(br#"{"model":"  "}"#), None);
+        assert_eq!(request_model_variant_hint(b"not json"), None);
     }
 
     #[test]
