@@ -104,10 +104,12 @@ async fn gate_adapter<S: PaymentState>(state: S, req: Request<Body>, next: Next)
                         .as_deref()
                         .is_some_and(|plan| plan.variant_hint.is_none())
                     {
-                        let (restored, body_variant) = match request_body_variant_hint(req).await {
-                            Ok(result) => result,
-                            Err(response) => return response,
-                        };
+                        let force_stream_usage = path.ends_with("chat/completions");
+                        let (restored, body_variant) =
+                            match prepare_delegated_request_body(req, force_stream_usage).await {
+                                Ok(result) => result,
+                                Err(response) => return response,
+                            };
                         req = restored;
                         if let Some(plan) = sf.settlement.as_deref_mut() {
                             plan.variant_hint = body_variant;
@@ -211,10 +213,11 @@ async fn gate_adapter<S: PaymentState>(state: S, req: Request<Body>, next: Next)
 /// Read the model selected by OpenAI/Anthropic-compatible JSON requests and
 /// restore the body for the upstream handler. Native model routes already
 /// carry their variant in the path and never enter this path.
-async fn request_body_variant_hint(
+async fn prepare_delegated_request_body(
     request: Request<Body>,
+    force_stream_usage: bool,
 ) -> Result<(Request<Body>, Option<String>), Response> {
-    let (parts, body) = request.into_parts();
+    let (mut parts, body) = request.into_parts();
     let bytes = axum::body::to_bytes(body, MAX_DELEGATED_MODEL_HINT_BODY_BYTES)
         .await
         .map_err(|error| {
@@ -225,17 +228,49 @@ async fn request_body_variant_hint(
                 .body(Body::from(r#"{"error":"request_body_too_large"}"#))
                 .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
         })?;
-    let variant = request_model_variant_hint(&bytes);
+    let (variant, bytes) = prepare_delegated_json_body(&bytes, force_stream_usage);
+    if force_stream_usage && let Ok(content_length) = bytes.len().to_string().parse() {
+        parts.headers.insert(header::CONTENT_LENGTH, content_length);
+    }
     Ok((Request::from_parts(parts, Body::from(bytes)), variant))
 }
 
-fn request_model_variant_hint(body: &[u8]) -> Option<String> {
-    let json = serde_json::from_slice::<serde_json::Value>(body).ok()?;
-    json.get("model")
+fn prepare_delegated_json_body(body: &[u8], force_stream_usage: bool) -> (Option<String>, Vec<u8>) {
+    let Ok(mut json) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return (None, body.to_vec());
+    };
+    let variant = json
+        .get("model")
         .and_then(serde_json::Value::as_str)
         .map(str::trim)
         .filter(|model| !model.is_empty())
-        .map(str::to_string)
+        .map(str::to_string);
+
+    let is_stream = json
+        .get("stream")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    if !force_stream_usage || !is_stream {
+        return (variant, body.to_vec());
+    }
+
+    let Some(object) = json.as_object_mut() else {
+        return (variant, body.to_vec());
+    };
+    let stream_options = object
+        .entry("stream_options")
+        .or_insert_with(|| serde_json::json!({}));
+    if !stream_options.is_object() {
+        *stream_options = serde_json::json!({});
+    }
+    if let Some(stream_options) = stream_options.as_object_mut() {
+        stream_options.insert("include_usage".to_string(), serde_json::Value::Bool(true));
+    }
+
+    (
+        variant,
+        serde_json::to_vec(&json).unwrap_or_else(|_| body.to_vec()),
+    )
 }
 
 async fn settle_axum_delegated_response(
@@ -557,18 +592,46 @@ mod tests {
     }
 
     #[test]
-    fn request_model_variant_hint_reads_openai_compatible_model() {
+    fn delegated_json_body_reads_openai_compatible_model() {
         assert_eq!(
-            request_model_variant_hint(br#"{"model":"qwen3.7-max","stream":true}"#),
+            prepare_delegated_json_body(br#"{"model":"qwen3.7-max","stream":true}"#, false).0,
             Some("qwen3.7-max".to_string())
         );
     }
 
     #[test]
-    fn request_model_variant_hint_rejects_missing_or_invalid_models() {
-        assert_eq!(request_model_variant_hint(br#"{"stream":true}"#), None);
-        assert_eq!(request_model_variant_hint(br#"{"model":"  "}"#), None);
-        assert_eq!(request_model_variant_hint(b"not json"), None);
+    fn delegated_json_body_rejects_missing_or_invalid_models() {
+        assert_eq!(
+            prepare_delegated_json_body(br#"{"stream":true}"#, false).0,
+            None
+        );
+        assert_eq!(
+            prepare_delegated_json_body(br#"{"model":"  "}"#, false).0,
+            None
+        );
+        assert_eq!(prepare_delegated_json_body(b"not json", false).0, None);
+    }
+
+    #[test]
+    fn delegated_chat_stream_forces_provider_usage_frames() {
+        let (variant, body) = prepare_delegated_json_body(
+            br#"{"model":"qwen3.7-plus","stream":true,"stream_options":{"include_usage":false}}"#,
+            true,
+        );
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(variant.as_deref(), Some("qwen3.7-plus"));
+        assert_eq!(
+            json.pointer("/stream_options/include_usage"),
+            Some(&serde_json::Value::Bool(true))
+        );
+    }
+
+    #[test]
+    fn delegated_non_stream_request_body_is_unchanged() {
+        let body = br#"{"model":"qwen3.7-plus","stream":false}"#;
+        let (_, prepared) = prepare_delegated_json_body(body, true);
+        assert_eq!(prepared, body);
     }
 
     #[test]

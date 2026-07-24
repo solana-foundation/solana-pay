@@ -72,6 +72,7 @@ pub enum SessionOutcome {
 #[derive(Clone)]
 struct SessionOperatorRuntime {
     server: Arc<SessionServer<Arc<dyn ChannelStore>>>,
+    channel_store: Arc<dyn ChannelStore>,
     rpc_url: Option<String>,
     payment_channel_signer: Arc<Mutex<Option<Arc<dyn SolanaSigner>>>>,
     payment_channel_payer_signer: Arc<Mutex<Option<Arc<dyn SolanaSigner>>>>,
@@ -739,7 +740,7 @@ impl SessionMpp {
         channel_store: Arc<dyn ChannelStore>,
     ) -> Self {
         let session_config = config.clone();
-        let server = Arc::new(SessionServer::new(config, channel_store));
+        let server = Arc::new(SessionServer::new(config, Arc::clone(&channel_store)));
         let payment_channel_signer = Arc::new(Mutex::new(None));
         let payment_channel_payer_signer = Arc::new(Mutex::new(None));
         let committed_watermarks = Arc::new(Mutex::new(HashMap::new()));
@@ -749,6 +750,7 @@ impl SessionMpp {
         let pull_sessions = Arc::new(Mutex::new(HashSet::new()));
         let operator_runtime = SessionOperatorRuntime {
             server: Arc::clone(&server),
+            channel_store,
             rpc_url: session_config.rpc_url.clone(),
             payment_channel_signer: Arc::clone(&payment_channel_signer),
             payment_channel_payer_signer: Arc::clone(&payment_channel_payer_signer),
@@ -875,16 +877,28 @@ impl SessionMpp {
                 "session does not delegate voucher authority to the operator".to_string(),
             ));
         }
-        if amount == 0 {
-            return Ok(self.committed_watermark(channel_id).unwrap_or_default());
-        }
-
         // Serialize read/sign/verify so concurrent responses cannot construct
         // two vouchers from the same cumulative watermark.
         let _guard = self.operator_runtime.delegated_voucher_lock.lock().await;
-        let current = self.committed_watermark(channel_id).ok_or_else(|| {
-            Error::Mpp(format!("unknown delegated session channel: {channel_id}"))
-        })?;
+        // The durable store is authoritative. Reading it on every delegated
+        // authorization also lets a restarted or different gateway replica
+        // continue from a watermark advanced by another process.
+        let current = self
+            .operator_runtime
+            .channel_store
+            .get_channel(channel_id)
+            .await
+            .map_err(|error| {
+                Error::Mpp(format!(
+                    "failed to restore delegated session channel {channel_id}: {error}"
+                ))
+            })?
+            .ok_or_else(|| Error::Mpp(format!("unknown delegated session channel: {channel_id}")))?
+            .cumulative;
+        self.record_committed_watermark(channel_id.to_string(), current);
+        if amount == 0 {
+            return Ok(current);
+        }
         let cumulative = current
             .checked_add(amount)
             .ok_or_else(|| Error::Mpp("session cumulative amount overflow".to_string()))?;
@@ -2098,6 +2112,11 @@ mod tests {
             .unwrap(),
             75
         );
+        session
+            .committed_watermarks
+            .lock()
+            .expect("watermark lock")
+            .clear();
         assert_eq!(
             tokio::time::timeout(
                 Duration::from_secs(2),

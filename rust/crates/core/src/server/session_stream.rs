@@ -14,7 +14,9 @@ use pay_types::metering::{BillingUnit, MeterDimension, MeterDirection, Metering}
 use serde_json::Value;
 
 use crate::server::gate::SessionForward;
-use crate::server::metering::{RequestProperties, quota_tokens_per_unit, resolve_variant};
+use crate::server::metering::{
+    RequestProperties, provider_token_quantity, quota_tokens_per_unit, resolve_variant,
+};
 use crate::server::session::SessionMpp;
 use crate::server::session_metering::{
     GateMode, Result as MeteringResult, SessionGateDecision, SessionMeterDimension,
@@ -159,6 +161,8 @@ pub(crate) struct DelegatedSessionStreamMeter {
     accumulator: StreamUsageAccumulator,
     current: UsageObservation,
     priced_context_length: Option<u64>,
+    clamp_reprice_to_authorized: bool,
+    authorization_exhausted: bool,
 }
 
 impl DelegatedSessionStreamMeter {
@@ -194,6 +198,8 @@ impl DelegatedSessionStreamMeter {
             accumulator: StreamUsageAccumulator::new(spec, hints),
             current,
             priced_context_length,
+            clamp_reprice_to_authorized: false,
+            authorization_exhausted: false,
         })
     }
 
@@ -215,13 +221,21 @@ impl DelegatedSessionStreamMeter {
         chunk: &[u8],
         is_sse: bool,
     ) -> Result<Option<SessionGateDecision>, BoxError> {
+        let output_chars_before = self.accumulator.output_chars;
         if !self.accumulator.observe_chunk(chunk, is_sse) {
             return Ok(None);
+        }
+        if self.authorization_exhausted {
+            return Err(box_error(std::io::Error::other(format!(
+                "delegated session {} exhausted its authorization",
+                self.forward.channel_id
+            ))));
         }
         if let Some(context_length) = self.accumulator.observed_input_tokens()
             && self.priced_context_length != Some(context_length)
         {
-            self.reprice_for_context_length(context_length)?;
+            let usage_only_chunk = self.accumulator.output_chars == output_chars_before;
+            self.reprice_for_context_length(context_length, usage_only_chunk)?;
         }
         self.current = self.accumulator.observation();
         self.gate
@@ -231,7 +245,7 @@ impl DelegatedSessionStreamMeter {
     }
 
     fn finish(&mut self) -> MeteringResult<Option<SessionGateDecision>> {
-        if !self.accumulator.has_observation() {
+        if !self.accumulator.has_observation() || self.authorization_exhausted {
             return Ok(None);
         }
         self.gate
@@ -240,24 +254,32 @@ impl DelegatedSessionStreamMeter {
     }
 
     async fn settle(&mut self, decision: SessionGateDecision) -> Result<(), BoxError> {
+        let clamp_reprice_to_authorized = std::mem::take(&mut self.clamp_reprice_to_authorized);
         if !decision.requires_voucher() {
             return Ok(());
         }
-        let target = decision.target_cumulative_base_units();
+        let requested_target = decision.target_cumulative_base_units();
         let committed = self.gate.committed_base_units();
-        let amount = target.saturating_sub(committed);
-        if amount == 0 {
-            return Ok(());
-        }
         let authorized = self
             .forward
             .committed_base_units
             .saturating_add(self.forward.available_base_units);
+        let target = if clamp_reprice_to_authorized {
+            requested_target.min(authorized)
+        } else {
+            requested_target
+        };
+        let exhausted_by_reprice = clamp_reprice_to_authorized && requested_target > authorized;
         if target > authorized {
             return Err(box_error(std::io::Error::other(format!(
                 "delegated session {} requires cumulative {target}, above authorized {authorized}",
                 self.forward.channel_id
             ))));
+        }
+        let amount = target.saturating_sub(committed);
+        if amount == 0 {
+            self.authorization_exhausted |= exhausted_by_reprice;
+            return Ok(());
         }
         let accepted = self
             .forward
@@ -266,10 +288,15 @@ impl DelegatedSessionStreamMeter {
             .await
             .map_err(box_error)?;
         self.gate.record_commit(accepted);
+        self.authorization_exhausted |= exhausted_by_reprice;
         Ok(())
     }
 
-    fn reprice_for_context_length(&mut self, context_length: u64) -> Result<(), BoxError> {
+    fn reprice_for_context_length(
+        &mut self,
+        context_length: u64,
+        usage_only_chunk: bool,
+    ) -> Result<(), BoxError> {
         let plan = self.forward.settlement.as_deref().ok_or_else(|| {
             box_error(std::io::Error::other(
                 "delegated stream meter lost its settlement plan",
@@ -301,6 +328,7 @@ impl DelegatedSessionStreamMeter {
         self.accumulator.reconfigure(spec, hints);
         self.gate = gate;
         self.priced_context_length = Some(context_length);
+        self.clamp_reprice_to_authorized = usage_only_chunk;
         Ok(())
     }
 }
@@ -538,40 +566,14 @@ impl StreamUsageAccumulator {
                 changed = true;
             }
 
-            if let Some(usage) = value.get("usageMetadata") {
-                if let Some(input) = usage_u64(usage, "promptTokenCount") {
-                    self.input_tokens = self.input_tokens.max(input);
-                    changed = true;
-                }
-
-                let candidate_tokens = usage_u64(usage, "candidatesTokenCount").unwrap_or(0);
-                let thought_tokens = usage_u64(usage, "thoughtsTokenCount").unwrap_or(0);
-                let tool_prompt_tokens = usage_u64(usage, "toolUsePromptTokenCount").unwrap_or(0);
-                let metered_output = usage_u64(usage, "totalTokenCount")
-                    .map(|total| {
-                        total
-                            .saturating_sub(self.input_tokens)
-                            .saturating_sub(tool_prompt_tokens)
-                    })
-                    .unwrap_or(0);
-                let output = candidate_tokens
-                    .saturating_add(thought_tokens)
-                    .max(metered_output);
-                if output > 0 {
-                    self.output_tokens = self.output_tokens.max(output);
-                    changed = true;
-                }
+            if let Some(input) = provider_token_quantity(&value, MeterDirection::Input) {
+                self.input_tokens = self.input_tokens.max(input);
+                changed = true;
             }
 
-            if let Some(usage) = value.get("usage") {
-                if let Some(input) = usage_u64(usage, "prompt_tokens") {
-                    self.input_tokens = self.input_tokens.max(input);
-                    changed = true;
-                }
-                if let Some(output) = usage_u64(usage, "completion_tokens") {
-                    self.output_tokens = self.output_tokens.max(output);
-                    changed = true;
-                }
+            if let Some(output) = provider_token_quantity(&value, MeterDirection::Output) {
+                self.output_tokens = self.output_tokens.max(output);
+                changed = true;
             }
         }
 
@@ -763,10 +765,6 @@ fn streamed_texts(value: &Value) -> impl Iterator<Item = &str> {
         .into_iter();
 
     gemini.chain(openai).chain(top_level_delta)
-}
-
-fn usage_u64(value: &Value, key: &str) -> Option<u64> {
-    value.get(key).and_then(Value::as_u64)
 }
 
 fn count_words(text: &str) -> u64 {
@@ -982,6 +980,39 @@ mod tests {
             observation.get(MeterDirection::Output, BillingUnit::QuotaUnits),
             Some(3)
         );
+    }
+
+    #[test]
+    fn sse_accumulator_observes_responses_and_anthropic_usage() {
+        let spec = SessionMeterSpec::new([
+            SessionMeterDimension::required(MeterDirection::Input, BillingUnit::Tokens, 1, 1),
+            SessionMeterDimension::required(MeterDirection::Output, BillingUnit::Tokens, 1, 1),
+        ]);
+
+        for chunk in [
+            br#"data: {"type":"response.completed","response":{"usage":{"input_tokens":8,"output_tokens":5}}}
+
+"#
+            .as_slice(),
+            br#"data: {"type":"message_start","message":{"usage":{"input_tokens":8,"output_tokens":0}}}
+
+data: {"type":"message_delta","usage":{"output_tokens":5}}
+
+"#
+            .as_slice(),
+        ] {
+            let mut accumulator =
+                StreamUsageAccumulator::new(spec.clone(), SessionUsageHints::default());
+
+            assert!(accumulator.observe_chunk(chunk, true));
+            assert_eq!(accumulator.observed_input_tokens(), Some(8));
+            assert_eq!(
+                accumulator
+                    .observation()
+                    .get(MeterDirection::Output, BillingUnit::Tokens),
+                Some(5)
+            );
+        }
     }
 
     #[test]
@@ -1230,7 +1261,7 @@ mod tests {
                 ceiling_usd: 0.001,
                 inferred_usage: None,
             },
-            1_000,
+            10,
             reservation,
         );
         let meter = DelegatedSessionStreamMeter::from_forward(forward).unwrap();
@@ -1238,11 +1269,11 @@ mod tests {
         let upstream_release = Arc::clone(&release_second);
         let upstream = async_stream::stream! {
             yield Ok::<_, std::io::Error>(Bytes::from_static(
-                b"data: {\"choices\":[{\"delta\":{\"content\":\"one two\"}}]}\n\n"
+                b"data: {\"choices\":[{\"delta\":{\"content\":\"one two three\"}}]}\n\n"
             ));
             upstream_release.notified().await;
             yield Ok::<_, std::io::Error>(Bytes::from_static(
-                b"data: {\"choices\":[{\"delta\":{\"content\":\"three\"}}],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":3}}\n\n"
+                b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":3}}\n\n"
             ));
         };
         let metered = meter_delegated_response_stream(upstream, meter, true);
@@ -1255,9 +1286,11 @@ mod tests {
             .expect("first chunk should remain successful");
         assert_eq!(
             first,
-            Bytes::from_static(b"data: {\"choices\":[{\"delta\":{\"content\":\"one two\"}}]}\n\n")
+            Bytes::from_static(
+                b"data: {\"choices\":[{\"delta\":{\"content\":\"one two three\"}}]}\n\n"
+            )
         );
-        assert_eq!(session.committed_watermark(&state.channel_id), Some(2));
+        assert_eq!(session.committed_watermark(&state.channel_id), Some(3));
 
         assert!(
             tokio::time::timeout(Duration::from_millis(50), metered.next())
@@ -1274,13 +1307,17 @@ mod tests {
         assert_eq!(
             second,
             Bytes::from_static(
-                b"data: {\"choices\":[{\"delta\":{\"content\":\"three\"}}],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":3}}\n\n"
+                b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":3}}\n\n"
             )
         );
         assert_eq!(
             session.committed_watermark(&state.channel_id),
-            Some(15),
-            "actual prompt usage must reprice all output at the high-context tier"
+            Some(10),
+            "retroactive repricing must collect the remaining authorization without failing the stream"
+        );
+        assert!(
+            metered.next().await.is_none(),
+            "a clamped usage-only reprice must complete cleanly"
         );
     }
 }

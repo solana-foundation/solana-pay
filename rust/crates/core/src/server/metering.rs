@@ -381,7 +381,7 @@ fn extract_and_price_usage(
             .and_then(|usage| usage.tokens_prompt)
             .or_else(|| {
                 json.as_ref()
-                    .and_then(|json| quota_token_quantity(json, MeterDirection::Input))
+                    .and_then(|json| provider_token_quantity(json, MeterDirection::Input))
             });
     }
     let prices = resolve_price(metering, &priced_props, variant_hint, None)
@@ -447,19 +447,40 @@ pub(crate) fn parse_tokens_per_quota_unit(notes: &str) -> Option<u64> {
     })
 }
 
-fn quota_token_quantity(json: &serde_json::Value, direction: MeterDirection) -> Option<u64> {
-    let openai_usage = json.get("usage");
+pub(crate) fn provider_token_quantity(
+    json: &serde_json::Value,
+    direction: MeterDirection,
+) -> Option<u64> {
+    let usage_objects = [
+        json.get("usage"),
+        json.pointer("/response/usage"),
+        json.pointer("/message/usage"),
+    ];
     match direction {
-        MeterDirection::Input => openai_usage
-            .and_then(|usage| usage.get("prompt_tokens"))
-            .and_then(serde_json::Value::as_u64)
+        MeterDirection::Input => usage_objects
+            .into_iter()
+            .flatten()
+            .filter_map(|usage| {
+                usage
+                    .get("prompt_tokens")
+                    .or_else(|| usage.get("input_tokens"))
+                    .and_then(serde_json::Value::as_u64)
+            })
+            .max()
             .or_else(|| {
                 json.pointer("/usageMetadata/promptTokenCount")
                     .and_then(serde_json::Value::as_u64)
             }),
-        MeterDirection::Output => openai_usage
-            .and_then(|usage| usage.get("completion_tokens"))
-            .and_then(serde_json::Value::as_u64)
+        MeterDirection::Output => usage_objects
+            .into_iter()
+            .flatten()
+            .filter_map(|usage| {
+                usage
+                    .get("completion_tokens")
+                    .or_else(|| usage.get("output_tokens"))
+                    .and_then(serde_json::Value::as_u64)
+            })
+            .max()
             .or_else(|| {
                 let usage = json.get("usageMetadata")?;
                 let input = usage.get("promptTokenCount")?.as_u64()?;
@@ -529,7 +550,7 @@ fn extract_dimension_quantity(
     if dim.unit == BillingUnit::QuotaUnits {
         let json =
             json.ok_or_else(|| UptoUsageError::MissingUsage("response body unavailable".into()))?;
-        let tokens = quota_token_quantity(json, dim.direction).ok_or_else(|| {
+        let tokens = provider_token_quantity(json, dim.direction).ok_or_else(|| {
             UptoUsageError::MissingUsage(format!(
                 "no token usage for {:?} quota units",
                 dim.direction
@@ -547,7 +568,7 @@ fn extract_dimension_quantity(
     if dim.unit == BillingUnit::Tokens {
         let json =
             json.ok_or_else(|| UptoUsageError::MissingUsage("response body unavailable".into()))?;
-        return quota_token_quantity(json, dim.direction).ok_or_else(|| {
+        return provider_token_quantity(json, dim.direction).ok_or_else(|| {
             UptoUsageError::MissingUsage(format!("no token usage for {:?} tokens", dim.direction))
         });
     }
@@ -2531,16 +2552,24 @@ mod tests {
             }),
         );
 
-        let actual = upto_actual_amount_from_response(
-            &settlement_plan(metering, 0.10),
-            100_000,
-            &HeaderMap::new(),
-            Some(br#"{"usage":{"prompt_tokens":3,"completion_tokens":2}}"#),
-        )
-        .unwrap();
+        for body in [
+            br#"{"usage":{"prompt_tokens":3,"completion_tokens":2}}"#.as_slice(),
+            br#"{"usage":{"input_tokens":3,"output_tokens":2}}"#.as_slice(),
+            br#"{"response":{"usage":{"input_tokens":3,"output_tokens":2}}}"#.as_slice(),
+            br#"{"message":{"usage":{"input_tokens":3,"output_tokens":2}}}"#.as_slice(),
+            br#"{"usageMetadata":{"promptTokenCount":3,"candidatesTokenCount":2}}"#.as_slice(),
+        ] {
+            let actual = upto_actual_amount_from_response(
+                &settlement_plan(metering.clone(), 0.10),
+                100_000,
+                &HeaderMap::new(),
+                Some(body),
+            )
+            .unwrap();
 
-        assert_eq!(actual.usd, 0.000010);
-        assert_eq!(actual.base_units, 10);
+            assert_eq!(actual.usd, 0.000010);
+            assert_eq!(actual.base_units, 10);
+        }
     }
 
     #[test]

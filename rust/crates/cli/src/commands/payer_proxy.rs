@@ -35,6 +35,7 @@
 
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::Router;
 use axum::body::{Body, Bytes};
@@ -151,10 +152,14 @@ impl PayerState {
             .map(HeaderValue::from_str)
             .transpose()
             .map_err(|e| pay_core::Error::Config(format!("payer proxy Host header: {e}")))?;
-        // No request timeout: streamed completions stay open for minutes.
+        // Do not impose a total request timeout: streamed completions may stay
+        // open for minutes. Bound connection setup and silent read stalls so a
+        // hung provider cannot retain the session mutex forever.
         // `no_proxy` keeps env proxies from hijacking localhost traffic.
         let client = reqwest::Client::builder()
             .no_proxy()
+            .connect_timeout(Duration::from_secs(15))
+            .read_timeout(Duration::from_secs(300))
             .build()
             .map_err(|e| pay_core::Error::Config(format!("payer proxy HTTP client: {e}")))?;
         Ok(Self {
