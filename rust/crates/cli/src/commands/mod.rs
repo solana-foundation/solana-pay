@@ -1,10 +1,12 @@
 pub mod account;
+pub(crate) mod agent_args;
 pub mod catalog;
 pub mod claude;
 pub mod codex;
 pub mod curl;
 pub mod docs;
 pub mod fetch;
+pub mod goose;
 pub mod help;
 pub mod http;
 pub(crate) mod payer_proxy;
@@ -48,7 +50,10 @@ pub enum Command {
     Claude(claude::ClaudeCommand),
     /// Run Codex with 402 payment support.
     Codex(codex::CodexCommand),
+    /// Run Goose with 402 payment support.
+    Goose(goose::GooseCommand),
     /// Run Qoder CLI (qodercli) with 402 payment support.
+    #[command(alias = "qoder")]
     Qodercli(qodercli::QodercliCommand),
     /// Manage accounts (new, import, list, default, remove, export).
     /// With no subcommand, lists accounts and prints the available subcommands.
@@ -112,6 +117,7 @@ pub enum ToolKind {
     Fetch,
     Claude,
     Codex,
+    Goose,
     Qodercli,
     Mcp,
 }
@@ -141,6 +147,7 @@ impl Command {
             | Command::Fetch(_)
             | Command::Claude(_)
             | Command::Codex(_)
+            | Command::Goose(_)
             | Command::Qodercli(_)
             | Command::Send(_)
             | Command::Topup(_) => true,
@@ -167,6 +174,7 @@ impl Command {
             Command::Fetch(_) => ToolKind::Fetch,
             Command::Claude(_) => ToolKind::Claude,
             Command::Codex(_) => ToolKind::Codex,
+            Command::Goose(_) => ToolKind::Goose,
             Command::Qodercli(_) => ToolKind::Qodercli,
             Command::Account { .. }
             | Command::Whoami(_)
@@ -253,8 +261,24 @@ impl Command {
                 network_override,
                 alternate_provider,
             )?),
-            Command::Codex(cmd) => std::process::exit(cmd.run(&pay_bin, account_override)?),
-            Command::Qodercli(cmd) => std::process::exit(cmd.run(&pay_bin, account_override)?),
+            Command::Codex(cmd) => std::process::exit(cmd.run(
+                &pay_bin,
+                account_override,
+                network_override,
+                alternate_provider,
+            )?),
+            Command::Goose(cmd) => std::process::exit(cmd.run(
+                &pay_bin,
+                account_override,
+                network_override,
+                alternate_provider,
+            )?),
+            Command::Qodercli(cmd) => std::process::exit(cmd.run(
+                &pay_bin,
+                account_override,
+                network_override,
+                alternate_provider,
+            )?),
             Command::Docs { command } => return command.run(),
             _ => {}
         }

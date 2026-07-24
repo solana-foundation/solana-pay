@@ -5,7 +5,7 @@ resolver = "2"
 
 [workspace.package]
 edition = "2024"
-version = "0.23.0"
+version = "0.24.0"
 license = "MIT"
 
 [workspace.dependencies]
@@ -110,7 +110,7 @@ same-file = "1.0"
 # deps. The `axum` feature (kit's own gate) is intentionally OFF — pay has its
 # own gate (pay-core + pay-proxy).
 #
-pay-kit = { package = "solana-pay-kit", git = "https://github.com/solana-foundation/pay-kit", rev = "76402a5f", default-features = false, features = [
+pay-kit = { package = "solana-pay-kit", git = "https://github.com/solana-foundation/pay-kit.git", rev = "cb02b5afcbba8147c4483a9d800a3eff93ed6592", default-features = false, features = [
     "mpp",
     "x402",
     "client",

@@ -113,13 +113,33 @@ pub struct SessionForward {
     pub channel_id: String,
     pub committed_base_units: u64,
     /// Response-metered settlement plan for a delegated session. The adapter
-    /// buffers the response, rates actual usage, and persists an
-    /// operator-signed cumulative voucher before releasing the response.
+    /// rates actual usage and persists an operator-signed cumulative voucher
+    /// before releasing the matching response bytes.
     pub settlement: Option<Box<metering::UptoSettlementPlan>>,
     /// Remaining channel capacity available to the metered delivery.
     pub available_base_units: u64,
     /// Releases the exclusive capacity reservation on every terminal path.
     _reservation: Option<DelegatedCapacityLease>,
+}
+
+impl SessionForward {
+    pub(crate) fn delegated(
+        handle: Arc<SessionMpp>,
+        channel_id: String,
+        committed_base_units: u64,
+        settlement: metering::UptoSettlementPlan,
+        available_base_units: u64,
+        reservation: DelegatedCapacityLease,
+    ) -> Self {
+        Self {
+            handle,
+            channel_id,
+            committed_base_units,
+            settlement: Some(Box::new(settlement)),
+            available_base_units,
+            _reservation: Some(reservation),
+        }
+    }
 }
 
 pub fn delegated_session_receipt_annotation(
@@ -1552,22 +1572,22 @@ async fn session_authorized(
             };
             let variant = variant_hint_from_path(path);
             let ceiling_usd = available_base_units as f64 / 10_f64.powi(sm.decimals() as i32);
-            let settlement = Some(Box::new(metering::UptoSettlementPlan {
+            let settlement = metering::UptoSettlementPlan {
                 metering: meter.clone(),
                 variant_hint: variant,
                 request_properties: props,
                 ceiling_usd,
                 inferred_usage: None,
-            }));
+            };
             GateDecision::Forward {
-                session: Some(SessionForward {
+                session: Some(SessionForward::delegated(
                     handle,
-                    channel_id: state.channel_id,
-                    committed_base_units: state.cumulative,
+                    state.channel_id,
+                    state.cumulative,
                     settlement,
                     available_base_units,
-                    _reservation: Some(reservation),
-                }),
+                    reservation,
+                )),
                 receipt: signature
                     .map(|reference| session_receipt_annotation(sm.network(), reference)),
                 upto: None,

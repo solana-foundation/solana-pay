@@ -55,11 +55,6 @@ pub fn local_gateway_provider_host(slug: &str) -> String {
     format!("{slug}.localhost:{}", default_gateway_port())
 }
 
-/// User-facing provider URL for the default local gateway.
-pub fn local_gateway_provider_url(slug: &str) -> String {
-    format!("http://{}", local_gateway_provider_host(slug))
-}
-
 fn default_gateway_port() -> &'static str {
     DEFAULT_BIND
         .rsplit_once(':')

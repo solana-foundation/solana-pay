@@ -12,8 +12,10 @@ use pay_kit::mpp::AUTHORIZATION_HEADER;
 
 use crate::PaymentState;
 use crate::server::metering::{self, RequestProperties};
-use crate::server::session_stream::SessionStreamContext;
+use crate::server::session_stream::{self, SessionStreamContext};
 use crate::server::telemetry;
+
+const MAX_DELEGATED_MODEL_HINT_BODY_BYTES: usize = 10 * 1024 * 1024;
 
 /// Axum middleware that gates metered endpoints behind MPP payment.
 pub async fn payment_middleware<S: PaymentState>(
@@ -92,11 +94,27 @@ async fn gate_adapter<S: PaymentState>(state: S, req: Request<Body>, next: Next)
         } => {
             let mut req = req;
             let mut delegated_session = None;
-            if let Some(sf) = session {
+            if let Some(mut sf) = session {
                 if sf.settlement.is_some() {
                     // Delegated sessions are settled from the completed
                     // response below. The client-voucher stream context waits
                     // for client commits and must not be installed here.
+                    if sf
+                        .settlement
+                        .as_deref()
+                        .is_some_and(|plan| plan.variant_hint.is_none())
+                    {
+                        let force_stream_usage = path.ends_with("chat/completions");
+                        let (restored, body_variant) =
+                            match prepare_delegated_request_body(req, force_stream_usage).await {
+                                Ok(result) => result,
+                                Err(response) => return response,
+                            };
+                        req = restored;
+                        if let Some(plan) = sf.settlement.as_deref_mut() {
+                            plan.variant_hint = body_variant;
+                        }
+                    }
                     delegated_session = Some(sf);
                 } else {
                     req.extensions_mut().insert(SessionStreamContext::new(
@@ -192,6 +210,69 @@ async fn gate_adapter<S: PaymentState>(state: S, req: Request<Body>, next: Next)
     }
 }
 
+/// Read the model selected by OpenAI/Anthropic-compatible JSON requests and
+/// restore the body for the upstream handler. Native model routes already
+/// carry their variant in the path and never enter this path.
+async fn prepare_delegated_request_body(
+    request: Request<Body>,
+    force_stream_usage: bool,
+) -> Result<(Request<Body>, Option<String>), Response> {
+    let (mut parts, body) = request.into_parts();
+    let bytes = axum::body::to_bytes(body, MAX_DELEGATED_MODEL_HINT_BODY_BYTES)
+        .await
+        .map_err(|error| {
+            tracing::warn!(%error, "failed to read delegated session request model");
+            Response::builder()
+                .status(StatusCode::PAYLOAD_TOO_LARGE)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"error":"request_body_too_large"}"#))
+                .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+        })?;
+    let (variant, bytes) = prepare_delegated_json_body(&bytes, force_stream_usage);
+    if force_stream_usage && let Ok(content_length) = bytes.len().to_string().parse() {
+        parts.headers.insert(header::CONTENT_LENGTH, content_length);
+    }
+    Ok((Request::from_parts(parts, Body::from(bytes)), variant))
+}
+
+fn prepare_delegated_json_body(body: &[u8], force_stream_usage: bool) -> (Option<String>, Vec<u8>) {
+    let Ok(mut json) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return (None, body.to_vec());
+    };
+    let variant = json
+        .get("model")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+        .map(str::to_string);
+
+    let is_stream = json
+        .get("stream")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    if !force_stream_usage || !is_stream {
+        return (variant, body.to_vec());
+    }
+
+    let Some(object) = json.as_object_mut() else {
+        return (variant, body.to_vec());
+    };
+    let stream_options = object
+        .entry("stream_options")
+        .or_insert_with(|| serde_json::json!({}));
+    if !stream_options.is_object() {
+        *stream_options = serde_json::json!({});
+    }
+    if let Some(stream_options) = stream_options.as_object_mut() {
+        stream_options.insert("include_usage".to_string(), serde_json::Value::Bool(true));
+    }
+
+    (
+        variant,
+        serde_json::to_vec(&json).unwrap_or_else(|_| body.to_vec()),
+    )
+}
+
 async fn settle_axum_delegated_response(
     forward: crate::server::gate::SessionForward,
     response: Response,
@@ -200,6 +281,39 @@ async fn settle_axum_delegated_response(
         // Dropping `forward` releases the capacity lease without charging for
         // a response that was not successfully served.
         return response;
+    }
+
+    let is_sse = response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| {
+            value
+                .split(';')
+                .any(|part| part.trim().eq_ignore_ascii_case("text/event-stream"))
+        });
+    if is_sse && session_stream::DelegatedSessionStreamMeter::supports(&forward) {
+        let (mut parts, body) = response.into_parts();
+        let meter = match session_stream::DelegatedSessionStreamMeter::from_forward(forward) {
+            Ok(meter) => meter,
+            Err(error) => {
+                tracing::error!(%error, "failed to configure delegated session stream metering");
+                return Response::builder()
+                    .status(StatusCode::BAD_GATEWAY)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"error":"session_metering_failed"}"#))
+                    .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
+            }
+        };
+        parts.headers.remove(header::CONTENT_LENGTH);
+        return Response::from_parts(
+            parts,
+            Body::from_stream(session_stream::meter_delegated_response_stream(
+                body.into_data_stream(),
+                meter,
+                true,
+            )),
+        );
     }
 
     let limit = forward
@@ -475,6 +589,49 @@ mod tests {
     fn extract_variant_hint_models_at_end() {
         // "models" is the last segment — no next segment
         assert_eq!(extract_variant_hint("v1/models"), None);
+    }
+
+    #[test]
+    fn delegated_json_body_reads_openai_compatible_model() {
+        assert_eq!(
+            prepare_delegated_json_body(br#"{"model":"qwen3.7-max","stream":true}"#, false).0,
+            Some("qwen3.7-max".to_string())
+        );
+    }
+
+    #[test]
+    fn delegated_json_body_rejects_missing_or_invalid_models() {
+        assert_eq!(
+            prepare_delegated_json_body(br#"{"stream":true}"#, false).0,
+            None
+        );
+        assert_eq!(
+            prepare_delegated_json_body(br#"{"model":"  "}"#, false).0,
+            None
+        );
+        assert_eq!(prepare_delegated_json_body(b"not json", false).0, None);
+    }
+
+    #[test]
+    fn delegated_chat_stream_forces_provider_usage_frames() {
+        let (variant, body) = prepare_delegated_json_body(
+            br#"{"model":"qwen3.7-plus","stream":true,"stream_options":{"include_usage":false}}"#,
+            true,
+        );
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(variant.as_deref(), Some("qwen3.7-plus"));
+        assert_eq!(
+            json.pointer("/stream_options/include_usage"),
+            Some(&serde_json::Value::Bool(true))
+        );
+    }
+
+    #[test]
+    fn delegated_non_stream_request_body_is_unchanged() {
+        let body = br#"{"model":"qwen3.7-plus","stream":false}"#;
+        let (_, prepared) = prepare_delegated_json_body(body, true);
+        assert_eq!(prepared, body);
     }
 
     #[test]

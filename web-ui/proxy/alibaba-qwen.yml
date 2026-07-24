@@ -1,0 +1,201 @@
+name: alibaba-qwen
+subdomain: qwen
+title: "Alibaba Model Studio"
+description: >
+  Run current Qwen general-purpose and coding models through Alibaba Cloud
+  Model Studio's OpenAI- and Anthropic-compatible APIs.
+category: ai_ml
+version: v1
+routing:
+  type: proxy
+  url: https://dashscope-us.aliyuncs.com/compatible-mode
+  auth: &dashscope_auth
+    method: header
+    key: Authorization
+    prefix: "Bearer "
+    value_from_env: DASHSCOPE_API_KEY
+
+operator:
+  currencies:
+    usd: ["USDC", "USDT", "CASH"]
+  network: "localnet"
+  fee_payer: true
+
+recipients:
+  gateway:
+    account: "DxyXRSjEgHzRwXiaDpkPRJwZizpFk4g15eJVDh1ea2M8"
+    label: "Gateway"
+
+# Streaming agent sessions are metered from the usage reported by Model Studio.
+session:
+  cap_usdc: 10.0
+  min_voucher_delta: 1
+  settlement_authority: delegated
+  close_delay_ms: 15000
+  settlement_interval_ms: 5000
+  modes: [push]
+  splits:
+    - recipient: gateway
+      percent: 0.1
+      memo: "Agentic gateway fee"
+
+# Global list prices for the US (Virginia) Model Studio endpoint. Keep the
+# model names here as the gateway's discoverable model catalog as well as its
+# metering variants.
+x-qwen-model-pricing: &qwen_model_pricing
+  - param: model
+    value: qwen3.7-plus
+    description: "Flagship multimodal agent model with a 1M context window."
+    dimensions:
+      - direction: input
+        unit: tokens
+        scale: 1000000
+        tiers:
+          - price_usd: 0.276
+            condition: { field: context_length, op: "<=", value: 256000 }
+          - price_usd: 0.826
+            condition: { field: context_length, op: ">", value: 256000 }
+      - direction: output
+        unit: tokens
+        scale: 1000000
+        tiers:
+          - price_usd: 1.101
+            condition: { field: context_length, op: "<=", value: 256000 }
+          - price_usd: 3.301
+            condition: { field: context_length, op: ">", value: 256000 }
+  - param: model
+    value: qwen3.7-max
+    description: "Highest-capability Qwen model for long-horizon agent tasks."
+    dimensions:
+      - direction: input
+        unit: tokens
+        scale: 1000000
+        tiers: [{ price_usd: 2.5 }]
+      - direction: output
+        unit: tokens
+        scale: 1000000
+        tiers: [{ price_usd: 7.5 }]
+  - param: model
+    value: qwen3.6-flash
+    description: "Low-latency multimodal Qwen model."
+    dimensions:
+      - direction: input
+        unit: tokens
+        scale: 1000000
+        tiers:
+          - price_usd: 0.165
+            condition: { field: context_length, op: "<=", value: 256000 }
+          - price_usd: 0.66
+            condition: { field: context_length, op: ">", value: 256000 }
+      - direction: output
+        unit: tokens
+        scale: 1000000
+        tiers:
+          - price_usd: 0.99
+            condition: { field: context_length, op: "<=", value: 256000 }
+          - price_usd: 3.961
+            condition: { field: context_length, op: ">", value: 256000 }
+  - param: model
+    value: qwen3-coder-next
+    description: "Coding-specialized Qwen model optimized for agent workflows."
+    dimensions:
+      - direction: input
+        unit: tokens
+        scale: 1000000
+        tiers:
+          - price_usd: 0.3
+            condition: { field: context_length, op: "<=", value: 32000 }
+          - price_usd: 0.5
+            condition: { field: context_length, op: "<=", value: 128000 }
+          - price_usd: 0.8
+            condition: { field: context_length, op: "<=", value: 256000 }
+      - direction: output
+        unit: tokens
+        scale: 1000000
+        tiers:
+          - price_usd: 1.5
+            condition: { field: context_length, op: "<=", value: 32000 }
+          - price_usd: 2.5
+            condition: { field: context_length, op: "<=", value: 128000 }
+          - price_usd: 4.0
+            condition: { field: context_length, op: "<=", value: 256000 }
+  - param: model
+    value: qwen3-coder-plus
+    description: "Qwen's large-context coding model with implicit caching."
+    dimensions:
+      - direction: input
+        unit: tokens
+        scale: 1000000
+        tiers:
+          - price_usd: 0.574
+            condition: { field: context_length, op: "<=", value: 32000 }
+          - price_usd: 0.861
+            condition: { field: context_length, op: "<=", value: 128000 }
+          - price_usd: 1.434
+            condition: { field: context_length, op: "<=", value: 256000 }
+          - price_usd: 2.868
+            condition: { field: context_length, op: ">", value: 256000 }
+      - direction: output
+        unit: tokens
+        scale: 1000000
+        tiers:
+          - price_usd: 2.294
+            condition: { field: context_length, op: "<=", value: 32000 }
+          - price_usd: 3.441
+            condition: { field: context_length, op: "<=", value: 128000 }
+          - price_usd: 5.735
+            condition: { field: context_length, op: "<=", value: 256000 }
+          - price_usd: 28.671
+            condition: { field: context_length, op: ">", value: 256000 }
+  - param: model
+    value: default
+    description: "Conservative fallback for an unrecognized Model Studio model."
+    dimensions:
+      - direction: input
+        unit: tokens
+        scale: 1000000
+        tiers: [{ price_usd: 2.868 }]
+      - direction: output
+        unit: tokens
+        scale: 1000000
+        tiers: [{ price_usd: 28.671 }]
+
+endpoints:
+  # Claude Code and other OpenAI-chat clients are routed through this surface.
+  - method: POST
+    # The deployed Agent Gateway exposes Model Studio's OpenAI surface under
+    # its upstream-compatible prefix. Agent harnesses still use the standard
+    # `/v1/chat/completions`; the payer proxy maps that path to this one.
+    path: "compatible-mode/v1/chat/completions"
+    resource: "chat"
+    description: "OpenAI-compatible streaming chat completions for Qwen models."
+    routing:
+      type: proxy
+      url: https://dashscope-us.aliyuncs.com
+      auth: *dashscope_auth
+    metering:
+      schemes: [mpp-session]
+      variants: *qwen_model_pricing
+
+  # Codex uses the OpenAI Responses API wire format.
+  - method: POST
+    path: "v1/responses"
+    resource: "responses"
+    description: "OpenAI-compatible Responses API for Qwen agent models."
+    metering:
+      schemes: [mpp-session]
+      variants: *qwen_model_pricing
+
+  # Qoder and Claude-compatible clients can use Model Studio's native
+  # Anthropic-compatible endpoint without protocol translation.
+  - method: POST
+    path: "v1/messages"
+    resource: "messages"
+    description: "Anthropic-compatible messages API for Qoder and Claude clients."
+    routing:
+      type: proxy
+      url: https://dashscope-us.aliyuncs.com/apps/anthropic
+      auth: *dashscope_auth
+    metering:
+      schemes: [mpp-session]
+      variants: *qwen_model_pricing

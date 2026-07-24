@@ -7,7 +7,7 @@ Options:
 {options}";
 
 pub const SUPPORTED_PASS_THROUGH_COMMANDS: &[&str] = &[
-    "curl", "wget", "http", "claude", "codex", "qodercli", "whoami",
+    "curl", "wget", "http", "claude", "codex", "goose", "qodercli", "whoami",
 ];
 pub const DEVELOPER_COMMANDS: &[&str] = &["server", "catalog"];
 pub const AGENT_COMMANDS: &[&str] = &["mcp", "skills"];
@@ -17,7 +17,7 @@ pub const OTHER_COMMANDS: &[&str] = &["fetch", "install"];
 
 pub const ROOT_COMMAND_SUMMARY: &str = "\
 Supported pass-through:
-  \x1b[1mcurl\x1b[0m, \x1b[1mwget\x1b[0m, \x1b[1mhttp\x1b[0m, \x1b[1mclaude\x1b[0m, \x1b[1mcodex\x1b[0m, \x1b[1mqodercli\x1b[0m, \x1b[1mwhoami\x1b[0m
+  \x1b[1mcurl\x1b[0m, \x1b[1mwget\x1b[0m, \x1b[1mhttp\x1b[0m, \x1b[1mclaude\x1b[0m, \x1b[1mcodex\x1b[0m, \x1b[1mgoose\x1b[0m, \x1b[1mqodercli\x1b[0m, \x1b[1mwhoami\x1b[0m
 
 Developers:
   \x1b[1mserver\x1b[0m:  Gate your API with stablecoin payments

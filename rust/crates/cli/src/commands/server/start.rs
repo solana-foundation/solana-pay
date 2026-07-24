@@ -47,6 +47,43 @@ fn default_bind() -> String {
     }
 }
 
+async fn session_channel_store() -> pay_core::Result<Arc<dyn pay_kit::mpp::store::ChannelStore>> {
+    let redis_url = std::env::var("PAY_SESSION_REDIS_URL")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+
+    let Some(redis_url) = redis_url else {
+        return Ok(Arc::new(pay_kit::mpp::store::MemoryChannelStore::new()));
+    };
+
+    #[cfg(feature = "redis-session-store")]
+    {
+        let prefix = std::env::var("PAY_SESSION_REDIS_PREFIX")
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| "pay:session:v1:".to_string());
+        let store = pay_kit::mpp::store::RedisChannelStore::connect(&redis_url, prefix)
+            .await
+            .map_err(|error| {
+                pay_core::Error::Config(format!("failed to connect session Redis store: {error}"))
+            })?;
+        tracing::info!("using durable Redis channel store for MPP sessions");
+        return Ok(Arc::new(store));
+    }
+
+    #[cfg(not(feature = "redis-session-store"))]
+    {
+        let _ = redis_url;
+        Err(pay_core::Error::Config(
+            "PAY_SESSION_REDIS_URL is set, but this pay binary was built without the \
+             redis-session-store feature"
+                .to_string(),
+        ))
+    }
+}
+
 /// Start the payment gateway proxy.
 ///
 /// Loads an API spec from a YAML file and starts an HTTP proxy that:
@@ -1036,6 +1073,7 @@ impl StartCommand {
                         .await?;
                 }
 
+                let session_channel_store = session_channel_store().await?;
                 let mut session_mpps = Vec::with_capacity(currency_configs.len());
                 for (_currency, session_mpp_currency, session_decimals) in &currency_configs {
                     let cap_base =
@@ -1058,7 +1096,11 @@ impl StartCommand {
                         program_id: Some(channel_program_id),
                     };
 
-                    let mut smpp = SessionMpp::new(config, session_secret.clone())
+                    let mut smpp = SessionMpp::new_with_channel_store(
+                        config,
+                        session_secret.clone(),
+                        Arc::clone(&session_channel_store),
+                    )
                         .with_realm(api.title.clone())
                         .with_pull_voucher_strategy(pull_voucher_strategy)
                         .with_blockhash_cache(blockhash_cache.clone());
@@ -1070,7 +1112,10 @@ impl StartCommand {
                     }
 
                     let smpp = Arc::new(smpp);
-                    smpp.start_lifecycle_runloop(Duration::from_millis(sess.close_delay_ms));
+                    smpp.start_lifecycle_runloop_with_settlement(
+                        Duration::from_millis(sess.close_delay_ms),
+                        Duration::from_millis(sess.settlement_interval_ms),
+                    );
                     session_mpps.push(smpp);
                 }
                 session_mpps

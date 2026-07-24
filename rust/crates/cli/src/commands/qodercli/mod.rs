@@ -12,9 +12,14 @@ use std::process::{Command, Stdio};
 
 use clap::Args;
 
+use super::agent_args::args_without_model;
+use super::claude::{AlternateClient, AlternateProvider, prepare_alternate_provider};
+
 /// Allow-list of pay MCP tools surfaced to qodercli. Must stay in sync
 /// with the tool set exposed by other pay launchers.
 const ALLOWED_TOOLS: &str = "mcp__pay__curl,mcp__pay__search_catalog,mcp__pay__list_catalog,mcp__pay__get_catalog_entry,mcp__pay__get_balance,mcp__pay__topup,mcp__pay__create_skill";
+const EXTERNAL_PROVIDER_PROBE_BASE_URL: &str = "http://127.0.0.1:9/v1";
+const EXTERNAL_PROVIDER_PROBE_MODEL: &str = "pay-qoder-access-probe";
 
 /// Run Qoder CLI (qodercli) with 402 payment support.
 ///
@@ -74,12 +79,30 @@ where
 }
 
 impl QodercliCommand {
-    pub fn run(self, pay_bin: &str, active_account_name: Option<&str>) -> pay_core::Result<i32> {
+    pub fn run(
+        self,
+        pay_bin: &str,
+        active_account_name: Option<&str>,
+        network_override: Option<&str>,
+        alternate_provider: bool,
+    ) -> pay_core::Result<i32> {
         let mcp_config =
             build_mcp_config(pay_bin, active_account_name, |var| std::env::var(var).ok());
+        let alternate = if alternate_provider && !qoder_metadata_requested(&self.args) {
+            ensure_qoder_external_provider_access()?;
+            Some(prepare_alternate_provider(
+                AlternateClient::Qoder,
+                &self.args,
+                network_override,
+                active_account_name,
+            )?)
+        } else {
+            None
+        };
+        let qoder_args = qoder_args(&self.args, alternate.as_ref())?;
 
         #[cfg(windows)]
-        return launch_windows(mcp_config, &self.args);
+        return launch_windows(mcp_config, &qoder_args);
 
         #[cfg(not(windows))]
         {
@@ -90,7 +113,7 @@ impl QodercliCommand {
                 .arg(ALLOWED_TOOLS)
                 .arg("--append-system-prompt")
                 .arg(pay_core::instructions::INSTRUCTIONS)
-                .args(&self.args)
+                .args(&qoder_args)
                 .stdin(Stdio::inherit())
                 .stdout(Stdio::inherit())
                 .stderr(Stdio::inherit())
@@ -104,6 +127,100 @@ impl QodercliCommand {
             Ok(status.code().unwrap_or(1))
         }
     }
+}
+
+fn qoder_metadata_requested(args: &[String]) -> bool {
+    args.iter()
+        .any(|arg| matches!(arg.as_str(), "-h" | "--help" | "--version" | "-v"))
+}
+
+fn qoder_args(
+    extra_args: &[String],
+    alternate: Option<&AlternateProvider>,
+) -> pay_core::Result<Vec<String>> {
+    let Some(alternate) = alternate else {
+        return Ok(extra_args.to_vec());
+    };
+    let Some(model) = alternate.model.as_deref() else {
+        return Err(pay_core::Error::Config(
+            "Qoder alternate-provider routing requires a selected model; pass `--model <model>`"
+                .to_string(),
+        ));
+    };
+
+    let (settings, provider_model) = qoder_provider_settings(alternate, model);
+    let mut args = vec![
+        "--settings".to_string(),
+        settings.to_string(),
+        "--model".to_string(),
+        provider_model,
+    ];
+    args.extend(args_without_model(extra_args));
+    Ok(args)
+}
+
+// Qoder's BYOK custom-model path is forwarded by Qoder's servers, so it
+// cannot reach the payer proxy on 127.0.0.1. The external-provider path is a
+// direct client transport, but Qoder enables it only for entitled accounts.
+fn qoder_provider_settings(
+    alternate: &AlternateProvider,
+    model: &str,
+) -> (serde_json::Value, String) {
+    let provider_model = format!("pay/{model}");
+    let settings = serde_json::json!({
+        "providers": {
+            "pay": {
+                "baseUrl": alternate.base_url,
+                "apiKey": "pay",
+                "displayName": "Pay alternate provider",
+                "model": provider_model,
+                "models": [{
+                    "model": provider_model,
+                    "displayName": format!("Pay: {model}"),
+                    "capabilities": {
+                        "tools": true,
+                        "vision": false,
+                        "thinking": false
+                    }
+                }]
+            }
+        }
+    });
+    (settings, provider_model)
+}
+
+fn ensure_qoder_external_provider_access() -> pay_core::Result<()> {
+    let probe = AlternateProvider {
+        base_url: EXTERNAL_PROVIDER_PROBE_BASE_URL.to_string(),
+        model: Some(EXTERNAL_PROVIDER_PROBE_MODEL.to_string()),
+    };
+    let (settings, provider_model) = qoder_provider_settings(&probe, EXTERNAL_PROVIDER_PROBE_MODEL);
+    let output = Command::new("qodercli")
+        .arg("--list-models")
+        .arg("--settings")
+        .arg(settings.to_string())
+        .output()
+        .map_err(|e| {
+            pay_core::Error::Config(format!(
+                "Failed to query Qoder's external-provider capability: {e}"
+            ))
+        })?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    if output.status.success()
+        && qoder_model_list_contains(&stdout, &provider_model, EXTERNAL_PROVIDER_PROBE_MODEL)
+    {
+        return Ok(());
+    }
+
+    Err(pay_core::Error::Config(
+        "Qoder has not enabled direct external providers for this account. Its public custom-model feature routes through Qoder's servers and does not accept the local payer proxy URL. Ask Qoder to enable direct external providers for this account, or use `pay --alt codex`, `pay --alt claude`, or `pay goose`.".to_string(),
+    ))
+}
+
+fn qoder_model_list_contains(output: &str, provider_model: &str, model: &str) -> bool {
+    output.lines().map(str::trim).any(|line| {
+        line == provider_model || line == format!("Pay: {model}") || line == format!("Pay {model}")
+    })
 }
 
 // On Windows, cmd.exe (used to execute .cmd batch wrappers) rejects
@@ -278,5 +395,62 @@ mod tests {
         assert!(!env.contains_key("PAY_PROTOCOL_ENFORCED"));
         assert!(!env.contains_key("PAY_DEBUGGER_PROXY"));
         assert!(!env.contains_key("PAY_ACTIVE_ACCOUNT"));
+    }
+
+    #[test]
+    fn alternate_provider_is_injected_as_a_direct_qoder_provider() {
+        let alternate = AlternateProvider {
+            base_url: "http://127.0.0.1:54321/v1".to_string(),
+            model: Some("qwen3-coder-next".to_string()),
+        };
+
+        let args = qoder_args(
+            &[
+                "--model".to_string(),
+                "qwen3-coder-next".to_string(),
+                "-p".to_string(),
+                "hello".to_string(),
+            ],
+            Some(&alternate),
+        )
+        .unwrap();
+
+        assert_eq!(args[0], "--settings");
+        assert_eq!(args[2], "--model");
+        assert_eq!(args[3], "pay/qwen3-coder-next");
+        let settings: serde_json::Value = serde_json::from_str(&args[1]).unwrap();
+        let provider = &settings["providers"]["pay"];
+        assert_eq!(provider["baseUrl"], "http://127.0.0.1:54321/v1");
+        assert_eq!(provider["apiKey"], "pay");
+        assert_eq!(provider["model"], "pay/qwen3-coder-next");
+        assert_eq!(provider["models"][0]["model"], "pay/qwen3-coder-next");
+        assert_eq!(provider["models"][0]["capabilities"]["tools"], true);
+        assert_eq!(&args[4..], ["-p", "hello"]);
+    }
+
+    #[test]
+    fn metadata_requests_skip_alternate_provider_selection() {
+        assert!(qoder_metadata_requested(&["--version".to_string()]));
+        assert!(qoder_metadata_requested(&["-h".to_string()]));
+        assert!(!qoder_metadata_requested(&["hello".to_string()]));
+    }
+
+    #[test]
+    fn qoder_external_provider_must_appear_in_the_entitled_model_list() {
+        assert!(qoder_model_list_contains(
+            "MODEL\nUltimate\npay/qwen3.7-plus\n",
+            "pay/qwen3.7-plus",
+            "qwen3.7-plus"
+        ));
+        assert!(qoder_model_list_contains(
+            "MODEL\nPay: qwen3.7-plus\n",
+            "pay/qwen3.7-plus",
+            "qwen3.7-plus"
+        ));
+        assert!(!qoder_model_list_contains(
+            "MODEL\nUltimate\nQwen3.7-Plus\n",
+            "pay/qwen3.7-plus",
+            "qwen3.7-plus"
+        ));
     }
 }

@@ -21,7 +21,7 @@ COPY . .
 ARG PAY_PDB_ALLOW_PLACEHOLDER
 ENV PAY_PDB_ALLOW_PLACEHOLDER=${PAY_PDB_ALLOW_PLACEHOLDER}
 
-RUN cargo build --release --features gcp_kms
+RUN cargo build --release --features gcp_kms,redis-session-store
 
 RUN cp target/release/pay /usr/local/bin/pay
 

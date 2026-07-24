@@ -6,6 +6,9 @@ use std::time::Duration;
 
 use clap::Args;
 
+use super::agent_args::model_arg;
+use owo_colors::OwoColorize;
+
 use crate::commands::payer_proxy;
 use crate::commands::server::inference::{
     self,
@@ -20,6 +23,8 @@ const PROVIDER_PROBE_TIMEOUT: Duration = Duration::from_millis(400);
 const ANTHROPIC_BASE_URL_ENV: &str = "ANTHROPIC_BASE_URL";
 const ANTHROPIC_API_KEY_ENV: &str = "ANTHROPIC_API_KEY";
 const ANTHROPIC_AUTH_TOKEN_ENV: &str = "ANTHROPIC_AUTH_TOKEN";
+const CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION_ENV: &str = "CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION";
+const CLAUDE_CODE_DISABLE_TERMINAL_TITLE_ENV: &str = "CLAUDE_CODE_DISABLE_TERMINAL_TITLE";
 const OLLAMA_AUTH_TOKEN: &str = "ollama";
 /// Hosted catalog gateways are remote (TLS handshake included) — give their
 /// reachability/model probes more room than the localhost ones.
@@ -138,6 +143,266 @@ struct ClaudeLaunch {
     args: Vec<String>,
 }
 
+/// Agent harness using a provider selected by `--alt`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum AlternateClient {
+    Claude,
+    Codex,
+    Goose,
+    Qoder,
+}
+
+impl AlternateClient {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Claude => "claude",
+            Self::Codex => "codex",
+            Self::Goose => "goose",
+            Self::Qoder => "qoder",
+        }
+    }
+
+    fn display_name(self) -> &'static str {
+        match self {
+            Self::Claude => "Claude",
+            Self::Codex => "Codex",
+            Self::Goose => "Goose",
+            Self::Qoder => "Qoder",
+        }
+    }
+
+    fn compatibility_label(self) -> &'static str {
+        match self {
+            Self::Claude => "Anthropic or OpenAI-compatible",
+            Self::Codex => "OpenAI Responses-compatible",
+            Self::Goose => "OpenAI Chat Completions-compatible",
+            Self::Qoder => "OpenAI Chat Completions-compatible",
+        }
+    }
+
+    fn fallback_dialect(self) -> Dialect {
+        match self {
+            Self::Claude => Dialect::Anthropic,
+            Self::Codex | Self::Goose | Self::Qoder => Dialect::OpenAiCompat,
+        }
+    }
+
+    fn supports_dialect(self, dialect: Dialect) -> bool {
+        match self {
+            Self::Claude => matches!(dialect, Dialect::Anthropic | Dialect::OpenAiCompat),
+            Self::Codex | Self::Goose | Self::Qoder => dialect == Dialect::OpenAiCompat,
+        }
+    }
+
+    fn provider_supported(self, provider: &DiscoveredProvider) -> bool {
+        let dialect = provider.provider.dialect();
+        if !self.supports_dialect(dialect) {
+            return false;
+        }
+        match (self, dialect) {
+            (Self::Claude, Dialect::Anthropic) => supports_post_endpoint(provider, "v1/messages"),
+            (Self::Claude, Dialect::OpenAiCompat) => {
+                supports_post_endpoint(provider, "chat/completions")
+            }
+            (Self::Codex, Dialect::OpenAiCompat) => {
+                supports_post_endpoint(provider, "v1/responses")
+            }
+            (Self::Goose | Self::Qoder, Dialect::OpenAiCompat) => {
+                supports_post_endpoint(provider, "chat/completions")
+            }
+            _ => false,
+        }
+    }
+
+    fn payer_base_url(self, payer_base_url: &str) -> String {
+        match self {
+            Self::Claude => payer_base_url.to_string(),
+            // Goose takes a host and a separate `OPENAI_BASE_PATH`.
+            Self::Goose => payer_base_url.to_string(),
+            // Codex and Qoder append their operation to an OpenAI `/v1` base.
+            Self::Codex | Self::Qoder => {
+                format!("{}/v1", payer_base_url.trim_end_matches('/'))
+            }
+        }
+    }
+}
+
+/// One-run provider settings backed by the local payer proxy.
+pub(crate) struct AlternateProvider {
+    pub base_url: String,
+    pub model: Option<String>,
+}
+
+#[derive(Clone, Copy)]
+enum AlternateRouteKind {
+    Hosted,
+    LocalGateway,
+    Direct,
+}
+
+/// Discover, filter, select, and proxy a provider for an alternate agent
+/// harness. Compatibility is enforced before the provider picker is shown.
+pub(crate) fn prepare_alternate_provider(
+    client: AlternateClient,
+    args: &[String],
+    network_override: Option<&str>,
+    account_override: Option<&str>,
+) -> pay_core::Result<AlternateProvider> {
+    let agent = client.name();
+    let requested_model = model_arg(args);
+    let gateway_up = gateway_listening();
+    let mut providers = discover_local_providers()?;
+    if gateway_up {
+        let gateway_providers = gateway_provider_summaries();
+        if !gateway_providers.is_empty() {
+            apply_gateway_provider_summaries(&mut providers, &gateway_providers);
+        } else {
+            apply_gateway_proxy_fallback(&mut providers);
+        }
+    }
+    providers.extend(discover_catalog_providers());
+    providers.retain(|provider| client.provider_supported(provider));
+
+    let choice = if providers.is_empty() {
+        None
+    } else {
+        Some(select_provider_choice(
+            agent,
+            providers,
+            requested_model.as_deref(),
+        )?)
+    };
+
+    let translated = client == AlternateClient::Claude
+        && choice
+            .as_ref()
+            .is_some_and(|choice| choice.provider.provider.dialect() == Dialect::OpenAiCompat);
+
+    let (upstream, model, provider_name, route_kind) = match choice {
+        Some(choice) if choice.provider.hosted() => {
+            let provider_name = choice.provider.title().to_string();
+            let upstream = payer_upstream(&choice.provider, choice.provider.base_url.clone());
+            (
+                upstream,
+                Some(choice.model),
+                provider_name,
+                AlternateRouteKind::Hosted,
+            )
+        }
+        Some(choice) if gateway_up => {
+            let provider_name = choice.provider.title().to_string();
+            let upstream = gateway_payer_upstream(&choice.provider);
+            (
+                upstream,
+                Some(choice.model),
+                provider_name,
+                AlternateRouteKind::LocalGateway,
+            )
+        }
+        Some(choice) => {
+            let provider_name = choice.provider.title().to_string();
+            let upstream = payer_upstream(&choice.provider, choice.provider.base_url.clone());
+            (
+                upstream,
+                Some(choice.model),
+                provider_name,
+                AlternateRouteKind::Direct,
+            )
+        }
+        None if gateway_up => {
+            let upstream = payer_proxy::PayerUpstream {
+                base_url: inference::LOCAL_GATEWAY_BASE_URL.to_string(),
+                host_header: None,
+                dialect: client.fallback_dialect(),
+                chat_path: providers::OPENAI_CHAT_COMPLETIONS_PATH.to_string(),
+                responses_path: "v1/responses".to_string(),
+                require_payment: false,
+                payment_protocol: payer_proxy::PaymentProtocol::Auto,
+            };
+            (
+                upstream,
+                requested_model,
+                "Local gateway".to_string(),
+                AlternateRouteKind::LocalGateway,
+            )
+        }
+        None => {
+            return Err(pay_core::Error::Config(format!(
+                "no {} provider found for {agent} and no gateway is listening on {}",
+                client.compatibility_label(),
+                inference::LOCAL_GATEWAY_BASE_URL
+            )));
+        }
+    };
+
+    let payer = payer_proxy::start_background(upstream, network_override, account_override)?;
+    print_alternate_route(
+        client,
+        &provider_name,
+        model.as_deref(),
+        route_kind,
+        translated,
+        payer.payer_pubkey.as_deref(),
+    );
+
+    Ok(AlternateProvider {
+        base_url: client.payer_base_url(&payer.base_url),
+        model,
+    })
+}
+
+fn print_alternate_route(
+    client: AlternateClient,
+    provider: &str,
+    model: Option<&str>,
+    route_kind: AlternateRouteKind,
+    translated: bool,
+    payer_pubkey: Option<&str>,
+) {
+    let model = model
+        .map(|model| format!(" {}", format!("· {model}").magenta()))
+        .unwrap_or_default();
+    let translation = if translated {
+        format!(" {}", "· Anthropic→OpenAI".dimmed())
+    } else {
+        String::new()
+    };
+    let route = match route_kind {
+        AlternateRouteKind::Hosted => payer_pubkey
+            .map(abbreviate_pubkey)
+            .map(|payer| format!(" {}", format!("· payer {payer}").dimmed()))
+            .unwrap_or_else(|| format!(" {}", "· paid".dimmed())),
+        AlternateRouteKind::LocalGateway => format!(" {}", "· local gateway".dimmed()),
+        AlternateRouteKind::Direct => format!(" {}", "· direct".dimmed()),
+    };
+
+    eprintln!(
+        "{} {} {} {}{}{}{}",
+        "⚡".yellow().bold(),
+        client.display_name().bold(),
+        "→".dimmed(),
+        provider.cyan().bold(),
+        model,
+        translation,
+        route,
+    );
+}
+
+fn abbreviate_pubkey(pubkey: &str) -> String {
+    if pubkey.len() <= 12 {
+        return pubkey.to_string();
+    }
+    format!("{}…{}", &pubkey[..5], &pubkey[pubkey.len() - 4..])
+}
+
+fn supports_post_endpoint(provider: &DiscoveredProvider, endpoint_path: &str) -> bool {
+    let required = endpoint_path.trim_matches('/');
+    provider.provider.paid_endpoints().iter().any(|endpoint| {
+        matches!(endpoint.method, pay_types::metering::HttpMethod::Post)
+            && endpoint.path.trim_matches('/').ends_with(required)
+    })
+}
+
 fn prepare_claude_launch(
     args: &[String],
     alternate_provider: bool,
@@ -160,7 +425,7 @@ fn prepare_claude_launch(
 ///
 /// `pay claude` never spawns a gateway itself — it routes:
 ///
-/// 1. **Hosted catalog provider selected** (Gemini, Model Studio, … from
+/// 1. **Hosted compatible provider selected** (Model Studio, … from
 ///    the pay catalog) → payer proxy targets its `service_url` directly
 ///    and settles the gateway's MPP 402 challenges per request.
 /// 2. **Gateway on 127.0.0.1:1402** (the user ran `pay serve inference`,
@@ -183,110 +448,17 @@ fn prepare_alternate_claude_launch(
         });
     }
 
-    let requested_model = model_arg(args);
-    let gateway_up = gateway_listening();
-    let mut providers = discover_local_providers()?;
-    if gateway_up {
-        let gateway_providers = gateway_provider_summaries();
-        if !gateway_providers.is_empty() {
-            apply_gateway_provider_summaries(&mut providers, &gateway_providers);
-        } else {
-            apply_gateway_proxy_fallback(&mut providers);
-        }
-    }
-    providers.extend(discover_catalog_providers());
-
-    let choice = if providers.is_empty() {
-        None
-    } else {
-        Some(select_provider_choice(
-            providers,
-            requested_model.as_deref(),
-        )?)
-    };
-
-    if let Some(choice) = &choice {
-        match choice.provider.provider.dialect() {
-            Dialect::Anthropic => {}
-            Dialect::OpenAiCompat => eprintln!(
-                "⏺ translating anthropic → openai for {}",
-                choice.provider.title()
-            ),
-            dialect => eprintln!(
-                "⚠ {} speaks {dialect}; no translator yet — expect errors from claude",
-                choice.provider.title()
-            ),
-        }
-    }
-
-    let (upstream, model) = match choice {
-        // A hosted catalog provider is its own upstream: the payer proxy
-        // pays its 402s directly; the local gateway never fronts it.
-        Some(choice) if choice.provider.hosted() => {
-            eprintln!(
-                "⏺ routing claude → {} {} (hosted, paid per request)",
-                choice.provider.slug(),
-                choice.provider.base_url
-            );
-            let upstream = payer_upstream(&choice.provider, choice.provider.base_url.clone());
-            (upstream, Some(choice.model))
-        }
-        // Direct discovery still supplies the model list for the
-        // ANTHROPIC_DEFAULT_* env vars; the gateway routes by model.
-        Some(choice) if gateway_up => {
-            let gateway_url = inference::local_gateway_provider_url(choice.provider.slug());
-            eprintln!("⏺ routing claude → gateway {gateway_url}");
-            let upstream = gateway_payer_upstream(&choice.provider);
-            (upstream, Some(choice.model))
-        }
-        Some(choice) => {
-            eprintln!(
-                "⏺ routing claude → {} {} (direct, unmetered)",
-                choice.provider.slug(),
-                choice.provider.base_url
-            );
-            let upstream = payer_upstream(&choice.provider, choice.provider.base_url.clone());
-            (upstream, Some(choice.model))
-        }
-        None if gateway_up => {
-            eprintln!(
-                "⏺ routing claude → gateway {}",
-                inference::LOCAL_GATEWAY_BASE_URL
-            );
-            let upstream = payer_proxy::PayerUpstream {
-                base_url: inference::LOCAL_GATEWAY_BASE_URL.to_string(),
-                host_header: None,
-                dialect: Dialect::Anthropic,
-                chat_path: providers::OPENAI_CHAT_COMPLETIONS_PATH.to_string(),
-            };
-            (upstream, requested_model)
-        }
-        None => {
-            return Err(pay_core::Error::Config(format!(
-                "no gateway on {} and no local inference provider detected — \
-                 start one, e.g. `ollama serve`, or run `pay serve inference`.",
-                inference::LOCAL_GATEWAY_BASE_URL
-            )));
-        }
-    };
-
-    let upstream_base = upstream.base_url.clone();
-    let payer = payer_proxy::start_background(upstream, network_override, account_override)?;
-    eprintln!(
-        "⏺ payer proxy on {} → {} (paying as {})",
-        payer.base_url,
-        upstream_base,
-        payer
-            .payer_pubkey
-            .as_deref()
-            .unwrap_or("unresolved account")
-    );
-
-    let args = claude_args_with_model(args, model.as_deref());
+    let alternate = prepare_alternate_provider(
+        AlternateClient::Claude,
+        args,
+        network_override,
+        account_override,
+    )?;
+    let args = claude_args_with_model(args, alternate.model.as_deref());
 
     Ok(ClaudeLaunch {
-        base_url: Some(payer.base_url),
-        model,
+        base_url: Some(alternate.base_url),
+        model: alternate.model,
         args,
     })
 }
@@ -299,6 +471,9 @@ fn payer_upstream(provider: &DiscoveredProvider, base_url: String) -> payer_prox
         host_header: None,
         dialect: provider.provider.dialect(),
         chat_path: chat_completions_path(provider.provider.as_ref()),
+        responses_path: responses_path(provider.provider.as_ref()),
+        require_payment: provider.hosted(),
+        payment_protocol: provider_payment_protocol(provider),
     }
 }
 
@@ -311,6 +486,19 @@ fn gateway_payer_upstream(provider: &DiscoveredProvider) -> payer_proxy::PayerUp
         host_header: Some(inference::local_gateway_provider_host(provider.slug())),
         dialect: provider.provider.dialect(),
         chat_path: chat_completions_path(provider.provider.as_ref()),
+        responses_path: responses_path(provider.provider.as_ref()),
+        require_payment: false,
+        payment_protocol: provider_payment_protocol(provider),
+    }
+}
+
+/// Alibaba Model Studio and Gemini are session-only agent routes. Keeping the
+/// requirement here makes the local payer fail closed even while a stale
+/// catalog entry still advertises the legacy x402 fallback.
+fn provider_payment_protocol(provider: &DiscoveredProvider) -> payer_proxy::PaymentProtocol {
+    match provider.slug() {
+        "modelstudio" | "generativelanguage" => payer_proxy::PaymentProtocol::MppSession,
+        _ => payer_proxy::PaymentProtocol::Auto,
     }
 }
 
@@ -327,17 +515,30 @@ fn chat_completions_path(provider: &dyn InferenceProvider) -> String {
         .unwrap_or_else(|| providers::OPENAI_CHAT_COMPLETIONS_PATH.to_string())
 }
 
+/// The provider's Responses API path. Some hosted providers expose it below
+/// the same compatibility prefix as Chat Completions.
+fn responses_path(provider: &dyn InferenceProvider) -> String {
+    provider
+        .paid_endpoints()
+        .into_iter()
+        .filter(|ep| matches!(ep.method, pay_types::metering::HttpMethod::Post))
+        .map(|ep| ep.path)
+        .find(|path| path.trim_matches('/').ends_with("/responses"))
+        .unwrap_or_else(|| "v1/responses".to_string())
+}
+
 fn select_provider_choice(
+    agent: &str,
     providers: Vec<DiscoveredProvider>,
     requested_model: Option<&str>,
 ) -> pay_core::Result<crate::tui::ProviderChoice> {
-    match select_provider("claude", providers, requested_model)
+    match select_provider(agent, providers, requested_model)
         .map_err(|e| pay_core::Error::Config(format!("Provider selection failed: {e}")))?
     {
         ProviderSelection::Selected(choice) => Ok(choice),
-        ProviderSelection::Cancelled => Err(pay_core::Error::Config(
-            "Claude provider selection cancelled".to_string(),
-        )),
+        ProviderSelection::Cancelled => Err(pay_core::Error::Config(format!(
+            "{agent} provider selection cancelled"
+        ))),
     }
 }
 
@@ -431,13 +632,18 @@ fn discover_catalog_providers() -> Vec<DiscoveredProvider> {
         return Vec::new();
     };
     rt.block_on(async {
-        let mut catalog = match load_catalog_quietly().await {
-            Ok(catalog) => catalog,
+        let mut resolved = match load_catalog_quietly().await {
+            Ok(mut catalog) => catalog_providers::resolve_catalog_providers(
+                &mut catalog,
+                catalog_providers::DEFAULT_CATALOG_FQNS,
+            )
+            .await,
             Err(e) => {
-                tracing::debug!(error = %e, "skills catalog unavailable — hosted providers skipped");
-                return Vec::new();
+                tracing::debug!(error = %e, "skills catalog unavailable — using built-in gateway providers");
+                Vec::new()
             }
         };
+        catalog_providers::append_default_fallbacks(&mut resolved);
         let Ok(client) = reqwest::Client::builder()
             .timeout(CATALOG_PROBE_TIMEOUT)
             .build()
@@ -446,11 +652,6 @@ fn discover_catalog_providers() -> Vec<DiscoveredProvider> {
         };
 
         let mut discovered = Vec::new();
-        let resolved = catalog_providers::resolve_catalog_providers(
-            &mut catalog,
-            catalog_providers::DEFAULT_CATALOG_FQNS,
-        )
-        .await;
         for provider in resolved {
             let base_url = provider.service_url().to_string();
             let provider: Arc<dyn InferenceProvider> = Arc::new(provider);
@@ -524,24 +725,6 @@ fn claude_metadata_requested(args: &[String]) -> bool {
         .any(|arg| matches!(arg.as_str(), "-h" | "--help" | "--version" | "-v"))
 }
 
-fn model_arg(args: &[String]) -> Option<String> {
-    let mut iter = args.iter();
-    while let Some(arg) = iter.next() {
-        if let Some(model) = arg.strip_prefix("--model=")
-            && !model.is_empty()
-        {
-            return Some(model.to_string());
-        }
-        if matches!(arg.as_str(), "--model" | "-m")
-            && let Some(model) = iter.next()
-            && !model.trim().is_empty()
-        {
-            return Some(model.to_string());
-        }
-    }
-    None
-}
-
 fn claude_args_with_model(args: &[String], model: Option<&str>) -> Vec<String> {
     let Some(model) = model else {
         return args.to_vec();
@@ -565,6 +748,14 @@ fn claude_env(base_url: &str, model: Option<&str>) -> Vec<(String, String)> {
         (
             "CLAUDE_CODE_ATTRIBUTION_HEADER".to_string(),
             "0".to_string(),
+        ),
+        (
+            CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION_ENV.to_string(),
+            "false".to_string(),
+        ),
+        (
+            CLAUDE_CODE_DISABLE_TERMINAL_TITLE_ENV.to_string(),
+            "1".to_string(),
         ),
     ];
 
@@ -682,23 +873,6 @@ mod tests {
     }
 
     #[test]
-    fn model_arg_reads_long_and_short_forms() {
-        assert_eq!(
-            model_arg(&["--model".into(), "llama3.2".into()]),
-            Some("llama3.2".into())
-        );
-        assert_eq!(
-            model_arg(&["--model=qwen3.5".into()]),
-            Some("qwen3.5".into())
-        );
-        assert_eq!(
-            model_arg(&["-m".into(), "gemma4".into()]),
-            Some("gemma4".into())
-        );
-        assert_eq!(model_arg(&["--model".into()]), None);
-    }
-
-    #[test]
     fn claude_args_inject_model_when_missing() {
         assert_eq!(
             claude_args_with_model(&["-p".into(), "hi".into()], Some("llama3.2")),
@@ -731,6 +905,73 @@ mod tests {
             "CLAUDE_CODE_SUBAGENT_MODEL".to_string(),
             "llama3.2".to_string()
         )));
+        assert!(env.contains(&(
+            CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION_ENV.to_string(),
+            "false".to_string()
+        )));
+        assert!(env.contains(&(
+            CLAUDE_CODE_DISABLE_TERMINAL_TITLE_ENV.to_string(),
+            "1".to_string()
+        )));
+    }
+
+    #[test]
+    fn alternate_clients_filter_incompatible_dialects_before_selection() {
+        assert!(!AlternateClient::Claude.supports_dialect(Dialect::GeminiNative));
+        assert!(AlternateClient::Claude.supports_dialect(Dialect::Anthropic));
+        assert!(AlternateClient::Claude.supports_dialect(Dialect::OpenAiCompat));
+        assert!(!AlternateClient::Codex.supports_dialect(Dialect::Anthropic));
+        assert!(AlternateClient::Codex.supports_dialect(Dialect::OpenAiCompat));
+        assert!(AlternateClient::Goose.supports_dialect(Dialect::OpenAiCompat));
+        assert!(AlternateClient::Qoder.supports_dialect(Dialect::OpenAiCompat));
+    }
+
+    #[test]
+    fn launch_banner_abbreviates_payer_pubkeys() {
+        assert_eq!(
+            abbreviate_pubkey("CHPEgF7X1hYJf64oRx53ABUL43DXpEjTJBzAYmZWNuKR"),
+            "CHPEg…NuKR"
+        );
+        assert_eq!(abbreviate_pubkey("short"), "short");
+    }
+
+    #[test]
+    fn alibaba_chat_path_uses_the_deployed_gateway_prefix() {
+        let provider = catalog_providers::alibaba_modelstudio_fallback();
+        assert_eq!(
+            chat_completions_path(&provider),
+            "compatible-mode/v1/chat/completions"
+        );
+        assert_eq!(responses_path(&provider), "v1/responses");
+    }
+
+    #[test]
+    fn hosted_fallbacks_are_filtered_by_agent_wire_api() {
+        let alibaba = catalog_providers::alibaba_modelstudio_fallback();
+        let alibaba = DiscoveredProvider {
+            models: vec!["qwen3.7-plus".to_string()],
+            base_url: alibaba.service_url().to_string(),
+            provider: Arc::new(alibaba),
+            version: None,
+            pricing: None,
+            model_pricing: Vec::new(),
+        };
+        assert!(AlternateClient::Claude.provider_supported(&alibaba));
+        assert!(AlternateClient::Codex.provider_supported(&alibaba));
+        assert!(AlternateClient::Goose.provider_supported(&alibaba));
+
+        let gemini = catalog_providers::google_gemini_fallback();
+        let gemini = DiscoveredProvider {
+            models: vec!["gemini-2.5-flash".to_string()],
+            base_url: gemini.service_url().to_string(),
+            provider: Arc::new(gemini),
+            version: None,
+            pricing: None,
+            model_pricing: Vec::new(),
+        };
+        assert!(AlternateClient::Claude.provider_supported(&gemini));
+        assert!(!AlternateClient::Codex.provider_supported(&gemini));
+        assert!(AlternateClient::Goose.provider_supported(&gemini));
     }
 
     #[test]

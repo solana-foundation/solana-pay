@@ -866,6 +866,15 @@ pub struct SessionSpec {
     /// Defaults to `15000` when omitted. Set to `0` to disable automatic close.
     #[serde(default = "default_session_close_delay_ms")]
     pub close_delay_ms: u64,
+    /// Interval between operator pushes of the latest accepted cumulative
+    /// watermark to the payment-channel program.
+    ///
+    /// This keeps an active channel open while bounding the amount represented
+    /// only by an off-chain voucher. Defaults to `5000` when omitted. Set to
+    /// `0` to disable intermediate settlement (the idle close still settles
+    /// the latest voucher).
+    #[serde(default = "default_session_settlement_interval_ms")]
+    pub settlement_interval_ms: u64,
     /// Channel settlement splits. Session splits are percentage-only and are
     /// converted to basis points for the payment channel distribution.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -887,6 +896,10 @@ fn default_session_batch_open_interval_ms() -> u64 {
 
 fn default_session_close_delay_ms() -> u64 {
     15_000
+}
+
+fn default_session_settlement_interval_ms() -> u64 {
+    5_000
 }
 
 /// Named recipient alias declared at the API spec level.
@@ -2517,11 +2530,12 @@ mod tests {
     }
 
     #[test]
-    fn session_spec_defaults_auto_close_delay() {
+    fn session_spec_defaults_lifecycle_intervals() {
         let session: SessionSpec = serde_json::from_str(r#"{"cap_usdc":10.0}"#).unwrap();
 
         assert_eq!(session.batch_open_interval_ms, 400);
         assert_eq!(session.close_delay_ms, 15_000);
+        assert_eq!(session.settlement_interval_ms, 5_000);
         assert_eq!(
             session.settlement_authority,
             SessionSettlementAuthority::ClientVoucher
@@ -3725,6 +3739,7 @@ value_from_env: PAY_SIGNER_KEYPAIR
             pull_voucher_strategy: SessionPullVoucherStrategy::Disabled,
             batch_open_interval_ms: 400,
             close_delay_ms: 15_000,
+            settlement_interval_ms: 5_000,
             splits: vec![],
         });
 
@@ -3890,6 +3905,7 @@ value_from_env: PAY_SIGNER_KEYPAIR
             pull_voucher_strategy: SessionPullVoucherStrategy::Disabled,
             batch_open_interval_ms: 400,
             close_delay_ms: 15_000,
+            settlement_interval_ms: 5_000,
             splits,
         });
         spec

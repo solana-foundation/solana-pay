@@ -403,6 +403,7 @@ fn render_card_panel(
                 ToolKind::Wget => "wget",
                 ToolKind::Http => "http",
                 ToolKind::Fetch => "fetch",
+                ToolKind::Goose => "goose",
                 ToolKind::Mcp => "mcp",
                 ToolKind::Claude | ToolKind::Codex | ToolKind::Qodercli => unreachable!(),
             };

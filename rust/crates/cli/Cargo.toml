@@ -12,6 +12,7 @@ path = "src/main.rs"
 default = []
 gcp_kms = ["pay-kit/gcp_kms"]
 vendored-openssl = ["pay-core/vendored-openssl"]
+redis-session-store = ["pay-core/redis-session-store", "pay-kit/redis-store"]
 
 [dependencies]
 async-trait = "0.1"
