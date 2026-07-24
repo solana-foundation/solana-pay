@@ -247,20 +247,13 @@ pub fn upto_uses_response_usage(metering: &Metering, variant_hint: Option<&str>)
 }
 
 pub fn upto_requires_response_body(metering: &Metering, variant_hint: Option<&str>) -> bool {
-    metering
+    let preset = metering
         .upto
         .as_ref()
-        .and_then(|upto| upto.usage_preset.as_deref())
-        .is_some()
-        || effective_dimensions(metering, variant_hint)
-            .iter()
-            .any(|dim| {
-                dim.unit == BillingUnit::QuotaUnits
-                    || dim
-                        .meter
-                        .as_ref()
-                        .is_some_and(|meter| matches!(meter.source, UsageMeterSource::ResponseJson))
-            })
+        .and_then(|upto| upto.usage_preset.as_deref());
+    effective_dimensions(metering, variant_hint)
+        .iter()
+        .any(|dim| dimension_reads_response_body(dim, preset))
 }
 
 pub fn upto_response_body_limit(metering: &Metering) -> usize {
@@ -353,8 +346,6 @@ fn extract_and_price_usage(
         ));
     }
 
-    let prices = resolve_price(metering, props, variant_hint, None)
-        .ok_or_else(|| UptoUsageError::MissingUsage("no resolved price".to_string()))?;
     // Observer-supplied token counts supersede body/meter extraction for token
     // dimensions. When every dimension that would otherwise read from the
     // response body is satisfiable from `inferred_usage`, we can skip parsing
@@ -384,6 +375,18 @@ fn extract_and_price_usage(
         None
     };
 
+    let mut priced_props = *props;
+    if priced_props.context_length.is_none() {
+        priced_props.context_length = inferred_usage
+            .and_then(|usage| usage.tokens_prompt)
+            .or_else(|| {
+                json.as_ref()
+                    .and_then(|json| quota_token_quantity(json, MeterDirection::Input))
+            });
+    }
+    let prices = resolve_price(metering, &priced_props, variant_hint, None)
+        .ok_or_else(|| UptoUsageError::MissingUsage("no resolved price".to_string()))?;
+
     let mut total = 0.0;
     for (idx, dim) in dimensions.iter().enumerate() {
         let price = prices
@@ -391,8 +394,14 @@ fn extract_and_price_usage(
             .get(idx)
             .map(|d| d.price_usd)
             .unwrap_or(0.0);
-        let quantity =
-            extract_dimension_quantity(dim, preset, props, headers, json.as_ref(), inferred_usage)?;
+        let quantity = extract_dimension_quantity(
+            dim,
+            preset,
+            &priced_props,
+            headers,
+            json.as_ref(),
+            inferred_usage,
+        )?;
         total += quantity as f64 / dim.scale.max(1) as f64 * price;
     }
     Ok(total)
@@ -535,6 +544,14 @@ fn extract_dimension_quantity(
         return Ok(ceil_div_u64(tokens, per_unit));
     }
 
+    if dim.unit == BillingUnit::Tokens {
+        let json =
+            json.ok_or_else(|| UptoUsageError::MissingUsage("response body unavailable".into()))?;
+        return quota_token_quantity(json, dim.direction).ok_or_else(|| {
+            UptoUsageError::MissingUsage(format!("no token usage for {:?} tokens", dim.direction))
+        });
+    }
+
     if let Some(path) = preset_json_path(preset, dim) {
         let json =
             json.ok_or_else(|| UptoUsageError::MissingUsage("response body unavailable".into()))?;
@@ -555,7 +572,10 @@ fn dimension_reads_response_body(dim: &MeterDimension, preset: Option<&str>) -> 
     match dim.meter.as_ref().map(|meter| &meter.source) {
         Some(UsageMeterSource::ResponseHeader) => false,
         Some(UsageMeterSource::ResponseJson) => true,
-        None => dim.unit == BillingUnit::QuotaUnits || preset_json_path(preset, dim).is_some(),
+        None => {
+            matches!(dim.unit, BillingUnit::Tokens | BillingUnit::QuotaUnits)
+                || preset_json_path(preset, dim).is_some()
+        }
     }
 }
 
@@ -2471,6 +2491,56 @@ mod tests {
 
         let expected = 12.0 / 1_000_000.0 * 0.10 + 214.0 / 1_000_000.0 * 0.30;
         assert!((actual.usd - expected).abs() < 1e-12, "usd={}", actual.usd);
+    }
+
+    #[test]
+    fn buffered_usage_selects_context_tier_from_provider_prompt_tokens() {
+        let metering = upto_metering(
+            vec![MeterDimension {
+                direction: MeterDirection::Output,
+                unit: BillingUnit::Tokens,
+                scale: 1,
+                period: None,
+                tiers: vec![
+                    PriceTier {
+                        up_to: None,
+                        price_usd: 0.000001,
+                        condition: Some(MeterCondition::ContextLength {
+                            op: CompareOp::Lte,
+                            value: 2,
+                        }),
+                        notes: None,
+                        splits: vec![],
+                    },
+                    PriceTier {
+                        up_to: None,
+                        price_usd: 0.000005,
+                        condition: Some(MeterCondition::ContextLength {
+                            op: CompareOp::Gt,
+                            value: 2,
+                        }),
+                        notes: None,
+                        splits: vec![],
+                    },
+                ],
+                meter: None,
+            }],
+            Some(pay_types::metering::UptoMetering {
+                max_usd: Some(0.10),
+                ..Default::default()
+            }),
+        );
+
+        let actual = upto_actual_amount_from_response(
+            &settlement_plan(metering, 0.10),
+            100_000,
+            &HeaderMap::new(),
+            Some(br#"{"usage":{"prompt_tokens":3,"completion_tokens":2}}"#),
+        )
+        .unwrap();
+
+        assert_eq!(actual.usd, 0.000010);
+        assert_eq!(actual.base_units, 10);
     }
 
     #[test]

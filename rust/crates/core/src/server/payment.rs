@@ -99,23 +99,18 @@ async fn gate_adapter<S: PaymentState>(state: S, req: Request<Body>, next: Next)
                     // Delegated sessions are settled from the completed
                     // response below. The client-voucher stream context waits
                     // for client commits and must not be installed here.
-                    if sf.settlement.is_some() {
-                        let (restored, body_hints) = match request_body_metering_hints(req).await {
+                    if sf
+                        .settlement
+                        .as_deref()
+                        .is_some_and(|plan| plan.variant_hint.is_none())
+                    {
+                        let (restored, body_variant) = match request_body_variant_hint(req).await {
                             Ok(result) => result,
                             Err(response) => return response,
                         };
                         req = restored;
                         if let Some(plan) = sf.settlement.as_deref_mut() {
-                            let RequestBodyMeteringHints {
-                                variant,
-                                estimated_context_tokens,
-                            } = body_hints;
-                            if plan.variant_hint.is_none() {
-                                plan.variant_hint = variant;
-                            }
-                            if let Some(context_length) = estimated_context_tokens {
-                                plan.request_properties.context_length = Some(context_length);
-                            }
+                            plan.variant_hint = body_variant;
                         }
                     }
                     delegated_session = Some(sf);
@@ -216,9 +211,9 @@ async fn gate_adapter<S: PaymentState>(state: S, req: Request<Body>, next: Next)
 /// Read the model selected by OpenAI/Anthropic-compatible JSON requests and
 /// restore the body for the upstream handler. Native model routes already
 /// carry their variant in the path and never enter this path.
-async fn request_body_metering_hints(
+async fn request_body_variant_hint(
     request: Request<Body>,
-) -> Result<(Request<Body>, RequestBodyMeteringHints), Response> {
+) -> Result<(Request<Body>, Option<String>), Response> {
     let (parts, body) = request.into_parts();
     let bytes = axum::body::to_bytes(body, MAX_DELEGATED_MODEL_HINT_BODY_BYTES)
         .await
@@ -230,75 +225,17 @@ async fn request_body_metering_hints(
                 .body(Body::from(r#"{"error":"request_body_too_large"}"#))
                 .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
         })?;
-    let hints = request_body_hints(&bytes);
-    Ok((Request::from_parts(parts, Body::from(bytes)), hints))
+    let variant = request_model_variant_hint(&bytes);
+    Ok((Request::from_parts(parts, Body::from(bytes)), variant))
 }
 
-#[derive(Debug, Default, PartialEq, Eq)]
-struct RequestBodyMeteringHints {
-    variant: Option<String>,
-    estimated_context_tokens: Option<u64>,
-}
-
-fn request_body_hints(body: &[u8]) -> RequestBodyMeteringHints {
-    let Ok(json) = serde_json::from_slice::<serde_json::Value>(body) else {
-        return RequestBodyMeteringHints::default();
-    };
-    let variant = json
-        .get("model")
+fn request_model_variant_hint(body: &[u8]) -> Option<String> {
+    let json = serde_json::from_slice::<serde_json::Value>(body).ok()?;
+    json.get("model")
         .and_then(serde_json::Value::as_str)
         .map(str::trim)
         .filter(|model| !model.is_empty())
-        .map(str::to_string);
-    let estimated_context_tokens = estimate_request_context_tokens(&json);
-    RequestBodyMeteringHints {
-        variant,
-        estimated_context_tokens,
-    }
-}
-
-fn estimate_request_context_tokens(json: &serde_json::Value) -> Option<u64> {
-    const CONTEXT_FIELDS: [&str; 7] = [
-        "messages",
-        "input",
-        "prompt",
-        "instructions",
-        "system",
-        "contents",
-        "tools",
-    ];
-    let mut estimate = 0u64;
-    let mut found = false;
-    for field in CONTEXT_FIELDS {
-        if let Some(value) = json.get(field) {
-            found = true;
-            estimate = estimate.saturating_add(estimate_json_tokens(value));
-        }
-    }
-    found.then_some(estimate)
-}
-
-/// Conservative tokenizer-independent estimate used only to select a pricing
-/// tier before provider usage arrives. ASCII text averages roughly three or
-/// more bytes per token for agent prompts; non-ASCII scalars count as one each.
-fn estimate_json_tokens(value: &serde_json::Value) -> u64 {
-    match value {
-        serde_json::Value::Null => 0,
-        serde_json::Value::Bool(_) | serde_json::Value::Number(_) => 1,
-        serde_json::Value::String(text) => {
-            let ascii = text.chars().filter(char::is_ascii).count() as u64;
-            let non_ascii = text.chars().filter(|ch| !ch.is_ascii()).count() as u64;
-            ascii.saturating_add(2) / 3 + non_ascii
-        }
-        serde_json::Value::Array(items) => items.iter().map(estimate_json_tokens).sum(),
-        serde_json::Value::Object(fields) => fields
-            .iter()
-            .map(|(key, value)| {
-                estimate_json_tokens(&serde_json::Value::String(key.clone()))
-                    .saturating_add(estimate_json_tokens(value))
-            })
-            .sum(),
-    }
+        .map(str::to_string)
 }
 
 async fn settle_axum_delegated_response(
@@ -620,49 +557,18 @@ mod tests {
     }
 
     #[test]
-    fn request_body_hints_read_model_and_estimate_context() {
+    fn request_model_variant_hint_reads_openai_compatible_model() {
         assert_eq!(
-            request_body_hints(
-                br#"{"model":"qwen3.7-max","messages":[{"role":"user","content":"hello world"}],"stream":true}"#
-            ),
-            RequestBodyMeteringHints {
-                variant: Some("qwen3.7-max".to_string()),
-                estimated_context_tokens: Some(11),
-            }
+            request_model_variant_hint(br#"{"model":"qwen3.7-max","stream":true}"#),
+            Some("qwen3.7-max".to_string())
         );
     }
 
     #[test]
-    fn request_body_hints_handle_missing_blank_and_invalid_models() {
-        assert_eq!(
-            request_body_hints(br#"{"messages":["hello"]}"#),
-            RequestBodyMeteringHints {
-                variant: None,
-                estimated_context_tokens: Some(2),
-            }
-        );
-        assert_eq!(
-            request_body_hints(br#"{"model":"  "}"#),
-            RequestBodyMeteringHints::default()
-        );
-        assert_eq!(
-            request_body_hints(b"not json"),
-            RequestBodyMeteringHints::default()
-        );
-    }
-
-    #[test]
-    fn request_context_estimate_crosses_long_context_pricing_tiers() {
-        let prompt = "a".repeat(600_003);
-        let body = serde_json::json!({
-            "model": "gemini-3.1-pro-preview",
-            "contents": [{"parts": [{"text": prompt}]}],
-        });
-
-        assert!(
-            estimate_request_context_tokens(&body).unwrap() > 200_000,
-            "long prompts must select the configured high-context tier"
-        );
+    fn request_model_variant_hint_rejects_missing_or_invalid_models() {
+        assert_eq!(request_model_variant_hint(br#"{"stream":true}"#), None);
+        assert_eq!(request_model_variant_hint(br#"{"model":"  "}"#), None);
+        assert_eq!(request_model_variant_hint(b"not json"), None);
     }
 
     #[test]

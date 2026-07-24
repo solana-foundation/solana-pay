@@ -158,6 +158,7 @@ pub(crate) struct DelegatedSessionStreamMeter {
     gate: SessionUsageGate,
     accumulator: StreamUsageAccumulator,
     current: UsageObservation,
+    priced_context_length: Option<u64>,
 }
 
 impl DelegatedSessionStreamMeter {
@@ -186,11 +187,13 @@ impl DelegatedSessionStreamMeter {
         let gate = SessionUsageGate::new(spec.clone(), settlement, forward.committed_base_units, 1)
             .map_err(box_error)?;
         let current = zero_observation(&spec);
+        let priced_context_length = plan.request_properties.context_length;
         Ok(Self {
             forward,
             gate,
             accumulator: StreamUsageAccumulator::new(spec, hints),
             current,
+            priced_context_length,
         })
     }
 
@@ -211,14 +214,20 @@ impl DelegatedSessionStreamMeter {
         &mut self,
         chunk: &[u8],
         is_sse: bool,
-    ) -> MeteringResult<Option<SessionGateDecision>> {
+    ) -> Result<Option<SessionGateDecision>, BoxError> {
         if !self.accumulator.observe_chunk(chunk, is_sse) {
             return Ok(None);
+        }
+        if let Some(context_length) = self.accumulator.observed_input_tokens()
+            && self.priced_context_length != Some(context_length)
+        {
+            self.reprice_for_context_length(context_length)?;
         }
         self.current = self.accumulator.observation();
         self.gate
             .observe(self.current.clone(), GateMode::Streaming)
             .map(Some)
+            .map_err(box_error)
     }
 
     fn finish(&mut self) -> MeteringResult<Option<SessionGateDecision>> {
@@ -257,6 +266,41 @@ impl DelegatedSessionStreamMeter {
             .await
             .map_err(box_error)?;
         self.gate.record_commit(accepted);
+        Ok(())
+    }
+
+    fn reprice_for_context_length(&mut self, context_length: u64) -> Result<(), BoxError> {
+        let plan = self.forward.settlement.as_deref().ok_or_else(|| {
+            box_error(std::io::Error::other(
+                "delegated stream meter lost its settlement plan",
+            ))
+        })?;
+        let mut properties = plan.request_properties;
+        properties.context_length = Some(context_length);
+        let spec = spec_from_metering(
+            &plan.metering,
+            SessionMeteringContext::new()
+                .with_request_properties(&properties)
+                .with_optional_variant_hint(plan.variant_hint.as_deref()),
+        )
+        .map_err(box_error)?;
+        let hints = SessionUsageHints::from_metering(
+            &plan.metering,
+            plan.variant_hint.as_deref(),
+            &properties,
+        );
+        let committed = self.gate.committed_base_units();
+        let mut gate = SessionUsageGate::new(
+            spec.clone(),
+            StablecoinSettlement::new(self.forward.handle.decimals()),
+            self.forward.committed_base_units,
+            1,
+        )
+        .map_err(box_error)?;
+        gate.record_commit(committed);
+        self.accumulator.reconfigure(spec, hints);
+        self.gate = gate;
+        self.priced_context_length = Some(context_length);
         Ok(())
     }
 }
@@ -362,7 +406,7 @@ where
         futures_util::pin_mut!(stream);
         while let Some(next) = stream.next().await {
             let chunk = next.map_err(box_error)?;
-            let decision = meter.observe_chunk(&chunk, is_sse).map_err(box_error)?;
+            let decision = meter.observe_chunk(&chunk, is_sse)?;
             if let Some(decision) = decision {
                 meter.settle(decision).await?;
             }
@@ -570,6 +614,15 @@ impl StreamUsageAccumulator {
 
     fn has_observation(&self) -> bool {
         self.observed
+    }
+
+    fn observed_input_tokens(&self) -> Option<u64> {
+        (self.input_tokens > 0).then_some(self.input_tokens)
+    }
+
+    fn reconfigure(&mut self, spec: SessionMeterSpec, hints: SessionUsageHints) {
+        self.spec = spec;
+        self.hints = hints;
     }
 }
 
@@ -1148,13 +1201,28 @@ mod tests {
                     unit: BillingUnit::Tokens,
                     scale: 1,
                     period: None,
-                    tiers: vec![PriceTier {
-                        up_to: None,
-                        price_usd: 0.000001,
-                        condition: None,
-                        notes: None,
-                        splits: vec![],
-                    }],
+                    tiers: vec![
+                        PriceTier {
+                            up_to: None,
+                            price_usd: 0.000001,
+                            condition: Some(pay_types::metering::MeterCondition::ContextLength {
+                                op: pay_types::metering::CompareOp::Lte,
+                                value: 2,
+                            }),
+                            notes: None,
+                            splits: vec![],
+                        },
+                        PriceTier {
+                            up_to: None,
+                            price_usd: 0.000005,
+                            condition: Some(pay_types::metering::MeterCondition::ContextLength {
+                                op: pay_types::metering::CompareOp::Gt,
+                                value: 2,
+                            }),
+                            notes: None,
+                            splits: vec![],
+                        },
+                    ],
                     meter: None,
                 }]),
                 variant_hint: None,
@@ -1174,7 +1242,7 @@ mod tests {
             ));
             upstream_release.notified().await;
             yield Ok::<_, std::io::Error>(Bytes::from_static(
-                b"data: {\"choices\":[{\"delta\":{\"content\":\"three\"}}]}\n\n"
+                b"data: {\"choices\":[{\"delta\":{\"content\":\"three\"}}],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":3}}\n\n"
             ));
         };
         let metered = meter_delegated_response_stream(upstream, meter, true);
@@ -1205,8 +1273,14 @@ mod tests {
             .expect("second chunk should remain successful");
         assert_eq!(
             second,
-            Bytes::from_static(b"data: {\"choices\":[{\"delta\":{\"content\":\"three\"}}]}\n\n")
+            Bytes::from_static(
+                b"data: {\"choices\":[{\"delta\":{\"content\":\"three\"}}],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":3}}\n\n"
+            )
         );
-        assert_eq!(session.committed_watermark(&state.channel_id), Some(3));
+        assert_eq!(
+            session.committed_watermark(&state.channel_id),
+            Some(15),
+            "actual prompt usage must reprice all output at the high-context tier"
+        );
     }
 }
