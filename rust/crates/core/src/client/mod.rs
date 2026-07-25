@@ -3,6 +3,7 @@ pub mod balance;
 pub mod fetch;
 pub mod mpp;
 pub(crate) mod prompt;
+pub mod receipt;
 pub mod runner;
 pub mod sandbox;
 pub mod send;

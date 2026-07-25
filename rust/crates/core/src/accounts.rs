@@ -108,6 +108,7 @@ pub struct Account {
     /// Whether loading the secret key should pass through the backend's
     /// auth gate (Touch ID, Windows Hello, polkit, etc.). When omitted,
     /// defaults to `true` for `mainnet` and `false` for other networks.
+    /// Ignored for ephemeral accounts, which are intentionally ungated.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub auth_required: Option<bool>,
 
@@ -281,8 +282,10 @@ pub struct Subscription {
 impl Account {
     /// Whether this account should require backend auth on secret-key access.
     pub fn auth_required_for_network(&self, network: &str) -> bool {
-        self.auth_required
-            .unwrap_or_else(|| default_auth_required_for_network(network))
+        self.keystore != Keystore::Ephemeral
+            && self
+                .auth_required
+                .unwrap_or_else(|| default_auth_required_for_network(network))
     }
 
     /// Build the signer source string used by `pay_core::signer::load_signer`
@@ -295,11 +298,11 @@ impl Account {
             Keystore::GnomeKeyring => Some(format!("gnome-keyring:{name}")),
             Keystore::WindowsHello => Some(format!("windows-hello:{name}")),
             Keystore::OnePassword => Some(format!("1password:{name}")),
-            Keystore::File => Some(
-                self.path
-                    .clone()
-                    .unwrap_or_else(|| format!("~/.config/pay/{name}.json")),
-            ),
+            Keystore::File => Some(self.path.clone().unwrap_or_else(|| {
+                FileAccountsStore::default_keypair_path(name)
+                    .to_string_lossy()
+                    .into_owned()
+            })),
             Keystore::Ephemeral => None,
         }
     }
@@ -558,6 +561,13 @@ impl FileAccountsStore {
         Self {
             path: PathBuf::from(shellexpand::tilde(ACCOUNTS_FILE).into_owned()),
         }
+    }
+
+    /// Default owner-only keypair path alongside `accounts.yml`.
+    pub fn default_keypair_path(account_name: &str) -> PathBuf {
+        Self::default_path()
+            .path
+            .with_file_name(format!("{account_name}.json"))
     }
 
     /// Store rooted at an explicit path (used by tests and non-default deployments).
@@ -992,7 +1002,11 @@ mod tests {
         };
         assert_eq!(
             acct.signer_source("myacct"),
-            Some("~/.config/pay/myacct.json".to_string())
+            Some(
+                FileAccountsStore::default_keypair_path("myacct")
+                    .to_string_lossy()
+                    .into_owned()
+            )
         );
     }
 
@@ -1035,6 +1049,14 @@ mod tests {
     fn auth_required_explicit_override_wins() {
         let mut acct = keychain_account("pk");
         acct.auth_required = Some(false);
+        assert!(!acct.auth_required_for_network(MAINNET_NETWORK));
+    }
+
+    #[test]
+    fn auth_required_is_always_false_for_ephemeral_accounts() {
+        let mut acct = keychain_account("pk");
+        acct.keystore = Keystore::Ephemeral;
+        acct.auth_required = Some(true);
         assert!(!acct.auth_required_for_network(MAINNET_NETWORK));
     }
 

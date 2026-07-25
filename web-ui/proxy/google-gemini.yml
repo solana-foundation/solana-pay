@@ -27,21 +27,23 @@ recipients:
 
 # Session channel parameters.
 # The middleware issues a 402 with intent="session" instead of intent="charge".
-# Clients send signed vouchers on each call; no on-chain tx per request.
+# The client opens one channel, then the gateway signs cumulative vouchers.
 session:
   # Default channel cap offered to clients (USDC, human-readable).
   # Clients may request a lower cap; the server will not accept higher.
   cap_usdc: 10.0
+  # The gateway meters successful responses and signs cumulative vouchers.
+  settlement_authority: delegated
   # Minimum voucher increment (base units = µUSDC).
   # Official Gemini token prices can be sub-µUSDC per token. We settle in
   # 0.000001 USDC quanta (1 µUSDC) once usage has accumulated enough value.
   min_voucher_delta: 1
   # Idle delay before the operator closes and settles the channel.
   close_delay_ms: 15000
-  # Pull follows charge semantics at the payment boundary: the operator opens
-  # and funds the payment-channel, then the client signs cumulative vouchers.
-  modes: [pull]
-  pull_voucher_strategy: client_voucher
+  settlement_interval_ms: 5000
+  # The agent payer opens the channel and reuses its authorization while the
+  # delegated gateway operator signs metered vouchers.
+  modes: [push]
   splits:
     - recipient: platform
       percent: 0.1
@@ -203,6 +205,17 @@ endpoints:
       metered against official Gemini API paid-tier standard pricing, quantized
       to 0.000001 USDC settlement increments where sub-µUSDC token prices
       require batching.
+    metering:
+      schemes: [mpp-session]
+      variants: *official_gemini_generation_metering
+
+  # Agent harnesses such as Claude, Goose, and Qoder speak OpenAI Chat
+  # Completions. Google exposes the same Gemini models through this official
+  # compatibility surface, so they do not need a Gemini-native client.
+  - method: POST
+    path: "v1beta/openai/chat/completions"
+    resource: "chat"
+    description: "OpenAI-compatible chat completions for Gemini models."
     metering:
       schemes: [mpp-session]
       variants: *official_gemini_generation_metering

@@ -5,6 +5,8 @@
 //! (subscription activation tx, charge signature, plan PDA, …) renders the
 //! same link shape and stays in sync when we add networks.
 
+use pay_kit::x402::exact::{SOLANA_DEVNET, SOLANA_MAINNET, SOLANA_TESTNET};
+
 /// pay.sh receipt viewer base. Resolves the signature against the right
 /// chain server-side; clients only need to thread the `network` query
 /// param when it's not the implicit default (mainnet).
@@ -26,6 +28,22 @@ pub fn tx_url(network: &str, signature: &str) -> Option<String> {
         None => String::new(),
     };
     Some(format!("{PAY_RECEIPT_BASE}/{signature}{suffix}"))
+}
+
+/// Build an advanced-view pay.sh receipt URL for a transaction signature.
+///
+/// Unlike [`tx_url`], this always includes `view=advanced`. When an explicit
+/// pay.sh network is needed, `network` is emitted first so URLs have the stable
+/// shape `?network=<slug>&view=advanced` used by the debugger UI.
+pub fn advanced_tx_url(network: &str, signature: &str) -> Option<String> {
+    if signature.is_empty() {
+        return None;
+    }
+    let query = match network_query(network)? {
+        Some(slug) => format!("?network={slug}&view=advanced"),
+        None => "?view=advanced".to_string(),
+    };
+    Some(format!("{PAY_RECEIPT_BASE}/{signature}{query}"))
 }
 
 /// Build a pay.sh address URL for an account / PDA on the given network.
@@ -50,10 +68,10 @@ pub fn account_url(network: &str, address: &str) -> Option<String> {
 /// recognise — callers fall back to printing the bare signature.
 fn network_query(network: &str) -> Option<Option<&'static str>> {
     match network {
-        "mainnet" | "mainnet-beta" => Some(None),
-        "devnet" => Some(Some("devnet")),
-        "testnet" => Some(Some("testnet")),
-        "localnet" | "surfnet" => Some(Some("sandbox")),
+        "mainnet" | "mainnet-beta" | "solana" | SOLANA_MAINNET => Some(None),
+        "devnet" | "solana-devnet" | SOLANA_DEVNET => Some(Some("devnet")),
+        "testnet" | "solana-testnet" | SOLANA_TESTNET => Some(Some("testnet")),
+        "localnet" | "surfnet" | "sandbox" | "local" | "solana-localnet" => Some(Some("sandbox")),
         _ => None,
     }
 }
@@ -96,6 +114,56 @@ mod tests {
     fn tx_url_localnet_maps_to_sandbox() {
         let url = tx_url("localnet", "sig").unwrap();
         assert_eq!(url, "https://pay.sh/receipt/sig?network=sandbox");
+    }
+
+    #[test]
+    fn tx_url_supports_debugger_network_aliases() {
+        assert_eq!(
+            tx_url("sandbox", "sig").as_deref(),
+            Some("https://pay.sh/receipt/sig?network=sandbox")
+        );
+        assert_eq!(
+            tx_url("solana-localnet", "sig").as_deref(),
+            Some("https://pay.sh/receipt/sig?network=sandbox")
+        );
+        assert_eq!(
+            tx_url(SOLANA_MAINNET, "sig").as_deref(),
+            Some("https://pay.sh/receipt/sig")
+        );
+        assert_eq!(
+            tx_url(SOLANA_DEVNET, "sig").as_deref(),
+            Some("https://pay.sh/receipt/sig?network=devnet")
+        );
+        assert_eq!(
+            tx_url(SOLANA_TESTNET, "sig").as_deref(),
+            Some("https://pay.sh/receipt/sig?network=testnet")
+        );
+    }
+
+    #[test]
+    fn advanced_tx_url_puts_network_before_view() {
+        assert_eq!(
+            advanced_tx_url("sandbox", "sig").as_deref(),
+            Some("https://pay.sh/receipt/sig?network=sandbox&view=advanced")
+        );
+        assert_eq!(
+            advanced_tx_url(SOLANA_DEVNET, "sig").as_deref(),
+            Some("https://pay.sh/receipt/sig?network=devnet&view=advanced")
+        );
+    }
+
+    #[test]
+    fn advanced_tx_url_mainnet_only_adds_view() {
+        assert_eq!(
+            advanced_tx_url(SOLANA_MAINNET, "sig").as_deref(),
+            Some("https://pay.sh/receipt/sig?view=advanced")
+        );
+    }
+
+    #[test]
+    fn advanced_tx_url_rejects_unknown_network_or_empty_signature() {
+        assert!(advanced_tx_url("solana-bogus", "sig").is_none());
+        assert!(advanced_tx_url("mainnet", "").is_none());
     }
 
     #[test]

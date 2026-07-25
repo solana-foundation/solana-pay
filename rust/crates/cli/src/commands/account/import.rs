@@ -13,7 +13,8 @@ pub struct ImportCommand {
     /// Path to the JSON key file.
     pub file: String,
 
-    /// Storage backend: "keychain", "gnome-keyring", or "windows-hello".
+    /// Storage backend: "keychain", "gnome-keyring", "windows-hello", or
+    /// "file" (headless fallback).
     #[arg(long)]
     pub backend: Option<String>,
 
@@ -77,7 +78,14 @@ impl ImportCommand {
         };
 
         let (ks, keystore_kind, _) =
-            super::import::build_keystore(&backend_id, self.vault.as_deref())?;
+            super::import::build_keystore(&backend_id, self.vault.as_deref(), &name)?;
+
+        if backend_id == "file" && ks.exists(&name) {
+            return Err(pay_core::Error::Config(format!(
+                "Keypair file {} already exists. Choose another account name or remove the file explicitly before importing.",
+                super::new::file_backend_path(&name).display()
+            )));
+        }
 
         let sync = if backend_id == "1password" {
             pay_core::keystore::SyncMode::CloudSync
@@ -197,6 +205,7 @@ fn resolve_name(
 pub(super) fn build_keystore(
     backend_id: &str,
     vault: Option<&str>,
+    account_name: &str,
 ) -> pay_core::Result<(Keystore, pay_core::accounts::Keystore, &'static str)> {
     match backend_id {
         #[cfg(target_os = "macos")]
@@ -212,9 +221,9 @@ pub(super) fn build_keystore(
 
         #[cfg(target_os = "linux")]
         "gnome-keyring" => {
-            crate::commands::setup::install_linux_polkit_policy_if_needed()?;
+            let ks = super::new::gnome_keyring_for_account_write()?;
             Ok((
-                Keystore::gnome_keyring(),
+                ks,
                 pay_core::accounts::Keystore::GnomeKeyring,
                 "Stored in GNOME Keyring.",
             ))
@@ -233,6 +242,12 @@ pub(super) fn build_keystore(
         #[cfg(not(target_os = "windows"))]
         "windows-hello" => Err(pay_core::Error::Config(
             "Windows Hello is only available on Windows".into(),
+        )),
+
+        "file" => Ok((
+            Keystore::file(super::new::file_backend_path(account_name)),
+            pay_core::accounts::Keystore::File,
+            "Stored in an owner-only keypair file.",
         )),
 
         "1password" => {

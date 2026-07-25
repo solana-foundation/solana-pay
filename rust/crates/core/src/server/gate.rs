@@ -16,11 +16,12 @@
 use std::sync::Arc;
 
 use bytes::Bytes;
-use http::{HeaderName, HeaderValue, Method, StatusCode, header};
+use http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, header};
 use pay_kit::mpp::server::{ChargeOptions, VerificationError};
 use pay_kit::mpp::{
-    ChargeRequest, PAYMENT_RECEIPT_HEADER, PaymentCredential, ReceiptKind, format_receipt,
-    format_www_authenticate, format_www_authenticate_many, parse_authorization,
+    ChargeRequest, PAYMENT_RECEIPT_HEADER, PaymentCredential, Receipt, ReceiptKind,
+    base64url_encode, format_receipt, format_www_authenticate, format_www_authenticate_many,
+    parse_authorization,
 };
 use pay_kit::x402::PAYMENT_RESPONSE_HEADER;
 use pay_kit::x402::server::{ExactOptions, VerifiedUptoOpen, X402, X402BatchSettlement, X402Upto};
@@ -29,7 +30,7 @@ use serde_json::json;
 
 use crate::PaymentState;
 use crate::server::metering;
-use crate::server::session::{SessionMpp, SessionOutcome};
+use crate::server::session::{DelegatedCapacityLease, SessionMpp, SessionOutcome};
 use crate::server::telemetry;
 
 /// `payment-receipt-url` — shareable `pay.sh/receipt/<sig>` link.
@@ -111,6 +112,145 @@ pub struct SessionForward {
     pub handle: Arc<SessionMpp>,
     pub channel_id: String,
     pub committed_base_units: u64,
+    /// Response-metered settlement plan for a delegated session. The adapter
+    /// rates actual usage and persists an operator-signed cumulative voucher
+    /// before releasing the matching response bytes.
+    pub settlement: Option<Box<metering::UptoSettlementPlan>>,
+    /// Remaining channel capacity available to the metered delivery.
+    pub available_base_units: u64,
+    /// Releases the exclusive capacity reservation on every terminal path.
+    _reservation: Option<DelegatedCapacityLease>,
+}
+
+impl SessionForward {
+    pub(crate) fn delegated(
+        handle: Arc<SessionMpp>,
+        channel_id: String,
+        committed_base_units: u64,
+        settlement: metering::UptoSettlementPlan,
+        available_base_units: u64,
+        reservation: DelegatedCapacityLease,
+    ) -> Self {
+        Self {
+            handle,
+            channel_id,
+            committed_base_units,
+            settlement: Some(Box::new(settlement)),
+            available_base_units,
+            _reservation: Some(reservation),
+        }
+    }
+}
+
+pub fn delegated_session_receipt_annotation(
+    network: &str,
+    currency: &str,
+    channel_id: &str,
+    amount: u64,
+    cumulative: u64,
+    authorized: u64,
+) -> Result<ReceiptAnnotation, String> {
+    let mut receipt = serde_json::to_value(Receipt::success("solana", channel_id, ""))
+        .map_err(|error| format!("failed to serialize MPP session receipt: {error}"))?;
+    let fields = receipt
+        .as_object_mut()
+        .ok_or_else(|| "MPP session receipt did not serialize as an object".to_string())?;
+    fields.insert("intent".to_string(), serde_json::json!("session"));
+    fields.insert("amount".to_string(), serde_json::json!(amount.to_string()));
+    fields.insert(
+        "acceptedCumulative".to_string(),
+        serde_json::json!(cumulative.to_string()),
+    );
+    fields.insert(
+        "spent".to_string(),
+        serde_json::json!(cumulative.to_string()),
+    );
+    fields.insert(
+        "authorized".to_string(),
+        serde_json::json!(authorized.to_string()),
+    );
+    fields.insert(
+        "remaining".to_string(),
+        serde_json::json!(authorized.saturating_sub(cumulative).to_string()),
+    );
+    fields.insert("currency".to_string(), serde_json::json!(currency));
+    fields.insert("network".to_string(), serde_json::json!(network));
+
+    let encoded = serde_json::to_vec(&receipt)
+        .map(|json| base64url_encode(&json))
+        .map_err(|error| format!("failed to encode MPP session receipt: {error}"))?;
+    let receipt_value = HeaderValue::from_str(&encoded)
+        .map_err(|error| format!("invalid MPP session receipt header: {error}"))?;
+    let mut headers = vec![(
+        HeaderName::from_static(PAYMENT_RECEIPT_HEADER),
+        receipt_value,
+    )];
+    if let Some(url) = crate::explorer::account_url(network, channel_id) {
+        let value = HeaderValue::from_str(&url)
+            .map_err(|error| format!("invalid MPP session receipt URL: {error}"))?;
+        headers.push((PAYMENT_RECEIPT_URL, value));
+    }
+
+    Ok(ReceiptAnnotation {
+        headers,
+        // The stable receipt reference is the channel PDA, not a transaction
+        // signature. Settlement only reaches chain when the channel closes.
+        reference: None,
+    })
+}
+
+/// Rate and persist a delegated-session response before releasing it.
+///
+/// Consuming `pending` also consumes its capacity lease. The lease's drop
+/// implementation therefore releases capacity on success and on every error.
+pub async fn settle_delegated_session(
+    pending: SessionForward,
+    response_headers: &HeaderMap,
+    response_body: Option<&[u8]>,
+) -> Result<Option<ReceiptAnnotation>, String> {
+    let Some(plan) = pending.settlement.as_deref() else {
+        return Ok(None);
+    };
+    let actual = metering::upto_actual_amount_from_response(
+        plan,
+        pending.available_base_units,
+        response_headers,
+        response_body,
+    )
+    .map_err(|error| error.to_string())?;
+    if actual.base_units == 0 {
+        pending.handle.touch_channel(pending.channel_id.clone());
+        tracing::info!(
+            channel = %pending.channel_id,
+            "delegated MPP session response rated at zero"
+        );
+        return Ok(None);
+    }
+
+    let cumulative = pending
+        .handle
+        .authorize_delegated_usage(&pending.channel_id, actual.base_units)
+        .await
+        .map_err(|error| error.to_string())?;
+    tracing::info!(
+        channel = %pending.channel_id,
+        amount = actual.base_units,
+        cumulative,
+        usd = actual.usd,
+        "delegated MPP session voucher accepted"
+    );
+    let authorized = pending
+        .committed_base_units
+        .saturating_add(pending.available_base_units);
+    delegated_session_receipt_annotation(
+        pending.handle.network(),
+        pending.handle.currency(),
+        &pending.channel_id,
+        actual.base_units,
+        cumulative,
+        authorized,
+    )
+    .map(Some)
 }
 
 /// An x402 `upto` channel opened (and confirmed on-chain) before the resource
@@ -258,10 +398,12 @@ impl<S: PaymentState> PaymentGate<S> {
         let meter = metering_config.expect("gated endpoint has metering");
         let accepted = meter.accepted_schemes();
 
-        let session_handle = self.state.session_mpp_handle();
-        let session_mpp = session_handle
-            .as_deref()
-            .or_else(|| self.state.session_mpp());
+        let session_handles = self.state.session_mpp_handles();
+        let session_mpps: Vec<&SessionMpp> = if session_handles.is_empty() {
+            self.state.session_mpps()
+        } else {
+            session_handles.iter().map(Arc::as_ref).collect()
+        };
 
         // MPP credential present → dispatch by intent (only if accepted). Only
         // `Payment`-scheme Authorization headers are payment credentials — any
@@ -275,12 +417,20 @@ impl<S: PaymentState> PaymentGate<S> {
                     let intent = cred.challenge.intent.as_str();
                     if intent == "session"
                         && accepted.contains(&Scheme::MppSession)
-                        && let Some(sm) = session_mpp
+                        && let Ok(request) = cred
+                            .challenge
+                            .request
+                            .decode::<pay_kit::mpp::SessionRequest>()
+                        && let Some(index) = session_mpps
+                            .iter()
+                            .position(|session| session.currency() == request.currency)
                     {
                         return session_authorized(
-                            sm,
-                            session_handle.clone(),
+                            session_mpps[index],
+                            session_handles.get(index).cloned(),
                             auth,
+                            meter,
+                            req,
                             subdomain,
                             path,
                         )
@@ -349,7 +499,7 @@ impl<S: PaymentState> PaymentGate<S> {
             api,
             meter,
             &accepted,
-            session_mpp,
+            &session_mpps,
             req,
             subdomain,
             path,
@@ -369,7 +519,7 @@ impl<S: PaymentState> PaymentGate<S> {
         api: &pay_types::metering::ApiSpec,
         meter: &pay_types::metering::Metering,
         accepted: &[Scheme],
-        session_mpp: Option<&SessionMpp>,
+        session_mpps: &[&SessionMpp],
         req: &GateRequest<'_>,
         subdomain: &str,
         path: &str,
@@ -395,21 +545,21 @@ impl<S: PaymentState> PaymentGate<S> {
         let mut challenge_headers: Vec<(HeaderName, HeaderValue)> = Vec::new();
         let mut advertised: Vec<&str> = Vec::new();
 
-        if accepted.contains(&Scheme::MppSession)
-            && let Some(sm) = session_mpp
-        {
-            match sm.challenge_header(u64::MAX) {
-                Ok(h) => {
-                    if let Ok(v) = HeaderValue::from_str(&h) {
-                        challenge_headers.push((header::WWW_AUTHENTICATE, v));
-                        advertised.push("session");
+        if accepted.contains(&Scheme::MppSession) && !session_mpps.is_empty() {
+            for sm in session_mpps {
+                match sm.challenge_header(u64::MAX) {
+                    Ok(h) => {
+                        if let Ok(v) = HeaderValue::from_str(&h) {
+                            challenge_headers.push((header::WWW_AUTHENTICATE, v));
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!(currency = sm.currency(), error = %e, "session challenge generation failed");
+                        return gen_failed();
                     }
                 }
-                Err(e) => {
-                    tracing::error!(error = %e, "session challenge generation failed");
-                    return gen_failed();
-                }
             }
+            advertised.push("session");
         }
 
         if accepted.contains(&Scheme::MppCharge) {
@@ -1347,24 +1497,102 @@ fn variant_hint_from_path(path: &str) -> Option<String> {
     None
 }
 
+fn session_receipt_annotation(network: &str, reference: String) -> ReceiptAnnotation {
+    let mut headers = Vec::new();
+    if let Some(url) = crate::explorer::tx_url(network, &reference)
+        && let Ok(value) = HeaderValue::from_str(&url)
+    {
+        headers.push((PAYMENT_RECEIPT_URL, value));
+    }
+    ReceiptAnnotation {
+        headers,
+        reference: Some(reference),
+    }
+}
+
 /// Process a session credential and map the outcome to a [`GateDecision`].
 async fn session_authorized(
     sm: &SessionMpp,
     handle: Option<Arc<SessionMpp>>,
     auth: &str,
+    meter: &pay_types::metering::Metering,
+    req: &GateRequest<'_>,
     subdomain: &str,
     path: &str,
 ) -> GateDecision {
     match sm.process(auth).await {
-        Ok(SessionOutcome::Active(state)) => GateDecision::Forward {
-            session: handle.map(|h| SessionForward {
-                handle: h,
-                channel_id: state.channel_id,
-                committed_base_units: state.cumulative,
-            }),
-            receipt: None,
-            upto: None,
-        },
+        Ok(SessionOutcome::Active { state, signature }) => {
+            if sm.settlement_authority() == pay_kit::mpp::SessionSettlementAuthority::ClientVoucher
+            {
+                let mut response = GateResponse::json(
+                    StatusCode::PAYMENT_REQUIRED,
+                    serde_json::to_vec(&json!({
+                        "error": "session_voucher_required",
+                        "message": "The channel is open; submit a client-signed voucher before requesting paid service.",
+                        "channelId": state.channel_id,
+                    }))
+                    .unwrap_or_default(),
+                );
+                if let Some(reference) = signature {
+                    response
+                        .headers
+                        .extend(session_receipt_annotation(sm.network(), reference).headers);
+                }
+                return GateDecision::Respond(response);
+            }
+            let Some(handle) = handle else {
+                return GateDecision::Respond(GateResponse::json(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Bytes::from_static(br#"{"error":"session_backend_unavailable"}"#),
+                ));
+            };
+            let available_base_units = state.deposit.saturating_sub(state.cumulative);
+            if available_base_units == 0 {
+                return GateDecision::Respond(GateResponse::json(
+                    StatusCode::PAYMENT_REQUIRED,
+                    serde_json::to_vec(&json!({
+                        "error": "session_cap_exhausted",
+                        "message": "The session spending cap has been exhausted; open a new session.",
+                        "channelId": state.channel_id,
+                    }))
+                    .unwrap_or_default(),
+                ));
+            }
+            let Some(reservation) =
+                handle.reserve_delegated_capacity(&state.channel_id, available_base_units)
+            else {
+                return GateDecision::Respond(GateResponse::json(
+                    StatusCode::PAYMENT_REQUIRED,
+                    Bytes::from_static(br#"{"error":"session_capacity_reserved","message":"Another request is currently using this session capacity."}"#),
+                ));
+            };
+            let props = metering::RequestProperties {
+                body_size: req.content_length,
+                ..Default::default()
+            };
+            let variant = variant_hint_from_path(path);
+            let ceiling_usd = available_base_units as f64 / 10_f64.powi(sm.decimals() as i32);
+            let settlement = metering::UptoSettlementPlan {
+                metering: meter.clone(),
+                variant_hint: variant,
+                request_properties: props,
+                ceiling_usd,
+                inferred_usage: None,
+            };
+            GateDecision::Forward {
+                session: Some(SessionForward::delegated(
+                    handle,
+                    state.channel_id,
+                    state.cumulative,
+                    settlement,
+                    available_base_units,
+                    reservation,
+                )),
+                receipt: signature
+                    .map(|reference| session_receipt_annotation(sm.network(), reference)),
+                upto: None,
+            }
+        }
         Ok(SessionOutcome::Voucher {
             channel_id,
             cumulative,
@@ -1373,6 +1601,9 @@ async fn session_authorized(
                 handle: h,
                 channel_id,
                 committed_base_units: cumulative,
+                settlement: None,
+                available_base_units: 0,
+                _reservation: None,
             }),
             receipt: None,
             upto: None,
@@ -1416,6 +1647,7 @@ async fn session_authorized(
                 serde_json::to_vec(&json!({
                     "error": "session_failed",
                     "message": e.to_string(),
+                    "retryable": true,
                 }))
                 .unwrap_or_default(),
             ))
@@ -1430,6 +1662,19 @@ mod tests {
     // Ceiling $0.10 at 6 decimals == 100_000 base units (USDC).
     const CEILING_USD: f64 = 0.10;
     const CEILING_BASE: u64 = 100_000;
+
+    #[test]
+    fn session_receipt_links_to_the_authorizing_transaction() {
+        let receipt = session_receipt_annotation("mainnet", "open_signature".to_string());
+
+        assert_eq!(receipt.reference.as_deref(), Some("open_signature"));
+        assert_eq!(receipt.headers.len(), 1);
+        assert_eq!(receipt.headers[0].0, PAYMENT_RECEIPT_URL);
+        assert_eq!(
+            receipt.headers[0].1.to_str().unwrap(),
+            "https://pay.sh/receipt/open_signature"
+        );
+    }
 
     #[test]
     fn only_payment_scheme_counts_as_credential() {

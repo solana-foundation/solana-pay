@@ -615,8 +615,8 @@ async fn push_session_full_flow() {
         .unwrap();
     assert_eq!(
         resp.status(),
-        200,
-        "open should return 200, got {}: {}",
+        402,
+        "open should acknowledge with 402, got {}: {}",
         resp.status(),
         resp.text().await.unwrap()
     );

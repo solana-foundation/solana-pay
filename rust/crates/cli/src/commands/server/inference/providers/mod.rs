@@ -161,6 +161,9 @@ pub fn builtin_providers() -> Vec<Arc<dyn InferenceProvider>> {
 /// Ollama's native paths as well (`/api/chat`, `/api/generate`,
 /// `/api/embed`) and llama.cpp's (`/completion`, `/infill`, `/embedding`).
 pub fn default_endpoint_kind(path: &str) -> &'static str {
+    if let Some(endpoint) = pay_core::server::profiles::openai_endpoint(path) {
+        return endpoint.kind;
+    }
     let path = path.to_ascii_lowercase();
     if path.contains("chat") || path.contains("messages") {
         "chat"
@@ -181,13 +184,16 @@ pub(crate) fn post(path: &str) -> PaidEndpoint {
     }
 }
 
-/// The three OpenAI-compatible paid endpoints every provider serves.
+/// Known OpenAI-compatible paid endpoints, sourced from the versioned profile.
 pub(crate) fn openai_paid_endpoints() -> Vec<PaidEndpoint> {
-    vec![
-        post(OPENAI_CHAT_COMPLETIONS_PATH),
-        post("v1/completions"),
-        post("v1/embeddings"),
-    ]
+    pay_core::server::profiles::openai_compatible_endpoints()
+        .iter()
+        .filter(|endpoint| matches!(endpoint.method, pay_types::metering::HttpMethod::Post))
+        .map(|endpoint| PaidEndpoint {
+            method: endpoint.method.clone(),
+            path: endpoint.path.to_string(),
+        })
+        .collect()
 }
 
 /// GET `base_url + path`, returning the body only on a 2xx response.

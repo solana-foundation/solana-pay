@@ -41,6 +41,43 @@ use tokio::runtime::Handle;
 /// users on async surfaces (Telegram, Slack) have time to respond.
 const ELICITATION_TIMEOUT: Duration = Duration::from_secs(300);
 
+/// Ask the connected MCP client before Pay reads a local file into an HTTP
+/// request body. This is deliberately separate from wallet authorization:
+/// the user must first approve sharing the file, then may separately approve
+/// a payment if the destination returns a 402 challenge.
+pub async fn confirm_file_upload(
+    peer: &Peer<RoleServer>,
+    path: &str,
+    bytes: u64,
+    method: &str,
+    destination: &str,
+) -> Result<(), String> {
+    let params = build_file_upload_request(path, bytes, method, destination);
+    let outcome = tokio::time::timeout(ELICITATION_TIMEOUT, peer.create_elicitation(params))
+        .await
+        .map_err(|_| "Timed out waiting for approval to send the local file.".to_string())?
+        .map_err(|error| format!("Could not request approval to send the local file: {error}"))?;
+
+    match outcome.action {
+        ElicitationAction::Accept => {
+            let explicitly_denied = outcome
+                .content
+                .as_ref()
+                .and_then(|value| value.get("approved"))
+                .and_then(|value| value.as_bool())
+                .map(|approved| !approved)
+                .unwrap_or(false);
+            if explicitly_denied {
+                Err("The user declined to send the local file.".to_string())
+            } else {
+                Ok(())
+            }
+        }
+        ElicitationAction::Decline => Err("The user declined to send the local file.".to_string()),
+        ElicitationAction::Cancel => Err("The user cancelled sending the local file.".to_string()),
+    }
+}
+
 /// `AuthGate` that asks the connected MCP client for approval via
 /// `elicitation/create` instead of a platform biometric prompt.
 pub struct ElicitationAuth {
@@ -168,6 +205,24 @@ fn build_request(intent: &AuthIntent) -> CreateElicitationRequestParam {
     }
 }
 
+fn build_file_upload_request(
+    path: &str,
+    bytes: u64,
+    method: &str,
+    destination: &str,
+) -> CreateElicitationRequestParam {
+    let schema = ElicitationSchema::builder()
+        .required_bool("approved")
+        .build()
+        .expect("required_bool registers `approved` in properties");
+    CreateElicitationRequestParam {
+        message: format!(
+            "Allow Pay to read and send `{path}` ({bytes} bytes) in an HTTP {method} request to {destination}? The file is read once after approval; the exact snapshot may be reused only to retry this same request after a 402 payment challenge."
+        ),
+        requested_schema: schema,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -200,6 +255,20 @@ mod tests {
             props.get("approved").is_some(),
             "schema should expose `approved` boolean: {json}",
         );
+    }
+
+    #[test]
+    fn file_upload_request_names_the_file_destination_and_size() {
+        let req = build_file_upload_request(
+            "/workspace/photo.png",
+            1_024,
+            "POST",
+            "https://api.example.com/upload",
+        );
+        assert!(req.message.contains("/workspace/photo.png"));
+        assert!(req.message.contains("1024 bytes"));
+        assert!(req.message.contains("POST"));
+        assert!(req.message.contains("https://api.example.com/upload"));
     }
 
     fn result(

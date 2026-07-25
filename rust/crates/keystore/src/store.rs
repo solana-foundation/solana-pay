@@ -1,4 +1,4 @@
-//! Secret storage backends — where encrypted bytes are persisted.
+//! Secret storage backends — where secret bytes are persisted.
 
 use crate::{Error, Result, Zeroizing};
 
@@ -60,6 +60,199 @@ impl SecretStore for InMemoryStore {
         self.data.lock().unwrap().remove(key);
         Ok(())
     }
+}
+
+// ── Owner-only keypair file ────────────────────────────────────────────────
+
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static FILE_STORE_TEMP_ID: AtomicU64 = AtomicU64::new(0);
+
+/// A Solana JSON keypair file protected by owner-only filesystem permissions.
+///
+/// This backend is intentionally not encrypted. It is a pragmatic fallback for
+/// headless service users that have no Secret Service session. Higher layers
+/// should keep runtime authentication enabled (for example, MCP elicitation).
+pub struct FileStore {
+    path: PathBuf,
+}
+
+impl FileStore {
+    pub fn new(path: impl Into<PathBuf>) -> Self {
+        Self { path: path.into() }
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn read_keypair(&self) -> Result<Zeroizing<Vec<u8>>> {
+        let raw = Zeroizing::new(std::fs::read_to_string(&self.path).map_err(|e| {
+            Error::Backend(format!("read keypair file {}: {e}", self.path.display()))
+        })?);
+        let bytes: Vec<u8> = serde_json::from_str(&raw).map_err(|e| {
+            Error::Backend(format!("parse keypair file {}: {e}", self.path.display()))
+        })?;
+        if bytes.len() != 64 {
+            return Err(Error::InvalidKeypair(format!(
+                "keypair file {} contains {} bytes; expected 64",
+                self.path.display(),
+                bytes.len()
+            )));
+        }
+        Ok(Zeroizing::new(bytes))
+    }
+
+    fn write_keypair(&self, data: &[u8]) -> Result<()> {
+        if data.len() != 64 {
+            return Err(Error::InvalidKeypair(format!(
+                "file backend expected 64 keypair bytes, got {}",
+                data.len()
+            )));
+        }
+
+        if std::fs::symlink_metadata(&self.path).is_ok_and(|meta| meta.file_type().is_symlink()) {
+            return Err(Error::Backend(format!(
+                "refusing to overwrite symlinked keypair file {}",
+                self.path.display()
+            )));
+        }
+
+        let parent = self
+            .path
+            .parent()
+            .filter(|path| !path.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        std::fs::create_dir_all(parent).map_err(|e| {
+            Error::Backend(format!(
+                "create keypair directory {}: {e}",
+                parent.display()
+            ))
+        })?;
+        set_private_directory_permissions(parent)?;
+
+        let file_name = self
+            .path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("keypair.json");
+        let temp_id = FILE_STORE_TEMP_ID.fetch_add(1, Ordering::Relaxed);
+        let temp_path = parent.join(format!(
+            ".{file_name}.pay-tmp-{}-{temp_id}",
+            std::process::id()
+        ));
+
+        let result = write_temp_keypair(&temp_path, data).and_then(|()| {
+            #[cfg(windows)]
+            if self.path.exists() {
+                std::fs::remove_file(&self.path)?;
+            }
+            std::fs::rename(&temp_path, &self.path)?;
+            set_private_file_permissions(&self.path)
+        });
+
+        if result.is_err() {
+            let _ = std::fs::remove_file(&temp_path);
+        }
+        result
+            .map_err(|e| Error::Backend(format!("write keypair file {}: {e}", self.path.display())))
+    }
+}
+
+impl SecretStore for FileStore {
+    fn store(&self, key: &str, data: &[u8]) -> Result<()> {
+        if key.starts_with("keypair:") {
+            return self.write_keypair(data);
+        }
+        if key.starts_with("pubkey:") {
+            if data.len() != 32 {
+                return Err(Error::InvalidKeypair(format!(
+                    "file backend expected 32 public-key bytes, got {}",
+                    data.len()
+                )));
+            }
+            let keypair = self.read_keypair()?;
+            if keypair[32..] != data[..] {
+                return Err(Error::InvalidKeypair(
+                    "public key does not match the stored keypair".to_string(),
+                ));
+            }
+            return Ok(());
+        }
+        Err(Error::Backend(format!("unsupported file-store key: {key}")))
+    }
+
+    fn load(&self, key: &str) -> Result<Zeroizing<Vec<u8>>> {
+        let keypair = self.read_keypair()?;
+        if key.starts_with("keypair:") {
+            return Ok(keypair);
+        }
+        if key.starts_with("pubkey:") {
+            return Ok(Zeroizing::new(keypair[32..].to_vec()));
+        }
+        Err(Error::Backend(format!("unsupported file-store key: {key}")))
+    }
+
+    fn exists(&self, key: &str) -> bool {
+        (key.starts_with("keypair:") || key.starts_with("pubkey:")) && self.path.exists()
+    }
+
+    fn delete(&self, key: &str) -> Result<()> {
+        if key.starts_with("pubkey:") {
+            return Ok(());
+        }
+        if !key.starts_with("keypair:") {
+            return Err(Error::Backend(format!("unsupported file-store key: {key}")));
+        }
+        match std::fs::remove_file(&self.path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(Error::Backend(format!(
+                "delete keypair file {}: {e}",
+                self.path.display()
+            ))),
+        }
+    }
+}
+
+fn write_temp_keypair(path: &Path, data: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
+    serde_json::to_writer(&mut file, data).map_err(std::io::Error::other)?;
+    file.write_all(b"\n")?;
+    file.sync_all()
+}
+
+fn set_private_directory_permissions(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).map_err(|e| {
+            Error::Backend(format!(
+                "set keypair directory permissions {}: {e}",
+                path.display()
+            ))
+        })?;
+    }
+    Ok(())
+}
+
+fn set_private_file_permissions(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
 }
 
 // ── Shared hex helpers ──────────────────────────────────────────────────────
@@ -304,4 +497,64 @@ impl SecretStore for OnePasswordStore {
 
 fn stderr_str(stderr: &[u8]) -> String {
     String::from_utf8_lossy(stderr).trim().to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn file_store_roundtrips_keypair_and_derived_pubkey() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("pay").join("server.json");
+        let store = FileStore::new(path.clone());
+        let keypair: Vec<u8> = (0..64).collect();
+
+        store.store("keypair:server", &keypair).unwrap();
+        store.store("pubkey:server", &keypair[32..]).unwrap();
+
+        assert_eq!(&*store.load("keypair:server").unwrap(), &keypair);
+        assert_eq!(&*store.load("pubkey:server").unwrap(), &keypair[32..]);
+        assert!(store.exists("keypair:server"));
+        assert!(store.exists("pubkey:server"));
+
+        let serialized: Vec<u8> =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(serialized, keypair);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(path.parent().unwrap())
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o700
+            );
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+
+        store.delete("keypair:server").unwrap();
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn file_store_rejects_mismatched_pubkey() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("server.json");
+        let store = FileStore::new(path);
+        let keypair: Vec<u8> = (0..64).collect();
+
+        store.store("keypair:server", &keypair).unwrap();
+        let error = store.store("pubkey:server", &[0; 32]).unwrap_err();
+
+        assert!(
+            matches!(error, Error::InvalidKeypair(message) if message.contains("does not match"))
+        );
+    }
 }

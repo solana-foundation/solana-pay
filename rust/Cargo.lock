@@ -1205,6 +1205,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "backon"
+version = "1.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cffb0e931875b666fc4fcb20fee52e9bbd1ef836fd9e9e04ec21555f9f85f7ef"
+dependencies = [
+ "fastrand 2.4.1",
+]
+
+[[package]]
 name = "backtrace"
 version = "0.3.76"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1919,7 +1928,11 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ba5a308b75df32fe02788e748662718f03fde005016435c444eea572398219fd"
 dependencies = [
  "bytes 1.12.0",
+ "futures-core",
  "memchr",
+ "pin-project-lite",
+ "tokio",
+ "tokio-util 0.7.18",
 ]
 
 [[package]]
@@ -6330,7 +6343,7 @@ checksum = "2ee67f1008b1ba2321834326597b8e186293b049a023cdef258527550b9935b4"
 
 [[package]]
 name = "pay"
-version = "0.21.0"
+version = "0.24.0"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -6366,6 +6379,7 @@ dependencies = [
  "serde_yml",
  "serial_test",
  "shellexpand",
+ "solana-commitment-config",
  "solana-instruction 3.2.0",
  "solana-message 3.1.0",
  "solana-pay-kit",
@@ -6385,7 +6399,7 @@ dependencies = [
 
 [[package]]
 name = "pay-core"
-version = "0.21.0"
+version = "0.24.0"
 dependencies = [
  "async-stream",
  "axum",
@@ -6401,7 +6415,9 @@ dependencies = [
  "futures-util",
  "hmac 0.12.1",
  "http 1.4.2",
+ "libc",
  "md-5",
+ "mime_guess",
  "openssl-sys",
  "opentelemetry 0.31.0",
  "pay-keystore",
@@ -6440,7 +6456,7 @@ dependencies = [
 
 [[package]]
 name = "pay-integration"
-version = "0.21.0"
+version = "0.24.0"
 dependencies = [
  "base64 0.22.1",
  "pay-core",
@@ -6452,13 +6468,13 @@ dependencies = [
 
 [[package]]
 name = "pay-keystore"
-version = "0.21.0"
+version = "0.24.0"
 dependencies = [
  "bs58",
  "secret-service",
  "serde",
  "serde_json",
- "shellexpand",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "windows",
@@ -6469,7 +6485,7 @@ dependencies = [
 
 [[package]]
 name = "pay-mcp"
-version = "0.21.0"
+version = "0.24.0"
 dependencies = [
  "base64 0.22.1",
  "crc32fast",
@@ -6479,7 +6495,9 @@ dependencies = [
  "pay-keystore",
  "pay-types",
  "qrcode",
+ "reqwest 0.12.28",
  "rmcp",
+ "same-file",
  "schemars 0.8.22",
  "serde",
  "serde_json",
@@ -6492,7 +6510,7 @@ dependencies = [
 
 [[package]]
 name = "pay-pdb"
-version = "0.21.0"
+version = "0.24.0"
 dependencies = [
  "async-stream",
  "axum",
@@ -6514,7 +6532,7 @@ dependencies = [
 
 [[package]]
 name = "pay-proxy"
-version = "0.21.0"
+version = "0.24.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -6535,7 +6553,7 @@ dependencies = [
 
 [[package]]
 name = "pay-types"
-version = "0.21.0"
+version = "0.24.0"
 dependencies = [
  "schemars 0.8.22",
  "serde",
@@ -7222,7 +7240,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b570b25f7617e43d59005d0990ccb79e950a423952cea19671b7a876da390adf"
 dependencies = [
  "anyhow",
- "itertools 0.13.0",
+ "itertools 0.10.5",
  "proc-macro2",
  "quote",
  "syn 2.0.118",
@@ -7554,6 +7572,34 @@ checksum = "22e18b0f0062d30d4230b2e85ff77fdfe4326feb054b9783a3460d8435c8ab91"
 dependencies = [
  "crossbeam-deque",
  "crossbeam-utils",
+]
+
+[[package]]
+name = "redis"
+version = "0.32.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "014cc767fefab6a3e798ca45112bccad9c6e0e218fbd49720042716c73cfef44"
+dependencies = [
+ "arc-swap",
+ "backon",
+ "bytes 1.12.0",
+ "cfg-if 1.0.4",
+ "combine 4.6.7",
+ "futures-channel",
+ "futures-util",
+ "itoa",
+ "num-bigint 0.4.6",
+ "percent-encoding 2.3.2",
+ "pin-project-lite",
+ "rustls 0.23.40",
+ "rustls-native-certs 0.8.4",
+ "ryu",
+ "sha1_smol",
+ "socket2 0.6.4",
+ "tokio",
+ "tokio-rustls 0.26.4",
+ "tokio-util 0.7.18",
+ "url 2.5.8",
 ]
 
 [[package]]
@@ -8594,6 +8640,12 @@ dependencies = [
  "cpufeatures 0.2.17",
  "digest 0.10.7",
 ]
+
+[[package]]
+name = "sha1_smol"
+version = "1.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bbfa15b3dddfee50a0fff136974b3e1bde555604ba463834a7eb7deb6417705d"
 
 [[package]]
 name = "sha2"
@@ -10700,8 +10752,8 @@ dependencies = [
 
 [[package]]
 name = "solana-pay-kit"
-version = "0.2.0"
-source = "git+https://github.com/solana-foundation/pay-kit?rev=bdaad4f5ea40f365d73be8cf5634555aa5bca677#bdaad4f5ea40f365d73be8cf5634555aa5bca677"
+version = "0.4.0"
+source = "git+https://github.com/solana-foundation/pay-kit.git?rev=cb02b5afcbba8147c4483a9d800a3eff93ed6592#cb02b5afcbba8147c4483a9d800a3eff93ed6592"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -10720,6 +10772,7 @@ dependencies = [
  "opentelemetry-otlp",
  "opentelemetry-semantic-conventions 0.31.0",
  "opentelemetry_sdk 0.31.0",
+ "redis",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
@@ -15338,7 +15391,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]

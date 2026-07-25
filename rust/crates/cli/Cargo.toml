@@ -12,6 +12,7 @@ path = "src/main.rs"
 default = []
 gcp_kms = ["pay-kit/gcp_kms"]
 vendored-openssl = ["pay-core/vendored-openssl"]
+redis-session-store = ["pay-core/redis-session-store", "pay-kit/redis-store"]
 
 [dependencies]
 async-trait = "0.1"
@@ -38,6 +39,7 @@ pay-mcp = { workspace = true }
 reqwest = { workspace = true }
 pay-kit = { workspace = true }
 solana-pubkey = { workspace = true }
+solana-commitment-config = { workspace = true }
 # Solana SDK atomic crates used by `pay subscriptions cancel` to build
 # and broadcast the cancel_subscription transaction directly.
 solana-instruction = { workspace = true }

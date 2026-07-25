@@ -46,7 +46,7 @@ struct EndpointEntry {
 
 pub async fn run(params: Params) -> Result<CallToolResult, rmcp::ErrorData> {
     let fqn = params.fqn.clone();
-    let mut catalog = match pay_core::skills::load_skills().await {
+    let mut catalog = match pay_core::skills::load_skills_for(pay_core::ClientApp::Mcp).await {
         Ok(catalog) => catalog,
         Err(err) => {
             return Ok(super::tool_error(format!(
@@ -54,7 +54,9 @@ pub async fn run(params: Params) -> Result<CallToolResult, rmcp::ErrorData> {
             )));
         }
     };
-    if let Err(err) = pay_core::skills::ensure_endpoints(&mut catalog, &fqn).await {
+    if let Err(err) =
+        pay_core::skills::ensure_endpoints_for(&mut catalog, &fqn, pay_core::ClientApp::Mcp).await
+    {
         return Ok(super::tool_error(format!(
             "Failed to load catalog entry `{fqn}`: {err}"
         )));

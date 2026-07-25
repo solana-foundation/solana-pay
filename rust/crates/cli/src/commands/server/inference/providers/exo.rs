@@ -64,17 +64,23 @@ mod tests {
     }
 
     #[test]
-    fn paid_endpoints_are_the_openai_compat_trio() {
+    fn paid_endpoints_are_the_openai_compat_surface() {
         let paths: Vec<String> = Exo.paid_endpoints().into_iter().map(|e| e.path).collect();
         assert_eq!(
             paths,
-            ["v1/chat/completions", "v1/completions", "v1/embeddings"]
+            [
+                "v1/responses",
+                "v1/chat/completions",
+                "v1/embeddings",
+                "v1/completions",
+            ]
         );
     }
 
     #[test]
     fn endpoint_kind_table() {
         for (path, kind) in [
+            ("/v1/responses", "chat"),
             ("/v1/chat/completions", "chat"),
             ("/v1/completions", "completion"),
             ("/v1/embeddings", "embeddings"),

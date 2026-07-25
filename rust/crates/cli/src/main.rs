@@ -34,6 +34,10 @@ struct Opts {
     )]
     yolo_upto: Option<u64>,
 
+    /// Use the experimental alternate inference-provider picker for agent CLIs.
+    #[arg(long, hide = true)]
+    alt: bool,
+
     /// Sandbox mode: force network=localnet and route to the hosted
     /// Surfpool RPC (https://402.surfnet.dev:8899). Ephemeral wallets
     /// are auto-generated and funded on first use.
@@ -249,6 +253,7 @@ fn main() {
                 | Command::Send(_)
                 | Command::Claude(_)
                 | Command::Codex(_)
+                | Command::Goose(_)
                 | Command::Qodercli(_)
                 | Command::Curl(_)
                 | Command::Wget(_)
@@ -312,6 +317,7 @@ fn main() {
         opts.account.as_deref(),
         verbose,
         sandbox_mode,
+        opts.alt,
     ) {
         if no_dna::should_json(output_fmt) {
             output::error_json(&err.to_string());
@@ -536,6 +542,117 @@ mod tests {
                 assert_eq!(cmd.recipient, "ludo");
             }
             _ => panic!("expected send command"),
+        }
+    }
+
+    #[test]
+    fn claude_uses_native_provider_by_default() {
+        let opts = Opts::try_parse_from(["pay", "claude", "--model", "sonnet", "hello"]).unwrap();
+
+        assert!(!opts.alt);
+        match opts.command {
+            Some(Command::Claude(cmd)) => {
+                assert_eq!(cmd.args, ["--model", "sonnet", "hello"]);
+            }
+            _ => panic!("expected claude command"),
+        }
+    }
+
+    #[test]
+    fn claude_alt_enables_provider_picker_without_forwarding_flag() {
+        let opts = Opts::try_parse_from(["pay", "--alt", "claude", "--model", "llama3.2", "hello"])
+            .unwrap();
+
+        assert!(opts.alt);
+        match opts.command {
+            Some(Command::Claude(cmd)) => {
+                assert_eq!(cmd.args, ["--model", "llama3.2", "hello"]);
+            }
+            _ => panic!("expected claude command"),
+        }
+    }
+
+    #[test]
+    fn claude_subcommand_alt_is_forwarded_to_claude() {
+        let opts = Opts::try_parse_from(["pay", "claude", "--alt"]).unwrap();
+
+        assert!(!opts.alt);
+        match opts.command {
+            Some(Command::Claude(cmd)) => assert_eq!(cmd.args, ["--alt"]),
+            _ => panic!("expected claude command"),
+        }
+    }
+
+    #[test]
+    fn alt_is_hidden_from_help() {
+        let mut command = Opts::command();
+
+        assert!(!command.render_long_help().to_string().contains("--alt"));
+    }
+
+    #[test]
+    fn codex_keeps_native_provider_and_forwards_arguments() {
+        let opts = Opts::try_parse_from(["pay", "codex", "--model", "gpt-5", "hello"]).unwrap();
+
+        assert!(!opts.alt);
+        match opts.command {
+            Some(Command::Codex(cmd)) => {
+                assert_eq!(cmd.args, ["--model", "gpt-5", "hello"]);
+            }
+            _ => panic!("expected codex command"),
+        }
+    }
+
+    #[test]
+    fn qoder_alias_launches_qodercli() {
+        let opts = Opts::try_parse_from(["pay", "qoder", "--model", "performance"]).unwrap();
+
+        match opts.command {
+            Some(Command::Qodercli(cmd)) => {
+                assert_eq!(cmd.args, ["--model", "performance"]);
+            }
+            _ => panic!("expected qodercli command"),
+        }
+    }
+
+    #[test]
+    fn qoder_alt_enables_provider_picker_without_forwarding_flag() {
+        let opts =
+            Opts::try_parse_from(["pay", "--alt", "qoder", "--model", "qwen3-coder-next"]).unwrap();
+
+        assert!(opts.alt);
+        match opts.command {
+            Some(Command::Qodercli(cmd)) => {
+                assert_eq!(cmd.args, ["--model", "qwen3-coder-next"]);
+            }
+            _ => panic!("expected qodercli command"),
+        }
+    }
+
+    #[test]
+    fn goose_alt_enables_provider_picker_without_forwarding_flag() {
+        let opts =
+            Opts::try_parse_from(["pay", "--alt", "goose", "--model", "qwen3.7-plus"]).unwrap();
+
+        assert!(opts.alt);
+        match opts.command {
+            Some(Command::Goose(cmd)) => {
+                assert_eq!(cmd.args, ["--model", "qwen3.7-plus"]);
+            }
+            _ => panic!("expected goose command"),
+        }
+    }
+
+    #[test]
+    fn goose_defaults_to_paid_alternate_launcher() {
+        let opts = Opts::try_parse_from(["pay", "goose", "--model", "qwen3.7-plus"]).unwrap();
+
+        assert!(!opts.alt);
+        match opts.command {
+            Some(Command::Goose(cmd)) => {
+                assert_eq!(cmd.args, ["--model", "qwen3.7-plus"]);
+            }
+            _ => panic!("expected goose command"),
         }
     }
 

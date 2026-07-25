@@ -4,8 +4,8 @@
 //! voucher dependencies. The proxy can feed it provider-specific observations
 //! and use the returned base-unit deltas to decide when a new voucher is needed.
 
-use super::metering::{RequestProperties, evaluate_condition};
-use pay_types::metering::{BillingUnit, MeterDimension, MeterDirection, Metering, PriceTier};
+use super::metering::{RequestProperties, resolve_variant, select_price_tier};
+use pay_types::metering::{BillingUnit, MeterDimension, MeterDirection, Metering};
 use thiserror::Error;
 
 const MICRO_USD_PER_USD: u128 = 1_000_000;
@@ -564,12 +564,7 @@ fn select_dimensions<'a>(
     variant_hint: Option<&str>,
 ) -> Result<&'a [MeterDimension]> {
     if !metering.variants.is_empty() {
-        if let Some(hint) = variant_hint
-            && let Some(variant) = metering
-                .variants
-                .iter()
-                .find(|variant| hint.contains(&variant.value))
-        {
+        if let Some(variant) = resolve_variant(&metering.variants, variant_hint) {
             return Ok(&variant.dimensions);
         }
 
@@ -602,7 +597,11 @@ fn dimension_from_metering(
         });
     }
 
-    let tier = select_price_tier(dimension, properties)?;
+    let tier =
+        select_price_tier(dimension, properties).ok_or(SessionMeteringError::NoPriceTier {
+            direction: dimension.direction,
+            unit: dimension.unit,
+        })?;
     let price_micro_usd = price_usd_to_micro_usd(tier.price_usd)?;
     Ok(SessionMeterDimension::required(
         dimension.direction,
@@ -610,43 +609,6 @@ fn dimension_from_metering(
         dimension.scale,
         price_micro_usd,
     ))
-}
-
-fn select_price_tier<'a>(
-    dimension: &'a MeterDimension,
-    properties: &RequestProperties,
-) -> Result<&'a PriceTier> {
-    if dimension.tiers.is_empty() {
-        return Err(SessionMeteringError::NoPriceTier {
-            direction: dimension.direction,
-            unit: dimension.unit,
-        });
-    }
-
-    if dimension.tiers.iter().any(|tier| tier.up_to.is_some()) {
-        return Ok(dimension
-            .tiers
-            .iter()
-            .find(|tier| tier.price_usd > 0.0)
-            .unwrap_or(&dimension.tiers[0]));
-    }
-
-    for tier in &dimension.tiers {
-        if let Some(condition) = &tier.condition
-            && !evaluate_condition(condition, properties)
-        {
-            continue;
-        }
-        return Ok(tier);
-    }
-
-    dimension
-        .tiers
-        .last()
-        .ok_or(SessionMeteringError::NoPriceTier {
-            direction: dimension.direction,
-            unit: dimension.unit,
-        })
 }
 
 fn price_usd_to_micro_usd(price_usd: f64) -> Result<u64> {
@@ -684,6 +646,7 @@ fn ceil_div(numerator: u128, denominator: u128) -> Result<u128> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pay_types::metering::PriceTier;
 
     fn gemini_spec() -> SessionMeterSpec {
         SessionMeterSpec::new([
@@ -845,20 +808,33 @@ endpoints:
     }
 
     #[test]
-    fn adapter_falls_back_to_first_variant_for_unknown_hint() {
+    fn adapter_uses_explicit_default_variant_for_unknown_hint() {
         let metering = Metering {
             dimensions: vec![],
-            variants: vec![pay_types::metering::MeterVariant {
-                param: "model".to_string(),
-                value: "default".to_string(),
-                description: None,
-                dimensions: vec![one_tier_dimension(
-                    MeterDirection::Usage,
-                    BillingUnit::Requests,
-                    1,
-                    0.001,
-                )],
-            }],
+            variants: vec![
+                pay_types::metering::MeterVariant {
+                    param: "model".to_string(),
+                    value: "qwen-turbo".to_string(),
+                    description: None,
+                    dimensions: vec![one_tier_dimension(
+                        MeterDirection::Usage,
+                        BillingUnit::Requests,
+                        1,
+                        0.001,
+                    )],
+                },
+                pay_types::metering::MeterVariant {
+                    param: "model".to_string(),
+                    value: "default".to_string(),
+                    description: None,
+                    dimensions: vec![one_tier_dimension(
+                        MeterDirection::Usage,
+                        BillingUnit::Requests,
+                        1,
+                        0.100,
+                    )],
+                },
+            ],
             sku_tiers: vec![],
             splits: vec![],
             schemes: None,
@@ -872,7 +848,7 @@ endpoints:
         )
         .unwrap();
 
-        assert_eq!(spec.dimensions[0].price_micro_usd, 1_000);
+        assert_eq!(spec.dimensions[0].price_micro_usd, 100_000);
     }
 
     #[test]

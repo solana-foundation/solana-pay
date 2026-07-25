@@ -151,7 +151,7 @@ pub struct InferenceInfo {
 }
 
 /// Discovered local inference provider, broadcast to UIs on (re)probe.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProviderSummary {
     pub slug: String,
@@ -166,11 +166,11 @@ pub struct ProviderSummary {
     pub color: Option<String>,
     /// Per-model price/description metadata for display. `models` remains the
     /// compatibility field; this mirrors it when pricing data is known.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub model_pricing: Vec<ModelPricingSummary>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ModelPricingSummary {
     pub model: String,

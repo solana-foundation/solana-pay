@@ -1,11 +1,340 @@
 //! Built-in HTTP client using reqwest. No external binary needed.
 
+use std::fs::{self, File, OpenOptions};
+use std::io::Read;
+use std::path::{Path, PathBuf};
+
+use rand::{RngCore, rngs::OsRng};
 use reqwest::Method;
 use reqwest::blocking::Client;
 use tracing::debug;
 
 use crate::client::runner::{self, RunOutcome};
-use crate::{Error, Result};
+use crate::{ClientApp, Error, Result};
+
+/// Internal header used to preserve no-redirect semantics through Pay's local
+/// debugger proxy. The proxy must remove this before forwarding upstream.
+pub const DEBUGGER_NO_FOLLOW_HEADER: &str = "x-pay-debugger-no-follow";
+pub const DEBUGGER_NO_FOLLOW_HEADER_VALUE: &str = "1";
+
+/// Maximum size of an owned request body, including multipart framing.
+pub const MAX_REQUEST_BODY_BYTES: usize = 64 * 1024 * 1024;
+
+/// One file included in a multipart request body.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MultipartFile {
+    pub name: String,
+    pub path: PathBuf,
+    pub filename: Option<String>,
+    pub content_type: Option<String>,
+}
+
+/// An owned, replayable HTTP request body.
+///
+/// Keeping the body owned lets callers reuse the exact same byte snapshot for
+/// an initial request and a paid retry without rereading a source file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RequestBody(bytes::Bytes);
+
+impl RequestBody {
+    pub fn text(value: impl Into<String>) -> Self {
+        Self(bytes::Bytes::from(value.into()))
+    }
+
+    pub fn bytes(value: impl Into<bytes::Bytes>) -> Self {
+        Self(value.into())
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+
+    /// Returns a UTF-8 view when the body can participate in JSON/OpenAPI
+    /// validation. Binary bodies that are not UTF-8 return `None`.
+    pub fn as_text(&self) -> Option<&str> {
+        std::str::from_utf8(&self.0).ok()
+    }
+
+    /// Snapshot one regular, non-symlink file into a replayable request body.
+    pub fn from_file(path: &Path) -> Result<(Self, String)> {
+        let bytes = read_request_file(path)?;
+        let content_type = mime_guess::from_path(path)
+            .first_raw()
+            .unwrap_or("application/octet-stream")
+            .to_string();
+        Ok((Self::bytes(bytes), content_type))
+    }
+
+    /// Snapshot files and construct one replayable multipart/form-data body.
+    pub fn multipart(
+        fields: &[(String, String)],
+        files: &[MultipartFile],
+    ) -> Result<(Self, String)> {
+        if fields.is_empty() && files.is_empty() {
+            return Err(Error::RequestValidation(
+                "A multipart request needs at least one --form or --form-file value.".to_string(),
+            ));
+        }
+        if files.len() > 16 {
+            return Err(Error::RequestValidation(format!(
+                "A multipart request can contain at most 16 files; received {}.",
+                files.len()
+            )));
+        }
+
+        for (name, _) in fields {
+            validate_disposition_value("form field name", name)?;
+        }
+        for file in files {
+            validate_disposition_value("file field name", &file.name)?;
+            if let Some(filename) = &file.filename {
+                validate_disposition_value("filename", filename)?;
+            }
+            if let Some(content_type) = &file.content_type {
+                normalize_content_type(content_type)?;
+            }
+        }
+
+        let snapshots = files
+            .iter()
+            .map(|file| {
+                let bytes = read_request_file(&file.path)?;
+                let filename = match &file.filename {
+                    Some(filename) => filename.clone(),
+                    None => file
+                        .path
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .map(str::to_string)
+                        .ok_or_else(|| {
+                            Error::RequestValidation(format!(
+                                "Multipart file `{}` needs a UTF-8 filename; rename it or supply an explicit filename.",
+                                file.path.display()
+                            ))
+                        })?,
+                };
+                validate_disposition_value("filename", &filename)?;
+                let content_type = file
+                    .content_type
+                    .as_deref()
+                    .map(normalize_content_type)
+                    .transpose()?
+                    .unwrap_or_else(|| {
+                        mime_guess::from_path(&file.path)
+                            .first_raw()
+                            .unwrap_or("application/octet-stream")
+                            .to_string()
+                    });
+                Ok((file.name.clone(), filename, content_type, bytes))
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        let boundary = multipart_boundary(fields, &snapshots);
+        let mut body = Vec::new();
+        for (name, value) in fields {
+            append_with_limit(&mut body, format!("--{boundary}\r\n").as_bytes())?;
+            append_with_limit(
+                &mut body,
+                format!("Content-Disposition: form-data; name=\"{name}\"\r\n\r\n").as_bytes(),
+            )?;
+            append_with_limit(&mut body, value.as_bytes())?;
+            append_with_limit(&mut body, b"\r\n")?;
+        }
+        for (name, filename, content_type, bytes) in snapshots {
+            append_with_limit(&mut body, format!("--{boundary}\r\n").as_bytes())?;
+            append_with_limit(
+                &mut body,
+                format!(
+                    "Content-Disposition: form-data; name=\"{name}\"; filename=\"{filename}\"\r\n"
+                )
+                .as_bytes(),
+            )?;
+            append_with_limit(
+                &mut body,
+                format!("Content-Type: {content_type}\r\n\r\n").as_bytes(),
+            )?;
+            append_with_limit(&mut body, &bytes)?;
+            append_with_limit(&mut body, b"\r\n")?;
+        }
+        append_with_limit(&mut body, format!("--{boundary}--\r\n").as_bytes())?;
+
+        Ok((
+            Self::bytes(body),
+            format!("multipart/form-data; boundary={boundary}"),
+        ))
+    }
+}
+
+/// Validate and canonicalize an HTTP content type.
+pub fn normalize_content_type(value: &str) -> Result<String> {
+    let value = value.trim();
+    if value.is_empty() || value.len() > 1024 {
+        return Err(Error::RequestValidation(
+            "Content type must be a non-empty MIME type of at most 1024 bytes.".to_string(),
+        ));
+    }
+    let parsed = value.parse::<mime_guess::Mime>().map_err(|_| {
+        Error::RequestValidation(format!(
+            "Content type `{value}` is invalid; use a MIME type such as `application/json` or `image/png`."
+        ))
+    })?;
+    let canonical = parsed.to_string();
+    reqwest::header::HeaderValue::from_str(&canonical).map_err(|_| {
+        Error::RequestValidation(format!(
+            "Content type `{value}` is not a valid HTTP header value."
+        ))
+    })?;
+    Ok(canonical)
+}
+
+fn read_request_file(path: &Path) -> Result<Vec<u8>> {
+    let metadata = fs::symlink_metadata(path).map_err(|error| {
+        Error::RequestValidation(format!(
+            "Could not inspect request body file `{}`: {error}",
+            path.display()
+        ))
+    })?;
+    if metadata.file_type().is_symlink() {
+        return Err(Error::RequestValidation(format!(
+            "Request body file `{}` must not be a symlink.",
+            path.display()
+        )));
+    }
+    if !metadata.file_type().is_file() {
+        return Err(Error::RequestValidation(format!(
+            "Request body source `{}` must be a regular file.",
+            path.display()
+        )));
+    }
+    if metadata.len() > MAX_REQUEST_BODY_BYTES as u64 {
+        return Err(Error::RequestValidation(format!(
+            "Request body file `{}` exceeds the 64 MiB limit.",
+            path.display()
+        )));
+    }
+
+    let file = open_request_file_no_follow(path).map_err(|error| {
+        Error::RequestValidation(format!(
+            "Could not open request body file `{}`: {error}",
+            path.display()
+        ))
+    })?;
+    if !file.metadata()?.file_type().is_file() {
+        return Err(Error::RequestValidation(format!(
+            "Request body source `{}` must be a regular file.",
+            path.display()
+        )));
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.take(MAX_REQUEST_BODY_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > MAX_REQUEST_BODY_BYTES {
+        return Err(Error::RequestValidation(format!(
+            "Request body file `{}` exceeds the 64 MiB limit.",
+            path.display()
+        )));
+    }
+    Ok(bytes)
+}
+
+fn open_request_file_no_follow(path: &Path) -> std::io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    options.open(path)
+}
+
+fn validate_disposition_value(label: &str, value: &str) -> Result<()> {
+    if value.is_empty()
+        || value
+            .chars()
+            .any(|character| character == '"' || character == '\\' || character.is_control())
+    {
+        return Err(Error::RequestValidation(format!(
+            "Multipart {label} `{value}` must be non-empty and contain no quotes, backslashes, or control characters."
+        )));
+    }
+    Ok(())
+}
+
+fn multipart_boundary(
+    fields: &[(String, String)],
+    files: &[(String, String, String, Vec<u8>)],
+) -> String {
+    loop {
+        let mut random = [0_u8; 24];
+        OsRng.fill_bytes(&mut random);
+        let boundary = format!("pay-{}", hex_bytes(&random));
+        let appears_in_input = fields.iter().any(|(_, value)| {
+            value
+                .as_bytes()
+                .windows(boundary.len())
+                .any(|w| w == boundary.as_bytes())
+        }) || files.iter().any(|(_, _, _, bytes)| {
+            bytes
+                .windows(boundary.len())
+                .any(|window| window == boundary.as_bytes())
+        });
+        if !appears_in_input {
+            return boundary;
+        }
+    }
+}
+
+fn hex_bytes(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        encoded.push(HEX[(byte >> 4) as usize] as char);
+        encoded.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    encoded
+}
+
+fn append_with_limit(body: &mut Vec<u8>, bytes: &[u8]) -> Result<()> {
+    let next_len = body.len().checked_add(bytes.len()).ok_or_else(|| {
+        Error::RequestValidation("Multipart request body size overflowed.".to_string())
+    })?;
+    if next_len > MAX_REQUEST_BODY_BYTES {
+        return Err(Error::RequestValidation(
+            "Multipart request body exceeds the 64 MiB limit.".to_string(),
+        ));
+    }
+    body.extend_from_slice(bytes);
+    Ok(())
+}
+
+impl From<&str> for RequestBody {
+    fn from(value: &str) -> Self {
+        Self(bytes::Bytes::copy_from_slice(value.as_bytes()))
+    }
+}
+
+impl From<String> for RequestBody {
+    fn from(value: String) -> Self {
+        Self(bytes::Bytes::from(value))
+    }
+}
+
+impl From<Vec<u8>> for RequestBody {
+    fn from(value: Vec<u8>) -> Self {
+        Self(bytes::Bytes::from(value))
+    }
+}
+
+/// Controls whether reqwest follows HTTP redirects.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum RedirectPolicy {
+    /// Use reqwest's normal redirect behavior.
+    #[default]
+    Follow,
+    /// Return the first redirect response without forwarding the request body.
+    None,
+}
 
 /// Raw HTTP response — keeps status, headers, and body together so callers
 /// (e.g. the rich probe pipeline) can both run `classify_402` and extract
@@ -61,15 +390,82 @@ pub fn fetch_request(
     extra_headers: &[(String, String)],
     body: Option<&str>,
 ) -> Result<RunOutcome> {
+    fetch_request_for(ClientApp::Cli, method, url, extra_headers, body)
+}
+
+pub fn fetch_request_for(
+    client_app: ClientApp,
+    method: &str,
+    url: &str,
+    extra_headers: &[(String, String)],
+    body: Option<&str>,
+) -> Result<RunOutcome> {
+    let body = body.map(RequestBody::from);
+    fetch_request_with_body_for(
+        client_app,
+        method,
+        url,
+        extra_headers,
+        body.as_ref(),
+        RedirectPolicy::Follow,
+    )
+}
+
+/// Fetch a URL with an owned, replayable body and explicit redirect policy.
+pub fn fetch_request_with_body_for(
+    client_app: ClientApp,
+    method: &str,
+    url: &str,
+    extra_headers: &[(String, String)],
+    body: Option<&RequestBody>,
+    redirect_policy: RedirectPolicy,
+) -> Result<RunOutcome> {
     let method = Method::from_bytes(method.as_bytes())
         .map_err(|e| Error::Mpp(format!("Invalid HTTP method `{method}`: {e}")))?;
-    let raw = fetch_raw_with_method(method, url, extra_headers, body)?;
+    let raw = fetch_raw_with_method(
+        client_app,
+        method,
+        url,
+        extra_headers,
+        body,
+        redirect_policy,
+    )?;
+    if redirect_policy == RedirectPolicy::None && (300..400).contains(&raw.status) {
+        let location = raw
+            .headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("location"))
+            .map(|(_, value)| value.as_str())
+            .filter(|value| !value.is_empty());
+        let location_guidance = location.map_or_else(
+            || {
+                " The response did not include a Location header; find the endpoint's final URL before staging the body again."
+                    .to_string()
+            },
+            |location| {
+                format!(
+                    " The response Location is `{location}`; rerun the request against that final URL before retrying."
+                )
+            },
+        );
+        return Err(Error::RequestValidation(format!(
+            "The request body was sent only to its bound URL. Pay did not forward it to the redirect destination after the server returned HTTP {}.{location_guidance}",
+            raw.status
+        )));
+    }
     Ok(raw_to_outcome(raw, url))
 }
 
 /// Fetch a URL, detecting 402 + MPP challenges.
 pub fn fetch(url: &str, extra_headers: &[(String, String)]) -> Result<RunOutcome> {
-    let raw = fetch_raw_with_method(Method::GET, url, extra_headers, None)?;
+    let raw = fetch_raw_with_method(
+        ClientApp::Cli,
+        Method::GET,
+        url,
+        extra_headers,
+        None,
+        RedirectPolicy::Follow,
+    )?;
     Ok(raw_to_outcome(raw, url))
 }
 
@@ -84,9 +480,46 @@ pub fn fetch_raw(
     extra_headers: &[(String, String)],
     body: Option<&str>,
 ) -> Result<RawResponse> {
+    fetch_raw_for(ClientApp::Cli, method, url, extra_headers, body)
+}
+
+pub fn fetch_raw_for(
+    client_app: ClientApp,
+    method: &str,
+    url: &str,
+    extra_headers: &[(String, String)],
+    body: Option<&str>,
+) -> Result<RawResponse> {
+    let body = body.map(RequestBody::from);
+    fetch_raw_with_body_for(
+        client_app,
+        method,
+        url,
+        extra_headers,
+        body.as_ref(),
+        RedirectPolicy::Follow,
+    )
+}
+
+/// Fetch a raw response with an owned, replayable body and redirect policy.
+pub fn fetch_raw_with_body_for(
+    client_app: ClientApp,
+    method: &str,
+    url: &str,
+    extra_headers: &[(String, String)],
+    body: Option<&RequestBody>,
+    redirect_policy: RedirectPolicy,
+) -> Result<RawResponse> {
     let method = Method::from_bytes(method.as_bytes())
         .map_err(|e| Error::Mpp(format!("Invalid HTTP method `{method}`: {e}")))?;
-    fetch_raw_with_method(method, url, extra_headers, body)
+    fetch_raw_with_method(
+        client_app,
+        method,
+        url,
+        extra_headers,
+        body,
+        redirect_policy,
+    )
 }
 
 fn raw_to_outcome(raw: RawResponse, url: &str) -> RunOutcome {
@@ -101,17 +534,23 @@ fn raw_to_outcome(raw: RawResponse, url: &str) -> RunOutcome {
         exit_code,
         body: Some(raw.body),
         content_type,
+        response_headers: raw.headers,
     }
 }
 
 fn fetch_raw_with_method(
+    client_app: ClientApp,
     method: Method,
     url: &str,
     extra_headers: &[(String, String)],
-    body: Option<&str>,
+    body: Option<&RequestBody>,
+    redirect_policy: RedirectPolicy,
 ) -> Result<RawResponse> {
-    let client = Client::builder()
-        .user_agent(format!("pay/{}", env!("CARGO_PKG_VERSION")))
+    let mut client_builder = Client::builder().user_agent(client_app.user_agent());
+    if redirect_policy == RedirectPolicy::None {
+        client_builder = client_builder.redirect(reqwest::redirect::Policy::none());
+    }
+    let client = client_builder
         .build()
         .map_err(|e| Error::Mpp(format!("Failed to create HTTP client: {e}")))?;
 
@@ -140,8 +579,11 @@ fn fetch_raw_with_method(
     for (key, value) in extra_headers {
         req = req.header(key.as_str(), value.as_str());
     }
+    if forward_header.is_some() && redirect_policy == RedirectPolicy::None {
+        req = req.header(DEBUGGER_NO_FOLLOW_HEADER, DEBUGGER_NO_FOLLOW_HEADER_VALUE);
+    }
     if let Some(body) = body {
-        req = req.body(body.to_owned());
+        req = req.body(body.0.clone());
     }
 
     let resp = req
@@ -278,6 +720,59 @@ mod tests {
     }
 
     #[test]
+    fn fetch_defaults_to_cli_user_agent() {
+        let app = axum::Router::new().route(
+            "/ua",
+            axum::routing::get(|headers: axum::http::HeaderMap| async move {
+                headers
+                    .get("user-agent")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("missing")
+                    .to_string()
+            }),
+        );
+        let base_url = start_server(app);
+
+        let result = fetch(&format!("{base_url}/ua"), &[]).unwrap();
+        match result {
+            RunOutcome::Completed { body, .. } => {
+                assert_eq!(
+                    body.unwrap(),
+                    ClientApp::Cli.user_agent().as_bytes().to_vec()
+                );
+            }
+            _ => panic!("Expected Completed"),
+        }
+    }
+
+    #[test]
+    fn fetch_request_for_sends_mcp_user_agent() {
+        let app = axum::Router::new().route(
+            "/ua",
+            axum::routing::get(|headers: axum::http::HeaderMap| async move {
+                headers
+                    .get("user-agent")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("missing")
+                    .to_string()
+            }),
+        );
+        let base_url = start_server(app);
+
+        let result =
+            fetch_request_for(ClientApp::Mcp, "GET", &format!("{base_url}/ua"), &[], None).unwrap();
+        match result {
+            RunOutcome::Completed { body, .. } => {
+                assert_eq!(
+                    body.unwrap(),
+                    ClientApp::Mcp.user_agent().as_bytes().to_vec()
+                );
+            }
+            _ => panic!("Expected Completed"),
+        }
+    }
+
+    #[test]
     fn fetch_request_sends_post_body() {
         let app = axum::Router::new().route(
             "/echo-body",
@@ -299,6 +794,111 @@ mod tests {
             } => {
                 assert_eq!(exit_code, 0);
                 assert_eq!(body.unwrap(), br#"{"query":"SELECT 1"}"#);
+            }
+            _ => panic!("Expected Completed"),
+        }
+    }
+
+    #[test]
+    fn replayable_request_body_preserves_non_utf8_bytes() {
+        let app = axum::Router::new().route(
+            "/echo-bytes",
+            axum::routing::post(|body: axum::body::Bytes| async move { body }),
+        );
+        let base_url = start_server(app);
+        let payload = vec![0x00, 0xFF, 0xFE, 0x80, b'P', b'N', b'G'];
+        let body = RequestBody::bytes(payload.clone());
+
+        // The same owned snapshot can be borrowed for both the initial request
+        // and its retry without rereading or re-encoding it.
+        for _ in 0..2 {
+            let raw = fetch_raw_with_body_for(
+                ClientApp::Cli,
+                "POST",
+                &format!("{base_url}/echo-bytes"),
+                &[],
+                Some(&body),
+                RedirectPolicy::Follow,
+            )
+            .unwrap();
+
+            assert_eq!(raw.status, 200);
+            assert_eq!(raw.body, payload);
+        }
+    }
+
+    #[test]
+    fn redirect_policy_can_follow_or_reject_redirects() {
+        let app = axum::Router::new()
+            .route(
+                "/redirect",
+                axum::routing::post(|| async {
+                    (
+                        axum::http::StatusCode::TEMPORARY_REDIRECT,
+                        [(axum::http::header::LOCATION, "/destination")],
+                        "",
+                    )
+                }),
+            )
+            .route(
+                "/destination",
+                axum::routing::post(|body: axum::body::Bytes| async move { body }),
+            );
+        let base_url = start_server(app);
+        let body = RequestBody::text("same body");
+
+        let followed = fetch_raw_with_body_for(
+            ClientApp::Cli,
+            "POST",
+            &format!("{base_url}/redirect"),
+            &[],
+            Some(&body),
+            RedirectPolicy::Follow,
+        )
+        .unwrap();
+        assert_eq!(followed.status, 200);
+        assert_eq!(followed.body, b"same body");
+
+        let not_followed = fetch_raw_with_body_for(
+            ClientApp::Cli,
+            "POST",
+            &format!("{base_url}/redirect"),
+            &[],
+            Some(&body),
+            RedirectPolicy::None,
+        )
+        .unwrap();
+        assert_eq!(not_followed.status, 307);
+
+        let redirect_error = fetch_request_with_body_for(
+            ClientApp::Cli,
+            "POST",
+            &format!("{base_url}/redirect"),
+            &[],
+            Some(&body),
+            RedirectPolicy::None,
+        )
+        .unwrap_err();
+        match redirect_error {
+            Error::RequestValidation(message) => {
+                assert!(message.contains("HTTP 307"));
+                assert!(message.contains("`/destination`"));
+                assert!(message.contains("final URL"));
+            }
+            other => panic!("Expected RequestValidation, got {other}"),
+        }
+
+        // Existing string-body APIs retain reqwest's normal redirect behavior.
+        let existing = fetch_request(
+            "POST",
+            &format!("{base_url}/redirect"),
+            &[],
+            Some("existing body"),
+        )
+        .unwrap();
+        match existing {
+            RunOutcome::Completed { body, .. } => {
+                assert_eq!(body.unwrap(), b"existing body");
             }
             _ => panic!("Expected Completed"),
         }
@@ -371,6 +971,29 @@ mod tests {
             } => {
                 assert_eq!(content_type.as_deref(), Some("image/png"));
                 assert_eq!(body.unwrap(), vec![0x89, b'P', b'N', b'G']);
+            }
+            _ => panic!("Expected Completed"),
+        }
+    }
+
+    #[test]
+    fn fetch_completed_preserves_payment_response_header() {
+        let app = axum::Router::new().route(
+            "/paid",
+            axum::routing::get(|| async {
+                ([("payment-response", "encoded-settlement")], "delivered")
+            }),
+        );
+        let base_url = start_server(app);
+
+        let result = fetch(&format!("{base_url}/paid"), &[]).unwrap();
+        match result {
+            RunOutcome::Completed {
+                response_headers, ..
+            } => {
+                assert!(response_headers.iter().any(|(name, value)| {
+                    name.eq_ignore_ascii_case("payment-response") && value == "encoded-settlement"
+                }));
             }
             _ => panic!("Expected Completed"),
         }

@@ -43,6 +43,9 @@ pub struct SessionHandle {
     inner: Arc<Mutex<ActiveSession>>,
     /// Original challenge — echoed back in every `PaymentCredential`.
     challenge: PaymentChallenge,
+    /// Delegated sessions bind the operator, rather than the local ephemeral
+    /// voucher key, as the channel's on-chain authorized signer.
+    authorized_signer_override: Option<Pubkey>,
 }
 
 impl SessionHandle {
@@ -73,7 +76,13 @@ impl SessionHandle {
         Self {
             inner: Arc::new(Mutex::new(ActiveSession::new(channel_id, signer))),
             challenge,
+            authorized_signer_override: None,
         }
+    }
+
+    fn with_authorized_signer(mut self, authorized_signer: Pubkey) -> Self {
+        self.authorized_signer_override = Some(authorized_signer);
+        self
     }
 
     /// Build an `Authorization` header for the `open` action.
@@ -176,7 +185,10 @@ impl SessionHandle {
         ) else {
             unreachable!("open_payment_channel_action always returns SessionAction::Open")
         };
-        let payload = payload.with_transaction(transaction);
+        let mut payload = payload.with_transaction(transaction);
+        if let Some(authorized_signer) = self.authorized_signer_override {
+            payload.authorized_signer = authorized_signer.to_string();
+        }
         build_header(&self.challenge, &SessionAction::Open(payload))
     }
 
@@ -355,7 +367,15 @@ pub fn open_payment_channel_session_header_with_mode(
     kp_bytes[32..].copy_from_slice(vk.as_bytes());
     let session_signer: Box<dyn pay_kit::mpp::solana_keychain::SolanaSigner> =
         Box::new(MemorySigner::from_bytes(&kp_bytes).map_err(|e| Error::Mpp(e.to_string()))?);
-    let authorized_signer = session_signer.pubkey();
+    let authorized_signer = match request.settlement_authority {
+        pay_kit::mpp::SessionSettlementAuthority::ClientVoucher => session_signer.pubkey(),
+        pay_kit::mpp::SessionSettlementAuthority::Delegated => fee_payer,
+        _ => {
+            return Err(Error::Mpp(
+                "unsupported MPP session settlement authority".to_string(),
+            ));
+        }
+    };
 
     let open = derive_payment_channel_open(DerivePaymentChannelOpenParams {
         request,
@@ -380,7 +400,8 @@ pub fn open_payment_channel_session_header_with_mode(
         ))
         .map_err(|e| Error::Mpp(format!("build_open_payment_channel_transaction: {e}")))?;
 
-    let handle = SessionHandle::new(open_tx.channel_id, session_signer, challenge.clone());
+    let handle = SessionHandle::new(open_tx.channel_id, session_signer, challenge.clone())
+        .with_authorized_signer(authorized_signer);
     let auth_header = rt.block_on(handle.open_payment_channel_header_with_mode(
         submission_mode.clone(),
         deposit,
@@ -397,7 +418,7 @@ pub fn open_payment_channel_session_header_with_mode(
         open_tx.transaction,
     ))?;
 
-    tracing::info!(
+    tracing::debug!(
         payer = %payer,
         channel = %open_tx.channel_id,
         deposit,
@@ -448,6 +469,7 @@ mod tests {
             description: Some("test session".to_string()),
             external_id: Some("ext-123".to_string()),
             min_voucher_delta: Some("25".to_string()),
+            settlement_authority: pay_kit::mpp::SessionSettlementAuthority::ClientVoucher,
             modes: vec![SessionMode::Push, SessionMode::Pull],
             pull_voucher_strategy: Some(SessionPullVoucherStrategy::ClientVoucher),
             recent_blockhash: None,
@@ -547,6 +569,36 @@ mod tests {
             }
             _ => panic!("expected close action"),
         }
+    }
+
+    #[tokio::test]
+    async fn delegated_open_uses_operator_as_authorized_signer() {
+        let operator = Pubkey::new_unique();
+        let handle = SessionHandle::new(
+            Pubkey::new_unique(),
+            test_signer(),
+            test_challenge("session"),
+        )
+        .with_authorized_signer(operator);
+        let header = handle
+            .open_payment_channel_header_with_mode(
+                SessionMode::Push,
+                1_000_000,
+                &Pubkey::new_unique().to_string(),
+                &Pubkey::new_unique().to_string(),
+                &Pubkey::new_unique().to_string(),
+                7,
+                900,
+                42,
+                "transaction".to_string(),
+            )
+            .await
+            .unwrap();
+
+        let SessionAction::Open(payload) = parse_action(&header) else {
+            panic!("expected open action");
+        };
+        assert_eq!(payload.authorized_signer, operator.to_string());
     }
 
     #[test]

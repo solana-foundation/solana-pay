@@ -56,6 +56,7 @@ impl DemoCommand {
             otlp_sidecar: self.otlp_sidecar,
             openapi: None,
             public_url: None,
+            no_register: false,
             scaffolded_spec: Some("./pay-demo.yaml".to_string()),
         };
         cmd.run(active_account_name, true)

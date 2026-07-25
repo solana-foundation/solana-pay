@@ -1,9 +1,13 @@
-use std::path::Path;
 #[cfg(windows)]
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
 use clap::Args;
+
+use super::claude::{AlternateClient, AlternateProvider, prepare_alternate_provider};
+
+const ALTERNATE_PROVIDER_ID: &str = "pay_alt";
+const ALTERNATE_BASE_INSTRUCTIONS: &str = "You are Codex, a coding agent working with the user in the current workspace. Follow the developer instructions. Use the provided tools to inspect and modify files when requested, verify your work, and report results concisely. Do not invent tool results.";
 
 pub(crate) const PAY_MCP_ENABLED_TOOLS: &[&str] = &[
     "curl",
@@ -28,12 +32,34 @@ pub struct CodexCommand {
 }
 
 impl CodexCommand {
-    pub fn run(self, pay_bin: &str, active_account_name: Option<&str>) -> pay_core::Result<i32> {
-        let instructions_file = write_instructions_file()?;
+    pub fn run(
+        self,
+        pay_bin: &str,
+        active_account_name: Option<&str>,
+        network_override: Option<&str>,
+        alternate_provider: bool,
+    ) -> pay_core::Result<i32> {
+        let alternate = if alternate_provider && !codex_metadata_requested(&self.args) {
+            Some(prepare_alternate_provider(
+                AlternateClient::Codex,
+                &self.args,
+                network_override,
+                active_account_name,
+            )?)
+        } else {
+            None
+        };
+
+        let model_catalog_file = alternate
+            .as_ref()
+            .and_then(|provider| provider.model.as_deref())
+            .map(write_model_catalog_file)
+            .transpose()?;
         let codex_args = build_codex_args(
             pay_bin,
             active_account_name,
-            instructions_file.path(),
+            alternate.as_ref(),
+            model_catalog_file.as_ref().map(|file| file.path()),
             &self.args,
         );
 
@@ -59,10 +85,16 @@ impl CodexCommand {
     }
 }
 
+fn codex_metadata_requested(args: &[String]) -> bool {
+    args.iter()
+        .any(|arg| matches!(arg.as_str(), "-h" | "--help" | "--version" | "-V"))
+}
+
 fn build_codex_args(
     pay_bin: &str,
     active_account_name: Option<&str>,
-    instructions_path: &Path,
+    alternate: Option<&AlternateProvider>,
+    model_catalog_path: Option<&std::path::Path>,
     extra_args: &[String],
 ) -> Vec<String> {
     let mut args = vec![
@@ -76,6 +108,42 @@ fn build_codex_args(
             toml_string_array(PAY_MCP_ENABLED_TOOLS)
         ),
     ];
+
+    if let Some(alternate) = alternate {
+        args.extend([
+            "-c".to_string(),
+            config_string("model_provider", ALTERNATE_PROVIDER_ID),
+            "-c".to_string(),
+            config_string(
+                &format!("model_providers.{ALTERNATE_PROVIDER_ID}.name"),
+                "Pay alternate provider",
+            ),
+            "-c".to_string(),
+            config_string(
+                &format!("model_providers.{ALTERNATE_PROVIDER_ID}.base_url"),
+                &alternate.base_url,
+            ),
+            "-c".to_string(),
+            config_string(
+                &format!("model_providers.{ALTERNATE_PROVIDER_ID}.wire_api"),
+                "responses",
+            ),
+        ]);
+        if let Some(model) = alternate.model.as_deref() {
+            args.extend([
+                "-c".to_string(),
+                config_string("model", model),
+                "-c".to_string(),
+                config_string("model_reasoning_effort", "none"),
+            ]);
+        }
+        if let Some(path) = model_catalog_path {
+            args.extend([
+                "-c".to_string(),
+                config_string("model_catalog_json", &path.to_string_lossy()),
+            ]);
+        }
+    }
 
     // Pass config to MCP server via env.
     let mut env_parts = Vec::new();
@@ -99,25 +167,64 @@ fn build_codex_args(
         args.push(format!("mcp_servers.pay.env={{{}}}", env_parts.join(",")));
     }
 
+    // This is additive to Codex's model prompt. `model_instructions_file`
+    // replaces the model prompt and leaves alternate models without Codex's
+    // core agent instructions.
     args.push("-c".to_string());
     args.push(config_string(
-        "model_instructions_file",
-        &instructions_path.to_string_lossy(),
+        "developer_instructions",
+        pay_core::instructions::INSTRUCTIONS,
     ));
     args.extend(extra_args.iter().cloned());
     args
 }
 
-fn write_instructions_file() -> pay_core::Result<tempfile::NamedTempFile> {
+fn write_model_catalog_file(model: &str) -> pay_core::Result<tempfile::NamedTempFile> {
     use std::io::Write;
 
     let mut file = tempfile::Builder::new()
-        .prefix("pay_codex_instructions_")
-        .suffix(".md")
+        .prefix("pay_codex_model_catalog_")
+        .suffix(".json")
         .tempfile()?;
-    file.write_all(pay_core::instructions::INSTRUCTIONS.as_bytes())?;
+    let catalog = build_model_catalog(model);
+    serde_json::to_writer(&mut file, &catalog)?;
     file.flush()?;
     Ok(file)
+}
+
+fn build_model_catalog(model: &str) -> serde_json::Value {
+    serde_json::json!({
+        "models": [{
+            "slug": model,
+            "display_name": model,
+            "description": "OpenAI-compatible model routed through Pay",
+            "default_reasoning_level": null,
+            "supported_reasoning_levels": [],
+            "shell_type": "default",
+            "visibility": "list",
+            "supported_in_api": true,
+            "priority": 1,
+            "availability_nux": null,
+            "upgrade": null,
+            "base_instructions": ALTERNATE_BASE_INSTRUCTIONS,
+            "supports_reasoning_summaries": false,
+            "default_reasoning_summary": "none",
+            "support_verbosity": false,
+            "default_verbosity": null,
+            "apply_patch_tool_type": null,
+            "web_search_tool_type": "text",
+            "truncation_policy": {"mode": "bytes", "limit": 10000},
+            "supports_parallel_tool_calls": false,
+            "supports_image_detail_original": false,
+            "context_window": 1000000,
+            "max_context_window": 1000000,
+            "effective_context_window_percent": 95,
+            "experimental_supported_tools": [],
+            "input_modalities": ["text"],
+            "supports_search_tool": false,
+            "use_responses_lite": false
+        }]
+    })
 }
 
 fn config_string(key: &str, value: &str) -> String {
@@ -231,12 +338,7 @@ mod tests {
 
     #[test]
     fn build_args_escapes_windows_paths_as_toml() {
-        let args = build_codex_args(
-            r#"C:\Users\me\pay.exe"#,
-            Some("default"),
-            Path::new(r#"C:\Users\me\AppData\Local\Temp\pay instructions.md"#),
-            &[],
-        );
+        let args = build_codex_args(r#"C:\Users\me\pay.exe"#, Some("default"), None, None, &[]);
 
         assert!(args.contains(&r#"mcp_servers.pay.command="C:\\Users\\me\\pay.exe""#.to_string()));
         assert!(args.contains(
@@ -245,10 +347,53 @@ mod tests {
         assert!(
             args.contains(&r#"mcp_servers.pay.env={PAY_ACTIVE_ACCOUNT="default"}"#.to_string())
         );
+        assert!(
+            args.iter()
+                .any(|arg| arg.starts_with("developer_instructions="))
+        );
+    }
+
+    #[test]
+    fn build_args_routes_codex_through_alternate_responses_provider() {
+        let alternate = AlternateProvider {
+            base_url: "http://127.0.0.1:54321/v1".to_string(),
+            model: Some("qwen3-coder-next".to_string()),
+        };
+        let args = build_codex_args(
+            "pay",
+            None,
+            Some(&alternate),
+            Some(std::path::Path::new("/tmp/pay-model-catalog.json")),
+            &[],
+        );
+
+        assert!(args.contains(&"model_provider=\"pay_alt\"".to_string()));
         assert!(args.contains(
-            &r#"model_instructions_file="C:\\Users\\me\\AppData\\Local\\Temp\\pay instructions.md""#
-                .to_string()
+            &"model_providers.pay_alt.base_url=\"http://127.0.0.1:54321/v1\"".to_string()
         ));
+        assert!(args.contains(&"model_providers.pay_alt.wire_api=\"responses\"".to_string()));
+        assert!(args.contains(&"model=\"qwen3-coder-next\"".to_string()));
+        assert!(args.contains(&"model_reasoning_effort=\"none\"".to_string()));
+        assert!(args.contains(&"model_catalog_json=\"/tmp/pay-model-catalog.json\"".to_string()));
+    }
+
+    #[test]
+    fn alternate_model_catalog_disables_unsupported_openai_features() {
+        let catalog = build_model_catalog("qwen3.7-plus");
+        let model = &catalog["models"][0];
+
+        assert_eq!(model["slug"], "qwen3.7-plus");
+        assert_eq!(model["supported_reasoning_levels"], serde_json::json!([]));
+        assert_eq!(model["supports_reasoning_summaries"], false);
+        assert_eq!(model["supports_parallel_tool_calls"], false);
+        assert_eq!(model["input_modalities"], serde_json::json!(["text"]));
+    }
+
+    #[test]
+    fn metadata_requests_skip_alternate_provider_selection() {
+        assert!(codex_metadata_requested(&["--version".to_string()]));
+        assert!(codex_metadata_requested(&["-h".to_string()]));
+        assert!(!codex_metadata_requested(&["hello".to_string()]));
     }
 
     #[cfg(windows)]

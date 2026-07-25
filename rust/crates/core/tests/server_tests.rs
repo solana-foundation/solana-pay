@@ -62,6 +62,33 @@ struct SessionTestState {
     session_mpp: Option<Arc<SessionMpp>>,
 }
 
+#[derive(Clone)]
+struct MultiCurrencySessionTestState {
+    apis: Arc<Vec<ApiSpec>>,
+    session_mpps: Vec<Arc<SessionMpp>>,
+}
+
+impl PaymentState for MultiCurrencySessionTestState {
+    fn apis(&self) -> &[ApiSpec] {
+        &self.apis
+    }
+    fn mpp(&self) -> Option<&Mpp> {
+        None
+    }
+    fn session_mpp(&self) -> Option<&SessionMpp> {
+        self.session_mpps.first().map(Arc::as_ref)
+    }
+    fn session_mpp_handle(&self) -> Option<Arc<SessionMpp>> {
+        self.session_mpps.first().cloned()
+    }
+    fn session_mpps(&self) -> Vec<&SessionMpp> {
+        self.session_mpps.iter().map(Arc::as_ref).collect()
+    }
+    fn session_mpp_handles(&self) -> Vec<Arc<SessionMpp>> {
+        self.session_mpps.clone()
+    }
+}
+
 impl PaymentState for SessionTestState {
     fn apis(&self) -> &[ApiSpec] {
         &self.apis
@@ -220,13 +247,13 @@ async fn start_respond_server() -> (String, tokio::task::JoinHandle<()>) {
     (url, handle)
 }
 
-fn test_session_mpp() -> SessionMpp {
+fn test_session_mpp_for_currency(currency: &str) -> SessionMpp {
     SessionMpp::new(
         SessionConfig {
             operator: solana_pubkey::Pubkey::new_unique().to_string(),
             recipient: solana_pubkey::Pubkey::new_unique().to_string(),
             max_cap: 5_000_000,
-            currency: solana_pubkey::Pubkey::new_unique().to_string(),
+            currency: currency.to_string(),
             network: "localnet".to_string(),
             modes: vec![
                 pay_kit::mpp::SessionMode::Push,
@@ -236,6 +263,10 @@ fn test_session_mpp() -> SessionMpp {
         },
         "test-secret-key-do-not-use-32b-pad",
     )
+}
+
+fn test_session_mpp() -> SessionMpp {
+    test_session_mpp_for_currency(&solana_pubkey::Pubkey::new_unique().to_string())
 }
 
 async fn start_session_server() -> (String, tokio::task::JoinHandle<()>) {
@@ -251,6 +282,42 @@ async fn start_session_server() -> (String, tokio::task::JoinHandle<()>) {
         .layer(middleware::from_fn_with_state(
             state.clone(),
             pay_core::server::payment::payment_middleware::<SessionTestState>,
+        ))
+        .with_state(state);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+    let handle = tokio::spawn(async { axum::serve(listener, app).await.unwrap() });
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    (url, handle)
+}
+
+async fn start_multi_currency_session_server() -> (String, tokio::task::JoinHandle<()>) {
+    use pay_types::stablecoin_mints::{
+        CASH_MAINNET, PYUSD_MAINNET, USDC_MAINNET, USDG_MAINNET, USDT_MAINNET,
+    };
+
+    let api = load_test_api();
+    let session_mpps = [
+        USDC_MAINNET,
+        USDT_MAINNET,
+        PYUSD_MAINNET,
+        CASH_MAINNET,
+        USDG_MAINNET,
+    ]
+    .into_iter()
+    .map(|currency| Arc::new(test_session_mpp_for_currency(currency)))
+    .collect();
+    let state = MultiCurrencySessionTestState {
+        apis: Arc::new(vec![api]),
+        session_mpps,
+    };
+
+    let app = Router::new()
+        .fallback(any(echo_handler))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            pay_core::server::payment::payment_middleware::<MultiCurrencySessionTestState>,
         ))
         .with_state(state);
 
@@ -536,6 +603,53 @@ async fn middleware_returns_session_challenge_when_session_mpp_configured() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn middleware_returns_one_session_challenge_per_configured_currency() {
+    use pay_types::stablecoin_mints::{
+        CASH_MAINNET, PYUSD_MAINNET, USDC_MAINNET, USDG_MAINNET, USDT_MAINNET,
+    };
+
+    let (url, _h) = start_multi_currency_session_server().await;
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{url}/v1/simple/echo"))
+        .headers(client_with_host("testapi"))
+        .body("{}")
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 402);
+    let headers: Vec<_> = resp
+        .headers()
+        .get_all("www-authenticate")
+        .iter()
+        .map(|value| value.to_str().unwrap())
+        .collect();
+    let challenges = pay_kit::mpp::parse_www_authenticate_all(headers)
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    let currencies: Vec<String> = challenges
+        .into_iter()
+        .map(|challenge| {
+            assert_eq!(challenge.intent.as_str(), "session");
+            let request: pay_kit::mpp::SessionRequest = challenge.request.decode().unwrap();
+            request.currency
+        })
+        .collect();
+    assert_eq!(
+        currencies,
+        [
+            USDC_MAINNET,
+            USDT_MAINNET,
+            PYUSD_MAINNET,
+            CASH_MAINNET,
+            USDG_MAINNET,
+        ]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn middleware_accepts_session_open_and_voucher_then_close() {
     let (url, _h) = start_session_server().await;
     let client = reqwest::Client::new();
@@ -572,7 +686,9 @@ async fn middleware_accepts_session_open_and_voucher_then_close() {
         .send()
         .await
         .unwrap();
-    assert_eq!(open_resp.status(), 200);
+    // Client-voucher sessions acknowledge the open before requiring the first
+    // client-signed voucher for paid service.
+    assert_eq!(open_resp.status(), 402);
 
     let voucher_header = handle.voucher_header(25).await.unwrap();
     let voucher_resp = client

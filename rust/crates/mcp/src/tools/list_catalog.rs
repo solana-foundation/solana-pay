@@ -76,13 +76,13 @@ struct ListCatalogResponse {
 pub async fn run(params: Params) -> Result<CallToolResult, rmcp::ErrorData> {
     let cache_bust = params.cache_bust;
     let catalog_result = if params.refresh || cache_bust {
-        pay_core::skills::update_skills(cache_bust)
+        pay_core::skills::update_skills_for(cache_bust, pay_core::ClientApp::Mcp)
             .await
             .map_err(|e| format!("Failed to refresh Pay catalog: {e}"))
     } else {
         match pay_core::skills::load_cached_skills() {
             Ok(catalog) => Ok(catalog),
-            Err(_) => pay_core::skills::load_skills()
+            Err(_) => pay_core::skills::load_skills_for(pay_core::ClientApp::Mcp)
                 .await
                 .map_err(|e| format!("Failed to load Pay catalog: {e}")),
         }

@@ -43,6 +43,19 @@ pub fn notice(level: NoticeLevel, title: &str, body: &str) -> String {
     out
 }
 
+/// Render body lines inside a colored notice rail without adding a title.
+///
+/// Useful when a preceding log line already supplies the title and the next
+/// content (such as an ASCII table) should remain visually connected to it.
+pub fn notice_body(level: NoticeLevel, body: &str) -> String {
+    let rail = level.rail();
+    let mut out = String::new();
+    for line in body.lines() {
+        out.push_str(&format!("{rail} {}\n", line.dimmed()));
+    }
+    out
+}
+
 /// Print a notice to stderr, using compact text when NO_DNA is active.
 pub fn print_notice(level: NoticeLevel, title: &str, body: &str) {
     if crate::no_dna::is_agent() {
@@ -112,6 +125,13 @@ mod tests {
         let rendered = notice(NoticeLevel::Info, "Wallet generated", "ready");
 
         assert_eq!(strip_ansi(&rendered), "│ Wallet generated\n│ ready\n");
+    }
+
+    #[test]
+    fn notice_body_keeps_every_table_line_on_the_same_rail() {
+        let rendered = notice_body(NoticeLevel::Info, "+--+\n|x |\n+--+");
+
+        assert_eq!(strip_ansi(&rendered), "│ +--+\n│ |x |\n│ +--+\n");
     }
 
     #[test]

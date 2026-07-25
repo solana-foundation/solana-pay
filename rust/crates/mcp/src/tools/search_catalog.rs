@@ -90,11 +90,11 @@ pub async fn run(params: Params) -> Result<CallToolResult, rmcp::ErrorData> {
 
     let cache_bust = params.cache_bust;
     let catalog_result = if params.refresh || cache_bust {
-        pay_core::skills::update_skills(cache_bust)
+        pay_core::skills::update_skills_for(cache_bust, pay_core::ClientApp::Mcp)
             .await
             .map_err(|e| format!("Failed to refresh Pay catalog: {e}"))
     } else {
-        pay_core::skills::load_skills()
+        pay_core::skills::load_skills_for(pay_core::ClientApp::Mcp)
             .await
             .map_err(|e| format!("Failed to load Pay catalog: {e}"))
     };
@@ -105,7 +105,14 @@ pub async fn run(params: Params) -> Result<CallToolResult, rmcp::ErrorData> {
 
     let max_results = params.max_results.clamp(1, 10);
     let category = params.category.clone();
-    let response = build_search_catalog_response(catalog, query, category, max_results).await;
+    let response = build_search_catalog_response(
+        catalog,
+        query,
+        category,
+        max_results,
+        pay_core::ClientApp::Mcp,
+    )
+    .await;
 
     let json = match serde_json::to_string_pretty(&response) {
         Ok(json) => json,
@@ -126,6 +133,7 @@ async fn build_search_catalog_response(
     query: String,
     category: Option<String>,
     max_results: usize,
+    client_app: pay_core::ClientApp,
 ) -> SearchCatalogResponse {
     let lookup_limit = (max_results * ENDPOINT_LOOKUP_MULTIPLIER).clamp(max_results, 20);
     let preliminary = pay_core::skills::search_services_ranked(
@@ -138,7 +146,9 @@ async fn build_search_catalog_response(
     let mut endpoint_errors = HashMap::new();
     for candidate in &preliminary {
         let fqn = candidate.service.name.clone();
-        if let Err(err) = pay_core::skills::ensure_endpoints(&mut catalog, &fqn).await {
+        if let Err(err) =
+            pay_core::skills::ensure_endpoints_for(&mut catalog, &fqn, client_app).await
+        {
             endpoint_errors.insert(fqn, err.to_string());
         }
     }
@@ -393,6 +403,7 @@ mod tests {
             "what's the volume of USDC that moved on Solana the past week".to_string(),
             None,
             5,
+            pay_core::ClientApp::Cli,
         )
         .await;
 
@@ -425,6 +436,7 @@ mod tests {
             "no matching service".to_string(),
             None,
             5,
+            pay_core::ClientApp::Cli,
         )
         .await;
 
@@ -513,6 +525,7 @@ mod tests {
                 case.prompt.clone(),
                 case.category.clone(),
                 5,
+                pay_core::ClientApp::Cli,
             )
             .await;
             let actual = response.candidates.first();

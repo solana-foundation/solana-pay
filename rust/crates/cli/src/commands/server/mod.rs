@@ -3,6 +3,7 @@ pub mod inference;
 pub mod local_registration;
 pub(crate) mod payments;
 pub mod plans;
+pub(crate) mod provider_registration;
 pub mod scaffold;
 pub mod start;
 
@@ -49,7 +50,7 @@ impl ServerCommand {
         match self {
             Self::Demo(cmd) => cmd.run(active_account_name, sandbox),
             Self::Start(cmd) => cmd.run(active_account_name, sandbox),
-            Self::Inference(cmd) => cmd.run(sandbox),
+            Self::Inference(cmd) => cmd.run(active_account_name, sandbox),
             Self::Scaffold(cmd) => cmd.run(),
             Self::Plans { command } => match command {
                 PlansCommand::Publish(cmd) => cmd.run(),

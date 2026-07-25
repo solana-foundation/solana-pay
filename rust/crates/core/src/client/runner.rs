@@ -6,7 +6,24 @@ use tracing::{debug, info};
 use crate::client::mpp;
 use crate::client::subscription;
 use crate::client::x402;
-use crate::{Error, Result};
+use crate::{ClientApp, Error, Result};
+
+/// Payment challenges advertised by the first 402 response, decoded into
+/// JSON and grouped by wire protocol for verbose CLI diagnostics.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize)]
+pub struct DecodedPaymentChallenges {
+    /// Every x402 offer from the decoded `accepts` list (or the legacy
+    /// single-requirement payload), in server order.
+    pub x402: Vec<serde_json::Value>,
+    /// Every MPP challenge with its base64url payload fields decoded as JSON.
+    pub mpp: Vec<serde_json::Value>,
+}
+
+impl DecodedPaymentChallenges {
+    pub fn is_empty(&self) -> bool {
+        self.x402.is_empty() && self.mpp.is_empty()
+    }
+}
 
 /// The outcome of running a wrapped command.
 #[derive(Debug)]
@@ -26,12 +43,14 @@ pub enum RunOutcome {
         /// balance- and cost-aware selector can settle whichever is cheapest (or
         /// the only fundable one) — not just the first. See [`mpp::choose_payment`].
         x402_upto_accepts: Vec<pay_kit::x402::upto::UptoRequirements>,
+        advertised_challenges: DecodedPaymentChallenges,
         resource_url: String,
     },
     /// The server returned 402 with an MPP session challenge (intent="session").
     /// Session payments require a stateful client with a Fiber channel.
     SessionChallenge {
         challenge: Box<mpp::Challenge>,
+        advertised_challenges: DecodedPaymentChallenges,
         resource_url: String,
     },
     /// The server returned 402 with an MPP subscription challenge
@@ -49,11 +68,13 @@ pub enum RunOutcome {
     SubscriptionChallenge {
         challenge: Box<mpp::Challenge>,
         authenticate: Option<Box<mpp::Challenge>>,
+        advertised_challenges: DecodedPaymentChallenges,
         resource_url: String,
     },
     /// The server returned 402 with an x402 challenge.
     X402Challenge {
         challenge: Box<x402::Challenge>,
+        advertised_challenges: DecodedPaymentChallenges,
         resource_url: String,
     },
     /// The server returned 402 with an x402 `upto` (usage-metered) challenge —
@@ -61,6 +82,7 @@ pub enum RunOutcome {
     /// actual amount after serving.
     X402UptoChallenge {
         challenge: Box<x402::UptoChallenge>,
+        advertised_challenges: DecodedPaymentChallenges,
         resource_url: String,
     },
     /// The server returned 402 with an x402 `sign-in-with-x` challenge.
@@ -72,11 +94,13 @@ pub enum RunOutcome {
     X402SignInChallenge {
         challenge: Box<x402::SiwxAuthChallenge>,
         payment_fallback: Option<Box<x402::Challenge>>,
+        advertised_challenges: DecodedPaymentChallenges,
         resource_url: String,
     },
     /// The server returned 402 but without a recognized payment protocol.
     UnknownPaymentRequired {
         headers: Vec<(String, String)>,
+        advertised_challenges: DecodedPaymentChallenges,
         resource_url: String,
     },
     /// The server returned 402 with a `verification_failed` body — this is a
@@ -85,6 +109,7 @@ pub enum RunOutcome {
     PaymentRejected {
         reason: String,
         retryable: bool,
+        advertised_challenges: DecodedPaymentChallenges,
         resource_url: String,
     },
     /// The command completed (any status other than 402).
@@ -96,11 +121,14 @@ pub enum RunOutcome {
         /// a text view when the content-type guarantees UTF-8 (e.g. JSON).
         body: Option<Vec<u8>>,
         /// `content-type` header value (when known). Set by the built-in
-        /// fetch path; `None` for the external curl/wget/httpie wrappers
-        /// (those discard headers after parsing). Lets consumers route
+        /// fetch path; `None` for the external curl/wget/httpie wrappers.
+        /// Lets consumers route
         /// binary responses (image/*, application/pdf, …) differently
         /// from text — see `pay-mcp`'s curl tool.
         content_type: Option<String>,
+        /// Final response headers, retained so callers can decode settlement
+        /// receipts after a paid retry.
+        response_headers: Vec<(String, String)>,
     },
 }
 
@@ -144,7 +172,9 @@ fn run_curl_inner(user_args: &[String], extra_headers: &[String]) -> Result<RunO
     let body_file = NamedTempFile::new()?;
     let body_path = body_file.path();
 
-    debug!(args = ?user_args, extra = ?extra_headers, "Running curl");
+    let headers = headers_with_default_user_agent(user_args, extra_headers, ToolKind::Curl);
+
+    debug!(args = ?user_args, extra = ?headers, "Running curl");
 
     // Body goes to `-o body_file` so we can swallow it on 402; stdout is piped
     // so curl's `-w` writeout (which it emits to stdout after the transfer) is
@@ -152,7 +182,7 @@ fn run_curl_inner(user_args: &[String], extra_headers: &[String]) -> Result<RunO
     // '%{http_code}'` silently drops the writeout because we'd discard stdout.
     let mut cmd = Command::new("curl");
     cmd.args(user_args);
-    for h in extra_headers {
+    for h in &headers {
         cmd.arg("-H").arg(h);
     }
     cmd.arg("-D").arg(header_path);
@@ -196,6 +226,7 @@ fn run_curl_inner(user_args: &[String], extra_headers: &[String]) -> Result<RunO
         exit_code,
         body: None,
         content_type: None,
+        response_headers: headers,
     })
 }
 
@@ -259,19 +290,21 @@ fn run_wget_inner(user_args: &[String], extra_headers: &[String]) -> Result<RunO
         .iter()
         .any(|a| a == "-S" || a == "--server-response");
 
+    let headers = headers_with_default_user_agent(user_args, extra_headers, ToolKind::Wget);
+
     let mut cmd = Command::new("wget");
     if !has_server_response {
         cmd.arg("--server-response");
     }
     cmd.args(user_args);
-    for h in extra_headers {
+    for h in &headers {
         cmd.arg("--header").arg(h);
     }
     cmd.stdin(Stdio::inherit());
     cmd.stdout(Stdio::inherit());
     cmd.stderr(Stdio::piped());
 
-    debug!(args = ?user_args, extra = ?extra_headers, "Running wget");
+    debug!(args = ?user_args, extra = ?headers, "Running wget");
 
     let output = cmd.output()?;
     let exit_code = output.status.code().unwrap_or(1);
@@ -297,6 +330,7 @@ fn run_wget_inner(user_args: &[String], extra_headers: &[String]) -> Result<RunO
         exit_code,
         body: None,
         content_type: None,
+        response_headers: headers,
     })
 }
 
@@ -305,11 +339,15 @@ fn run_httpie_inner(user_args: &[String], extra_headers: &[String]) -> Result<Ru
 
     check_command_exists("http")?;
 
-    debug!(args = ?user_args, extra = ?extra_headers, "Running httpie");
+    let headers = headers_with_default_user_agent(user_args, extra_headers, ToolKind::Httpie);
+
+    debug!(args = ?user_args, extra = ?headers, "Running httpie");
 
     // HTTPie has no `-D <file>` equivalent, so we capture stdout and parse the
-    // response status from the first `HTTP/x.y <code>` line. We force two flags
+    // response status from the first `HTTP/x.y <code>` line. We force three flags
     // *after* the user's args so they always win:
+    //   - `--no-all` — print only the final exchange. `-v` implies `--all`, whose
+    //     combined history cannot be distinguished safely from response body.
     //   - `--print=hb` — httpie's default when piped is body-only, which would
     //     hide the status line our parser needs.
     //   - `--pretty=all` — only when our parent stdout is a TTY, so the user
@@ -319,9 +357,10 @@ fn run_httpie_inner(user_args: &[String], extra_headers: &[String]) -> Result<Ru
     let stdin_is_tty = std::io::stdin().is_terminal();
     let mut cmd = Command::new("http");
     cmd.args(user_args);
-    for h in extra_headers {
+    for h in &headers {
         cmd.arg(h);
     }
+    cmd.arg("--no-all");
     cmd.arg("--print=hb");
     if stdout_is_tty {
         cmd.arg("--pretty=all");
@@ -364,6 +403,7 @@ fn run_httpie_inner(user_args: &[String], extra_headers: &[String]) -> Result<Ru
         exit_code,
         body: None,
         content_type: None,
+        response_headers: headers,
     })
 }
 
@@ -377,8 +417,11 @@ fn run_httpie_inner(user_args: &[String], extra_headers: &[String]) -> Result<Ru
 /// <blank line>
 /// <body>
 /// ```
-/// In verbose mode (`-v`) the request is printed first, so we take the LAST
-/// `HTTP/x.y` line as the response status and the headers that follow it.
+/// The runner forces `--no-all --print=hb`, so the first line beginning with
+/// `HTTP/` is the final response status. Once its header block ends, all
+/// remaining lines are body. In particular, an `HTTP/` line in the body must
+/// never be interpreted as another response. The parser also tolerates a
+/// verbose request prelude for callers that exercise it directly.
 /// ANSI escapes (from `--pretty=all`) are stripped before parsing.
 pub(crate) fn parse_httpie_output(
     raw: &str,
@@ -388,28 +431,27 @@ pub(crate) fn parse_httpie_output(
 
     let mut status_code = None;
     let mut headers = Vec::new();
-    let mut body_lines: Option<Vec<&str>> = None;
+    let mut body_start = None;
     let mut in_response_headers = false;
 
     for (i, line) in lines.iter().enumerate() {
         let trimmed_full = line.trim();
 
-        if trimmed_full.starts_with("HTTP/") {
-            // Response status line. Reset — the LAST HTTP/ line wins so a
-            // verbose request line earlier in the stream doesn't confuse us.
-            status_code = trimmed_full
+        if status_code.is_none() && trimmed_full.starts_with("HTTP/") {
+            let parsed_status = trimmed_full
                 .split_whitespace()
                 .nth(1)
                 .and_then(|s| s.parse::<u16>().ok());
-            headers.clear();
-            body_lines = None;
-            in_response_headers = true;
+            if parsed_status.is_some() {
+                status_code = parsed_status;
+                in_response_headers = true;
+            }
             continue;
         }
 
         if in_response_headers {
             if trimmed_full.is_empty() {
-                body_lines = Some(lines[(i + 1)..].to_vec());
+                body_start = Some(i + 1);
                 break;
             }
             if let Some((k, v)) = trimmed_full.split_once(':') {
@@ -421,7 +463,7 @@ pub(crate) fn parse_httpie_output(
         }
     }
 
-    let body = body_lines.map(|lines| lines.join("\n"));
+    let body = body_start.map(|start| lines[start..].join("\n"));
     (status_code, headers, body)
 }
 
@@ -471,6 +513,112 @@ impl ProtocolPreference {
     }
 }
 
+/// Decode every payment challenge advertised by a 402 response without
+/// applying protocol or network selection. This is intentionally separate
+/// from [`classify_402`]: verbose diagnostics should show what the server
+/// returned, including offers the caller did not choose.
+pub fn decode_payment_challenges(
+    headers: &[(String, String)],
+    body: Option<&str>,
+) -> DecodedPaymentChallenges {
+    let mpp = mpp::parse_headers(headers)
+        .into_iter()
+        .map(|challenge| {
+            let mut value = serde_json::to_value(&challenge).unwrap_or_else(|_| {
+                serde_json::json!({
+                    "id": challenge.id,
+                    "realm": challenge.realm,
+                    "method": challenge.method.as_str(),
+                    "intent": challenge.intent.as_str(),
+                })
+            });
+            if let Some(object) = value.as_object_mut() {
+                if let Ok(request) = challenge.request.decode_value() {
+                    object.insert("request".to_string(), request);
+                }
+                if let Some(opaque) = challenge.opaque.as_ref()
+                    && let Ok(decoded) = opaque.decode_value()
+                {
+                    object.insert("opaque".to_string(), decoded);
+                }
+            }
+            value
+        })
+        .collect();
+
+    let mut x402 = Vec::new();
+    for (name, value) in headers {
+        if (name.eq_ignore_ascii_case(pay_kit::x402::PAYMENT_REQUIRED_HEADER)
+            || name.eq_ignore_ascii_case(pay_kit::x402::X402_V1_PAYMENT_REQUIRED_HEADER))
+            && let Some(decoded) = decode_json_value(value)
+        {
+            append_x402_challenges(&mut x402, decoded, true);
+        }
+    }
+
+    // x402 also permits the payment-required envelope in the response body.
+    // Only treat it as such when it self-identifies, so an arbitrary JSON
+    // error body is never mislabeled as a payment challenge.
+    if x402.is_empty()
+        && let Some(decoded) = body.and_then(decode_json_value)
+    {
+        append_x402_challenges(&mut x402, decoded, false);
+    }
+
+    DecodedPaymentChallenges { x402, mpp }
+}
+
+fn append_x402_challenges(
+    output: &mut Vec<serde_json::Value>,
+    decoded: serde_json::Value,
+    trusted_header: bool,
+) {
+    let self_identifies = decoded.get("x402Version").is_some()
+        || decoded.get("scheme").is_some()
+        || (decoded.get("network").is_some()
+            && (decoded.get("amount").is_some() || decoded.get("maxAmountRequired").is_some()));
+
+    if let Some(accepts) = decoded.get("accepts").and_then(serde_json::Value::as_array) {
+        if accepts.is_empty() {
+            // SIWX-only x402 challenges carry their challenge in `extensions`
+            // and legitimately advertise no payment accepts. Preserve the
+            // envelope so verbose output still shows that decoded challenge.
+            if (trusted_header || self_identifies) && !output.contains(&decoded) {
+                output.push(decoded);
+            }
+            return;
+        }
+        for challenge in accepts {
+            if !output.contains(challenge) {
+                output.push(challenge.clone());
+            }
+        }
+        return;
+    }
+
+    if (trusted_header || self_identifies) && !output.contains(&decoded) {
+        output.push(decoded);
+    }
+}
+
+fn decode_json_value(raw: &str) -> Option<serde_json::Value> {
+    if let Ok(value) = serde_json::from_str(raw) {
+        return Some(value);
+    }
+
+    use base64::Engine;
+    use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD};
+
+    for engine in [&STANDARD, &STANDARD_NO_PAD, &URL_SAFE, &URL_SAFE_NO_PAD] {
+        if let Ok(bytes) = engine.decode(raw.trim())
+            && let Ok(value) = serde_json::from_slice(&bytes)
+        {
+            return Some(value);
+        }
+    }
+    None
+}
+
 /// Given 402 headers (and optional body), determine the payment protocol.
 ///
 /// Reads the user's protocol preference from the environment. Internal
@@ -495,6 +643,8 @@ pub(crate) fn classify_402_with_preference(
     resource_url: &str,
     preference: ProtocolPreference,
 ) -> RunOutcome {
+    let advertised_challenges = decode_payment_challenges(headers, body);
+
     // A `verification_failed` body wins over a fresh challenge: it means the
     // server saw our payment header and rejected it. We must surface the
     // reason instead of looping into a second pay-and-retry.
@@ -503,6 +653,7 @@ pub(crate) fn classify_402_with_preference(
         return RunOutcome::PaymentRejected {
             reason,
             retryable,
+            advertised_challenges,
             resource_url: resource_url.to_string(),
         };
     }
@@ -534,18 +685,20 @@ pub(crate) fn classify_402_with_preference(
     // the recipient is a valid Solana pubkey.
     // Session MPP: the method field ("solana") indicates chain support.
     // Session requests don't use ChargeRequest so mpp_is_solana doesn't apply.
-    if let Some(challenge) = mpp_challenges
-        .iter()
-        .find(|challenge| challenge.intent.as_str() == "session")
+    if preference != ProtocolPreference::OnlyX402
+        && let Some(challenge) = mpp_challenges
+            .iter()
+            .find(|challenge| challenge.intent.as_str() == "session")
     {
         let is_solana_method = challenge.method.as_str() == "solana";
         if is_solana_method {
-            info!(
+            debug!(
                 resource = resource_url,
-                "Detected MPP session challenge (Solana)"
+                "Detected MPP payment-channel challenge (Solana)"
             );
             return RunOutcome::SessionChallenge {
                 challenge: Box::new(challenge.clone()),
+                advertised_challenges,
                 resource_url: resource_url.to_string(),
             };
         }
@@ -555,9 +708,10 @@ pub(crate) fn classify_402_with_preference(
     // Subscription challenge: checked before generic charge because the
     // intent is more specific. Solana is the only method profile pay
     // implements today, so we filter by both.
-    if let Some(challenge) = mpp_challenges
-        .iter()
-        .find(|c| subscription::is_subscription_challenge(c))
+    if preference != ProtocolPreference::OnlyX402
+        && let Some(challenge) = mpp_challenges
+            .iter()
+            .find(|c| subscription::is_subscription_challenge(c))
     {
         info!(
             resource = resource_url,
@@ -571,6 +725,7 @@ pub(crate) fn classify_402_with_preference(
         return RunOutcome::SubscriptionChallenge {
             challenge: Box::new(challenge.clone()),
             authenticate,
+            advertised_challenges,
             resource_url: resource_url.to_string(),
         };
     }
@@ -605,6 +760,7 @@ pub(crate) fn classify_402_with_preference(
             // fundable option.
             x402_alternative,
             x402_upto_accepts,
+            advertised_challenges,
             resource_url: resource_url.to_string(),
         };
     }
@@ -625,6 +781,7 @@ pub(crate) fn classify_402_with_preference(
             return RunOutcome::X402SignInChallenge {
                 challenge: Box::new(siwx),
                 payment_fallback: x402_challenge.map(Box::new),
+                advertised_challenges,
                 resource_url: resource_url.to_string(),
             };
         }
@@ -633,12 +790,13 @@ pub(crate) fn classify_402_with_preference(
         // challenge also parses leniently as exact, so prefer the upto reading
         // when the server advertises the `upto` scheme.
         if let Some(upto) = x402::parse_upto(headers, body) {
-            info!(
+            debug!(
                 resource = resource_url,
                 "Detected x402 upto challenge (Solana)"
             );
             return RunOutcome::X402UptoChallenge {
                 challenge: Box::new(upto),
+                advertised_challenges,
                 resource_url: resource_url.to_string(),
             };
         }
@@ -647,6 +805,7 @@ pub(crate) fn classify_402_with_preference(
             info!(resource = resource_url, "Detected x402 challenge (Solana)");
             return RunOutcome::X402Challenge {
                 challenge: Box::new(challenge),
+                advertised_challenges,
                 resource_url: resource_url.to_string(),
             };
         }
@@ -664,15 +823,21 @@ pub(crate) fn classify_402_with_preference(
                          Drop --mpp to settle via x402, or pick a server that advertises MPP."
                     .to_string(),
                 retryable: false,
+                advertised_challenges,
                 resource_url: resource_url.to_string(),
             };
         }
-        ProtocolPreference::OnlyX402 if !charge_challenges.is_empty() => {
+        ProtocolPreference::OnlyX402
+            if mpp_challenges
+                .iter()
+                .any(|challenge| challenge.method.as_str() == "solana") =>
+        {
             return RunOutcome::PaymentRejected {
                 reason: "Server only offers an MPP challenge, but --x402 was requested. \
                          Drop --x402 to settle via MPP, or pick a server that advertises x402."
                     .to_string(),
                 retryable: false,
+                advertised_challenges,
                 resource_url: resource_url.to_string(),
             };
         }
@@ -687,23 +852,25 @@ pub(crate) fn classify_402_with_preference(
                      Check if the provider supports Solana USDC."
                 .to_string(),
             retryable: false,
+            advertised_challenges,
             resource_url: resource_url.to_string(),
         };
     }
 
     RunOutcome::UnknownPaymentRequired {
         headers: headers.to_vec(),
+        advertised_challenges,
         resource_url: resource_url.to_string(),
     }
 }
 
-/// Pure parser: pulls a `verification_failed` reason out of a 402 JSON body.
+/// Pure parser: pulls a payment rejection reason out of a 402 JSON body.
 ///
 /// Returns `(message, retryable)` if the body matches the shape emitted by
-/// `crates/core/src/server/payment.rs` for verification failures:
+/// the server emits for verification and session failures:
 ///
 /// ```json
-/// {"error": "verification_failed", "message": "...", "retryable": false}
+/// {"error": "session_failed", "message": "...", "retryable": true}
 /// ```
 ///
 /// Returns `None` for any other body shape (or absent body), so the caller
@@ -714,7 +881,8 @@ pub(crate) fn parse_verification_failure(body: Option<&str>) -> Option<(String, 
         return None;
     }
     let v: serde_json::Value = serde_json::from_str(body).ok()?;
-    if v.get("error")?.as_str()? != "verification_failed" {
+    let error = v.get("error")?.as_str()?;
+    if !matches!(error, "verification_failed" | "session_failed") {
         return None;
     }
     let message = v
@@ -818,6 +986,34 @@ enum ToolKind {
     Httpie,
 }
 
+fn headers_with_default_user_agent(
+    args: &[String],
+    extra_headers: &[String],
+    tool: ToolKind,
+) -> Vec<String> {
+    let mut headers = Vec::with_capacity(extra_headers.len() + 1);
+    if !user_already_set_user_agent(args, tool)
+        && !extra_headers
+            .iter()
+            .any(|header| is_header_name(header, "user-agent"))
+    {
+        headers.push(formatted_header(
+            tool,
+            "User-Agent",
+            &ClientApp::Cli.user_agent(),
+        ));
+    }
+    headers.extend(extra_headers.iter().cloned());
+    headers
+}
+
+fn formatted_header(tool: ToolKind, name: &str, value: &str) -> String {
+    match tool {
+        ToolKind::Curl | ToolKind::Wget => format!("{name}: {value}"),
+        ToolKind::Httpie => format!("{name}:{value}"),
+    }
+}
+
 /// Best-effort URL extraction across the three CLI tools we wrap.
 ///
 /// `curl`/`wget` require a fully-qualified URL on the command line —
@@ -912,55 +1108,97 @@ fn pre_attach_cached_auth(args: &[String], tool: ToolKind) -> Vec<String> {
     let Some(token) = crate::client::authenticate::cached_header_for_resource(&store, &url) else {
         return Vec::new();
     };
-    let formatted = match tool {
-        ToolKind::Curl | ToolKind::Wget => format!("Authorization: {token}"),
-        ToolKind::Httpie => format!("Authorization:{token}"),
-    };
-    vec![formatted]
+    vec![formatted_header(tool, "Authorization", &token)]
 }
 
 /// True when the user already passed an Authorization header through
 /// the wrapper's args, so we don't clobber it with a cached token.
 fn user_already_set_auth(args: &[String], tool: ToolKind) -> bool {
+    user_already_set_header(args, tool, "authorization")
+}
+
+fn user_already_set_user_agent(args: &[String], tool: ToolKind) -> bool {
+    if user_already_set_header(args, tool, "user-agent") {
+        return true;
+    }
+    let mut iter = args.iter().peekable();
+    while let Some(arg) = iter.next() {
+        match tool {
+            ToolKind::Curl => {
+                if arg == "-A" || arg == "--user-agent" {
+                    return iter.peek().is_some();
+                }
+                if arg.starts_with("-A") && arg.len() > 2 {
+                    return true;
+                }
+                if arg.starts_with("--user-agent=") {
+                    return true;
+                }
+            }
+            ToolKind::Wget => {
+                if arg == "-U" || arg == "--user-agent" {
+                    return iter.peek().is_some();
+                }
+                if arg.starts_with("-U") && arg.len() > 2 {
+                    return true;
+                }
+                if arg.starts_with("--user-agent=") {
+                    return true;
+                }
+            }
+            ToolKind::Httpie => {}
+        }
+    }
+    false
+}
+
+fn user_already_set_header(args: &[String], tool: ToolKind, header_name: &str) -> bool {
     let mut iter = args.iter().peekable();
     while let Some(arg) = iter.next() {
         match tool {
             ToolKind::Curl => {
                 if (arg == "-H" || arg == "--header")
                     && let Some(next) = iter.peek()
-                    && next.to_ascii_lowercase().starts_with("authorization:")
+                    && is_header_name(next, header_name)
                 {
                     return true;
                 }
                 if let Some(val) = arg
                     .strip_prefix("-H")
                     .or_else(|| arg.strip_prefix("--header="))
-                    && val.to_ascii_lowercase().starts_with("authorization:")
+                    && is_header_name(val, header_name)
                 {
                     return true;
                 }
             }
             ToolKind::Wget => {
                 if let Some(val) = arg.strip_prefix("--header=")
-                    && val.to_ascii_lowercase().starts_with("authorization:")
+                    && is_header_name(val, header_name)
                 {
                     return true;
                 }
                 if arg == "--header"
                     && let Some(next) = iter.peek()
-                    && next.to_ascii_lowercase().starts_with("authorization:")
+                    && is_header_name(next, header_name)
                 {
                     return true;
                 }
             }
             ToolKind::Httpie => {
-                if arg.to_ascii_lowercase().starts_with("authorization:") {
+                if is_header_name(arg, header_name) {
                     return true;
                 }
             }
         }
     }
     false
+}
+
+fn is_header_name(header: &str, expected: &str) -> bool {
+    header
+        .split_once(':')
+        .map(|(name, _)| name.trim().eq_ignore_ascii_case(expected))
+        .unwrap_or(false)
 }
 
 #[cfg(test)]
@@ -1011,6 +1249,52 @@ mod pre_attach_tests {
     }
 
     #[test]
+    fn curl_injects_default_cli_user_agent() {
+        let args = s(&["https://example.com"]);
+        let headers = headers_with_default_user_agent(&args, &[], ToolKind::Curl);
+        assert_eq!(
+            headers,
+            vec![format!("User-Agent: {}", ClientApp::Cli.user_agent())]
+        );
+    }
+
+    #[test]
+    fn httpie_injects_default_cli_user_agent_in_request_item_form() {
+        let args = s(&["GET", "example.com"]);
+        let headers = headers_with_default_user_agent(&args, &[], ToolKind::Httpie);
+        assert_eq!(
+            headers,
+            vec![format!("User-Agent:{}", ClientApp::Cli.user_agent())]
+        );
+    }
+
+    #[test]
+    fn user_agent_header_overrides_default_for_wget() {
+        let args = s(&[
+            "--header",
+            "User-Agent: custom-client",
+            "https://example.com",
+        ]);
+        let headers = headers_with_default_user_agent(&args, &[], ToolKind::Wget);
+        assert!(headers.is_empty());
+    }
+
+    #[test]
+    fn curl_user_agent_flag_overrides_default() {
+        let args = s(&["-A", "custom-client", "https://example.com"]);
+        let headers = headers_with_default_user_agent(&args, &[], ToolKind::Curl);
+        assert!(headers.is_empty());
+    }
+
+    #[test]
+    fn extra_user_agent_header_overrides_default() {
+        let args = s(&["https://example.com"]);
+        let extra = s(&["User-Agent: retry-client"]);
+        let headers = headers_with_default_user_agent(&args, &extra, ToolKind::Curl);
+        assert_eq!(headers, extra);
+    }
+
+    #[test]
     fn no_url_means_no_pre_attach() {
         let args = s(&["--help"]);
         assert_eq!(resolve_request_url(&args, ToolKind::Httpie), None);
@@ -1041,6 +1325,7 @@ fn run_plain_command(program: &str, args: &[String]) -> Result<RunOutcome> {
         exit_code: status.code().unwrap_or(1),
         body: None,
         content_type: None,
+        response_headers: Vec::new(),
     })
 }
 
@@ -1518,6 +1803,103 @@ HTTP request sent, awaiting response...
         ]
     }
 
+    fn dual_protocol_session_402() -> Vec<(String, String)> {
+        use base64::Engine;
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+
+        let session_request = serde_json::json!({
+            "cap": "1000000",
+            "currency": "USDC",
+            "network": "devnet",
+            "operator": "So11111111111111111111111111111111111111112",
+            "recipient": "So11111111111111111111111111111111111111112",
+            "modes": ["pull"]
+        });
+        let session_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&session_request).unwrap());
+        let mut headers = dual_protocol_402();
+        headers[0].1 = format!(
+            "Payment id=\"dual-session\", realm=\"test\", method=\"solana\", \
+             intent=\"session\", request=\"{session_b64}\""
+        );
+        headers
+    }
+
+    #[test]
+    fn decoded_challenges_group_mpp_and_x402_before_protocol_selection() {
+        let headers = dual_protocol_402();
+        let decoded = decode_payment_challenges(&headers, None);
+
+        assert_eq!(decoded.mpp.len(), 1);
+        assert_eq!(decoded.x402.len(), 1);
+        assert_eq!(decoded.mpp[0]["intent"], "charge");
+        assert_eq!(decoded.mpp[0]["request"]["currency"], "USDC");
+        assert_eq!(decoded.x402[0]["currency"], "USDC");
+        assert_eq!(decoded.x402[0]["cluster"], "devnet");
+    }
+
+    #[test]
+    fn decoded_challenges_preserve_every_x402_accept() {
+        use base64::Engine;
+
+        let envelope = serde_json::json!({
+            "x402Version": 2,
+            "accepts": [
+                {
+                    "scheme": "exact",
+                    "network": "solana:mainnet",
+                    "amount": "10",
+                    "asset": "USDC",
+                    "payTo": "exact-recipient"
+                },
+                {
+                    "scheme": "upto",
+                    "network": "solana:mainnet",
+                    "amount": "250000",
+                    "asset": "USDC",
+                    "payTo": "upto-recipient"
+                }
+            ]
+        });
+        let encoded = base64::engine::general_purpose::STANDARD
+            .encode(serde_json::to_vec(&envelope).unwrap());
+        let headers = vec![(
+            pay_kit::x402::PAYMENT_REQUIRED_HEADER.to_ascii_lowercase(),
+            encoded,
+        )];
+
+        let decoded = decode_payment_challenges(&headers, None);
+        assert_eq!(decoded.x402.len(), 2);
+        assert_eq!(decoded.x402[0]["scheme"], "exact");
+        assert_eq!(decoded.x402[1]["scheme"], "upto");
+    }
+
+    #[test]
+    fn decoded_challenges_preserve_siwx_only_envelope() {
+        use base64::Engine;
+
+        let envelope = serde_json::json!({
+            "x402Version": 2,
+            "accepts": [],
+            "extensions": {
+                "sign-in-with-x": {
+                    "info": {
+                        "domain": "example.com",
+                        "nonce": "nonce-123"
+                    }
+                }
+            }
+        });
+        let encoded = base64::engine::general_purpose::STANDARD
+            .encode(serde_json::to_vec(&envelope).unwrap());
+        let headers = vec![(
+            pay_kit::x402::PAYMENT_REQUIRED_HEADER.to_ascii_lowercase(),
+            encoded,
+        )];
+
+        let decoded = decode_payment_challenges(&headers, None);
+        assert_eq!(decoded.x402, vec![envelope]);
+    }
+
     #[test]
     fn preference_auto_prefers_mpp_when_both_offered() {
         let outcome = classify_402_with_preference(
@@ -1538,6 +1920,28 @@ HTTP request sent, awaiting response...
             ProtocolPreference::OnlyX402,
         );
         assert!(matches!(outcome, RunOutcome::X402Challenge { .. }));
+    }
+
+    #[test]
+    fn preference_only_x402_skips_mpp_session_when_both_offered() {
+        let outcome = classify_402_with_preference(
+            &dual_protocol_session_402(),
+            None,
+            "https://example.com/resource",
+            ProtocolPreference::OnlyX402,
+        );
+        assert!(matches!(outcome, RunOutcome::X402Challenge { .. }));
+    }
+
+    #[test]
+    fn preference_auto_still_prefers_mpp_session_when_both_offered() {
+        let outcome = classify_402_with_preference(
+            &dual_protocol_session_402(),
+            None,
+            "https://example.com/resource",
+            ProtocolPreference::Auto,
+        );
+        assert!(matches!(outcome, RunOutcome::SessionChallenge { .. }));
     }
 
     #[test]
@@ -1775,6 +2179,16 @@ HTTP request sent, awaiting response...
         assert_eq!(
             parsed,
             Some(("rpc temporarily unavailable".to_string(), true))
+        );
+    }
+
+    #[test]
+    fn parse_verification_failure_accepts_session_failure() {
+        let body = r#"{"error":"session_failed","message":"open transaction not visible","retryable":true}"#;
+        let parsed = parse_verification_failure(Some(body));
+        assert_eq!(
+            parsed,
+            Some(("open transaction not visible".to_string(), true))
         );
     }
 
@@ -2202,6 +2616,41 @@ HTTP request sent, awaiting response...
         // headers — `Host` is set by the client, never echoed by the server here.
         assert!(!headers.iter().any(|(k, _)| k == "host"));
         assert_eq!(body.as_deref(), Some("{\"ok\":1}"));
+    }
+
+    #[test]
+    fn parse_httpie_history_is_not_reparsed_from_response_body() {
+        let raw = "HTTP/1.1 302 Found\nLocation: https://example.com/final\n\nredirecting\nHTTP/1.1 200 OK\nContent-Type: application/json\nPayment-Response: encoded-settlement\n\n{\"ok\":true}";
+        let (status, headers, body) = parse_httpie_output(raw);
+
+        assert_eq!(status, Some(302));
+        assert!(
+            headers.iter().any(|(name, value)| {
+                name == "location" && value == "https://example.com/final"
+            })
+        );
+        assert!(!headers.iter().any(|(name, _)| name == "payment-response"));
+        assert_eq!(
+            body.as_deref(),
+            Some(
+                "redirecting\nHTTP/1.1 200 OK\nContent-Type: application/json\nPayment-Response: encoded-settlement\n\n{\"ok\":true}"
+            )
+        );
+    }
+
+    #[test]
+    fn parse_httpie_200_body_cannot_inject_payment_required_response() {
+        let raw = "HTTP/1.1 200 OK\nContent-Type: text/plain\n\nharmless body\nHTTP/1.1 402 Payment Required\nPayment-Required: attacker-controlled-challenge\n\ncharge me";
+        let (status, headers, body) = parse_httpie_output(raw);
+
+        assert_eq!(status, Some(200));
+        assert_eq!(headers, vec![("content-type".into(), "text/plain".into())]);
+        assert_eq!(
+            body.as_deref(),
+            Some(
+                "harmless body\nHTTP/1.1 402 Payment Required\nPayment-Required: attacker-controlled-challenge\n\ncharge me"
+            )
+        );
     }
 
     #[test]

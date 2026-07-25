@@ -7,7 +7,7 @@ license.workspace = true
 [features]
 default = []
 # Payment middleware for axum-based servers (metering, accounting, 402 flow).
-server = ["dep:axum", "dep:http", "dep:bytes"]
+server = ["dep:axum", "dep:http"]
 # Distributed-tracing context propagation: extract W3C traceparent from incoming
 # requests and parent the server spans to it. Lets a client (e.g. pay-bench) and
 # this proxy share one end-to-end trace. Off by default to keep the lib lean.
@@ -18,13 +18,16 @@ network_tests = []
 # Activates openssl-sys/vendored which is pulled in transitively by
 # solana-rpc-client → reqwest → native-tls → openssl-sys.
 vendored-openssl = ["openssl-sys/vendored"]
+# Durable MPP session state backed by Redis. Runtime selection still requires
+# PAY_SESSION_REDIS_URL; without it the in-memory store remains the default.
+redis-session-store = ["pay-kit/redis-store"]
 
 [dependencies]
 axum = { workspace = true, optional = true }
 # Framework-neutral HTTP types for the payment gate core (axum/pingora/reqwest
 # all build on these). Already in the tree transitively.
 http = { version = "1", optional = true }
-bytes = { version = "1", optional = true }
+bytes = "1"
 async-stream = "0.3"
 futures-util = "0.3"
 openssl-sys = { version = "0.9", optional = true }
@@ -47,6 +50,7 @@ shellexpand = { workspace = true }
 tokio = { workspace = true, features = ["time", "sync"] }
 hmac = "0.12"
 md-5 = "0.10"
+mime_guess = { workspace = true }
 sha1 = "0.10"
 sha2 = "0.10"
 ed25519-dalek = { workspace = true }
@@ -75,6 +79,9 @@ solana-transaction = { workspace = true }
 # solana-keypair/solana-signature no longer depend on the feature-unified `std`
 # gate (re-check on the next solana-* bump).
 five8_core = { version = "=0.1.2", features = ["std"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
 serde_yml = { workspace = true }

@@ -8,7 +8,6 @@ license.workspace = true
 bs58 = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-shellexpand = { workspace = true }
 thiserror = { workspace = true }
 zeroize = { workspace = true }
 
@@ -27,3 +26,6 @@ windows = { version = "0.58", features = [
     "Security_Credentials_UI",
 ] }
 windows-core = "0.58"
+
+[dev-dependencies]
+tempfile = { workspace = true }

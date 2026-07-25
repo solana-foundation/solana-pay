@@ -79,7 +79,7 @@ mod tests {
     }
 
     #[test]
-    fn paid_endpoints_add_native_paths_to_openai_trio() {
+    fn paid_endpoints_add_native_paths_to_openai_surface() {
         let paths: Vec<String> = LlamaCpp
             .paid_endpoints()
             .into_iter()
@@ -88,9 +88,10 @@ mod tests {
         assert_eq!(
             paths,
             [
+                "v1/responses",
                 "v1/chat/completions",
-                "v1/completions",
                 "v1/embeddings",
+                "v1/completions",
                 "completion",
                 "infill",
                 "embedding",
@@ -101,6 +102,7 @@ mod tests {
     #[test]
     fn endpoint_kind_table() {
         for (path, kind) in [
+            ("/v1/responses", "chat"),
             ("/v1/chat/completions", "chat"),
             ("/completion", "completion"),
             ("/infill", "completion"),

@@ -20,7 +20,7 @@ pub struct SetupCommand {
     pub force: bool,
 
     /// Storage backend: "keychain" (macOS), "gnome-keyring" (Linux),
-    /// or "windows-hello" (Windows).
+    /// "windows-hello" (Windows), or "file" (headless fallback).
     #[arg(long)]
     pub backend: Option<String>,
 
@@ -89,6 +89,10 @@ impl SetupCommand {
             return Ok(());
         }
 
+        // Resolve the backend first so an unavailable headless Secret Service
+        // does not leave MCP/agent configuration partially installed.
+        let backend = super::account::new::resolve_backend(self.backend.as_deref())?;
+
         // Offer to install the agent skill if npx is available.
         maybe_install_skill();
 
@@ -97,7 +101,7 @@ impl SetupCommand {
 
         let (pubkey, backend_name) = super::account::new::create_account(
             &account_name,
-            self.backend.as_deref(),
+            Some(&backend),
             self.vault.as_deref(),
             self.force,
         )?;
@@ -193,7 +197,7 @@ fn has_biometric_backend() -> bool {
     }
     #[cfg(target_os = "linux")]
     {
-        pay_core::keystore::Keystore::gnome_keyring_available()
+        pay_core::keystore::Keystore::gnome_keyring_local_auth_available()
     }
     #[cfg(target_os = "windows")]
     {

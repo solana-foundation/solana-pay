@@ -25,7 +25,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{Error, Result};
+use crate::{ClientApp, Error, Result};
 
 /// Accept both `"1"` (string) and `1` (integer) for the version field.
 fn deserialize_version<'de, D: serde::Deserializer<'de>>(
@@ -796,6 +796,14 @@ pub async fn load_service_endpoints(
     catalog: &Catalog,
     service_name: &str,
 ) -> Result<Vec<Endpoint>> {
+    load_service_endpoints_for(catalog, service_name, ClientApp::Cli).await
+}
+
+pub async fn load_service_endpoints_for(
+    catalog: &Catalog,
+    service_name: &str,
+    client_app: ClientApp,
+) -> Result<Vec<Endpoint>> {
     let svc = find_service(catalog, service_name)
         .ok_or_else(|| {
             Error::Config(format!(
@@ -825,7 +833,7 @@ pub async fn load_service_endpoints(
         return Ok(detail.endpoints);
     }
 
-    let raw = fetch_url(&detail_url).await?;
+    let raw = fetch_url(&detail_url, client_app).await?;
     let detail = parse_detail(&raw)?;
 
     let _ = std::fs::create_dir_all(&cache_dir);
@@ -845,6 +853,14 @@ pub async fn load_service_endpoints(
 pub async fn load_service_openapi(
     catalog: &Catalog,
     service_name: &str,
+) -> Result<Option<serde_json::Value>> {
+    load_service_openapi_for(catalog, service_name, ClientApp::Cli).await
+}
+
+pub async fn load_service_openapi_for(
+    catalog: &Catalog,
+    service_name: &str,
+    client_app: ClientApp,
 ) -> Result<Option<serde_json::Value>> {
     let svc = find_service(catalog, service_name)
         .ok_or_else(|| {
@@ -871,7 +887,7 @@ pub async fn load_service_openapi(
         return Ok(detail.openapi_doc);
     }
 
-    let raw = fetch_url(&detail_url).await?;
+    let raw = fetch_url(&detail_url, client_app).await?;
     let detail = parse_detail(&raw)?;
     let _ = std::fs::create_dir_all(&cache_dir);
     let _ = std::fs::write(&cache_file, &raw);
@@ -881,6 +897,14 @@ pub async fn load_service_openapi(
 
 /// Convenience: load endpoints and inject them into the catalog's service.
 pub async fn ensure_endpoints(catalog: &mut Catalog, service_name: &str) -> Result<()> {
+    ensure_endpoints_for(catalog, service_name, ClientApp::Cli).await
+}
+
+pub async fn ensure_endpoints_for(
+    catalog: &mut Catalog,
+    service_name: &str,
+    client_app: ClientApp,
+) -> Result<()> {
     let base_url = catalog.base_url.clone();
     let idx = catalog
         .providers
@@ -923,7 +947,7 @@ pub async fn ensure_endpoints(catalog: &mut Catalog, service_name: &str) -> Resu
         return Ok(());
     }
 
-    let raw = fetch_url(&detail_url).await?;
+    let raw = fetch_url(&detail_url, client_app).await?;
     let detail = match parse_detail(&raw) {
         Ok(detail) => detail,
         Err(e) => {
@@ -999,6 +1023,10 @@ fn parse_detail(raw: &str) -> Result<ProviderDetailFile> {
 /// edits + restarts their server; the 30 min TTL would otherwise hide
 /// those edits from agents running in the same shell.
 pub async fn load_skills() -> Result<Catalog> {
+    load_skills_for(ClientApp::Cli).await
+}
+
+pub async fn load_skills_for(client_app: ClientApp) -> Result<Catalog> {
     let cfg = config::SkillsConfig::load()?;
 
     // Cache hit? Ephemeral sources are merged in separately below so a
@@ -1009,7 +1037,7 @@ pub async fn load_skills() -> Result<Catalog> {
         let mut catalog = parse_catalog(&raw)?;
         if !catalog.providers.is_empty() {
             if cfg.has_ephemeral_sources() {
-                merge_ephemeral_into(&mut catalog, &cfg).await;
+                merge_ephemeral_into(&mut catalog, &cfg, client_app).await;
             }
             overlay::merge_pins_into(&mut catalog);
             return Ok(catalog);
@@ -1018,7 +1046,7 @@ pub async fn load_skills() -> Result<Catalog> {
     }
 
     // Cache miss — fetch, merge, cache.
-    match fetch_and_merge(&cfg, false).await {
+    match fetch_and_merge(&cfg, false, client_app).await {
         Ok(mut catalog) => {
             // Cache only the durable catalog (ephemerals fold in fresh
             // on every load).
@@ -1027,7 +1055,7 @@ pub async fn load_skills() -> Result<Catalog> {
             }
             clean_stale_detail_cache(&catalog);
             if cfg.has_ephemeral_sources() {
-                merge_ephemeral_into(&mut catalog, &cfg).await;
+                merge_ephemeral_into(&mut catalog, &cfg, client_app).await;
             }
             overlay::merge_pins_into(&mut catalog);
             Ok(catalog)
@@ -1070,13 +1098,17 @@ pub fn load_cached_skills() -> Result<Catalog> {
 /// When `cache_bust` is true, append `?v=<timestamp>` to source URLs
 /// to bypass CDN edge caches, and purge all local detail caches.
 pub async fn update_skills(cache_bust: bool) -> Result<Catalog> {
+    update_skills_for(cache_bust, ClientApp::Cli).await
+}
+
+pub async fn update_skills_for(cache_bust: bool, client_app: ClientApp) -> Result<Catalog> {
     let cfg = config::SkillsConfig::load()?;
-    let mut catalog = fetch_and_merge(&cfg, cache_bust).await?;
+    let mut catalog = fetch_and_merge(&cfg, cache_bust, client_app).await?;
     let written = write_cache(&cfg, &catalog)?;
     cfg.clean_stale_caches(&written);
     clean_stale_detail_cache(&catalog);
     if cfg.has_ephemeral_sources() {
-        merge_ephemeral_into(&mut catalog, &cfg).await;
+        merge_ephemeral_into(&mut catalog, &cfg, client_app).await;
     }
     overlay::merge_pins_into(&mut catalog);
     Ok(catalog)
@@ -1089,11 +1121,12 @@ pub async fn update_skills(cache_bust: bool) -> Result<Catalog> {
 /// on top of either the cached or the freshly-fetched durable catalog —
 /// they're never persisted to disk so a crashed `pay server` doesn't
 /// leave stale entries in the cache.
-async fn fetch_and_merge(cfg: &config::SkillsConfig, cache_bust: bool) -> Result<Catalog> {
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(15))
-        .build()
-        .map_err(|e| Error::Config(format!("http client: {e}")))?;
+async fn fetch_and_merge(
+    cfg: &config::SkillsConfig,
+    cache_bust: bool,
+    client_app: ClientApp,
+) -> Result<Catalog> {
+    let client = http_client(std::time::Duration::from_secs(15), client_app)?;
 
     let mut all_providers: Vec<Service> = Vec::new();
     let mut base_url = String::new();
@@ -1160,11 +1193,12 @@ async fn fetch_and_merge(cfg: &config::SkillsConfig, cache_bust: bool) -> Result
 /// dedup'd by FQN against what's already there. Failures are logged
 /// at debug — a crashed `pay server` is the common case and we don't
 /// want to clobber every `list_catalog` invocation with warnings.
-async fn merge_ephemeral_into(catalog: &mut Catalog, cfg: &config::SkillsConfig) {
-    let Ok(client) = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(2))
-        .build()
-    else {
+async fn merge_ephemeral_into(
+    catalog: &mut Catalog,
+    cfg: &config::SkillsConfig,
+    client_app: ClientApp,
+) {
+    let Ok(client) = http_client(std::time::Duration::from_secs(2), client_app) else {
         return;
     };
     let mut seen: std::collections::HashSet<String> =
@@ -1212,11 +1246,8 @@ async fn fetch_one_async(client: &reqwest::Client, url: &str) -> Result<Catalog>
 }
 
 /// Shared async HTTP fetch used by detail/endpoint/openapi loaders.
-async fn fetch_url(url: &str) -> Result<String> {
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(15))
-        .build()
-        .map_err(|e| Error::Config(format!("http client: {e}")))?;
+async fn fetch_url(url: &str, client_app: ClientApp) -> Result<String> {
+    let client = http_client(std::time::Duration::from_secs(15), client_app)?;
 
     let resp = client
         .get(url)
@@ -1233,6 +1264,14 @@ async fn fetch_url(url: &str) -> Result<String> {
         .map_err(|e| Error::Config(format!("read {url}: {e}")))
 }
 
+fn http_client(timeout: std::time::Duration, client_app: ClientApp) -> Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .timeout(timeout)
+        .user_agent(client_app.user_agent())
+        .build()
+        .map_err(|e| Error::Config(format!("http client: {e}")))
+}
+
 /// Sync wrappers for CLI callers that don't have a tokio runtime.
 pub mod blocking {
     use super::*;
@@ -1243,10 +1282,22 @@ pub mod blocking {
             .block_on(super::load_skills())
     }
 
+    pub fn load_skills_for(client_app: ClientApp) -> Result<Catalog> {
+        tokio::runtime::Runtime::new()
+            .map_err(|e| Error::Config(format!("runtime: {e}")))?
+            .block_on(super::load_skills_for(client_app))
+    }
+
     pub fn update_skills(cache_bust: bool) -> Result<Catalog> {
         tokio::runtime::Runtime::new()
             .map_err(|e| Error::Config(format!("runtime: {e}")))?
             .block_on(super::update_skills(cache_bust))
+    }
+
+    pub fn update_skills_for(cache_bust: bool, client_app: ClientApp) -> Result<Catalog> {
+        tokio::runtime::Runtime::new()
+            .map_err(|e| Error::Config(format!("runtime: {e}")))?
+            .block_on(super::update_skills_for(cache_bust, client_app))
     }
 
     pub fn ensure_endpoints(catalog: &mut Catalog, service_name: &str) -> Result<()> {
@@ -1255,10 +1306,38 @@ pub mod blocking {
             .block_on(super::ensure_endpoints(catalog, service_name))
     }
 
+    pub fn ensure_endpoints_for(
+        catalog: &mut Catalog,
+        service_name: &str,
+        client_app: ClientApp,
+    ) -> Result<()> {
+        tokio::runtime::Runtime::new()
+            .map_err(|e| Error::Config(format!("runtime: {e}")))?
+            .block_on(super::ensure_endpoints_for(
+                catalog,
+                service_name,
+                client_app,
+            ))
+    }
+
     pub fn load_service_endpoints(catalog: &Catalog, service_name: &str) -> Result<Vec<Endpoint>> {
         tokio::runtime::Runtime::new()
             .map_err(|e| Error::Config(format!("runtime: {e}")))?
             .block_on(super::load_service_endpoints(catalog, service_name))
+    }
+
+    pub fn load_service_endpoints_for(
+        catalog: &Catalog,
+        service_name: &str,
+        client_app: ClientApp,
+    ) -> Result<Vec<Endpoint>> {
+        tokio::runtime::Runtime::new()
+            .map_err(|e| Error::Config(format!("runtime: {e}")))?
+            .block_on(super::load_service_endpoints_for(
+                catalog,
+                service_name,
+                client_app,
+            ))
     }
 
     pub fn load_service_openapi(
@@ -1268,6 +1347,20 @@ pub mod blocking {
         tokio::runtime::Runtime::new()
             .map_err(|e| Error::Config(format!("runtime: {e}")))?
             .block_on(super::load_service_openapi(catalog, service_name))
+    }
+
+    pub fn load_service_openapi_for(
+        catalog: &Catalog,
+        service_name: &str,
+        client_app: ClientApp,
+    ) -> Result<Option<serde_json::Value>> {
+        tokio::runtime::Runtime::new()
+            .map_err(|e| Error::Config(format!("runtime: {e}")))?
+            .block_on(super::load_service_openapi_for(
+                catalog,
+                service_name,
+                client_app,
+            ))
     }
 }
 
@@ -1336,16 +1429,44 @@ pub fn validate_cached_catalog_request(
     resource_url: &str,
     body: Option<&str>,
 ) -> Result<()> {
+    validate_cached_catalog_request_with_body_validation(method, resource_url, body, true, None)
+}
+
+/// Validate a cached endpoint's method and query parameters without attempting
+/// JSON-schema validation for an opaque request body.
+pub fn validate_cached_catalog_opaque_request(
+    method: &str,
+    resource_url: &str,
+    content_type: &str,
+) -> Result<()> {
+    validate_cached_catalog_request_with_body_validation(
+        method,
+        resource_url,
+        None,
+        false,
+        Some(content_type),
+    )
+}
+
+fn validate_cached_catalog_request_with_body_validation(
+    method: &str,
+    resource_url: &str,
+    body: Option<&str>,
+    validate_body: bool,
+    opaque_content_type: Option<&str>,
+) -> Result<()> {
     let Some(context) = cached_openapi_context_for_resource_url(resource_url) else {
         return Ok(());
     };
 
-    match openapi::validate_request(
+    match openapi::validate_request_with_body_validation(
         &context.openapi_doc,
         method,
         &context.relative_path,
         &context.query_params,
         body,
+        validate_body,
+        opaque_content_type,
     ) {
         openapi::RequestValidationOutcome::Valid | openapi::RequestValidationOutcome::NotInSpec => {
             Ok(())
@@ -1819,7 +1940,9 @@ mod tests {
             sources: Vec::new(),
         };
 
-        let err = fetch_and_merge(&cfg, false).await.unwrap_err();
+        let err = fetch_and_merge(&cfg, false, ClientApp::Cli)
+            .await
+            .unwrap_err();
 
         assert!(err.to_string().contains("no skills sources configured"));
     }

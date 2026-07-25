@@ -7,6 +7,8 @@ use owo_colors::OwoColorize;
 
 use crate::network::SolanaExplorerCluster;
 
+use super::terminal::sanitize_terminal_text;
+
 /// The character appended to visually indicate a clickable link.
 pub const LINK_ARROW: &str = "↗";
 
@@ -15,7 +17,9 @@ pub const LINK_ARROW: &str = "↗";
 /// Note: the hyperlink covers only the exact `text` — no padding, no arrow.
 /// Pairs well with [`link_with_arrow`] when you want a visible indicator.
 pub fn link(text: &str, url: &str) -> String {
-    format!("\x1b]8;;{}\x1b\\{}\x1b]8;;\x1b\\", url, text)
+    let text = sanitize_terminal_text(text);
+    let url = sanitize_terminal_text(url);
+    format!("\x1b]8;;{url}\x1b\\{text}\x1b]8;;\x1b\\")
 }
 
 /// Wrap `text` in an OSC 8 hyperlink and append a dimmed `↗` arrow after it.
@@ -42,7 +46,9 @@ pub fn solana_explorer_cluster_query(cluster: &SolanaExplorerCluster) -> String 
 /// to the right chain via the `?network=` query (sandbox for local).
 /// Falls back to the bare signature when the network slug is unknown.
 pub fn solana_transaction_link(signature: &str, network: &str) -> String {
-    match pay_core::explorer::tx_url(network, signature) {
+    let signature = sanitize_terminal_text(signature);
+    let network = sanitize_terminal_text(network);
+    match pay_core::explorer::tx_url(&network, &signature) {
         Some(url) => link_with_arrow("Link to receipt", &url),
         None => signature.to_string(),
     }
@@ -70,5 +76,14 @@ mod tests {
     fn solana_transaction_link_falls_back_to_bare_signature_for_unknown_network() {
         let rendered = solana_transaction_link("sig123", "solana-bogus");
         assert_eq!(rendered, "sig123");
+    }
+
+    #[test]
+    fn links_do_not_embed_untrusted_terminal_controls() {
+        let rendered = link("receipt\u{1b}[2J", "https://pay.sh/\u{1b}]8;;evil");
+
+        assert_eq!(rendered.matches('\u{1b}').count(), 4);
+        assert!(rendered.contains("receipt[2J"));
+        assert!(!rendered.contains("\u{1b}[2J"));
     }
 }

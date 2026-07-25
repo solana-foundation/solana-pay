@@ -7,6 +7,7 @@ pub mod instructions;
 pub mod keystore;
 pub mod signer;
 pub mod skills;
+pub mod user_agent;
 
 // Client modules (CLI)
 pub mod client;
@@ -31,6 +32,7 @@ pub mod server;
 pub use config::{Config, LogFormat};
 pub use error::{Error, Result};
 pub use server::{AccountingKey, AccountingStore, InMemoryStore, current_period};
+pub use user_agent::ClientApp;
 
 #[cfg(feature = "server")]
 pub use pay_kit::mpp as solana_mpp;
@@ -57,6 +59,12 @@ pub trait PaymentState: Clone + Send + Sync + 'static {
     }
     fn session_mpp_handle(&self) -> Option<Arc<server::session::SessionMpp>> {
         None
+    }
+    fn session_mpps(&self) -> Vec<&server::session::SessionMpp> {
+        self.session_mpp().into_iter().collect()
+    }
+    fn session_mpp_handles(&self) -> Vec<Arc<server::session::SessionMpp>> {
+        self.session_mpp_handle().into_iter().collect()
     }
     fn fee_payer_wallet(&self) -> Option<&server::telemetry::FeePayerWallet> {
         None

@@ -94,9 +94,10 @@ mod tests {
                 "api/chat",
                 "api/generate",
                 "api/embed",
+                "v1/responses",
                 "v1/chat/completions",
-                "v1/completions",
                 "v1/embeddings",
+                "v1/completions",
                 "v1/messages",
             ]
         );
@@ -108,6 +109,7 @@ mod tests {
             ("/api/chat", "chat"),
             ("/api/generate", "completion"),
             ("/api/embed", "embeddings"),
+            ("/v1/responses", "chat"),
             ("/v1/chat/completions", "chat"),
             ("/v1/completions", "completion"),
             ("/v1/embeddings", "embeddings"),

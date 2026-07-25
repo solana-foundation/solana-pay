@@ -1,11 +1,17 @@
 use base64::{Engine, engine::general_purpose};
-use rmcp::model::{CallToolResult, Content, RawResource};
+use pay_core::client::fetch::{RedirectPolicy, RequestBody};
+use rmcp::model::{CallToolResult, Content, RawResource, Root};
 use rmcp::schemars;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::Value;
+use std::fs::File;
+use std::io::Read;
+use std::path::PathBuf;
+use std::time::SystemTime;
 
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct Params {
     #[schemars(description = "The URL to fetch (e.g. https://api.example.com/data)")]
     pub url: String,
@@ -20,7 +26,7 @@ pub struct Params {
     )]
     pub body: Option<BodyParam>,
     #[schemars(
-        description = "Path to a local file whose contents become the request body. Use this instead of `body` for large payloads you can't inline into the tool call — e.g. a JSON request embedding a base64-encoded image for an image-to-image model. Mutually exclusive with `body`."
+        description = "Local file to use as the request body. The path must be within an MCP client-declared filesystem root. Pay snapshots the file and asks the user to approve its size, method, and destination before sending it. Cannot be combined with body."
     )]
     pub body_file: Option<String>,
 }
@@ -38,27 +44,6 @@ impl BodyParam {
             Self::Text(body) => Ok(body),
             Self::Json(value) => serde_json::to_string(&value),
         }
-    }
-}
-
-/// Resolve the outgoing request body from the mutually-exclusive `body`
-/// (inline) and `body_file` (path read from disk) params. `body_file` lets the
-/// caller send a payload too large to inline into a tool call — e.g. a JSON
-/// request embedding a base64-encoded image — by assembling it on disk first.
-fn resolve_body(
-    body: Option<BodyParam>,
-    body_file: Option<String>,
-) -> Result<Option<String>, String> {
-    match (body, body_file) {
-        (Some(_), Some(_)) => Err("Pass either `body` or `body_file`, not both.".to_string()),
-        (Some(inline), None) => inline
-            .into_string()
-            .map(Some)
-            .map_err(|err| format!("Failed to serialize request body: {err}")),
-        (None, Some(path)) => std::fs::read_to_string(&path)
-            .map(Some)
-            .map_err(|err| format!("Failed to read body_file '{path}': {err}")),
-        (None, None) => Ok(None),
     }
 }
 
@@ -82,29 +67,112 @@ pub fn prepare_headers(
     if has_body
         && !headers
             .iter()
-            .any(|(k, _)| k.eq_ignore_ascii_case("content-type"))
+            .any(|(key, _)| key.eq_ignore_ascii_case("content-type"))
     {
         headers.push(("Content-Type".to_string(), "application/json".to_string()));
     }
     headers
 }
 
+fn prepare_headers_with_content_type(
+    user_headers: &Option<std::collections::HashMap<String, String>>,
+    default_content_type: Option<&str>,
+) -> Vec<(String, String)> {
+    let mut headers = prepare_headers(user_headers, false);
+    if let Some(content_type) = default_content_type
+        && !headers
+            .iter()
+            .any(|(key, _)| key.eq_ignore_ascii_case("content-type"))
+    {
+        headers.push(("Content-Type".to_string(), content_type.to_string()));
+    }
+    headers
+}
+
+fn normalize_http_method(method: Option<&str>) -> Result<String, String> {
+    let method = method.unwrap_or("GET");
+    if method.is_empty() || !method.bytes().all(is_http_token_byte) {
+        return Err(format!(
+            "Invalid HTTP method `{method}`. Use an HTTP token such as GET, POST, PUT, PATCH, or DELETE."
+        ));
+    }
+    Ok(method.to_ascii_uppercase())
+}
+
+fn is_http_token_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric()
+        || matches!(
+            byte,
+            b'!' | b'#'
+                | b'$'
+                | b'%'
+                | b'&'
+                | b'\''
+                | b'*'
+                | b'+'
+                | b'-'
+                | b'.'
+                | b'^'
+                | b'_'
+                | b'`'
+                | b'|'
+                | b'~'
+        )
+}
+
 pub async fn run(
     params: Params,
     peer: rmcp::Peer<rmcp::service::RoleServer>,
 ) -> Result<CallToolResult, rmcp::ErrorData> {
-    // Resolve the request body from either the inline `body` or `body_file`
-    // (a path read from disk, for payloads too large to inline into a tool call).
-    let body: Option<String> = match resolve_body(params.body.clone(), params.body_file.clone()) {
-        Ok(body) => body,
-        Err(message) => return Ok(super::tool_error(message)),
+    if params.body.is_some() && params.body_file.is_some() {
+        return Ok(super::tool_error(
+            "Pass either `body` or `body_file`, not both.",
+        ));
+    }
+
+    let method = match normalize_http_method(params.method.as_deref()) {
+        Ok(method) => method,
+        Err(error) => return Ok(super::tool_error(error)),
     };
-    let headers = prepare_headers(&params.headers, body.is_some());
-    let method = params.method.clone().unwrap_or_else(|| "GET".to_string());
-    let url = params.url.clone();
+    let is_file_body = params.body_file.is_some();
+    let body_and_content_type = match (params.body, params.body_file) {
+        (Some(body), None) => match body.into_string() {
+            Ok(body) => (
+                Some(RequestBody::text(body)),
+                Some("application/json".to_string()),
+            ),
+            Err(error) => {
+                return Ok(super::tool_error(format!(
+                    "Failed to serialize request body: {error}"
+                )));
+            }
+        },
+        (None, Some(path)) => match approved_body_file(&peer, &path, &method, &params.url).await {
+            Ok(body) => (Some(body.body), Some(body.content_type)),
+            Err(error) => return Ok(super::tool_error(error)),
+        },
+        (None, None) => (None, None),
+        (Some(_), Some(_)) => unreachable!("body/body_file conflict returned above"),
+    };
+    let headers =
+        prepare_headers_with_content_type(&params.headers, body_and_content_type.1.as_deref());
+    let url = params.url;
+    let body = body_and_content_type.0;
+    let redirect_policy = if is_file_body {
+        RedirectPolicy::None
+    } else {
+        RedirectPolicy::Follow
+    };
 
     let response = tokio::task::spawn_blocking(move || {
-        do_paid_fetch(&method, &url, &headers, body, Some(peer))
+        do_paid_fetch(
+            &method,
+            &url,
+            &headers,
+            body.as_ref(),
+            redirect_policy,
+            Some(peer),
+        )
     })
     .await
     .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
@@ -117,6 +185,225 @@ pub async fn run(
         ))),
         Err(err) => Ok(pay_error_to_tool_result(err)),
     }
+}
+
+struct ApprovedBodyFile {
+    body: RequestBody,
+    content_type: String,
+}
+
+/// Resolve a local body file, obtain user approval, then snapshot the approved
+/// file. A changed file is rejected rather than silently sent after approval.
+async fn approved_body_file(
+    peer: &rmcp::Peer<rmcp::service::RoleServer>,
+    requested_path: &str,
+    method: &str,
+    url: &str,
+) -> Result<ApprovedBodyFile, String> {
+    let roots = peer
+        .list_roots()
+        .await
+        .map_err(|error| format!("Could not obtain MCP filesystem roots: {error}"))?;
+    let file = resolve_body_file_path(requested_path, &roots.roots)?;
+    let destination = destination_label(url);
+    let display_path = file.path.display().to_string();
+    crate::auth::confirm_file_upload(peer, &display_path, file.bytes, method, &destination).await?;
+
+    let path = file.path.clone();
+    let expected = file.identity;
+    let (body, content_type) =
+        tokio::task::spawn_blocking(move || snapshot_approved_body_file(&path, expected))
+            .await
+            .map_err(|error| format!("Could not read approved request body file: {error}"))?
+            .map_err(|error| error.to_string())?;
+    Ok(ApprovedBodyFile { body, content_type })
+}
+
+#[derive(Debug)]
+struct ResolvedBodyFile {
+    path: PathBuf,
+    bytes: u64,
+    identity: BodyFileIdentity,
+}
+
+#[derive(Debug)]
+struct BodyFileIdentity {
+    bytes: u64,
+    modified: SystemTime,
+    handle: same_file::Handle,
+}
+
+fn resolve_body_file_path(
+    requested_path: &str,
+    roots: &[Root],
+) -> Result<ResolvedBodyFile, String> {
+    if requested_path.is_empty() {
+        return Err("`body_file` must not be empty.".to_string());
+    }
+    if roots.is_empty() {
+        return Err(
+            "The MCP client did not provide any filesystem roots. Add the file's directory as an MCP root, then retry `body_file`."
+                .to_string(),
+        );
+    }
+
+    let root_paths = roots
+        .iter()
+        .map(mcp_root_path)
+        .collect::<Result<Vec<_>, _>>()?;
+    let requested = PathBuf::from(requested_path);
+    let path = if requested.is_absolute() {
+        requested
+    } else if root_paths.len() == 1 && root_paths[0].is_dir() {
+        root_paths[0].join(requested)
+    } else {
+        return Err(
+            "A relative `body_file` needs exactly one directory MCP root. Use an absolute path inside a declared root when more than one root is available."
+                .to_string(),
+        );
+    };
+
+    let metadata = std::fs::symlink_metadata(&path).map_err(|error| {
+        format!(
+            "Could not inspect `body_file` `{}`: {error}",
+            path.display()
+        )
+    })?;
+    if metadata.file_type().is_symlink() {
+        return Err(format!(
+            "`body_file` `{}` must not be a symlink.",
+            path.display()
+        ));
+    }
+    if !metadata.file_type().is_file() {
+        return Err(format!(
+            "`body_file` `{}` must be a regular file.",
+            path.display()
+        ));
+    }
+    if metadata.len() > pay_core::client::fetch::MAX_REQUEST_BODY_BYTES as u64 {
+        return Err(format!(
+            "`body_file` `{}` exceeds the 64 MiB limit.",
+            path.display()
+        ));
+    }
+
+    let canonical_file = std::fs::canonicalize(&path).map_err(|error| {
+        format!(
+            "Could not resolve `body_file` `{}`: {error}",
+            path.display()
+        )
+    })?;
+    let permitted = root_paths.iter().any(|root| {
+        let root_metadata = std::fs::metadata(root).ok();
+        root_metadata.is_some_and(|metadata| {
+            if metadata.is_file() {
+                canonical_file == *root
+            } else {
+                canonical_file.starts_with(root)
+            }
+        })
+    });
+    if !permitted {
+        return Err(format!(
+            "`body_file` `{}` is outside the MCP client's declared filesystem roots.",
+            canonical_file.display()
+        ));
+    }
+
+    let modified = metadata.modified().map_err(|error| {
+        format!(
+            "Could not read modification time for `body_file` `{}`: {error}",
+            path.display()
+        )
+    })?;
+    let handle = same_file::Handle::from_path(&canonical_file).map_err(|error| {
+        format!(
+            "Could not open `body_file` `{}` for approval: {error}",
+            canonical_file.display()
+        )
+    })?;
+    Ok(ResolvedBodyFile {
+        path: canonical_file,
+        bytes: metadata.len(),
+        identity: BodyFileIdentity {
+            bytes: metadata.len(),
+            modified,
+            handle,
+        },
+    })
+}
+
+fn snapshot_approved_body_file(
+    path: &std::path::Path,
+    expected: BodyFileIdentity,
+) -> pay_core::Result<(RequestBody, String)> {
+    let file = File::open(path).map_err(|error| {
+        pay_core::Error::RequestValidation(format!(
+            "Could not open approved `body_file` `{}`: {error}",
+            path.display()
+        ))
+    })?;
+    let handle = same_file::Handle::from_file(file.try_clone().map_err(|error| {
+        pay_core::Error::RequestValidation(format!(
+            "Could not verify approved `body_file` `{}`: {error}",
+            path.display()
+        ))
+    })?)
+    .map_err(|error| {
+        pay_core::Error::RequestValidation(format!(
+            "Could not verify approved `body_file` `{}`: {error}",
+            path.display()
+        ))
+    })?;
+    let metadata = file.metadata()?;
+    let unchanged = handle == expected.handle
+        && metadata.file_type().is_file()
+        && metadata.len() == expected.bytes
+        && metadata.modified().ok() == Some(expected.modified);
+    if !unchanged {
+        return Err(pay_core::Error::RequestValidation(
+            "The local file changed after approval. Review and retry the request.".to_string(),
+        ));
+    }
+    let mut bytes = Vec::with_capacity(expected.bytes as usize);
+    file.take(pay_core::client::fetch::MAX_REQUEST_BODY_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > pay_core::client::fetch::MAX_REQUEST_BODY_BYTES {
+        return Err(pay_core::Error::RequestValidation(
+            "The local file exceeds the 64 MiB upload limit.".to_string(),
+        ));
+    }
+    let content_type = mime_guess::from_path(path)
+        .first_raw()
+        .unwrap_or("application/octet-stream")
+        .to_string();
+    Ok((RequestBody::bytes(bytes), content_type))
+}
+
+fn mcp_root_path(root: &Root) -> Result<PathBuf, String> {
+    let uri = reqwest::Url::parse(&root.uri)
+        .map_err(|error| format!("MCP root `{}` is not a valid URI: {error}", root.uri))?;
+    if uri.scheme() != "file" {
+        return Err(format!("MCP root `{}` is not a local file URI.", root.uri));
+    }
+    let path = uri
+        .to_file_path()
+        .map_err(|_| format!("MCP root `{}` is not a valid local file path.", root.uri))?;
+    std::fs::canonicalize(&path)
+        .map_err(|error| format!("Could not resolve MCP root `{}`: {error}", path.display()))
+}
+
+fn destination_label(url: &str) -> String {
+    reqwest::Url::parse(url)
+        .ok()
+        .and_then(|parsed| {
+            parsed.host_str().map(|host| match parsed.port() {
+                Some(port) => format!("{}://{host}:{port}", parsed.scheme()),
+                None => format!("{}://{host}", parsed.scheme()),
+            })
+        })
+        .unwrap_or_else(|| url.to_string())
 }
 
 /// Route a response body to the right MCP content kind based on its MIME type.
@@ -518,12 +805,24 @@ fn do_paid_fetch(
     method: &str,
     url: &str,
     extra_headers: &[(String, String)],
-    body: Option<String>,
+    body: Option<&RequestBody>,
+    redirect_policy: RedirectPolicy,
     peer: Option<rmcp::Peer<rmcp::service::RoleServer>>,
 ) -> Result<PaidFetchResult, pay_core::Error> {
     use pay_core::client::runner::RunOutcome;
 
-    pay_core::skills::validate_cached_catalog_request(method, url, body.as_deref())?;
+    validate_cached_catalog_body(method, url, extra_headers, body)?;
+
+    let fetch_request = |headers: &[(String, String)]| {
+        pay_core::client::fetch::fetch_request_with_body_for(
+            pay_core::ClientApp::Mcp,
+            method,
+            url,
+            headers,
+            body,
+            redirect_policy,
+        )
+    };
 
     // Build a fresh elicitation-backed AuthGate per signing operation when
     // we have a peer AND no local biometric is available. A local Touch ID /
@@ -572,8 +871,7 @@ fn do_paid_fetch(
         _ => extra_headers.to_vec(),
     };
 
-    let outcome =
-        pay_core::client::fetch::fetch_request(method, url, &initial_headers, body.as_deref())?;
+    let outcome = fetch_request(&initial_headers)?;
 
     match outcome {
         RunOutcome::MppChallenge {
@@ -629,12 +927,14 @@ fn do_paid_fetch(
                     );
                 }
                 ChosenPayment::X402Upto(challenge) => {
-                    let built_payment = pay_core::client::x402::build_upto_payment(
+                    let built_payment =
+                        pay_core::client::x402::build_upto_payment_with_override(
                         challenge.as_ref(),
                         &store,
                         network_override.as_deref(),
                         account_override.as_deref(),
                         Some(url),
+                        make_auth_override(),
                     )?;
                     headers.extend(
                         built_payment
@@ -644,12 +944,7 @@ fn do_paid_fetch(
                     );
                 }
             }
-            interpret_retry(pay_core::client::fetch::fetch_request(
-                method,
-                url,
-                &headers,
-                body.as_deref(),
-            )?)
+            interpret_retry(fetch_request(&headers)?)
         }
         RunOutcome::X402Challenge { challenge, .. } => {
             let built_payment = pay_core::client::x402::build_payment_with_override(
@@ -667,20 +962,16 @@ fn do_paid_fetch(
                     .into_iter()
                     .map(|(name, value)| (name.to_string(), value)),
             );
-            interpret_retry(pay_core::client::fetch::fetch_request(
-                method,
-                url,
-                &headers,
-                body.as_deref(),
-            )?)
+            interpret_retry(fetch_request(&headers)?)
         }
         RunOutcome::X402UptoChallenge { challenge, .. } => {
-            let built_payment = pay_core::client::x402::build_upto_payment(
+            let built_payment = pay_core::client::x402::build_upto_payment_with_override(
                 &challenge,
                 &store,
                 network_override.as_deref(),
                 account_override.as_deref(),
                 Some(url),
+                make_auth_override(),
             )?;
             let mut headers = extra_headers.to_vec();
             headers.extend(
@@ -689,12 +980,7 @@ fn do_paid_fetch(
                     .into_iter()
                     .map(|(name, value)| (name.to_string(), value)),
             );
-            interpret_retry(pay_core::client::fetch::fetch_request(
-                method,
-                url,
-                &headers,
-                body.as_deref(),
-            )?)
+            interpret_retry(fetch_request(&headers)?)
         }
         RunOutcome::X402SignInChallenge {
             challenge,
@@ -720,8 +1006,7 @@ fn do_paid_fetch(
                     .into_iter()
                     .map(|(name, value)| (name.to_string(), value)),
             );
-            let retry =
-                pay_core::client::fetch::fetch_request(method, url, &headers, body.as_deref())?;
+            let retry = fetch_request(&headers)?;
 
             // If sign-in granted access, we're done — credits were spent, no
             // payment made. If the server still refuses (e.g. the wallet has
@@ -745,12 +1030,7 @@ fn do_paid_fetch(
                         .into_iter()
                         .map(|(name, value)| (name.to_string(), value)),
                 );
-                interpret_retry(pay_core::client::fetch::fetch_request(
-                    method,
-                    url,
-                    &headers,
-                    body.as_deref(),
-                )?)
+                interpret_retry(fetch_request(&headers)?)
             } else if let RunOutcome::PaymentRejected { reason, .. } = retry {
                 Err(pay_core::Error::PaymentRejected(reason))
             } else {
@@ -795,12 +1075,7 @@ fn do_paid_fetch(
                 )?;
             let mut headers = extra_headers.to_vec();
             headers.push(("Authorization".to_string(), built.authorization.clone()));
-            let retry = pay_core::client::fetch::fetch_request(
-                method,
-                url,
-                &headers,
-                body.as_deref(),
-            )?;
+            let retry = fetch_request(&headers)?;
             if let RunOutcome::Completed { exit_code, .. } = &retry
                 && *exit_code == 0
                 && let Err(e) =
@@ -825,6 +1100,51 @@ fn do_paid_fetch(
             ..
         } => Ok((body.unwrap_or_default(), content_type)),
     }
+}
+
+/// Run cached catalog validation for every request.
+///
+/// Non-JSON bodies keep method, path, query, and media-type validation while
+/// intentionally skipping JSON-schema validation.
+fn validate_cached_catalog_body(
+    method: &str,
+    url: &str,
+    headers: &[(String, String)],
+    body: Option<&RequestBody>,
+) -> Result<(), pay_core::Error> {
+    let Some(body) = body else {
+        return pay_core::skills::validate_cached_catalog_request(method, url, None);
+    };
+
+    let content_type = headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("content-type"))
+        .map(|(_, value)| value.as_str());
+    if !content_type.is_some_and(is_json_media_type) {
+        return pay_core::skills::validate_cached_catalog_opaque_request(
+            method,
+            url,
+            content_type.unwrap_or("application/octet-stream"),
+        );
+    }
+
+    let text = body.as_text().ok_or_else(|| {
+        pay_core::Error::RequestValidation(
+            "A request declared as JSON contains non-UTF-8 bytes. Stage valid UTF-8 JSON or use the payload's actual content type."
+                .to_string(),
+        )
+    })?;
+    pay_core::skills::validate_cached_catalog_request(method, url, Some(text))
+}
+
+fn is_json_media_type(value: &str) -> bool {
+    let media_type = value
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    media_type == "application/json" || media_type.ends_with("+json")
 }
 
 fn pay_error_to_tool_result(err: pay_core::Error) -> CallToolResult {
@@ -879,6 +1199,7 @@ mod tests {
         assert!(params.method.is_none());
         assert!(params.headers.is_none());
         assert!(params.body.is_none());
+        assert!(params.body_file.is_none());
     }
 
     #[test]
@@ -923,51 +1244,142 @@ mod tests {
     }
 
     #[test]
-    fn resolve_body_inline_text() {
-        let out = resolve_body(Some(BodyParam::Text("hello".to_string())), None).unwrap();
-        assert_eq!(out.as_deref(), Some("hello"));
+    fn method_normalization_matches_wire_method() {
+        assert_eq!(normalize_http_method(Some("post")).unwrap(), "POST");
+        assert_eq!(normalize_http_method(None).unwrap(), "GET");
+        assert!(normalize_http_method(Some("BAD METHOD")).is_err());
     }
 
     #[test]
-    fn resolve_body_inline_json_serialized() {
-        let out = resolve_body(Some(BodyParam::Json(serde_json::json!({"q": 1}))), None).unwrap();
-        assert_eq!(out.as_deref(), Some(r#"{"q":1}"#));
+    fn body_file_is_advertised_and_deserializes() {
+        let params = serde_json::from_str::<Params>(
+            r#"{"url":"https://example.com","body_file":"/workspace/photo.png"}"#,
+        )
+        .unwrap();
+        assert_eq!(params.body_file.as_deref(), Some("/workspace/photo.png"));
+
+        let schema = serde_json::to_value(rmcp::schemars::schema_for!(Params)).unwrap();
+        assert!(schema.pointer("/properties/body_file").is_some());
+        assert!(schema.pointer("/properties/body").is_some());
     }
 
     #[test]
-    fn resolve_body_none() {
-        assert_eq!(resolve_body(None, None).unwrap(), None);
+    fn resolves_relative_file_inside_the_single_declared_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("photo.png");
+        std::fs::write(&path, b"image bytes").unwrap();
+        let root = Root {
+            uri: reqwest::Url::from_directory_path(dir.path())
+                .unwrap()
+                .to_string(),
+            name: Some("workspace".to_string()),
+        };
+
+        let file = resolve_body_file_path("photo.png", &[root]).unwrap();
+        assert_eq!(file.path, std::fs::canonicalize(path).unwrap());
+        assert_eq!(file.bytes, 11);
     }
 
     #[test]
-    fn resolve_body_rejects_both() {
-        let err = resolve_body(
-            Some(BodyParam::Text("x".to_string())),
-            Some("/tmp/x".to_string()),
+    fn changed_body_file_is_rejected_after_approval() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("payload.json");
+        std::fs::write(&path, br#"{"approved":true}"#).unwrap();
+        let root = Root {
+            uri: reqwest::Url::from_directory_path(dir.path())
+                .unwrap()
+                .to_string(),
+            name: Some("workspace".to_string()),
+        };
+
+        let file = resolve_body_file_path("payload.json", &[root]).unwrap();
+        std::fs::write(&path, b"changed").unwrap();
+
+        assert!(snapshot_approved_body_file(&file.path, file.identity).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn swapped_root_cannot_redirect_an_approved_file() {
+        use std::os::unix::fs::symlink;
+
+        let outer = tempfile::tempdir().unwrap();
+        let root_path = outer.path().join("root");
+        let moved_root = outer.path().join("moved-root");
+        let outside = outer.path().join("outside");
+        std::fs::create_dir(&root_path).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(root_path.join("payload"), b"approved").unwrap();
+        std::fs::write(outside.join("payload"), b"outside!").unwrap();
+        let root = Root {
+            uri: reqwest::Url::from_directory_path(&root_path)
+                .unwrap()
+                .to_string(),
+            name: Some("workspace".to_string()),
+        };
+
+        let file = resolve_body_file_path("payload", &[root]).unwrap();
+        std::fs::rename(&root_path, &moved_root).unwrap();
+        symlink(&outside, &root_path).unwrap();
+
+        assert!(snapshot_approved_body_file(&file.path, file.identity).is_err());
+    }
+
+    #[test]
+    fn rejects_file_outside_declared_roots() {
+        let allowed = tempfile::tempdir().unwrap();
+        let outside = tempfile::NamedTempFile::new().unwrap();
+        let root = Root {
+            uri: reqwest::Url::from_directory_path(allowed.path())
+                .unwrap()
+                .to_string(),
+            name: None,
+        };
+
+        let error = resolve_body_file_path(outside.path().to_str().unwrap(), &[root]).unwrap_err();
+        assert!(error.contains("outside the MCP client's declared filesystem roots"));
+    }
+
+    #[test]
+    fn relative_file_with_multiple_roots_requires_an_absolute_path() {
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        let roots = [
+            Root {
+                uri: reqwest::Url::from_directory_path(first.path())
+                    .unwrap()
+                    .to_string(),
+                name: None,
+            },
+            Root {
+                uri: reqwest::Url::from_directory_path(second.path())
+                    .unwrap()
+                    .to_string(),
+                name: None,
+            },
+        ];
+
+        let error = resolve_body_file_path("photo.png", &roots).unwrap_err();
+        assert!(error.contains("relative `body_file`"));
+    }
+
+    #[test]
+    fn json_media_type_detection_handles_parameters_and_suffixes() {
+        assert!(is_json_media_type("application/json"));
+        assert!(is_json_media_type(
+            "Application/Problem+JSON; charset=utf-8"
+        ));
+        assert!(!is_json_media_type("image/png"));
+        assert!(!is_json_media_type("multipart/form-data; boundary=abc"));
+    }
+
+    #[test]
+    fn params_still_reject_unknown_fields() {
+        let error = serde_json::from_str::<Params>(
+            r#"{"url":"https://example.com","read_any_file":"/etc/passwd"}"#,
         )
         .unwrap_err();
-        assert!(err.contains("not both"));
-    }
-
-    #[test]
-    fn resolve_body_reads_file() {
-        use std::io::Write;
-
-        let mut file = tempfile::Builder::new()
-            .prefix("pay-curl-bodyfile-test-")
-            .suffix(".json")
-            .tempfile()
-            .unwrap();
-        file.write_all(br#"{"from":"file"}"#).unwrap();
-        file.flush().unwrap();
-        let out = resolve_body(None, Some(file.path().to_string_lossy().into_owned())).unwrap();
-        assert_eq!(out.as_deref(), Some(r#"{"from":"file"}"#));
-    }
-
-    #[test]
-    fn resolve_body_missing_file_errors() {
-        let err = resolve_body(None, Some("/no/such/file.json".to_string())).unwrap_err();
-        assert!(err.contains("Failed to read body_file"));
+        assert!(error.to_string().contains("unknown field `read_any_file`"));
     }
 
     #[test]
@@ -1034,7 +1446,7 @@ mod tests {
 
     #[test]
     fn do_paid_fetch_returns_error_for_invalid_url() {
-        let result = do_paid_fetch("GET", "not-a-url", &[], None, None);
+        let result = do_paid_fetch("GET", "not-a-url", &[], None, RedirectPolicy::Follow, None);
         assert!(result.is_err());
     }
 

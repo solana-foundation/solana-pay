@@ -254,7 +254,7 @@ pub fn load_keypair_bytes_from_account_with_intent_and_override(
 ) -> Result<crate::keystore::Zeroizing<Vec<u8>>> {
     let account_intent = intent.with_account_context(name);
     if account.keystore == Keystore::Ephemeral {
-        maybe_authenticate_ephemeral_account(account, network, &account_intent, auth_override)?;
+        let _ = auth_override;
         return account
             .ephemeral_keypair_bytes()
             .map(crate::keystore::Zeroizing::new)
@@ -376,7 +376,7 @@ pub fn load_keypair_bytes_from_account_with_intent_and_override(
                 .map_err(|e| map_keystore_backend_error("1password", e))
         }
         Keystore::File => {
-            let _ = auth_override;
+            maybe_authenticate_file_account(account, network, &account_intent, auth_override)?;
             load_signer_keypair_bytes_with_intent(&source, &account_intent)
         }
         Keystore::Ephemeral => unreachable!("handled above"),
@@ -444,7 +444,8 @@ fn signer_from_ephemeral(account: &Account) -> Result<MemorySigner> {
         .map_err(|e| Error::Config(format!("Invalid ephemeral keypair bytes: {e}")))
 }
 
-fn maybe_authenticate_ephemeral_account(
+/// Apply a file-backed account's auth policy before reading its keypair.
+fn maybe_authenticate_file_account(
     account: &Account,
     network: &str,
     intent: &AuthIntent,
@@ -454,77 +455,47 @@ fn maybe_authenticate_ephemeral_account(
         return Ok(());
     }
 
-    // When an override is provided, prefer it over the platform gate.
-    // Ephemeral accounts have no on-disk secret to load, so we just need
-    // to drive the auth prompt — for that, any backing store works.
+    // When an override is provided, prefer it over the platform gate. It is
+    // already a complete AuthGate, so no backing secret store is needed.
     if let Some(gate) = auth_override {
-        #[cfg(target_os = "macos")]
-        let ks = crate::keystore::Keystore::from_boxed_auth(
-            gate,
-            Box::new(crate::keystore::macos::AppleKeychainStore),
-            true,
-        );
-        #[cfg(target_os = "linux")]
-        let ks = crate::keystore::Keystore::from_boxed_auth(
-            gate,
-            Box::new(crate::keystore::linux::SecretServiceStore),
-            true,
-        );
-        #[cfg(target_os = "windows")]
-        let ks = crate::keystore::Keystore::from_boxed_auth(
-            gate,
-            Box::new(crate::keystore::windows::WindowsCredentialStore),
-            true,
-        );
-        #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
-        {
-            let _ = gate;
-            let _ = intent;
-            return Err(Error::Config(
-                "Ephemeral account auth gating is not available on this platform".to_string(),
-            ));
-        }
-        #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
-        return ks
-            .authenticate_intent(intent)
-            .map_err(map_ephemeral_auth_error);
+        return gate.authenticate(intent).map_err(map_file_auth_error);
     }
 
     #[cfg(target_os = "macos")]
     {
         crate::keystore::Keystore::apple_keychain()
             .authenticate_intent(intent)
-            .map_err(map_ephemeral_auth_error)
+            .map_err(map_file_auth_error)
     }
 
     #[cfg(target_os = "linux")]
     {
         crate::keystore::Keystore::gnome_keyring()
             .authenticate_intent(intent)
-            .map_err(map_ephemeral_auth_error)
+            .map_err(map_file_auth_error)
     }
 
     #[cfg(target_os = "windows")]
     {
         crate::keystore::Keystore::windows_hello()
             .authenticate_intent(intent)
-            .map_err(map_ephemeral_auth_error)
+            .map_err(map_file_auth_error)
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     {
         let _ = intent;
         Err(Error::Config(
-            "Ephemeral account auth gating is not available on this platform".to_string(),
+            "File account auth gating is not available on this platform".to_string(),
         ))
     }
 }
 
-fn map_ephemeral_auth_error(e: crate::keystore::Error) -> Error {
+fn map_file_auth_error(e: crate::keystore::Error) -> Error {
     if matches!(e, crate::keystore::Error::AuthDenied(_)) {
         Error::PaymentRejected("rejected by user at authentication prompt".to_string())
     } else {
-        Error::Config(format!("ephemeral auth gate: {e}"))
+        Error::Config(format!("file account auth gate: {e}"))
     }
 }
 
@@ -789,6 +760,121 @@ mod tests {
 
     use crate::accounts::{Account, AccountsFile, MAINNET_NETWORK, MemoryAccountsStore};
 
+    struct DenyAuth;
+
+    impl AuthGate for DenyAuth {
+        fn authenticate(
+            &self,
+            _intent: &AuthIntent,
+        ) -> std::result::Result<(), crate::keystore::Error> {
+            Err(crate::keystore::Error::AuthDenied(
+                "denied by test".to_string(),
+            ))
+        }
+
+        fn is_available(&self) -> bool {
+            true
+        }
+    }
+
+    fn fresh_file_account(auth_required: Option<bool>) -> (tempfile::TempDir, Account, Vec<u8>) {
+        let signing_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let verifying_key = signing_key.verifying_key();
+        let mut keypair_bytes = Vec::with_capacity(64);
+        keypair_bytes.extend_from_slice(&signing_key.to_bytes());
+        keypair_bytes.extend_from_slice(&verifying_key.to_bytes());
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let key_path = temp_dir.path().join("test-keypair.json");
+        std::fs::write(&key_path, serde_json::to_string(&keypair_bytes).unwrap()).unwrap();
+
+        let account = Account {
+            keystore: Keystore::File,
+            active: false,
+            auth_required,
+            pubkey: Some(bs58::encode(verifying_key.to_bytes()).into_string()),
+            vault: None,
+            account: None,
+            path: Some(key_path.to_string_lossy().into_owned()),
+            secret_key_b58: None,
+            created_at: None,
+            subscriptions: std::collections::BTreeMap::new(),
+        };
+
+        (temp_dir, account, keypair_bytes)
+    }
+
+    #[test]
+    fn file_account_honors_explicit_auth_gate_override() {
+        let (_temp_dir, account, _) = fresh_file_account(Some(true));
+
+        let err = load_keypair_bytes_from_account_with_intent_and_override(
+            &account,
+            "default",
+            MAINNET_NETWORK,
+            &AuthIntent::default_payment(),
+            Some(Box::new(DenyAuth)),
+        )
+        .unwrap_err();
+
+        assert!(matches!(err, Error::PaymentRejected(_)));
+    }
+
+    #[test]
+    fn file_account_authenticates_before_reading_keypair() {
+        let (temp_dir, mut account, _) = fresh_file_account(Some(true));
+        account.path = Some(
+            temp_dir
+                .path()
+                .join("missing-keypair.json")
+                .to_string_lossy()
+                .into_owned(),
+        );
+
+        let err = load_keypair_bytes_from_account_with_intent_and_override(
+            &account,
+            "default",
+            MAINNET_NETWORK,
+            &AuthIntent::default_payment(),
+            Some(Box::new(DenyAuth)),
+        )
+        .unwrap_err();
+
+        assert!(matches!(err, Error::PaymentRejected(_)));
+    }
+
+    #[test]
+    fn file_account_honors_mainnet_default_auth_gate_override() {
+        let (_temp_dir, account, _) = fresh_file_account(None);
+
+        let err = load_keypair_bytes_from_account_with_intent_and_override(
+            &account,
+            "default",
+            MAINNET_NETWORK,
+            &AuthIntent::default_payment(),
+            Some(Box::new(DenyAuth)),
+        )
+        .unwrap_err();
+
+        assert!(matches!(err, Error::PaymentRejected(_)));
+    }
+
+    #[test]
+    fn file_account_skips_auth_gate_when_disabled() {
+        let (_temp_dir, account, expected) = fresh_file_account(Some(false));
+
+        let bytes = load_keypair_bytes_from_account_with_intent_and_override(
+            &account,
+            "default",
+            MAINNET_NETWORK,
+            &AuthIntent::default_payment(),
+            Some(Box::new(DenyAuth)),
+        )
+        .unwrap();
+
+        assert_eq!(&*bytes, &expected);
+    }
+
     fn fresh_ephemeral_account() -> Account {
         // Build an ephemeral account directly so the test doesn't depend
         // on the lazy-create internals.
@@ -808,6 +894,26 @@ mod tests {
             secret_key_b58: Some(bs58::encode(&full).into_string()),
             created_at: Some("2026-04-10T00:00:00Z".to_string()),
             subscriptions: std::collections::BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn ephemeral_account_never_uses_auth_gate() {
+        for auth_required in [Some(true), None] {
+            let mut account = fresh_ephemeral_account();
+            account.auth_required = auth_required;
+            let expected = account.ephemeral_keypair_bytes().unwrap();
+
+            let bytes = load_keypair_bytes_from_account_with_intent_and_override(
+                &account,
+                "default",
+                MAINNET_NETWORK,
+                &AuthIntent::default_payment(),
+                Some(Box::new(DenyAuth)),
+            )
+            .unwrap();
+
+            assert_eq!(&*bytes, &expected);
         }
     }
 

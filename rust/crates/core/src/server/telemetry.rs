@@ -34,6 +34,7 @@ pub struct PaymentAmount {
 /// other than `"periodic"`) always warn so they surface for the
 /// in-flight request that just lost telemetry.
 const PERIODIC_WARN_AFTER_CONSECUTIVE_FAILURES: u64 = 5;
+const MAX_METRIC_ERROR_LABEL_BYTES: usize = 512;
 
 /// Timeout for a single `getBalance` round-trip. Without this, a stalled
 /// RPC connection can hang the periodic probe forever and accumulate
@@ -314,6 +315,7 @@ pub fn record_settlement_error(
     error: &str,
     retryable: bool,
 ) {
+    let error = bounded_metric_label(error, MAX_METRIC_ERROR_LABEL_BYTES);
     tracing::warn!(
         monotonic_counter.pay_payment_settlement_errors_total = 1_u64,
         protocol,
@@ -324,6 +326,17 @@ pub fn record_settlement_error(
         metric = METRIC_SETTLEMENT_ERRORS,
         "payment settlement failed",
     );
+}
+
+fn bounded_metric_label(value: &str, max_bytes: usize) -> &str {
+    if value.len() <= max_bytes {
+        return value;
+    }
+    let mut end = max_bytes;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    &value[..end]
 }
 
 pub fn record_upstream_error(subdomain: &str, path: &str, upstream: &str, error: &str) {
@@ -377,5 +390,15 @@ mod tests {
     fn paid_delivery_error_is_5xx() {
         assert!(is_paid_delivery_error(StatusCode::BAD_GATEWAY));
         assert!(!is_paid_delivery_error(StatusCode::BAD_REQUEST));
+    }
+
+    #[test]
+    fn metric_error_labels_are_bounded_on_utf8_boundaries() {
+        let error = format!("{}failure", "é".repeat(300));
+        let bounded = bounded_metric_label(&error, MAX_METRIC_ERROR_LABEL_BYTES);
+
+        assert!(bounded.len() <= MAX_METRIC_ERROR_LABEL_BYTES);
+        assert!(bounded.is_char_boundary(bounded.len()));
+        assert_eq!(bounded.len(), 512);
     }
 }

@@ -105,7 +105,7 @@ fn paid_endpoint(paid: &PaidEndpoint, config: &PricingConfig) -> Endpoint {
             param: "model".to_string(),
             value: model.clone(),
             description: None,
-            dimensions: token_dimensions(rate),
+            dimensions: token_dimensions(rate, paid),
         })
         .collect();
 
@@ -113,7 +113,7 @@ fn paid_endpoint(paid: &PaidEndpoint, config: &PricingConfig) -> Endpoint {
     let dimensions = config
         .default
         .as_ref()
-        .map(token_dimensions)
+        .map(|rate| token_dimensions(rate, paid))
         .unwrap_or_default();
 
     Endpoint {
@@ -148,19 +148,36 @@ fn paid_endpoint(paid: &PaidEndpoint, config: &PricingConfig) -> Endpoint {
 /// `upto_uses_response_usage` true (so the gate builds an `UptoSettlementPlan`)
 /// and serves as the JSON fallback for the buffered/axum path. At runtime the
 /// streamed Pingora path supersedes it with the observer's token counts.
-fn token_dimensions(rate: &TokenRate) -> Vec<MeterDimension> {
-    vec![
-        token_dim(
-            MeterDirection::Input,
-            rate.input_per_1m,
-            "/usage/prompt_tokens",
-        ),
-        token_dim(
-            MeterDirection::Output,
-            rate.output_per_1m,
-            "/usage/completion_tokens",
-        ),
-    ]
+fn token_dimensions(rate: &TokenRate, paid: &PaidEndpoint) -> Vec<MeterDimension> {
+    let profile = pay_core::server::profiles::openai_endpoint(&paid.path);
+    let input_path = profile
+        .and_then(|endpoint| endpoint.input_tokens)
+        .unwrap_or_else(|| {
+            if paid.path == "v1/messages" {
+                "/usage/input_tokens"
+            } else {
+                "/usage/prompt_tokens"
+            }
+        });
+    let output_path = profile
+        .map(|endpoint| endpoint.output_tokens)
+        .unwrap_or_else(|| {
+            Some(if paid.path == "v1/messages" {
+                "/usage/output_tokens"
+            } else {
+                "/usage/completion_tokens"
+            })
+        });
+
+    let mut dimensions = vec![token_dim(
+        MeterDirection::Input,
+        rate.input_per_1m,
+        input_path,
+    )];
+    if let Some(path) = output_path {
+        dimensions.push(token_dim(MeterDirection::Output, rate.output_per_1m, path));
+    }
+    dimensions
 }
 
 fn token_dim(direction: MeterDirection, price_per_1m: f64, json_pointer: &str) -> MeterDimension {
@@ -287,9 +304,10 @@ mod tests {
                 "api/chat",
                 "api/generate",
                 "api/embed",
+                "v1/responses",
                 "v1/chat/completions",
-                "v1/completions",
                 "v1/embeddings",
+                "v1/completions",
                 "v1/messages",
             ]
         );
@@ -313,21 +331,27 @@ mod tests {
 
             for variant in &meter.variants {
                 assert_eq!(variant.param, "model");
-                assert_eq!(variant.dimensions.len(), 2);
+                let has_output = endpoint.path != "v1/embeddings";
+                assert_eq!(variant.dimensions.len(), if has_output { 2 } else { 1 });
                 let input = &variant.dimensions[0];
-                let output = &variant.dimensions[1];
                 assert_eq!(input.direction, MeterDirection::Input);
                 assert_eq!(input.unit, BillingUnit::Tokens);
                 assert_eq!(input.scale, TOKEN_SCALE);
                 assert!(input.meter.is_some(), "token dim carries a usage meter");
-                assert_eq!(output.direction, MeterDirection::Output);
-                assert_eq!(output.unit, BillingUnit::Tokens);
+                if has_output {
+                    let output = &variant.dimensions[1];
+                    assert_eq!(output.direction, MeterDirection::Output);
+                    assert_eq!(output.unit, BillingUnit::Tokens);
+                }
             }
 
-            // gemma4 rates: in 0.15, out 0.60.
+            let has_output = endpoint.path != "v1/embeddings";
+            // gemma4 rates: in 0.15, out 0.60 where the operation reports output.
             let gemma = meter.variants.iter().find(|v| v.value == "gemma4").unwrap();
             assert_eq!(gemma.dimensions[0].tiers[0].price_usd, 0.15);
-            assert_eq!(gemma.dimensions[1].tiers[0].price_usd, 0.60);
+            if has_output {
+                assert_eq!(gemma.dimensions[1].tiers[0].price_usd, 0.60);
+            }
             // qwen3:8b rates: in 0.50, out 1.50.
             let qwen = meter
                 .variants
@@ -335,12 +359,16 @@ mod tests {
                 .find(|v| v.value == "qwen3:8b")
                 .unwrap();
             assert_eq!(qwen.dimensions[0].tiers[0].price_usd, 0.50);
-            assert_eq!(qwen.dimensions[1].tiers[0].price_usd, 1.50);
+            if has_output {
+                assert_eq!(qwen.dimensions[1].tiers[0].price_usd, 1.50);
+            }
 
             // Top-level dimensions fall back to the config default (0.10/0.30).
-            assert_eq!(meter.dimensions.len(), 2);
+            assert_eq!(meter.dimensions.len(), if has_output { 2 } else { 1 });
             assert_eq!(meter.dimensions[0].tiers[0].price_usd, 0.10);
-            assert_eq!(meter.dimensions[1].tiers[0].price_usd, 0.30);
+            if has_output {
+                assert_eq!(meter.dimensions[1].tiers[0].price_usd, 0.30);
+            }
 
             assert_eq!(
                 endpoint.resource.as_deref(),
@@ -348,6 +376,35 @@ mod tests {
                 "paid endpoints must carry a resource for memo uniqueness"
             );
         }
+
+        let meter_paths = |path: &str| {
+            spec.endpoints
+                .iter()
+                .find(|endpoint| endpoint.path == path)
+                .unwrap()
+                .metering
+                .as_ref()
+                .unwrap()
+                .dimensions
+                .iter()
+                .map(|dimension| {
+                    dimension
+                        .meter
+                        .as_ref()
+                        .and_then(|meter| meter.path.as_deref())
+                        .unwrap()
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            meter_paths("v1/responses"),
+            ["/usage/input_tokens", "/usage/output_tokens"]
+        );
+        assert_eq!(
+            meter_paths("v1/chat/completions"),
+            ["/usage/prompt_tokens", "/usage/completion_tokens"]
+        );
+        assert_eq!(meter_paths("v1/embeddings"), ["/usage/prompt_tokens"]);
 
         let operator = spec.operator.as_ref().expect("priced spec has operator");
         assert_eq!(operator.network.as_deref(), Some("localnet"));

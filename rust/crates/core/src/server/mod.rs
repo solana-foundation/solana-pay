@@ -16,6 +16,9 @@ pub mod openapi;
 pub mod payment;
 
 #[cfg(feature = "server")]
+pub mod profiles;
+
+#[cfg(feature = "server")]
 pub mod proxy;
 
 #[cfg(feature = "server")]

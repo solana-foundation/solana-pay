@@ -5,7 +5,7 @@ resolver = "2"
 
 [workspace.package]
 edition = "2024"
-version = "0.21.0"
+version = "0.24.0"
 license = "MIT"
 
 [workspace.dependencies]
@@ -102,6 +102,7 @@ bs58 = "0.5"
 blake3 = "1"
 qrcode = { version = "0.14", default-features = false }
 mime_guess = { version = "2.0", default-features = false, features = ["rev-mappings"] }
+same-file = "1.0"
 
 # Solana payment SDK umbrella — one dep that re-exports MPP (`pay_kit::mpp`),
 # x402 (`pay_kit::x402`), and the cross-protocol, balance-aware selection API
@@ -109,7 +110,7 @@ mime_guess = { version = "2.0", default-features = false, features = ["rev-mappi
 # deps. The `axum` feature (kit's own gate) is intentionally OFF — pay has its
 # own gate (pay-core + pay-proxy).
 #
-pay-kit = { package = "solana-pay-kit", git = "https://github.com/solana-foundation/pay-kit", rev = "bdaad4f5ea40f365d73be8cf5634555aa5bca677", default-features = false, features = [
+pay-kit = { package = "solana-pay-kit", git = "https://github.com/solana-foundation/pay-kit.git", rev = "cb02b5afcbba8147c4483a9d800a3eff93ed6592", default-features = false, features = [
     "mpp",
     "x402",
     "client",

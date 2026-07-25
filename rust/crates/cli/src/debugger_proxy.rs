@@ -15,6 +15,7 @@ use axum::extract::Request;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::any;
+use pay_core::client::fetch::{DEBUGGER_NO_FOLLOW_HEADER, DEBUGGER_NO_FOLLOW_HEADER_VALUE};
 
 /// Header carrying the original destination URL.
 pub const FORWARD_HEADER: &str = "x-pay-forward-to";
@@ -121,19 +122,34 @@ async fn forward_and_log(req: Request<Body>, pdb: pay_pdb::PdbState) -> Response
 
     let method = req.method().clone();
     let _path = req.uri().path().to_string();
+    let no_follow = req
+        .headers()
+        .get_all(DEBUGGER_NO_FOLLOW_HEADER)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .any(|value| value == DEBUGGER_NO_FOLLOW_HEADER_VALUE);
 
     // Extract headers to forward (skip hop-by-hop + our internal header).
     let mut fwd_headers = HeaderMap::new();
     for (k, v) in req.headers() {
         let name = k.as_str().to_lowercase();
-        if name == FORWARD_HEADER || name == "host" || name == "connection" {
+        if name == FORWARD_HEADER
+            || name == DEBUGGER_NO_FOLLOW_HEADER
+            || name == "host"
+            || name == "connection"
+        {
             continue;
         }
         fwd_headers.insert(k.clone(), v.clone());
     }
 
     // Read body.
-    let body_bytes = match axum::body::to_bytes(req.into_body(), 10 * 1024 * 1024).await {
+    let body_bytes = match axum::body::to_bytes(
+        req.into_body(),
+        pay_core::fetch::MAX_REQUEST_BODY_BYTES,
+    )
+    .await
+    {
         Ok(b) => b,
         Err(e) => {
             return (StatusCode::BAD_REQUEST, format!("read body: {e}")).into_response();
@@ -144,14 +160,27 @@ async fn forward_and_log(req: Request<Body>, pdb: pay_pdb::PdbState) -> Response
     let start = std::time::Instant::now();
 
     // Forward.
-    let client = reqwest::Client::new();
+    let mut client_builder = reqwest::Client::builder();
+    if no_follow {
+        client_builder = client_builder.redirect(reqwest::redirect::Policy::none());
+    }
+    let client = match client_builder.build() {
+        Ok(client) => client,
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("build forwarding client: {error}"),
+            )
+                .into_response();
+        }
+    };
     let upstream_resp = client
         .request(
             reqwest::Method::from_bytes(method.as_str().as_bytes()).unwrap(),
             &dest_url,
         )
         .headers(reqwest_headers(&fwd_headers))
-        .body(body_bytes.to_vec())
+        .body(body_bytes)
         .send()
         .await;
 
@@ -165,7 +194,8 @@ async fn forward_and_log(req: Request<Body>, pdb: pay_pdb::PdbState) -> Response
                 .iter()
                 .map(|(k, v)| (k.to_string(), v.to_str().unwrap_or("").to_string()))
                 .collect();
-            let res_body = resp.text().await.unwrap_or_default();
+            let res_body = resp.bytes().await.unwrap_or_default();
+            let res_body_for_log = String::from_utf8_lossy(&res_body).into_owned();
 
             // Log to PDB.
             let entry = pay_pdb::types::LogEntry {
@@ -180,7 +210,7 @@ async fn forward_and_log(req: Request<Body>, pdb: pay_pdb::PdbState) -> Response
                     .map(|(k, v)| (k.to_string(), v.to_str().unwrap_or("").to_string()))
                     .collect(),
                 res_headers: res_headers.clone(),
-                res_body: Some(res_body.clone()),
+                res_body: Some(res_body_for_log),
                 client_ip: "mcp".to_string(),
             };
             pdb.correlation.lock().unwrap().ingest(entry);
@@ -276,6 +306,25 @@ mod tests {
         addr
     }
 
+    fn start_test_upstream(app: Router) -> std::net::SocketAddr {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async move {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let addr = listener.local_addr().unwrap();
+                tx.send(addr).unwrap();
+                axum::serve(listener, app).await.ok();
+            });
+        });
+        let addr = rx.recv().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        addr
+    }
+
     #[test]
     fn pdb_served_with_trailing_slash() {
         let addr = start_test_proxy();
@@ -349,6 +398,100 @@ mod tests {
                 assert_eq!(resp.status(), 200, "asset at {asset_path} should serve");
             }
         }
+    }
+
+    #[test]
+    fn internal_no_follow_marker_blocks_upstream_redirects_without_leaking() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+        };
+
+        let marker_seen_upstream = Arc::new(AtomicBool::new(false));
+        let sink_hits = Arc::new(AtomicUsize::new(0));
+
+        let marker_for_307 = Arc::clone(&marker_seen_upstream);
+        let marker_for_308 = Arc::clone(&marker_seen_upstream);
+        let sink_hits_for_handler = Arc::clone(&sink_hits);
+        let upstream = Router::new()
+            .route(
+                "/redirect307",
+                axum::routing::post(move |headers: HeaderMap| {
+                    let marker_seen = Arc::clone(&marker_for_307);
+                    async move {
+                        if headers.contains_key(DEBUGGER_NO_FOLLOW_HEADER) {
+                            marker_seen.store(true, Ordering::SeqCst);
+                        }
+                        (
+                            StatusCode::TEMPORARY_REDIRECT,
+                            [(axum::http::header::LOCATION, "/sink")],
+                            "",
+                        )
+                    }
+                }),
+            )
+            .route(
+                "/redirect308",
+                axum::routing::post(move |headers: HeaderMap| {
+                    let marker_seen = Arc::clone(&marker_for_308);
+                    async move {
+                        if headers.contains_key(DEBUGGER_NO_FOLLOW_HEADER) {
+                            marker_seen.store(true, Ordering::SeqCst);
+                        }
+                        (
+                            StatusCode::PERMANENT_REDIRECT,
+                            [(axum::http::header::LOCATION, "/sink")],
+                            "",
+                        )
+                    }
+                }),
+            )
+            .route(
+                "/sink",
+                axum::routing::post(move || {
+                    let sink_hits = Arc::clone(&sink_hits_for_handler);
+                    async move {
+                        sink_hits.fetch_add(1, Ordering::SeqCst);
+                        "followed"
+                    }
+                }),
+            );
+        let upstream_addr = start_test_upstream(upstream);
+        let proxy_addr = start_test_proxy();
+        let client = reqwest::blocking::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap();
+
+        for (path, expected_status) in [
+            ("redirect307", StatusCode::TEMPORARY_REDIRECT),
+            ("redirect308", StatusCode::PERMANENT_REDIRECT),
+        ] {
+            let response = client
+                .post(format!("http://{proxy_addr}/forward"))
+                .header(FORWARD_HEADER, format!("http://{upstream_addr}/{path}"))
+                .header(DEBUGGER_NO_FOLLOW_HEADER, DEBUGGER_NO_FOLLOW_HEADER_VALUE)
+                .body("staged bytes")
+                .send()
+                .unwrap();
+            assert_eq!(response.status().as_u16(), expected_status.as_u16());
+        }
+
+        assert_eq!(sink_hits.load(Ordering::SeqCst), 0);
+        assert!(!marker_seen_upstream.load(Ordering::SeqCst));
+
+        // Unmarked debugger traffic retains its existing redirect behavior.
+        let response = client
+            .post(format!("http://{proxy_addr}/forward"))
+            .header(
+                FORWARD_HEADER,
+                format!("http://{upstream_addr}/redirect307"),
+            )
+            .body("inline bytes")
+            .send()
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(sink_hits.load(Ordering::SeqCst), 1);
     }
 
     #[test]

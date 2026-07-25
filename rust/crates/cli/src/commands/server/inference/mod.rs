@@ -55,11 +55,6 @@ pub fn local_gateway_provider_host(slug: &str) -> String {
     format!("{slug}.localhost:{}", default_gateway_port())
 }
 
-/// User-facing provider URL for the default local gateway.
-pub fn local_gateway_provider_url(slug: &str) -> String {
-    format!("http://{}", local_gateway_provider_host(slug))
-}
-
 fn default_gateway_port() -> &'static str {
     DEFAULT_BIND
         .rsplit_once(':')
@@ -80,6 +75,11 @@ pub struct InferenceCommand {
     /// a third-party echo service (opt-in — it leaks your public IP).
     #[arg(long)]
     pub public_url: Option<String>,
+
+    /// Skip decentralized provider registration even when `--public-url` is
+    /// supplied.
+    #[arg(long)]
+    pub no_register: bool,
 
     /// Only probe these providers (comma-separated slugs, e.g. `ollama,vllm`).
     #[arg(long, value_delimiter = ',')]
@@ -364,7 +364,11 @@ fn usage_to_info(usage: &pay_core::InferenceUsage) -> InferenceInfo {
 }
 
 impl InferenceCommand {
-    pub fn run(self, global_sandbox: bool) -> pay_core::Result<()> {
+    pub fn run(
+        self,
+        active_account_name: Option<&str>,
+        global_sandbox: bool,
+    ) -> pay_core::Result<()> {
         let sandbox = self.sandbox || global_sandbox;
         let pricing_config =
             resolve_pricing_config(self.pricing.as_deref(), self.price.as_deref())?;
@@ -398,6 +402,50 @@ impl InferenceCommand {
             .map_err(|e| pay_core::Error::Config(format!("tokio runtime: {e}")))?;
 
         let (internal_addr, state) = rt.block_on(self.setup(sandbox, pricing_config))?;
+
+        if !self.no_register && self.public_url.is_some() {
+            let endpoint = resolve_public_address(self.public_url.as_deref(), &self.bind);
+            let signer = if let Some(signer) = state.fee_payer_signer.clone() {
+                signer
+            } else {
+                let source = active_account_name.ok_or_else(|| {
+                    pay_core::Error::Config(
+                        "provider registration requires an active account; pass --no-register to serve without publishing"
+                            .to_string(),
+                    )
+                })?;
+                let intent = pay_core::keystore::AuthIntent::from_reason(
+                    "register your inference service in the pay provider registry",
+                );
+                Arc::new(pay_core::signer::load_signer_with_intent(source, &intent)?)
+                    as Arc<dyn SolanaSigner>
+            };
+            let registration = super::provider_registration::ServiceRegistration::new(
+                "inference",
+                "openai-v1",
+                "pay-inference",
+                "OpenAI-compatible inference served through pay",
+                endpoint,
+            )?;
+            let rpc_url = super::provider_registration::registry_rpc_url(sandbox);
+            rt.block_on(async {
+                let outcome = super::provider_registration::register_service(
+                    &registration,
+                    signer.clone(),
+                    &rpc_url,
+                )
+                .await?;
+                if let Some(signature) = outcome.signature {
+                    tracing::info!(%signature, pda = %outcome.pda, "provider registry heartbeat published");
+                }
+                super::provider_registration::spawn_renewal_task(
+                    registration,
+                    signer,
+                    rpc_url,
+                );
+                Ok::<(), pay_core::Error>(())
+            })?;
+        }
 
         let cores = std::thread::available_parallelism().map(|n| n.get()).ok();
         // `rt` stays alive so the watch/cleanup/axum/bridge tasks keep
@@ -564,7 +612,7 @@ impl InferenceCommand {
         for path in &self.spec {
             let contents = std::fs::read_to_string(shellexpand::tilde(path).as_ref())
                 .map_err(|e| pay_core::Error::Config(format!("read {path}: {e}")))?;
-            let mut api: ApiSpec = serde_yml::from_str(&contents)
+            let mut api = pay_core::server::profiles::load_yaml(&contents)
                 .map_err(|e| pay_core::Error::Config(format!("parse {path}: {e}")))?;
             if sandbox {
                 enforce_sandbox(&api, path)?;

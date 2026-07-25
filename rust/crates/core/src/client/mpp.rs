@@ -537,7 +537,7 @@ fn charge_prompt_reason<'a>(
 /// Base58 prefix that the Surfpool sandbox embeds in every blockhash it
 /// returns. The same constant lives in the SDK's server-side check; we
 /// duplicate it here so the client doesn't pull in a server-only feature.
-pub(crate) const SURFPOOL_BLOCKHASH_PREFIX: &str = "SURFNETxSAFEHASH";
+pub const SURFPOOL_BLOCKHASH_PREFIX: &str = "SURFNETxSAFEHASH";
 
 /// Pure check: refuse to sign a credential when the user explicitly
 /// forced a network slug (via `--sandbox`/`--mainnet`) but the server's

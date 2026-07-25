@@ -32,8 +32,26 @@ impl AuthGate for Polkit {
     }
 
     fn is_available(&self) -> bool {
-        run(async { zbus::Connection::system().await.is_ok() })
+        local_auth_prompt_environment(
+            std::env::var_os("DISPLAY").as_deref(),
+            std::env::var_os("WAYLAND_DISPLAY").as_deref(),
+        ) && run(async { zbus::Connection::system().await.is_ok() })
     }
+}
+
+/// Whether this process is attached to a graphical session where a Polkit
+/// authentication agent can display a prompt.
+///
+/// Secret Service and Polkit can both be reachable over D-Bus in an SSH or
+/// systemd service session without any agent capable of answering a challenge.
+/// Treating that as local-auth availability suppresses MCP elicitation and
+/// leaves the request waiting on a prompt that cannot be shown.
+fn local_auth_prompt_environment(
+    display: Option<&std::ffi::OsStr>,
+    wayland_display: Option<&std::ffi::OsStr>,
+) -> bool {
+    display.is_some_and(|value| !value.is_empty())
+        || wayland_display.is_some_and(|value| !value.is_empty())
 }
 
 async fn polkit_authenticate(action: &str) -> Result<()> {
@@ -175,10 +193,7 @@ impl SecretStore for SecretServiceStore {
         run(async move {
             let ss = connect().await?;
             let col = get_or_create_collection(&ss).await?;
-            ensure_unlocked(&col).await?;
-            let result = store_item(&col, &key, &data).await;
-            col.lock().await.map_err(ss_err)?;
-            result
+            with_unlocked_collection(&col, || store_item(&col, &key, &data)).await
         })
     }
 
@@ -189,18 +204,14 @@ impl SecretStore for SecretServiceStore {
             let col = get_collection(&ss).await.ok_or_else(|| {
                 Error::Backend("pay keyring not found — run `pay setup` first".to_string())
             })?;
-            ensure_unlocked(&col).await?;
-
-            let result = async {
+            with_unlocked_collection(&col, || async {
                 let items = col.search_items(attrs(&key)).await.map_err(ss_err)?;
                 let item = items
                     .first()
                     .ok_or_else(|| Error::Backend(format!("key not found: {key}")))?;
                 Ok(Zeroizing::new(item.get_secret().await.map_err(ss_err)?))
-            }
-            .await;
-            col.lock().await.map_err(ss_err)?;
-            result
+            })
+            .await
         })
     }
 
@@ -232,11 +243,13 @@ impl SecretStore for SecretServiceStore {
         run(async move {
             let ss = connect().await?;
             if let Some(col) = get_collection(&ss).await {
-                ensure_unlocked(&col).await?;
-                for item in col.search_items(attrs(&key)).await.map_err(ss_err)? {
-                    item.delete().await.map_err(ss_err)?;
-                }
-                col.lock().await.map_err(ss_err)?;
+                with_unlocked_collection(&col, || async {
+                    for item in col.search_items(attrs(&key)).await.map_err(ss_err)? {
+                        item.delete().await.map_err(ss_err)?;
+                    }
+                    Ok(())
+                })
+                .await?;
             }
             if let Ok(default) = ss.get_default_collection().await {
                 for item in default.search_items(attrs(&key)).await.map_err(ss_err)? {
@@ -282,8 +295,72 @@ async fn get_or_create_collection<'a>(
         .map_err(ss_err)
 }
 
-async fn ensure_unlocked(col: &secret_service::Collection<'_>) -> Result<()> {
-    if col.is_locked().await.unwrap_or(true) {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CollectionLockState {
+    Locked,
+    Unlocked,
+}
+
+impl CollectionLockState {
+    fn should_relock(self) -> bool {
+        matches!(self, Self::Locked)
+    }
+}
+
+trait CollectionLock {
+    type Error: std::fmt::Display;
+
+    async fn is_locked(&self) -> std::result::Result<bool, Self::Error>;
+    async fn unlock(&self) -> std::result::Result<(), Self::Error>;
+    async fn lock(&self) -> std::result::Result<(), Self::Error>;
+}
+
+impl CollectionLock for secret_service::Collection<'_> {
+    type Error = secret_service::Error;
+
+    async fn is_locked(&self) -> std::result::Result<bool, Self::Error> {
+        secret_service::Collection::is_locked(self).await
+    }
+
+    async fn unlock(&self) -> std::result::Result<(), Self::Error> {
+        secret_service::Collection::unlock(self).await
+    }
+
+    async fn lock(&self) -> std::result::Result<(), Self::Error> {
+        secret_service::Collection::lock(self).await
+    }
+}
+
+/// Run one operation with an unlocked collection, preserving the lock state
+/// that the caller established before Pay touched it.
+///
+/// A headless service commonly keeps its keyring unlocked for its lifetime.
+/// Locking that collection here would make the next operation require a Secret
+/// Service prompt that cannot be displayed. Only relock when this call found
+/// the collection locked and successfully unlocked it itself.
+async fn with_unlocked_collection<C, F, Fut, T>(col: &C, operation: F) -> Result<T>
+where
+    C: CollectionLock + ?Sized,
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<T>>,
+{
+    let original_state = ensure_unlocked(col).await?;
+    let result = operation().await;
+    restore_lock_state(col, original_state).await;
+    result
+}
+
+async fn ensure_unlocked<C>(col: &C) -> Result<CollectionLockState>
+where
+    C: CollectionLock + ?Sized,
+{
+    let original_state = if col.is_locked().await.unwrap_or(true) {
+        CollectionLockState::Locked
+    } else {
+        CollectionLockState::Unlocked
+    };
+
+    if original_state == CollectionLockState::Locked {
         col.unlock().await.map_err(|e| {
             let msg = e.to_string().to_lowercase();
             if msg.contains("dismissed") || msg.contains("cancel") || msg.contains("denied") {
@@ -293,7 +370,18 @@ async fn ensure_unlocked(col: &secret_service::Collection<'_>) -> Result<()> {
             }
         })?;
     }
-    Ok(())
+    Ok(original_state)
+}
+
+async fn restore_lock_state<C>(col: &C, original_state: CollectionLockState)
+where
+    C: CollectionLock + ?Sized,
+{
+    if original_state.should_relock() {
+        // The operation may already have committed. A relock failure must not
+        // turn that success into a reported failure and leave partial state.
+        let _ = col.lock().await;
+    }
 }
 
 async fn store_item(col: &secret_service::Collection<'_>, key: &str, secret: &[u8]) -> Result<()> {
@@ -331,6 +419,160 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::{Cell, RefCell};
+
+    #[test]
+    fn local_auth_prompt_requires_a_graphical_session() {
+        use std::ffi::OsStr;
+
+        assert!(!local_auth_prompt_environment(None, None));
+        assert!(!local_auth_prompt_environment(
+            Some(OsStr::new("")),
+            Some(OsStr::new(""))
+        ));
+        assert!(local_auth_prompt_environment(Some(OsStr::new(":0")), None));
+        assert!(local_auth_prompt_environment(
+            None,
+            Some(OsStr::new("wayland-0"))
+        ));
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum LockEvent {
+        IsLocked,
+        Unlock,
+        Operation,
+        Lock,
+    }
+
+    struct FakeCollection {
+        locked: Cell<bool>,
+        fail_relock: bool,
+        events: RefCell<Vec<LockEvent>>,
+    }
+
+    impl FakeCollection {
+        fn new(locked: bool) -> Self {
+            Self {
+                locked: Cell::new(locked),
+                fail_relock: false,
+                events: RefCell::new(Vec::new()),
+            }
+        }
+
+        fn with_failed_relock() -> Self {
+            Self {
+                fail_relock: true,
+                ..Self::new(true)
+            }
+        }
+
+        fn operation(&self) {
+            self.events.borrow_mut().push(LockEvent::Operation);
+        }
+    }
+
+    impl CollectionLock for FakeCollection {
+        type Error = &'static str;
+
+        async fn is_locked(&self) -> std::result::Result<bool, Self::Error> {
+            self.events.borrow_mut().push(LockEvent::IsLocked);
+            Ok(self.locked.get())
+        }
+
+        async fn unlock(&self) -> std::result::Result<(), Self::Error> {
+            self.events.borrow_mut().push(LockEvent::Unlock);
+            self.locked.set(false);
+            Ok(())
+        }
+
+        async fn lock(&self) -> std::result::Result<(), Self::Error> {
+            self.events.borrow_mut().push(LockEvent::Lock);
+            if self.fail_relock {
+                return Err("relock failed");
+            }
+            self.locked.set(true);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn preunlocked_collection_stays_unlocked_across_import_writes() {
+        let col = FakeCollection::new(false);
+
+        run(async {
+            for _ in 0..2 {
+                with_unlocked_collection(&col, || async {
+                    col.operation();
+                    Ok(())
+                })
+                .await
+                .unwrap();
+            }
+        });
+
+        assert!(!col.locked.get());
+        assert_eq!(
+            *col.events.borrow(),
+            [
+                LockEvent::IsLocked,
+                LockEvent::Operation,
+                LockEvent::IsLocked,
+                LockEvent::Operation,
+            ]
+        );
+    }
+
+    #[test]
+    fn locked_collection_is_restored_after_operation() {
+        let col = FakeCollection::new(true);
+
+        run(with_unlocked_collection(&col, || async {
+            col.operation();
+            Ok(())
+        }))
+        .unwrap();
+
+        assert!(col.locked.get());
+        assert_eq!(
+            *col.events.borrow(),
+            [
+                LockEvent::IsLocked,
+                LockEvent::Unlock,
+                LockEvent::Operation,
+                LockEvent::Lock,
+            ]
+        );
+    }
+
+    #[test]
+    fn operation_failure_still_restores_locked_collection() {
+        let col = FakeCollection::new(true);
+
+        let result: Result<()> = run(with_unlocked_collection(&col, || async {
+            col.operation();
+            Err(Error::Backend("operation failed".to_string()))
+        }));
+
+        assert!(matches!(result, Err(Error::Backend(message)) if message == "operation failed"));
+        assert!(col.locked.get());
+        assert_eq!(col.events.borrow().last(), Some(&LockEvent::Lock));
+    }
+
+    #[test]
+    fn relock_failure_does_not_mask_completed_operation() {
+        let col = FakeCollection::with_failed_relock();
+
+        let value = run(with_unlocked_collection(&col, || async {
+            col.operation();
+            Ok(42)
+        }))
+        .unwrap();
+
+        assert_eq!(value, 42);
+        assert!(!col.locked.get());
+        assert_eq!(col.events.borrow().last(), Some(&LockEvent::Lock));
+    }
 
     #[test]
     fn payment_intents_use_payment_action() {

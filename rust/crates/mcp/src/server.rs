@@ -41,7 +41,13 @@ them with upstream API hosts.
 
 `body` may be a string or a JSON value. JSON values are serialized before the
 request and `Content-Type: application/json` is added when no content type is
-provided.
+provided. For a local binary or large body, pass `body_file`. Its path must be
+inside an MCP client-declared filesystem root; Pay asks the user to approve the
+file, size, method, and destination before reading it. Pay snapshots the file
+once, does not follow redirects, and reuses those exact bytes for a 402 retry.
+
+For multipart local uploads, use one filesystem-authorized command:
+`pay fetch <URL> --method <METHOD> --form NAME=VALUE --form-file NAME=PATH`.
 
 For URLs that match a cached Pay catalog endpoint with an inlined OpenAPI
 document, Pay validates the method and JSON request body locally before sending.

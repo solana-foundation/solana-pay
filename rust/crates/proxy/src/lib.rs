@@ -13,13 +13,14 @@ pub mod observer;
 
 pub use http402::Http402Gate;
 
-#[cfg(unix)]
-use async_trait::async_trait;
 use pay_core::PaymentState;
 use pingora::proxy::http_proxy_service;
 use pingora::server::Server;
 #[cfg(unix)]
-use pingora::server::{RunArgs, ShutdownSignal, ShutdownSignalWatch};
+use {
+    async_trait::async_trait,
+    pingora::server::{RunArgs, ShutdownSignal, ShutdownSignalWatch},
+};
 
 /// Build and run the Pingora gateway on `bind`, fronting `state`'s
 /// [`PaymentGate`] and forwarding control-plane traffic to `control_plane`
@@ -91,9 +92,18 @@ pub fn run_with_shutdown<S: PaymentState>(
     svc.add_tcp(bind);
     server.add_service(svc);
     tracing::info!(bind, threads = cores, "pingora gateway up (Http402Gate)");
+    // Pingora's caller-driven shutdown (`RunArgs::shutdown_signal`) is unix-only;
+    // on Windows the server can't be signalled programmatically, so we just run it
+    // with defaults and drop the watcher.
+    #[cfg(unix)]
     server.run(RunArgs {
         shutdown_signal: Box::new(WatchShutdown(shutdown)),
     });
+    #[cfg(windows)]
+    {
+        let _ = shutdown;
+        server.run(RunArgs::default());
+    }
     Ok(())
 }
 

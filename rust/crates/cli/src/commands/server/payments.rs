@@ -640,13 +640,12 @@ pub(crate) fn build_sandbox_upto_backend(
     fee_payer_signer: Arc<dyn SolanaSigner>,
     blockhash_cache: &pay_kit::mpp::blockhash::BlockhashCache,
 ) -> pay_core::Result<pay_kit::x402::server::X402Upto> {
-    let operator = fee_payer_signer.pubkey().to_string();
-    let payout = if recipient == operator {
-        pay_kit::x402::server::UptoPayout::OperatorKeepsAll
+    let receiver_authorizer = fee_payer_signer.pubkey().to_string();
+    let payout = if recipient == receiver_authorizer {
+        pay_kit::x402::server::UptoPayout::ReceiverKeepsAll
     } else {
         pay_kit::x402::server::UptoPayout::Beneficiary {
             address: recipient.to_string(),
-            operator_fee_bps: 0,
         }
     };
     let currencies: Vec<pay_kit::x402::server::CurrencyConfig> = currency_configs
@@ -668,7 +667,9 @@ pub(crate) fn build_sandbox_upto_backend(
         description: None,
         max_timeout_seconds: 300,
         program_id: None,
-        operator_signer: fee_payer_signer,
+        withdraw_delay: 0,
+        fee_payer_signer,
+        receiver_authorizer_signer: None,
     };
     pay_kit::x402::server::X402Upto::new(cfg)
         .map(|u| u.with_blockhash_cache(blockhash_cache.clone()))

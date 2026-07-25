@@ -21,7 +21,7 @@ use pay_kit::x402::{
         siwx_extension_from_payment_required,
     },
 };
-use tracing::{info, warn};
+use tracing::{debug, warn};
 
 use crate::accounts::{AccountsStore, ResolvedEphemeral};
 use crate::{Error, Result};
@@ -45,7 +45,7 @@ pub struct SiwxAuthChallenge {
 }
 
 /// An x402 `upto` (usage-metered) challenge: authorize a ceiling now, the
-/// operator settles the actual amount after serving.
+/// receiver authorizer settles the actual amount after serving.
 #[derive(Debug, Clone)]
 pub struct UptoChallenge {
     pub requirements: pay_kit::x402::upto::UptoRequirements,
@@ -197,7 +197,7 @@ pub fn build_payment_with_override(
     });
     let rpc = RpcClient::new(rpc_url.clone());
 
-    info!(
+    debug!(
         amount = %requirements.amount,
         currency = %requirements.currency,
         cluster = %network,
@@ -272,18 +272,38 @@ pub fn parse_upto_accepts(
 }
 
 /// Build a signed x402 `upto` payment: a payment-channel `open` authorization
-/// whose deposit is the authorized ceiling, with the operator as the voucher
-/// signer. The client signs only the open; the operator broadcasts it and
-/// settles the actual metered amount. Mirrors [`build_payment`] — same signer
-/// resolution, surfpool detection, network check and auto-fund — but uses the
-/// server-provided `extra.recentBlockhash` + `extra.recentSlot`, so no RPC
-/// round-trip is needed.
+/// whose deposit is the authorized ceiling. The client signs only the open;
+/// the fee payer co-signs and broadcasts it, and the receiver authorizer signs
+/// settlement for the actual metered amount. Mirrors [`build_payment`] — same
+/// signer resolution, surfpool detection, network check and auto-fund — but
+/// uses the server-provided `extra.recentBlockhash` + `extra.recentSlot`, so no
+/// RPC round-trip is needed.
 pub fn build_upto_payment(
     challenge: &UptoChallenge,
     store: &dyn AccountsStore,
     network_override: Option<&str>,
     account_override: Option<&str>,
     resource_url: Option<&str>,
+) -> Result<BuiltPayment> {
+    build_upto_payment_with_override(
+        challenge,
+        store,
+        network_override,
+        account_override,
+        resource_url,
+        None,
+    )
+}
+
+/// Variant of [`build_upto_payment`] that accepts an optional auth-gate
+/// override threaded down to the signer.
+pub fn build_upto_payment_with_override(
+    challenge: &UptoChallenge,
+    store: &dyn AccountsStore,
+    network_override: Option<&str>,
+    account_override: Option<&str>,
+    resource_url: Option<&str>,
+    auth_override: crate::signer::AuthOverride,
 ) -> Result<BuiltPayment> {
     let requirements = &challenge.requirements;
     let amount = format_amount(&requirements.amount, &requirements.asset);
@@ -329,7 +349,7 @@ pub fn build_upto_payment(
             account_override,
             &amount,
             &intent,
-            None,
+            auth_override,
         )?;
 
     let rpc_url = std::env::var("PAY_RPC_URL").unwrap_or_else(|_| {
@@ -339,15 +359,6 @@ pub fn build_upto_payment(
             default_rpc_url(&network).to_string()
         }
     });
-
-    info!(
-        amount = %requirements.amount,
-        currency = %requirements.asset,
-        cluster = %network,
-        recipient = %requirements.pay_to,
-        signer = %signer.pubkey(),
-        "Building x402 upto payment"
-    );
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()

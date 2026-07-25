@@ -177,6 +177,7 @@ fn apply_json(
         let model = json
             .get("model")
             .or_else(|| json.pointer("/message/model"))
+            .or_else(|| json.pointer("/response/model"))
             .and_then(|v| v.as_str());
         if let Some(model) = model {
             usage.model = Some(model.to_string());
@@ -187,10 +188,14 @@ fn apply_json(
     // Anthropic (`input_tokens`/`output_tokens` — top-level on plain bodies
     // and `message_delta` events, nested under `message` on `message_start`;
     // output counts are cumulative, so later values overwrite).
-    for u in [json.get("usage"), json.pointer("/message/usage")]
-        .into_iter()
-        .flatten()
-        .filter(|u| !u.is_null())
+    for u in [
+        json.get("usage"),
+        json.pointer("/message/usage"),
+        json.pointer("/response/usage"),
+    ]
+    .into_iter()
+    .flatten()
+    .filter(|u| !u.is_null())
     {
         if let Some(prompt) = u
             .get("prompt_tokens")
@@ -230,6 +235,8 @@ fn apply_json(
             .and_then(|c| c.as_str())
             .is_some_and(|c| !c.is_empty())
         || json.get("response").is_some_and(|r| r.is_string())
+        || (json.get("type").and_then(|t| t.as_str()) == Some("response.output_text.delta")
+            && json.get("delta").is_some_and(|delta| delta.is_string()))
         || json.get("type").and_then(|t| t.as_str()) == Some("content_block_delta");
     if has_content {
         *events += 1;
@@ -289,6 +296,22 @@ mod tests {
             Some(3),
             "one content delta ≈ one token"
         );
+    }
+
+    #[test]
+    fn responses_sse_reads_nested_completed_usage() {
+        let mut obs = StreamObserver::new(true);
+        let stream = concat!(
+            "event: response.output_text.delta\n",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"Hello\"}\n\n",
+            "event: response.completed\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"model\":\"gpt-test\",\"usage\":{\"input_tokens\":21,\"output_tokens\":13}}}\n\n",
+        );
+        feed_all(&mut obs, stream);
+
+        assert_eq!(obs.usage.model.as_deref(), Some("gpt-test"));
+        assert_eq!(obs.usage.tokens_prompt, Some(21));
+        assert_eq!(obs.usage.tokens_completion, Some(13));
     }
 
     #[test]

@@ -20,10 +20,11 @@ use pay_kit::mpp::blockhash::{BlockhashCache, CachedBlockhash};
 use pay_kit::mpp::server::session::{SealParams, SessionConfig, SessionServer};
 use pay_kit::mpp::settlement::worker::{RpcBroadcaster, SettlementConfig, SettlementHandle, spawn};
 use pay_kit::mpp::solana_keychain::SolanaSigner;
-use pay_kit::mpp::store::{ChannelState, MemoryChannelStore};
+use pay_kit::mpp::store::{ChannelState, ChannelStore, MemoryChannelStore};
 use pay_kit::mpp::{
     Base64UrlJson, CommitReceipt, OpenPayload, PaymentChallenge, SessionAction, SessionMode,
-    SessionPullVoucherStrategy, parse_authorization,
+    SessionPullVoucherStrategy, SessionSettlementAuthority, SignedVoucher, VoucherData,
+    VoucherPayload, parse_authorization,
 };
 use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
@@ -36,12 +37,13 @@ use crate::{Error, Result};
 const INTENT: &str = "session";
 const METHOD: &str = "solana";
 const DEFAULT_REALM: &str = "MPP Session";
-fn session_close_already_requested(error: &pay_kit::mpp::Error) -> bool {
-    error.to_string().contains("Close already requested")
-}
-
 fn session_close_already_finalized(error: &pay_kit::mpp::Error) -> bool {
     error.to_string().contains("already finalized")
+}
+
+fn session_close_needs_reconciliation(error: &pay_kit::mpp::Error) -> bool {
+    let message = error.to_string();
+    message.contains("Close already requested") || message.contains("Channel is already sealed")
 }
 
 // ── Session outcome ────────────────────────────────────────────────────────
@@ -49,8 +51,12 @@ fn session_close_already_finalized(error: &pay_kit::mpp::Error) -> bool {
 /// The result of processing a session action.
 #[derive(Debug)]
 pub enum SessionOutcome {
-    /// `open` or `topup` — channel state after the action.
-    Active(ChannelState),
+    /// `open` or `topup` — channel state after the action and the on-chain
+    /// transaction signature that authorized it.
+    Active {
+        state: ChannelState,
+        signature: Option<String>,
+    },
     /// `voucher` accepted — channel id + new settled cumulative (base units).
     Voucher { channel_id: String, cumulative: u64 },
     /// `commit` accepted — receipt for the metered delivery.
@@ -65,11 +71,14 @@ pub enum SessionOutcome {
 
 #[derive(Clone)]
 struct SessionOperatorRuntime {
-    server: Arc<SessionServer<MemoryChannelStore>>,
+    server: Arc<SessionServer<Arc<dyn ChannelStore>>>,
+    channel_store: Arc<dyn ChannelStore>,
     rpc_url: Option<String>,
     payment_channel_signer: Arc<Mutex<Option<Arc<dyn SolanaSigner>>>>,
     payment_channel_payer_signer: Arc<Mutex<Option<Arc<dyn SolanaSigner>>>>,
     committed_watermarks: Arc<Mutex<HashMap<String, u64>>>,
+    reserved_capacity: Arc<Mutex<HashMap<String, u64>>>,
+    delegated_voucher_lock: Arc<tokio::sync::Mutex<()>>,
     /// Channel id → on-chain settlement signature, recorded when the channel
     /// finalizes. Surfaced via the `/sessions/receipt/:channelId` poll so the
     /// playground can show the settle receipt URL (sessions settle out-of-band
@@ -81,6 +90,21 @@ struct SessionOperatorRuntime {
 }
 
 impl SessionOperatorRuntime {
+    fn reserve_capacity(&self, channel_id: &str, amount: u64) -> bool {
+        let Ok(mut reservations) = self.reserved_capacity.lock() else {
+            return false;
+        };
+        if reservations.contains_key(channel_id) {
+            return false;
+        }
+        reservations.insert(channel_id.to_string(), amount);
+        true
+    }
+    fn release_capacity(&self, channel_id: &str) {
+        if let Ok(mut reservations) = self.reserved_capacity.lock() {
+            reservations.remove(channel_id);
+        }
+    }
     fn record_committed_watermark(&self, session_id: impl Into<String>, cumulative: u64) {
         if let Ok(mut watermarks) = self.committed_watermarks.lock() {
             let session_id = session_id.into();
@@ -117,6 +141,85 @@ impl SessionOperatorRuntime {
             .or_else(|| self.payment_channel_signer())
     }
 
+    /// Push the latest accepted cumulative voucher on-chain without sealing
+    /// the channel. The on-chain watermark is read first, so retries are
+    /// idempotent and a successfully landed watermark is not re-broadcast on
+    /// every lifecycle tick.
+    async fn operator_push_watermark(&self, channel_id: &str) -> Result<()> {
+        let Some(signer) = self.payment_channel_signer() else {
+            // Verification-only servers have no authority to settle. Idle
+            // close retains its existing no-op behavior for these instances.
+            return Ok(());
+        };
+        let Some(rpc_url) = self.rpc_url.clone() else {
+            return Ok(());
+        };
+        let params = self
+            .server
+            .seal_params(channel_id)
+            .await
+            .map_err(|e| Error::Mpp(format!("Failed to get watermark params: {e}")))?;
+        if params.settled == 0 {
+            return Ok(());
+        }
+
+        let channel = self.fetch_payment_channel(channel_id).await?;
+        let Some(channel) = channel else {
+            // A missing/deallocated channel has nothing left to settle.
+            return Ok(());
+        };
+        // Only OPEN channels accept an intermediate settle. CLOSING/SEALED/
+        // DISTRIBUTED channels are already advancing through the close path.
+        if channel.status != 0 || channel.settlement.settled >= params.settled {
+            return Ok(());
+        }
+
+        let authorized_signer = params.authorized_signer.ok_or_else(|| {
+            Error::Mpp("payment-channel watermark missing authorized signer".to_string())
+        })?;
+        let voucher_signature = params.voucher_signature.as_deref().ok_or_else(|| {
+            Error::Mpp("payment-channel watermark missing voucher signature".to_string())
+        })?;
+        let signature = decode_voucher_signature(voucher_signature)?;
+        let expires_at = params.voucher_expires_at.ok_or_else(|| {
+            Error::Mpp("payment-channel watermark missing voucher expiry".to_string())
+        })?;
+        let instructions = pay_kit::mpp::program::payment_channels::build_settle_instructions(
+            &params.channel_id,
+            &authorized_signer,
+            &signature,
+            params.settled,
+            expires_at,
+            &params.program_id,
+        )
+        .map_err(|e| Error::Mpp(format!("failed to build watermark instruction: {e}")))?;
+
+        let operator = signer.pubkey();
+        let handle = self
+            .settlement_worker
+            .get_or_init(|| {
+                let signer = Arc::clone(&signer);
+                async move {
+                    spawn(
+                        SettlementConfig::new(operator, signer),
+                        Arc::new(RpcBroadcaster::new(rpc_url)),
+                    )
+                }
+            })
+            .await;
+        let signature = handle
+            .settle(params.channel_id.to_string(), instructions)
+            .await
+            .map_err(|e| Error::Mpp(format!("payment-channel watermark settlement: {e}")))?;
+        tracing::info!(
+            channel_id,
+            cumulative = params.settled,
+            %signature,
+            "payment-channel watermark broadcast"
+        );
+        Ok(())
+    }
+
     async fn operator_close_channel(&self, channel_id: &str) -> Result<SessionCloseResult> {
         use pay_kit::mpp::ClosePayload;
 
@@ -137,7 +240,7 @@ impl SessionOperatorRuntime {
             Err(error) if session_close_already_finalized(&error) => {
                 return Ok(SessionCloseResult::AlreadyFinalized);
             }
-            Err(error) if session_close_already_requested(&error) => self
+            Err(error) if session_close_needs_reconciliation(&error) => self
                 .server
                 .seal_params(channel_id)
                 .await
@@ -169,6 +272,7 @@ impl SessionOperatorRuntime {
             // surface the on-chain receipt URL (sessions settle out-of-band).
             self.record_settlement_signature(params.channel_id.to_string(), signature.clone());
             tracing::info!(
+                monotonic_counter.pay_payment_channels_closed_total = 1_u64,
                 %signature,
                 channel = %params.channel_id,
                 "payment-channel settlement confirmed"
@@ -194,6 +298,32 @@ impl SessionOperatorRuntime {
             .await
             .map(|account| account.data.as_slice() == [2])
             .unwrap_or(false)
+    }
+
+    async fn fetch_payment_channel(
+        &self,
+        channel_id: &str,
+    ) -> Result<
+        Option<pay_kit::mpp::program::payment_channels::generated::generated::accounts::Channel>,
+    > {
+        let Some(rpc_url) = self.rpc_url.clone() else {
+            return Ok(None);
+        };
+        let channel = solana_pubkey::Pubkey::from_str(channel_id)
+            .map_err(|e| Error::Mpp(format!("invalid payment channel: {e}")))?;
+        use pay_kit::mpp::program::payment_channels::generated::generated::accounts::Channel;
+        use pay_kit::mpp::solana_rpc_client::nonblocking::rpc_client::RpcClient;
+        use solana_commitment_config::CommitmentConfig;
+        RpcClient::new(rpc_url)
+            .get_account_with_commitment(&channel, CommitmentConfig::confirmed())
+            .await
+            .map_err(|error| Error::Mpp(format!("failed to fetch payment channel: {error}")))?
+            .value
+            .map(|account| {
+                Channel::from_bytes(&account.data)
+                    .map_err(|e| Error::Mpp(format!("failed to decode payment channel: {e}")))
+            })
+            .transpose()
     }
 
     async fn submit_payment_channel_settlement(
@@ -228,10 +358,22 @@ impl SessionOperatorRuntime {
         })?;
         let token_program = spl_token_program();
 
-        let signature = match params.voucher_signature.as_deref() {
-            Some(signature) => Some(decode_voucher_signature(signature)?),
-            None if params.settled == 0 => None,
-            None => {
+        // A periodic watermark push may have landed immediately before this
+        // close. Reusing that same cumulative voucher in `settle_and_seal`
+        // fails with VoucherWatermarkNotMonotonic (0xEA). When chain already
+        // has the latest accepted watermark, seal it without another voucher.
+        let channel_id = params.channel_id.to_string();
+        let onchain_settled = self
+            .fetch_payment_channel(&channel_id)
+            .await?
+            .map(|channel| channel.settlement.settled)
+            .unwrap_or_default();
+        let voucher_required = close_voucher_required(onchain_settled, params.settled);
+        let signature = match (voucher_required, params.voucher_signature.as_deref()) {
+            (false, _) => None,
+            (true, Some(signature)) => Some(decode_voucher_signature(signature)?),
+            (true, None) if params.settled == 0 => None,
+            (true, None) => {
                 return Err(Error::Mpp(
                     "payment-channel settlement missing highest voucher signature".to_string(),
                 ));
@@ -284,6 +426,7 @@ impl SessionOperatorRuntime {
             .settlement_worker
             .get_or_init(|| {
                 let signer = Arc::clone(&signer);
+                let rpc_url = rpc_url.clone();
                 async move {
                     spawn(
                         SettlementConfig::new(operator, signer),
@@ -292,13 +435,31 @@ impl SessionOperatorRuntime {
                 }
             })
             .await;
-        match handle
-            .settle(params.channel_id.to_string(), instructions)
+        let signature = handle
+            .settle(channel_id, instructions)
             .await
-        {
-            Ok(signature) => Ok(Some(signature)),
-            Err(e) => Err(Error::Mpp(format!("payment-channel settlement: {e}"))),
-        }
+            .map_err(|e| Error::Mpp(format!("payment-channel settlement: {e}")))?;
+        wait_for_transaction_confirmed(&rpc_url, &signature, "payment-channel settlement").await?;
+        Ok(Some(signature))
+    }
+}
+
+fn close_voucher_required(onchain_settled: u64, latest_accepted: u64) -> bool {
+    onchain_settled < latest_accepted
+}
+
+/// Exclusive claim on a delegated session's remaining capacity.
+///
+/// The claim is released on drop so adapter errors, cancelled requests, and
+/// settlement failures cannot strand a channel in the reserved state.
+pub struct DelegatedCapacityLease {
+    runtime: SessionOperatorRuntime,
+    channel_id: String,
+}
+
+impl Drop for DelegatedCapacityLease {
+    fn drop(&mut self) {
+        self.runtime.release_capacity(&self.channel_id);
     }
 }
 
@@ -317,16 +478,25 @@ impl SessionLifecycleHandle {
 
 #[derive(Debug)]
 enum SessionLifecycleCommand {
-    ConfigureCloseDelay { close_delay: Option<Duration> },
-    Touch { channel_id: String },
-    Remove { channel_id: String },
+    Configure {
+        close_delay: Option<Duration>,
+        settlement_interval: Option<Duration>,
+    },
+    Touch {
+        channel_id: String,
+    },
+    Remove {
+        channel_id: String,
+    },
 }
 
 struct SessionLifecycleRunloop {
     runtime: SessionOperatorRuntime,
     close_delay: Option<Duration>,
+    settlement_interval: Option<Duration>,
+    next_settlement: Option<Instant>,
     rx: mpsc::UnboundedReceiver<SessionLifecycleCommand>,
-    deadlines: HashMap<String, Instant>,
+    last_activity: HashMap<String, Instant>,
 }
 
 impl SessionLifecycleRunloop {
@@ -337,8 +507,10 @@ impl SessionLifecycleRunloop {
         Self {
             runtime,
             close_delay: None,
+            settlement_interval: None,
+            next_settlement: None,
             rx,
-            deadlines: HashMap::new(),
+            last_activity: HashMap::new(),
         }
     }
 
@@ -353,6 +525,7 @@ impl SessionLifecycleRunloop {
                     }
                     _ = tokio::time::sleep_until(deadline) => {
                         self.close_due_channels().await;
+                        self.push_due_watermarks().await;
                     }
                 }
             } else {
@@ -366,22 +539,31 @@ impl SessionLifecycleRunloop {
 
     fn handle_command(&mut self, command: Option<SessionLifecycleCommand>) -> bool {
         match command {
-            Some(SessionLifecycleCommand::ConfigureCloseDelay { close_delay }) => {
+            Some(SessionLifecycleCommand::Configure {
+                close_delay,
+                settlement_interval,
+            }) => {
                 self.close_delay = close_delay;
-                if self.close_delay.is_none() {
-                    self.deadlines.clear();
-                }
+                self.settlement_interval = settlement_interval;
+                self.next_settlement = settlement_interval
+                    .filter(|_| !self.last_activity.is_empty())
+                    .map(|interval| Instant::now() + interval);
                 true
             }
             Some(SessionLifecycleCommand::Touch { channel_id }) => {
-                if let Some(close_delay) = self.close_delay {
-                    let deadline = Instant::now() + close_delay;
-                    self.deadlines.insert(channel_id, deadline);
+                self.last_activity.insert(channel_id, Instant::now());
+                if self.next_settlement.is_none()
+                    && let Some(interval) = self.settlement_interval
+                {
+                    self.next_settlement = Some(Instant::now() + interval);
                 }
                 true
             }
             Some(SessionLifecycleCommand::Remove { channel_id }) => {
-                self.deadlines.remove(&channel_id);
+                self.last_activity.remove(&channel_id);
+                if self.last_activity.is_empty() {
+                    self.next_settlement = None;
+                }
                 true
             }
             None => false,
@@ -389,21 +571,53 @@ impl SessionLifecycleRunloop {
     }
 
     fn next_wakeup(&self) -> Option<Instant> {
-        self.deadlines.values().copied().min()
+        let close = self.close_delay.and_then(|delay| {
+            self.last_activity
+                .values()
+                .map(|last_activity| *last_activity + delay)
+                .min()
+        });
+        match (close, self.next_settlement) {
+            (Some(close), Some(settlement)) => Some(close.min(settlement)),
+            (Some(close), None) => Some(close),
+            (None, Some(settlement)) => Some(settlement),
+            (None, None) => None,
+        }
     }
 
     async fn close_due_channels(&mut self) {
+        let Some(close_delay) = self.close_delay else {
+            return;
+        };
         let now = Instant::now();
         let due = self
-            .deadlines
+            .last_activity
             .iter()
-            .filter(|(_, deadline)| **deadline <= now)
+            .filter(|(_, last_activity)| **last_activity + close_delay <= now)
             .map(|(channel_id, _)| channel_id.clone())
             .collect::<Vec<_>>();
 
+        let mut closing = Vec::with_capacity(due.len());
         for channel_id in due {
-            self.deadlines.remove(&channel_id);
-            match self.runtime.operator_close_channel(&channel_id).await {
+            self.last_activity.remove(&channel_id);
+            // Closing and serving both claim the same channel slot. This makes
+            // the reservation check atomic with the start of close: a request
+            // already in flight defers close, while a close already in progress
+            // prevents a new request from reserving stale capacity.
+            if !self.runtime.reserve_capacity(&channel_id, 0) {
+                self.last_activity.insert(channel_id, Instant::now());
+                continue;
+            }
+            let runtime = self.runtime.clone();
+            closing.push(async move {
+                let result = runtime.operator_close_channel(&channel_id).await;
+                (channel_id, result)
+            });
+        }
+
+        for (channel_id, close_result) in futures_util::future::join_all(closing).await {
+            self.runtime.release_capacity(&channel_id);
+            match close_result {
                 Ok(SessionCloseResult::Closed { settled }) => {
                     tracing::info!(channel_id, settled, "operator auto-closed payment channel");
                 }
@@ -416,13 +630,48 @@ impl SessionLifecycleRunloop {
                         error = %error,
                         "operator auto-close failed; retrying after delay"
                     );
-                    if let Some(close_delay) = self.close_delay {
-                        self.deadlines
-                            .insert(channel_id, Instant::now() + close_delay);
-                    }
+                    self.last_activity.insert(channel_id, Instant::now());
                 }
             }
         }
+    }
+
+    async fn push_due_watermarks(&mut self) {
+        let Some(interval) = self.settlement_interval else {
+            self.next_settlement = None;
+            return;
+        };
+        let now = Instant::now();
+        if self.next_settlement.is_some_and(|deadline| deadline > now) {
+            return;
+        }
+
+        // Idle channels were removed (or rescheduled after an error) by
+        // `close_due_channels`; everything left here should remain open.
+        let channels = self.last_activity.keys().cloned().collect::<Vec<_>>();
+        let mut settlements = Vec::with_capacity(channels.len());
+        for channel_id in channels {
+            if !self.runtime.reserve_capacity(&channel_id, 0) {
+                continue;
+            }
+            let runtime = self.runtime.clone();
+            settlements.push(async move {
+                let result = runtime.operator_push_watermark(&channel_id).await;
+                (channel_id, result)
+            });
+        }
+        for (channel_id, result) in futures_util::future::join_all(settlements).await {
+            self.runtime.release_capacity(&channel_id);
+            if let Err(error) = result {
+                tracing::warn!(
+                    channel_id,
+                    error = %error,
+                    "operator watermark push failed; retrying next interval"
+                );
+            }
+        }
+
+        self.next_settlement = (!self.last_activity.is_empty()).then(|| now + interval);
     }
 }
 
@@ -442,7 +691,7 @@ enum SessionCloseResult {
 /// server validates and co-signs. Pull-mode delegation setup remains available
 /// for compatibility, but it no longer opens a synthetic channel.
 pub struct SessionMpp {
-    server: Arc<SessionServer<MemoryChannelStore>>,
+    server: Arc<SessionServer<Arc<dyn ChannelStore>>>,
     session_config: SessionConfig,
     challenge_binding_secret: String,
     realm: String,
@@ -470,21 +719,44 @@ impl SessionMpp {
         &self.session_config.network
     }
 
+    /// Currency identifier advertised by this session backend.
+    pub fn currency(&self) -> &str {
+        &self.session_config.currency
+    }
+
     /// Create from a [`SessionConfig`] and an HMAC secret key.
     pub fn new(config: SessionConfig, challenge_binding_secret: impl Into<String>) -> Self {
+        Self::new_with_channel_store(
+            config,
+            challenge_binding_secret,
+            Arc::new(MemoryChannelStore::new()),
+        )
+    }
+
+    /// Create with a caller-provided durable channel store.
+    pub fn new_with_channel_store(
+        config: SessionConfig,
+        challenge_binding_secret: impl Into<String>,
+        channel_store: Arc<dyn ChannelStore>,
+    ) -> Self {
         let session_config = config.clone();
-        let server = Arc::new(SessionServer::new(config, MemoryChannelStore::new()));
+        let server = Arc::new(SessionServer::new(config, Arc::clone(&channel_store)));
         let payment_channel_signer = Arc::new(Mutex::new(None));
         let payment_channel_payer_signer = Arc::new(Mutex::new(None));
         let committed_watermarks = Arc::new(Mutex::new(HashMap::new()));
+        let reserved_capacity = Arc::new(Mutex::new(HashMap::new()));
+        let delegated_voucher_lock = Arc::new(tokio::sync::Mutex::new(()));
         let settlement_signatures = Arc::new(Mutex::new(HashMap::new()));
         let pull_sessions = Arc::new(Mutex::new(HashSet::new()));
         let operator_runtime = SessionOperatorRuntime {
             server: Arc::clone(&server),
+            channel_store,
             rpc_url: session_config.rpc_url.clone(),
             payment_channel_signer: Arc::clone(&payment_channel_signer),
             payment_channel_payer_signer: Arc::clone(&payment_channel_payer_signer),
             committed_watermarks: Arc::clone(&committed_watermarks),
+            reserved_capacity: Arc::clone(&reserved_capacity),
+            delegated_voucher_lock,
             settlement_signatures: Arc::clone(&settlement_signatures),
             settlement_worker: Arc::new(tokio::sync::OnceCell::new()),
         };
@@ -558,19 +830,26 @@ impl SessionMpp {
     /// The runloop is intentionally centralized: request handlers only record
     /// activity, while this task owns the close/settle/distribute sequence.
     pub fn start_lifecycle_runloop(&self, close_delay: Duration) {
-        if close_delay.is_zero() {
-            self.lifecycle
-                .send(SessionLifecycleCommand::ConfigureCloseDelay { close_delay: None });
-            tracing::info!("session auto-close disabled");
-            return;
-        }
+        self.start_lifecycle_runloop_with_settlement(close_delay, Duration::ZERO);
+    }
 
-        self.lifecycle
-            .send(SessionLifecycleCommand::ConfigureCloseDelay {
-                close_delay: Some(close_delay),
-            });
+    /// Configure the lifecycle runloop to reconcile active channels' latest
+    /// cumulative voucher on-chain and to settle+seal channels after an idle
+    /// period. Either duration may be zero to disable that behavior.
+    pub fn start_lifecycle_runloop_with_settlement(
+        &self,
+        close_delay: Duration,
+        settlement_interval: Duration,
+    ) {
+        let close_delay = (!close_delay.is_zero()).then_some(close_delay);
+        let settlement_interval = (!settlement_interval.is_zero()).then_some(settlement_interval);
+        self.lifecycle.send(SessionLifecycleCommand::Configure {
+            close_delay,
+            settlement_interval,
+        });
         tracing::info!(
-            close_delay_ms = close_delay.as_millis(),
+            close_delay_ms = close_delay.map(|delay| delay.as_millis()),
+            settlement_interval_ms = settlement_interval.map(|interval| interval.as_millis()),
             "started session lifecycle runloop"
         );
     }
@@ -583,6 +862,98 @@ impl SessionMpp {
     /// Minimum accepted voucher increment in base units.
     pub fn min_voucher_delta(&self) -> u64 {
         self.session_config.min_voucher_delta
+    }
+
+    /// Who is authorized to sign cumulative settlement vouchers.
+    pub fn settlement_authority(&self) -> SessionSettlementAuthority {
+        self.session_config.settlement_authority
+    }
+
+    /// Meter a successful response and persist an operator-signed cumulative
+    /// voucher before releasing that response to the client.
+    pub async fn authorize_delegated_usage(&self, channel_id: &str, amount: u64) -> Result<u64> {
+        if self.settlement_authority() != SessionSettlementAuthority::Delegated {
+            return Err(Error::Mpp(
+                "session does not delegate voucher authority to the operator".to_string(),
+            ));
+        }
+        // Serialize read/sign/verify so concurrent responses cannot construct
+        // two vouchers from the same cumulative watermark.
+        let _guard = self.operator_runtime.delegated_voucher_lock.lock().await;
+        // The durable store is authoritative. Reading it on every delegated
+        // authorization also lets a restarted or different gateway replica
+        // continue from a watermark advanced by another process.
+        let current = self
+            .operator_runtime
+            .channel_store
+            .get_channel(channel_id)
+            .await
+            .map_err(|error| {
+                Error::Mpp(format!(
+                    "failed to restore delegated session channel {channel_id}: {error}"
+                ))
+            })?
+            .ok_or_else(|| Error::Mpp(format!("unknown delegated session channel: {channel_id}")))?
+            .cumulative;
+        self.record_committed_watermark(channel_id.to_string(), current);
+        if amount == 0 {
+            return Ok(current);
+        }
+        let cumulative = current
+            .checked_add(amount)
+            .ok_or_else(|| Error::Mpp("session cumulative amount overflow".to_string()))?;
+        let signer = self
+            .operator_runtime
+            .payment_channel_signer()
+            .ok_or_else(|| Error::Mpp("delegated session signer is not configured".to_string()))?;
+        let operator = solana_pubkey::Pubkey::from_str(&self.session_config.operator)
+            .map_err(|e| Error::Mpp(format!("invalid session operator: {e}")))?;
+        if signer.pubkey() != operator {
+            return Err(Error::Mpp(format!(
+                "delegated session signer {} does not match operator {operator}",
+                signer.pubkey()
+            )));
+        }
+
+        let data = VoucherData {
+            channel_id: channel_id.to_string(),
+            cumulative: cumulative.to_string(),
+            expires_at: pay_kit::mpp::DEFAULT_SESSION_EXPIRES_AT,
+            nonce: None,
+        };
+        let message = data
+            .message_bytes()
+            .map_err(|e| Error::Mpp(format!("failed to encode delegated voucher: {e}")))?;
+        let signature = signer
+            .sign_message(&message)
+            .await
+            .map_err(|e| Error::Mpp(format!("failed to sign delegated voucher: {e}")))?;
+        let accepted = self
+            .server
+            .verify_voucher(&VoucherPayload {
+                voucher: SignedVoucher {
+                    data,
+                    signature: bs58::encode(signature.as_ref()).into_string(),
+                },
+            })
+            .await
+            .map_err(|e| Error::PaymentRejected(e.to_string()))?;
+        self.record_committed_watermark(channel_id.to_string(), accepted.cumulative);
+        self.touch_channel(channel_id.to_string());
+        Ok(accepted.cumulative)
+    }
+
+    pub fn reserve_delegated_capacity(
+        &self,
+        channel_id: &str,
+        amount: u64,
+    ) -> Option<DelegatedCapacityLease> {
+        self.operator_runtime
+            .reserve_capacity(channel_id, amount)
+            .then(|| DelegatedCapacityLease {
+                runtime: self.operator_runtime.clone(),
+                channel_id: channel_id.to_string(),
+            })
     }
 
     /// Record channel activity so the lifecycle runloop can defer auto-close.
@@ -685,7 +1056,9 @@ impl SessionMpp {
 
                 let mut submitted_open = None;
                 let open_payload;
-                let payload_for_open = if client_voucher_pull {
+                let submit_client_transaction =
+                    p.transaction.is_some() && (p.mode == SessionMode::Push || client_voucher_pull);
+                let payload_for_open = if submit_client_transaction || client_voucher_pull {
                     let signature = if p.transaction.is_some() {
                         self.submit_payment_channel_open(p).await?.ok_or_else(|| {
                             Error::Mpp(
@@ -707,13 +1080,19 @@ impl SessionMpp {
                     p
                 };
 
-                let state = self
-                    .server
-                    .process_open(payload_for_open)
-                    .await
-                    .map_err(|e| Error::Mpp(format!("Session open failed: {e}")))?;
+                // The host has independently validated, co-signed, submitted,
+                // and observed a successful status for transactions it
+                // broadcasts. Persist those opens without asking a second RPC
+                // client to rediscover the same signature. Opens received by
+                // any other integration retain PayKit's standard verification.
+                let state = if submitted_open.is_some() {
+                    self.server.process_preverified_open(payload_for_open).await
+                } else {
+                    self.server.process_open(payload_for_open).await
+                }
+                .map_err(|e| Error::Mpp(format!("Session open failed: {e}")))?;
 
-                if let Some(signature) = submitted_open {
+                if let Some(signature) = &submitted_open {
                     tracing::info!(%signature, "payment-channel open transaction confirmed");
                 }
 
@@ -722,7 +1101,10 @@ impl SessionMpp {
                 }
                 self.record_committed_watermark(state.channel_id.clone(), state.cumulative);
                 self.touch_channel(state.channel_id.clone());
-                Ok(SessionOutcome::Active(state))
+                Ok(SessionOutcome::Active {
+                    state,
+                    signature: Some(payload_for_open.signature.clone()),
+                })
             }
 
             SessionAction::Voucher(p) => {
@@ -762,15 +1144,32 @@ impl SessionMpp {
                     .map_err(|e| Error::Mpp(format!("TopUp failed: {e}")))?;
                 self.record_committed_watermark(state.channel_id.clone(), state.cumulative);
                 self.touch_channel(state.channel_id.clone());
-                Ok(SessionOutcome::Active(state))
+                Ok(SessionOutcome::Active {
+                    state,
+                    signature: Some(p.signature.clone()),
+                })
             }
 
             SessionAction::Close(p) => {
-                let params = self
-                    .server
-                    .process_close(p)
-                    .await
-                    .map_err(|e| Error::Mpp(format!("Session close failed: {e}")))?;
+                let _lease = self
+                    .reserve_delegated_capacity(&p.channel_id, 0)
+                    .ok_or_else(|| {
+                        Error::Mpp(format!(
+                            "Session channel {} is busy with another request",
+                            p.channel_id
+                        ))
+                    })?;
+                let params = match self.server.process_close(p).await {
+                    Ok(params) => params,
+                    Err(error) if session_close_needs_reconciliation(&error) => self
+                        .server
+                        .seal_params(&p.channel_id)
+                        .await
+                        .map_err(|e| Error::Mpp(format!("Failed to get seal params: {e}")))?,
+                    Err(error) => {
+                        return Err(Error::Mpp(format!("Session close failed: {error}")));
+                    }
+                };
                 self.record_committed_watermark(params.channel_id.to_string(), params.settled);
                 let settlement = self.submit_payment_channel_settlement(&params).await;
                 let signature = match settlement {
@@ -800,7 +1199,12 @@ impl SessionMpp {
                         params.channel_id.to_string(),
                         signature.clone(),
                     );
-                    tracing::info!(%signature, channel = %params.channel_id, "payment-channel settlement confirmed");
+                    tracing::info!(
+                        monotonic_counter.pay_payment_channels_closed_total = 1_u64,
+                        %signature,
+                        channel = %params.channel_id,
+                        "payment-channel settlement confirmed"
+                    );
                 }
                 self.unschedule_channel_close(params.channel_id.to_string());
                 Ok(SessionOutcome::Closed { params, signature })
@@ -1110,34 +1514,51 @@ async fn sign_and_submit_transaction(
     .await
 }
 
-/// Broadcast an already-signed transaction (legacy or v0) and confirm it.
-/// Shared by the legacy server-opened path and the client-built open path.
+/// Broadcast an already-signed transaction (legacy or v0) and wait for its
+/// first successful processed status before returning.
 async fn submit_versioned_transaction(
     rpc_url: String,
     tx: solana_transaction::versioned::VersionedTransaction,
     context: &'static str,
 ) -> Result<String> {
     tokio::task::spawn_blocking(move || {
+        use std::time::Instant;
+
         use pay_kit::mpp::solana_rpc_client::rpc_client::RpcClient;
         use solana_commitment_config::CommitmentConfig;
 
-        let rpc = RpcClient::new_with_commitment(rpc_url, CommitmentConfig::confirmed());
+        let rpc = RpcClient::new_with_commitment(rpc_url, CommitmentConfig::processed());
         let expected_signature =
             tx.signatures.first().copied().ok_or_else(|| {
                 Error::Mpp(format!("{context} transaction is missing a signature"))
             })?;
 
+        let submit_started = Instant::now();
         match rpc.send_transaction(&tx) {
             Ok(signature) => {
-                wait_for_transaction_confirmation(&rpc, &signature, context)?;
+                let rpc_send_ms = submit_started.elapsed().as_millis();
+                let wait_started = Instant::now();
+                wait_for_transaction_processed(&rpc, &signature, context)?;
+                tracing::info!(
+                    %signature,
+                    context,
+                    rpc_send_ms,
+                    processed_wait_ms = wait_started.elapsed().as_millis(),
+                    "transaction reached processed status"
+                );
                 Ok(signature.to_string())
             }
             Err(send_error) => {
-                match wait_for_transaction_confirmation(&rpc, &expected_signature, context) {
+                let rpc_send_ms = submit_started.elapsed().as_millis();
+                let wait_started = Instant::now();
+                match wait_for_transaction_processed(&rpc, &expected_signature, context) {
                     Ok(()) => {
                         tracing::warn!(
                             %expected_signature,
                             error = %send_error,
+                            context,
+                            rpc_send_ms,
+                            processed_wait_ms = wait_started.elapsed().as_millis(),
                             "{context} transaction confirmed after submit returned an error"
                         );
                         Ok(expected_signature.to_string())
@@ -1153,7 +1574,48 @@ async fn submit_versioned_transaction(
     .map_err(|e| Error::Mpp(format!("spawn_blocking join error: {e}")))?
 }
 
-fn wait_for_transaction_confirmation(
+/// Wait for a previously broadcast transaction to succeed at confirmed
+/// commitment before allowing durable state to advance.
+async fn wait_for_transaction_confirmed(
+    rpc_url: &str,
+    signature: &str,
+    context: &'static str,
+) -> Result<()> {
+    use pay_kit::mpp::solana_rpc_client::nonblocking::rpc_client::RpcClient;
+    use solana_commitment_config::CommitmentConfig;
+
+    let signature = solana_signature::Signature::from_str(signature)
+        .map_err(|e| Error::Mpp(format!("invalid {context} signature: {e}")))?;
+    let rpc = RpcClient::new(rpc_url.to_string());
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut last_status_error = None;
+    while Instant::now() < deadline {
+        match rpc
+            .get_signature_status_with_commitment(&signature, CommitmentConfig::confirmed())
+            .await
+        {
+            Ok(Some(Ok(()))) => return Ok(()),
+            Ok(Some(Err(error))) => {
+                return Err(Error::Mpp(format!("{context} transaction failed: {error}")));
+            }
+            Ok(None) => {}
+            Err(error) => last_status_error = Some(error.to_string()),
+        }
+        tokio::time::sleep(Duration::from_millis(400)).await;
+    }
+
+    let detail = last_status_error
+        .map(|error| format!("; last status error: {error}"))
+        .unwrap_or_default();
+    Err(Error::Mpp(format!(
+        "{context} transaction was not confirmed before timeout{detail}"
+    )))
+}
+
+/// Wait for the transaction's first successful status. `get_signature_status`
+/// has no confirmation filter, so this accepts `processed` and anything above
+/// it rather than waiting for `confirmed` or `finalized`.
+fn wait_for_transaction_processed(
     rpc: &pay_kit::mpp::solana_rpc_client::rpc_client::RpcClient,
     signature: &solana_signature::Signature,
     context: &'static str,
@@ -1331,9 +1793,14 @@ mod tests {
         );
         let open_header = handle.open_header(CAP, "open_sig").await.unwrap();
 
-        let SessionOutcome::Active(opened) = session.process(&open_header).await.unwrap() else {
+        let SessionOutcome::Active {
+            state: opened,
+            signature: open_signature,
+        } = session.process(&open_header).await.unwrap()
+        else {
             panic!("expected open to return active session");
         };
+        assert_eq!(open_signature.as_deref(), Some("open_sig"));
         assert_eq!(opened.deposit, CAP);
         assert_eq!(session.committed_watermark(&opened.channel_id), Some(0));
 
@@ -1347,13 +1814,27 @@ mod tests {
         assert_eq!(session.committed_watermark(&opened.channel_id), Some(75));
 
         let topup_header = handle.topup_header(CAP + 500, "topup_sig").await.unwrap();
-        let SessionOutcome::Active(topped_up) = session.process(&topup_header).await.unwrap()
+        let SessionOutcome::Active {
+            state: topped_up,
+            signature: topup_signature,
+        } = session.process(&topup_header).await.unwrap()
         else {
             panic!("expected topup outcome");
         };
+        assert_eq!(topup_signature.as_deref(), Some("topup_sig"));
         assert_eq!(topped_up.deposit, CAP + 500);
 
         let close_header = handle.close_header(Some(25)).await.unwrap();
+        let competing_lease = session
+            .reserve_delegated_capacity(&opened.channel_id, 0)
+            .expect("test should reserve the channel");
+        let error = session.process(&close_header).await.unwrap_err();
+        assert!(
+            error.to_string().contains("busy with another request"),
+            "client close must not race another channel owner: {error}"
+        );
+        drop(competing_lease);
+
         let SessionOutcome::Closed { params, signature } =
             session.process(&close_header).await.unwrap()
         else {
@@ -1377,6 +1858,29 @@ mod tests {
         payload.mode = SessionMode::Pull;
 
         session.process_pull_open(&payload).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn push_open_submits_the_client_transaction_before_verification() {
+        let session = test_session_mpp();
+        let payload = payment_channel_payload(
+            &session,
+            solana_pubkey::Pubkey::new_unique(),
+            solana_pubkey::Pubkey::new_unique(),
+            45,
+        );
+        let challenge = session.challenge(CAP).unwrap();
+        let credential = PaymentCredential::new(
+            challenge.to_echo(),
+            serde_json::to_value(SessionAction::Open(payload)).unwrap(),
+        );
+        let auth_header = format_authorization(&credential).unwrap();
+
+        let err = session.process(&auth_header).await.unwrap_err();
+        assert!(
+            err.to_string().contains("requires an operator signer"),
+            "push transaction was not routed through server submission: {err}"
+        );
     }
 
     #[tokio::test]
@@ -1451,7 +1955,9 @@ mod tests {
         );
 
         let open_header = handle.open_header(CAP, "open_sig").await.unwrap();
-        let SessionOutcome::Active(opened) = session.process(&open_header).await.unwrap() else {
+        let SessionOutcome::Active { state: opened, .. } =
+            session.process(&open_header).await.unwrap()
+        else {
             panic!("expected open to return active session");
         };
         assert_eq!(session.committed_watermark(&opened.channel_id), Some(0));
@@ -1463,6 +1969,65 @@ mod tests {
         assert!(
             err.to_string().contains("close is pending"),
             "expected auto-close to reject later voucher, got: {err}"
+        );
+    }
+
+    #[test]
+    fn delegated_capacity_lease_releases_on_drop() {
+        let session = test_session_mpp();
+        let first = session
+            .reserve_delegated_capacity("channel", CAP)
+            .expect("first reservation should succeed");
+        assert!(
+            session.reserve_delegated_capacity("channel", CAP).is_none(),
+            "a live lease must exclude concurrent reservations"
+        );
+
+        drop(first);
+
+        assert!(
+            session.reserve_delegated_capacity("channel", CAP).is_some(),
+            "dropping the lease must release capacity"
+        );
+    }
+
+    #[tokio::test]
+    async fn delegated_capacity_lease_defers_idle_close() {
+        let session = Arc::new(test_session_mpp());
+        session.start_lifecycle_runloop(Duration::from_millis(10));
+        let challenge = session.challenge(CAP).unwrap();
+        let handle = SessionHandle::new(
+            solana_pubkey::Pubkey::new_unique(),
+            test_session_signer(),
+            challenge,
+        );
+
+        let open_header = handle.open_header(CAP, "open_sig").await.unwrap();
+        let SessionOutcome::Active { state: opened, .. } =
+            session.process(&open_header).await.unwrap()
+        else {
+            panic!("expected open to return active session");
+        };
+        let lease = session
+            .reserve_delegated_capacity(&opened.channel_id, CAP)
+            .expect("request should reserve channel capacity");
+
+        tokio::time::sleep(Duration::from_millis(60)).await;
+
+        let voucher_header = handle.voucher_header(75).await.unwrap();
+        assert!(
+            session.process(&voucher_header).await.is_ok(),
+            "idle-close must not start while a request owns the lease"
+        );
+
+        drop(lease);
+        tokio::time::sleep(Duration::from_millis(60)).await;
+
+        let voucher_header = handle.voucher_header(75).await.unwrap();
+        let error = session.process(&voucher_header).await.unwrap_err();
+        assert!(
+            error.to_string().contains("close is pending"),
+            "expected idle-close after lease release, got: {error}"
         );
     }
 
@@ -1481,7 +2046,7 @@ mod tests {
                 serde_json::to_value(open_action).unwrap(),
             ))
             .unwrap();
-        let SessionOutcome::Active(_) = session.process(&open_header).await.unwrap() else {
+        let SessionOutcome::Active { .. } = session.process(&open_header).await.unwrap() else {
             panic!("expected open outcome");
         };
 
@@ -1515,6 +2080,66 @@ mod tests {
             session.committed_watermark(&active.channel_id_str()),
             Some(60)
         );
+    }
+
+    #[tokio::test]
+    async fn delegated_usage_signs_and_persists_cumulative_voucher() {
+        let signer: Arc<dyn SolanaSigner> = Arc::from(test_session_signer());
+        let operator = signer.pubkey();
+        let mut config = test_session_config();
+        config.operator = operator.to_string();
+        config.settlement_authority = SessionSettlementAuthority::Delegated;
+        let session =
+            SessionMpp::new(config, "test-secret").with_payment_channel_signer(Arc::clone(&signer));
+        let payload =
+            payment_channel_payload(&session, solana_pubkey::Pubkey::new_unique(), operator, 91);
+        let opened = tokio::time::timeout(
+            Duration::from_secs(2),
+            session.server.process_preverified_open(&payload),
+        )
+        .await
+        .expect("delegated open timed out")
+        .unwrap();
+        session.record_committed_watermark(opened.channel_id.clone(), opened.cumulative);
+
+        assert_eq!(
+            tokio::time::timeout(
+                Duration::from_secs(2),
+                session.authorize_delegated_usage(&opened.channel_id, 75),
+            )
+            .await
+            .expect("first delegated voucher timed out")
+            .unwrap(),
+            75
+        );
+        session
+            .committed_watermarks
+            .lock()
+            .expect("watermark lock")
+            .clear();
+        assert_eq!(
+            tokio::time::timeout(
+                Duration::from_secs(2),
+                session.authorize_delegated_usage(&opened.channel_id, 25),
+            )
+            .await
+            .expect("second delegated voucher timed out")
+            .unwrap(),
+            100
+        );
+        let close_payload = pay_kit::mpp::ClosePayload {
+            channel_id: opened.channel_id.clone(),
+            voucher: None,
+        };
+        let close = tokio::time::timeout(
+            Duration::from_secs(2),
+            session.server.process_close(&close_payload),
+        )
+        .await
+        .expect("delegated close timed out")
+        .unwrap();
+        assert_eq!(close.settled, 100);
+        assert_eq!(session.committed_watermark(&opened.channel_id), Some(100));
     }
 
     #[tokio::test]
@@ -1753,5 +2378,23 @@ mod tests {
         let err = validate_payment_channel_open_transaction(&tx, &expected, &wrong_fee_payer)
             .unwrap_err();
         assert!(err.to_string().contains("fee payer"));
+    }
+
+    #[test]
+    fn close_omits_voucher_when_watermark_already_landed() {
+        assert!(close_voucher_required(4_330, 4_331));
+        assert!(!close_voucher_required(4_331, 4_331));
+        assert!(!close_voucher_required(4_332, 4_331));
+    }
+
+    #[test]
+    fn close_reconciles_durable_state_after_failed_broadcast() {
+        let close_pending = pay_kit::mpp::Error::Other("Close already requested".to_string());
+        let sealed = pay_kit::mpp::Error::Other("Channel is already sealed".to_string());
+        let missing = pay_kit::mpp::Error::Other("Channel not found".to_string());
+
+        assert!(session_close_needs_reconciliation(&close_pending));
+        assert!(session_close_needs_reconciliation(&sealed));
+        assert!(!session_close_needs_reconciliation(&missing));
     }
 }

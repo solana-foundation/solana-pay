@@ -439,6 +439,7 @@ fn probe_endpoint(
                     exit_code,
                     body: Some(raw.body.clone()),
                     content_type,
+                    response_headers: raw.headers.clone(),
                 }
             };
             let probe_status_kind = classify_outcome(outcome, &config.accepted_currencies);

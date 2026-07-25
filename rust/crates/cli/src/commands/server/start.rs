@@ -47,6 +47,43 @@ fn default_bind() -> String {
     }
 }
 
+async fn session_channel_store() -> pay_core::Result<Arc<dyn pay_kit::mpp::store::ChannelStore>> {
+    let redis_url = std::env::var("PAY_SESSION_REDIS_URL")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+
+    let Some(redis_url) = redis_url else {
+        return Ok(Arc::new(pay_kit::mpp::store::MemoryChannelStore::new()));
+    };
+
+    #[cfg(feature = "redis-session-store")]
+    {
+        let prefix = std::env::var("PAY_SESSION_REDIS_PREFIX")
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| "pay:session:v1:".to_string());
+        let store = pay_kit::mpp::store::RedisChannelStore::connect(&redis_url, prefix)
+            .await
+            .map_err(|error| {
+                pay_core::Error::Config(format!("failed to connect session Redis store: {error}"))
+            })?;
+        tracing::info!("using durable Redis channel store for MPP sessions");
+        return Ok(Arc::new(store));
+    }
+
+    #[cfg(not(feature = "redis-session-store"))]
+    {
+        let _ = redis_url;
+        Err(pay_core::Error::Config(
+            "PAY_SESSION_REDIS_URL is set, but this pay binary was built without the \
+             redis-session-store feature"
+                .to_string(),
+        ))
+    }
+}
+
 /// Start the payment gateway proxy.
 ///
 /// Loads an API spec from a YAML file and starts an HTTP proxy that:
@@ -97,6 +134,11 @@ pub struct StartCommand {
     #[arg(long, value_name = "URL")]
     pub public_url: Option<String>,
 
+    /// Skip decentralized provider registration even when `--public-url` and
+    /// a versioned API profile are present.
+    #[arg(long)]
+    pub no_register: bool,
+
     #[arg(skip)]
     pub scaffolded_spec: Option<String>,
 }
@@ -105,7 +147,7 @@ pub struct StartCommand {
 struct AppState {
     apis: Arc<Vec<ApiSpec>>,
     mpps: Vec<Mpp>,
-    session_mpp: Option<Arc<SessionMpp>>,
+    session_mpps: Vec<Arc<SessionMpp>>,
     browser_rpc_url: Option<String>,
     fee_payer_wallet: Option<FeePayerWallet>,
     fee_payer_signer: Option<Arc<dyn SolanaSigner>>,
@@ -128,10 +170,16 @@ impl PaymentState for AppState {
         self.browser_rpc_url.as_deref()
     }
     fn session_mpp(&self) -> Option<&SessionMpp> {
-        self.session_mpp.as_deref()
+        self.session_mpps.first().map(Arc::as_ref)
     }
     fn session_mpp_handle(&self) -> Option<Arc<SessionMpp>> {
-        self.session_mpp.clone()
+        self.session_mpps.first().cloned()
+    }
+    fn session_mpps(&self) -> Vec<&SessionMpp> {
+        self.session_mpps.iter().map(Arc::as_ref).collect()
+    }
+    fn session_mpp_handles(&self) -> Vec<Arc<SessionMpp>> {
+        self.session_mpps.clone()
     }
     fn fee_payer_wallet(&self) -> Option<&FeePayerWallet> {
         self.fee_payer_wallet.as_ref()
@@ -169,14 +217,13 @@ impl PaymentState for AppState {
 
 fn x402_upto_payout_for_recipient(
     recipient: &str,
-    operator: &str,
+    receiver_authorizer: &str,
 ) -> pay_kit::x402::server::UptoPayout {
-    if recipient == operator {
-        pay_kit::x402::server::UptoPayout::OperatorKeepsAll
+    if recipient == receiver_authorizer {
+        pay_kit::x402::server::UptoPayout::ReceiverKeepsAll
     } else {
         pay_kit::x402::server::UptoPayout::Beneficiary {
             address: recipient.to_string(),
-            operator_fee_bps: 0,
         }
     }
 }
@@ -272,6 +319,46 @@ fn resolve_session_splits(
     }
 
     Ok(splits)
+}
+
+fn delegated_session_channel_payout(
+    recipient: &str,
+    operator: &str,
+    mut splits: Vec<pay_kit::mpp::server::session::Split>,
+) -> pay_core::Result<(String, Vec<pay_kit::mpp::server::session::Split>)> {
+    if recipient == operator {
+        return Ok((recipient.to_string(), splits));
+    }
+
+    let recipient = solana_pubkey::Pubkey::from_str(recipient).map_err(|e| {
+        pay_core::Error::Config(format!(
+            "delegated session recipient is not a valid Solana pubkey: {e}"
+        ))
+    })?;
+    let explicit_bps = splits
+        .iter()
+        .try_fold(0_u16, |total, split| total.checked_add(split.bps))
+        .ok_or_else(|| {
+            pay_core::Error::Config("delegated session split basis points overflow".to_string())
+        })?;
+    let primary_bps = 10_000_u16.checked_sub(explicit_bps).ok_or_else(|| {
+        pay_core::Error::Config("delegated session splits exceed 100%".to_string())
+    })?;
+
+    if let Some(existing) = splits.iter_mut().find(|split| split.recipient == recipient) {
+        existing.bps = existing.bps.checked_add(primary_bps).ok_or_else(|| {
+            pay_core::Error::Config(
+                "delegated session recipient split basis points overflow".to_string(),
+            )
+        })?;
+    } else {
+        splits.push(pay_kit::mpp::server::session::Split {
+            recipient,
+            bps: primary_bps,
+        });
+    }
+
+    Ok((operator.to_string(), splits))
 }
 
 fn account_env_var(account: &str) -> Option<&str> {
@@ -497,7 +584,7 @@ impl StartCommand {
         let contents = std::fs::read_to_string(expanded.as_ref())
             .map_err(|e| pay_core::Error::Config(format!("Failed to read {}: {e}", self.spec)))?;
 
-        let mut api: ApiSpec = serde_yml::from_str(&contents)
+        let (mut api, api_profile) = pay_core::server::profiles::load_yaml_with_profile(&contents)
             .map_err(|e| pay_core::Error::Config(format!("Invalid spec: {e}")))?;
 
         apply_spec_env_vars(&api)?;
@@ -864,22 +951,19 @@ impl StartCommand {
                 fee_payer_signer.clone(),
                 &blockhash_cache,
             )?;
-            let (_session_currency, session_mpp_currency, session_decimals) =
-                currency_configs.first().cloned().ok_or_else(|| {
-                    pay_core::Error::Config(
-                        "At least one operator currency must be configured".to_string(),
-                    )
-                })?;
-
-            // ── Create session MPP server (if session config present) ──
-            let session_mpp: Option<Arc<SessionMpp>> = if let Some(ref sess) = api.session {
+            // ── Create one session MPP server per configured currency ──
+            let session_mpps: Vec<Arc<SessionMpp>> = if let Some(ref sess) = api.session {
                 use pay_core::server::session::PullVoucherStrategy;
-                use pay_types::metering::SessionPullVoucherStrategy as ConfigPullVoucherStrategy;
-                use pay_kit::mpp::server::session::SessionConfig;
+                use pay_types::metering::{
+                    SessionPullVoucherStrategy as ConfigPullVoucherStrategy,
+                    SessionSettlementAuthority as ConfigSettlementAuthority,
+                };
+                use pay_kit::mpp::server::session::{
+                    SessionConfig, SettlementAuthority,
+                };
                 use pay_kit::mpp::{SessionMode, SessionPullVoucherStrategy};
                 use std::str::FromStr;
 
-                let cap_base = (sess.cap_usdc * 10f64.powi(session_decimals as i32)).round() as u64;
                 let session_secret = std::env::var("PAY_SESSION_SECRET")
                     .unwrap_or_else(|_| challenge_binding_secret.clone());
                 // Default to pull + clientVoucher (payment-channel) when `modes`
@@ -943,6 +1027,19 @@ impl StartCommand {
                 let session_splits = resolve_session_splits(&api, sess)?;
                 let client_voucher_pull = modes.contains(&SessionMode::Pull)
                     && pull_voucher_strategy == PullVoucherStrategy::ClientVoucher;
+                let settlement_authority = match sess.settlement_authority {
+                    ConfigSettlementAuthority::ClientVoucher => {
+                        SettlementAuthority::ClientVoucher
+                    }
+                    ConfigSettlementAuthority::Delegated => SettlementAuthority::Delegated,
+                };
+                if settlement_authority == SettlementAuthority::Delegated
+                    && fee_payer_signer.is_none()
+                {
+                    return Err(pay_core::Error::Config(
+                        "delegated session settlement requires operator.fee_payer so the gateway can sign metered vouchers".to_string(),
+                    ));
+                }
                 if client_voucher_pull
                     && let Some(settlement_signer) = fee_payer_signer.as_ref()
                     && recipient != settlement_signer.pubkey().to_string()
@@ -956,49 +1053,74 @@ impl StartCommand {
                 } else {
                     None
                 };
-                let session_operator = session_channel_payer_signer
+                let session_operator = fee_payer_signer
                     .as_ref()
-                    .or(fee_payer_signer.as_ref())
+                    .or(session_channel_payer_signer.as_ref())
                     .map(|signer| signer.pubkey().to_string())
                     .unwrap_or_else(|| recipient.clone());
+                let (session_recipient, session_splits) =
+                    if settlement_authority == SettlementAuthority::Delegated {
+                        delegated_session_channel_payout(
+                            &recipient,
+                            &session_operator,
+                            session_splits,
+                        )?
+                    } else {
+                        (recipient.clone(), session_splits)
+                    };
                 if client_voucher_pull && should_fund {
                     ensure_surfpool_session_distribution_accounts(&rpc_url, &session_splits)
                         .await?;
                 }
 
-                let config = SessionConfig {
-                    recipient: recipient.clone(),
-                    operator: session_operator.clone(),
-                    splits: session_splits,
-                    currency: session_mpp_currency.clone(),
-                    decimals: session_decimals,
-                    network: network.slug().to_string(),
-                    max_cap: cap_base,
-                    min_voucher_delta: sess.min_voucher_delta,
-                    modes: modes.clone(),
-                    pull_voucher_strategy: sdk_pull_voucher_strategy,
-                    grace_period_seconds:
-                        pay_kit::mpp::program::payment_channels::DEFAULT_GRACE_PERIOD_SECONDS,
-                    rpc_url: Some(rpc_url.clone()),
-                    program_id: Some(channel_program_id),
-                };
+                let session_channel_store = session_channel_store().await?;
+                let mut session_mpps = Vec::with_capacity(currency_configs.len());
+                for (_currency, session_mpp_currency, session_decimals) in &currency_configs {
+                    let cap_base =
+                        (sess.cap_usdc * 10f64.powi(i32::from(*session_decimals))).round() as u64;
+                    let config = SessionConfig {
+                        recipient: session_recipient.clone(),
+                        operator: session_operator.clone(),
+                        splits: session_splits.clone(),
+                        currency: session_mpp_currency.clone(),
+                        decimals: *session_decimals,
+                        network: network.slug().to_string(),
+                        max_cap: cap_base,
+                        min_voucher_delta: sess.min_voucher_delta,
+                        settlement_authority,
+                        modes: modes.clone(),
+                        pull_voucher_strategy: sdk_pull_voucher_strategy.clone(),
+                        grace_period_seconds:
+                            pay_kit::mpp::program::payment_channels::DEFAULT_GRACE_PERIOD_SECONDS,
+                        rpc_url: Some(rpc_url.clone()),
+                        program_id: Some(channel_program_id),
+                    };
 
-                let mut smpp = SessionMpp::new(config, session_secret)
-                    .with_realm(api.title.clone())
-                    .with_pull_voucher_strategy(pull_voucher_strategy)
-                    .with_blockhash_cache(blockhash_cache.clone());
-                if let Some(operator_signer) = fee_payer_signer.clone() {
-                    smpp = smpp.with_payment_channel_signer(operator_signer);
-                }
-                if let Some(channel_payer_signer) = session_channel_payer_signer {
-                    smpp = smpp.with_payment_channel_payer_signer(channel_payer_signer);
-                }
+                    let mut smpp = SessionMpp::new_with_channel_store(
+                        config,
+                        session_secret.clone(),
+                        Arc::clone(&session_channel_store),
+                    )
+                        .with_realm(api.title.clone())
+                        .with_pull_voucher_strategy(pull_voucher_strategy)
+                        .with_blockhash_cache(blockhash_cache.clone());
+                    if let Some(operator_signer) = fee_payer_signer.clone() {
+                        smpp = smpp.with_payment_channel_signer(operator_signer);
+                    }
+                    if let Some(channel_payer_signer) = session_channel_payer_signer.clone() {
+                        smpp = smpp.with_payment_channel_payer_signer(channel_payer_signer);
+                    }
 
-                let smpp = Arc::new(smpp);
-                smpp.start_lifecycle_runloop(Duration::from_millis(sess.close_delay_ms));
-                Some(smpp)
+                    let smpp = Arc::new(smpp);
+                    smpp.start_lifecycle_runloop_with_settlement(
+                        Duration::from_millis(sess.close_delay_ms),
+                        Duration::from_millis(sess.settlement_interval_ms),
+                    );
+                    session_mpps.push(smpp);
+                }
+                session_mpps
             } else {
-                None
+                Vec::new()
             };
 
             // Validate split recipients that are knowable at startup. Runtime
@@ -1311,12 +1433,15 @@ impl StartCommand {
             // settlement vouchers), so it's only available with a fee-payer signer.
             let x402_upto = match (wants_x402, fee_payer_signer.clone()) {
                 (true, Some(signer)) => {
-                    let operator = signer.pubkey().to_string();
+                    let receiver_authorizer = signer.pubkey().to_string();
                     let cfg = pay_kit::x402::server::UptoConfig {
-                        // If the YAML recipient differs from the operator signer,
+                        // If the YAML recipient differs from the receiver signer,
                         // pay the recipient through a bound 100% distribution
-                        // split; otherwise the operator keeps the channel payout.
-                        payout: x402_upto_payout_for_recipient(&recipient, &operator),
+                        // split; otherwise the receiver keeps the channel payout.
+                        payout: x402_upto_payout_for_recipient(
+                            &recipient,
+                            &receiver_authorizer,
+                        ),
                         currencies: x402_currencies.clone(),
                         cluster: network.slug().to_string(),
                         rpc_url: Some(rpc_url.clone()),
@@ -1324,7 +1449,9 @@ impl StartCommand {
                         description: None,
                         max_timeout_seconds: 300,
                         program_id: None,
-                        operator_signer: signer,
+                        withdraw_delay: 0,
+                        fee_payer_signer: signer,
+                        receiver_authorizer_signer: None,
                     };
                     match pay_kit::x402::server::X402Upto::new(cfg) {
                         Ok(u) => Some(u.with_blockhash_cache(blockhash_cache.clone())),
@@ -1346,10 +1473,47 @@ impl StartCommand {
                 None
             };
 
+            if !self.no_register
+                && let (Some(public_url), Some(profile)) =
+                    (public_url_override.as_deref(), api_profile.as_ref())
+            {
+                let signer = fee_payer_signer.clone().ok_or_else(|| {
+                    pay_core::Error::Config(
+                        "provider registration requires an active account or operator signer; pass --no-register to serve without publishing"
+                            .to_string(),
+                    )
+                })?;
+                let (category, protocol) =
+                    super::provider_registration::profile_keys(profile);
+                let registration = super::provider_registration::ServiceRegistration::new(
+                    category,
+                    protocol,
+                    api.name.clone(),
+                    api.description.clone(),
+                    public_url,
+                )?;
+                let registry_rpc_url =
+                    super::provider_registration::registry_rpc_url_with_fallback(&rpc_url);
+                let outcome = super::provider_registration::register_service(
+                    &registration,
+                    signer.clone(),
+                    &registry_rpc_url,
+                )
+                .await?;
+                if let Some(signature) = outcome.signature {
+                    tracing::info!(%signature, pda = %outcome.pda, "provider registry heartbeat published");
+                }
+                super::provider_registration::spawn_renewal_task(
+                    registration,
+                    signer,
+                    registry_rpc_url,
+                );
+            }
+
             let state = AppState {
                 apis: Arc::new(vec![api.clone()]),
                 mpps,
-                session_mpp,
+                session_mpps,
                 browser_rpc_url: Some(BROWSER_RPC_PROXY_PATH.to_string()),
                 fee_payer_wallet,
                 fee_payer_signer: fee_payer_signer.clone(),
@@ -2535,9 +2699,9 @@ struct SessionDeliveryRequest {
 /// out-of-band at idle-close, so there's no per-request header).
 fn session_receipt(state: AppState, channel_id: String) -> axum::response::Response {
     let signature = state
-        .session_mpp
-        .as_ref()
-        .and_then(|sm| sm.settlement_signature(&channel_id));
+        .session_mpps
+        .iter()
+        .find_map(|session| session.settlement_signature(&channel_id));
     axum::Json(serde_json::json!({
         "settledSignature": signature,
         "finalized": signature.is_some(),
@@ -2583,12 +2747,27 @@ async fn reserve_session_delivery(
     use axum::http::StatusCode;
     use pay_kit::mpp::server::session::DeliveryRequest;
 
-    let Some(session_mpp) = state.session_mpp.as_ref() else {
+    if state.session_mpps.is_empty() {
         return (
             StatusCode::NOT_FOUND,
             axum::Json(serde_json::json!({
                 "error": "session_not_configured",
                 "message": "This gateway is not configured for session payments",
+            })),
+        )
+            .into_response();
+    }
+
+    let Some(session_mpp) = state
+        .session_mpps
+        .iter()
+        .find(|session| session.committed_watermark(&req.session_id).is_some())
+    else {
+        return (
+            StatusCode::NOT_FOUND,
+            axum::Json(serde_json::json!({
+                "error": "session_not_found",
+                "message": "No active session matches the supplied session ID",
             })),
         )
             .into_response();
@@ -2855,14 +3034,51 @@ mod tests {
         surfpool_funding_targets, surfpool_prep_notice_body,
     };
     use super::{
-        build_pdb_config, default_bind, payout_recipient_pubkeys, payout_recipient_targets,
-        resolve_operator_currencies, validate_browser_rpc_request, x402_currency_configs,
-        x402_upto_beneficiary_pubkey, x402_upto_payout_for_recipient,
+        build_pdb_config, default_bind, delegated_session_channel_payout, payout_recipient_pubkeys,
+        payout_recipient_targets, resolve_operator_currencies, validate_browser_rpc_request,
+        x402_currency_configs, x402_upto_beneficiary_pubkey, x402_upto_payout_for_recipient,
     };
     use crate::network::SolanaNetwork;
     use serial_test::serial;
     use solana_pubkey::Pubkey;
     use std::str::FromStr;
+
+    #[test]
+    fn profile_yaml_expands_before_startup_validation() {
+        let api = pay_core::server::profiles::load_yaml(
+            r#"
+name: local-ai
+subdomain: local-ai
+title: Local AI
+description: OpenAI-compatible local inference.
+category: ai_ml
+version: v1
+profile:
+  type: openai-compatible
+  version: v1
+routing:
+  type: proxy
+  url: http://127.0.0.1:8000
+"#,
+        )
+        .unwrap();
+
+        let paths: Vec<_> = api
+            .endpoints
+            .iter()
+            .map(|endpoint| endpoint.path.as_str())
+            .collect();
+        assert_eq!(
+            paths,
+            [
+                "v1/responses",
+                "v1/chat/completions",
+                "v1/embeddings",
+                "v1/models",
+            ]
+        );
+        assert!(pay_types::metering::validate_api_spec(&api).is_empty());
+    }
 
     #[test]
     fn resolve_operator_currencies_prefers_usd_group() {
@@ -3220,6 +3436,54 @@ endpoints:
     }
 
     #[test]
+    fn delegated_session_uses_operator_as_zero_share_payee() {
+        let operator = Pubkey::new_unique();
+        let recipient = Pubkey::new_unique();
+
+        let (payee, splits) = delegated_session_channel_payout(
+            &recipient.to_string(),
+            &operator.to_string(),
+            Vec::new(),
+        )
+        .unwrap();
+
+        assert_eq!(payee, operator.to_string());
+        assert_eq!(splits.len(), 1);
+        assert_eq!(splits[0].recipient, recipient);
+        assert_eq!(splits[0].bps, 10_000);
+    }
+
+    #[test]
+    fn delegated_session_preserves_explicit_splits_and_routes_remainder() {
+        let operator = Pubkey::new_unique();
+        let recipient = Pubkey::new_unique();
+        let partner = Pubkey::new_unique();
+
+        let (payee, splits) = delegated_session_channel_payout(
+            &recipient.to_string(),
+            &operator.to_string(),
+            vec![pay_kit::mpp::server::session::Split {
+                recipient: partner,
+                bps: 2_500,
+            }],
+        )
+        .unwrap();
+
+        assert_eq!(payee, operator.to_string());
+        assert!(
+            splits
+                .iter()
+                .any(|split| { split.recipient == recipient && split.bps == 7_500 })
+        );
+        assert!(
+            splits
+                .iter()
+                .any(|split| { split.recipient == partner && split.bps == 2_500 })
+        );
+        assert_eq!(splits.iter().map(|split| split.bps).sum::<u16>(), 10_000);
+    }
+
+    #[test]
     fn create_associated_token_account_ix_is_idempotent_shape() {
         let payer = Pubkey::new_unique();
         let owner = Pubkey::new_unique();
@@ -3303,13 +3567,13 @@ endpoints:
     }
 
     #[test]
-    fn x402_upto_payout_keeps_all_when_recipient_is_operator() {
+    fn x402_upto_payout_keeps_all_when_recipient_is_receiver_authorizer() {
         let payout =
             x402_upto_payout_for_recipient(VALID_TEST_KEYPAIR_PUBKEY, VALID_TEST_KEYPAIR_PUBKEY);
 
         assert!(matches!(
             payout,
-            pay_kit::x402::server::UptoPayout::OperatorKeepsAll
+            pay_kit::x402::server::UptoPayout::ReceiverKeepsAll
         ));
     }
 
@@ -3319,14 +3583,10 @@ endpoints:
         let payout = x402_upto_payout_for_recipient(recipient, VALID_TEST_KEYPAIR_PUBKEY);
 
         match payout {
-            pay_kit::x402::server::UptoPayout::Beneficiary {
-                address,
-                operator_fee_bps,
-            } => {
+            pay_kit::x402::server::UptoPayout::Beneficiary { address } => {
                 assert_eq!(address, recipient);
-                assert_eq!(operator_fee_bps, 0);
             }
-            pay_kit::x402::server::UptoPayout::OperatorKeepsAll => {
+            pay_kit::x402::server::UptoPayout::ReceiverKeepsAll => {
                 panic!("distinct recipient should be configured as beneficiary")
             }
         }
