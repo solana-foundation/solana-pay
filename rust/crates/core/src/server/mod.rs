@@ -25,6 +25,9 @@ pub mod proxy;
 pub mod session;
 
 #[cfg(feature = "server")]
+pub mod session_capacity;
+
+#[cfg(feature = "server")]
 pub mod session_metering;
 
 #[cfg(feature = "server")]

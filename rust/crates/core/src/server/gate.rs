@@ -119,7 +119,7 @@ pub struct SessionForward {
     /// Remaining channel capacity available to the metered delivery.
     pub available_base_units: u64,
     /// Releases the exclusive capacity reservation on every terminal path.
-    _reservation: Option<DelegatedCapacityLease>,
+    reservation: Option<DelegatedCapacityLease>,
 }
 
 impl SessionForward {
@@ -137,8 +137,14 @@ impl SessionForward {
             committed_base_units,
             settlement: Some(Box::new(settlement)),
             available_base_units,
-            _reservation: Some(reservation),
+            reservation: Some(reservation),
         }
+    }
+
+    /// The lease this forward is metering under, when it has one. Requests
+    /// without a reservation (non-delegated paths) are never gated on one.
+    pub fn capacity_lease(&self) -> Option<&DelegatedCapacityLease> {
+        self.reservation.as_ref()
     }
 }
 
@@ -1558,13 +1564,30 @@ async fn session_authorized(
                     .unwrap_or_default(),
                 ));
             }
-            let Some(reservation) =
-                handle.reserve_delegated_capacity(&state.channel_id, available_base_units)
-            else {
-                return GateDecision::Respond(GateResponse::json(
-                    StatusCode::PAYMENT_REQUIRED,
-                    Bytes::from_static(br#"{"error":"session_capacity_reserved","message":"Another request is currently using this session capacity."}"#),
-                ));
+            let reservation = match handle
+                .reserve_delegated_capacity(&state.channel_id, available_base_units)
+                .await
+            {
+                Ok(Some(reservation)) => reservation,
+                Ok(None) => {
+                    return GateDecision::Respond(GateResponse::json(
+                        StatusCode::PAYMENT_REQUIRED,
+                        Bytes::from_static(br#"{"error":"session_capacity_reserved","message":"Another request is currently using this session capacity."}"#),
+                    ));
+                }
+                // A lease backend outage is our failure, not the payer's: keep it
+                // out of the payment-required path so retries stay meaningful.
+                Err(error) => {
+                    tracing::error!(
+                        channel_id = %state.channel_id,
+                        error = %error,
+                        "session capacity lease backend unavailable"
+                    );
+                    return GateDecision::Respond(GateResponse::json(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        Bytes::from_static(br#"{"error":"session_capacity_unavailable","message":"Session capacity coordination is temporarily unavailable; retry shortly."}"#),
+                    ));
+                }
             };
             let props = metering::RequestProperties {
                 body_size: req.content_length,
@@ -1603,7 +1626,7 @@ async fn session_authorized(
                 committed_base_units: cumulative,
                 settlement: None,
                 available_base_units: 0,
-                _reservation: None,
+                reservation: None,
             }),
             receipt: None,
             upto: None,

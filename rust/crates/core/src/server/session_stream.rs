@@ -65,6 +65,14 @@ impl SessionStreamContext {
             .max(self.baseline_base_units)
     }
 
+    pub async fn refresh_committed_base_units(&self) -> u64 {
+        self.session_mpp
+            .refresh_committed_watermark(&self.session_id)
+            .await
+            .unwrap_or(self.baseline_base_units)
+            .max(self.baseline_base_units)
+    }
+
     pub fn settlement(&self) -> StablecoinSettlement {
         StablecoinSettlement::new(self.session_mpp.decimals())
     }
@@ -281,12 +289,28 @@ impl DelegatedSessionStreamMeter {
             self.authorization_exhausted |= exhausted_by_reprice;
             return Ok(());
         }
-        let accepted = self
+        let authorize = self
             .forward
             .handle
-            .authorize_delegated_usage(&self.forward.channel_id, amount)
-            .await
-            .map_err(box_error)?;
+            .authorize_delegated_usage(&self.forward.channel_id, amount);
+        // Losing the lease mid-authorization means another replica now owns the
+        // channel, so abandon this charge rather than race it to the store.
+        let accepted = match self.forward.capacity_lease() {
+            Some(lease) => {
+                tokio::select! {
+                    biased;
+                    () = lease.lost() => {
+                        return Err(box_error(std::io::Error::other(format!(
+                            "delegated session {} lost its capacity lease",
+                            self.forward.channel_id
+                        ))));
+                    }
+                    accepted = authorize => accepted,
+                }
+            }
+            None => authorize.await,
+        }
+        .map_err(box_error)?;
         self.gate.record_commit(accepted);
         self.authorization_exhausted |= exhausted_by_reprice;
         Ok(())
@@ -467,6 +491,13 @@ async fn wait_for_commit(context: &SessionStreamContext, target: u64) -> Result<
             let committed = context.committed_base_units();
             if committed >= target {
                 return Ok(committed);
+            }
+            // Another replica (or a restarted process) may have accepted the
+            // client voucher into the durable store without updating this
+            // process's cache — refresh before sleeping again.
+            let refreshed = context.refresh_committed_base_units().await;
+            if refreshed >= target {
+                return Ok(refreshed);
             }
             tokio::time::sleep(COMMIT_POLL_INTERVAL).await;
         }
@@ -1221,6 +1252,8 @@ data: {"type":"message_delta","usage":{"output_tokens":5}}
         };
         let reservation = session
             .reserve_delegated_capacity(&state.channel_id, 1_000)
+            .await
+            .unwrap()
             .expect("session capacity should be available");
         let forward = SessionForward::delegated(
             session.clone(),

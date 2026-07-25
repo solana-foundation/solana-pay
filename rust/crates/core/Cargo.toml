@@ -20,7 +20,8 @@ network_tests = []
 vendored-openssl = ["openssl-sys/vendored"]
 # Durable MPP session state backed by Redis. Runtime selection still requires
 # PAY_SESSION_REDIS_URL; without it the in-memory store remains the default.
-redis-session-store = ["pay-kit/redis-store"]
+# Also enables cross-replica capacity leases (SET NX) beside the channel store.
+redis-session-store = ["pay-kit/redis-store", "dep:redis"]
 
 [dependencies]
 axum = { workspace = true, optional = true }
@@ -61,6 +62,7 @@ blake3 = { workspace = true }
 reqwest = { workspace = true }
 pay-keystore = { workspace = true }
 pay-kit = { workspace = true }
+redis = { version = "0.32.5", optional = true, features = ["tokio-rustls-comp", "connection-manager"] }
 bincode = { workspace = true }
 solana-commitment-config = { workspace = true }
 solana-hash = { workspace = true }

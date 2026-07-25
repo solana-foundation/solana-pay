@@ -6424,6 +6424,7 @@ dependencies = [
  "pay-types",
  "percent-encoding 2.3.2",
  "rand 0.8.6",
+ "redis",
  "reqwest 0.12.28",
  "schemars 0.8.22",
  "serde",

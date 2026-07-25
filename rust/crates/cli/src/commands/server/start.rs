@@ -47,14 +47,20 @@ fn default_bind() -> String {
     }
 }
 
-async fn session_channel_store() -> pay_core::Result<Arc<dyn pay_kit::mpp::store::ChannelStore>> {
+async fn session_channel_store() -> pay_core::Result<(
+    Arc<dyn pay_kit::mpp::store::ChannelStore>,
+    pay_core::server::session_capacity::CapacityLeaseCoordinator,
+)> {
     let redis_url = std::env::var("PAY_SESSION_REDIS_URL")
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty());
 
     let Some(redis_url) = redis_url else {
-        return Ok(Arc::new(pay_kit::mpp::store::MemoryChannelStore::new()));
+        return Ok((
+            Arc::new(pay_kit::mpp::store::MemoryChannelStore::new()),
+            pay_core::server::session_capacity::CapacityLeaseCoordinator::local(),
+        ));
     };
 
     #[cfg(feature = "redis-session-store")]
@@ -64,13 +70,21 @@ async fn session_channel_store() -> pay_core::Result<Arc<dyn pay_kit::mpp::store
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty())
             .unwrap_or_else(|| "pay:session:v1:".to_string());
-        let store = pay_kit::mpp::store::RedisChannelStore::connect(&redis_url, prefix)
+        let store = pay_kit::mpp::store::RedisChannelStore::connect(&redis_url, prefix.clone())
             .await
             .map_err(|error| {
                 pay_core::Error::Config(format!("failed to connect session Redis store: {error}"))
             })?;
-        tracing::info!("using durable Redis channel store for MPP sessions");
-        return Ok(Arc::new(store));
+        let capacity =
+            pay_core::server::session_capacity::CapacityLeaseCoordinator::redis(&redis_url, prefix)
+                .await
+                .map_err(|error| {
+                    pay_core::Error::Config(format!(
+                        "failed to connect session capacity lease Redis: {error}"
+                    ))
+                })?;
+        tracing::info!("using durable Redis channel store and capacity leases for MPP sessions");
+        return Ok((Arc::new(store), capacity));
     }
 
     #[cfg(not(feature = "redis-session-store"))]
@@ -1073,7 +1087,7 @@ impl StartCommand {
                         .await?;
                 }
 
-                let session_channel_store = session_channel_store().await?;
+                let (session_channel_store, session_capacity) = session_channel_store().await?;
                 let mut session_mpps = Vec::with_capacity(currency_configs.len());
                 for (_currency, session_mpp_currency, session_decimals) in &currency_configs {
                     let cap_base =
@@ -1096,10 +1110,11 @@ impl StartCommand {
                         program_id: Some(channel_program_id),
                     };
 
-                    let mut smpp = SessionMpp::new_with_channel_store(
+                    let mut smpp = SessionMpp::new_with_stores(
                         config,
                         session_secret.clone(),
                         Arc::clone(&session_channel_store),
+                        session_capacity.clone(),
                     )
                         .with_realm(api.title.clone())
                         .with_pull_voucher_strategy(pull_voucher_strategy)
@@ -1111,6 +1126,7 @@ impl StartCommand {
                         smpp = smpp.with_payment_channel_payer_signer(channel_payer_signer);
                     }
 
+                    smpp.rehydrate_from_store().await?;
                     let smpp = Arc::new(smpp);
                     smpp.start_lifecycle_runloop_with_settlement(
                         Duration::from_millis(sess.close_delay_ms),

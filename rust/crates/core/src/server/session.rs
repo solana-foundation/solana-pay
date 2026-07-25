@@ -32,6 +32,7 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 use tokio::time::{Duration, Instant};
 
+use crate::server::session_capacity::{CapacityLeaseCoordinator, CapacityLeaseToken};
 use crate::{Error, Result};
 
 const INTENT: &str = "session";
@@ -77,7 +78,7 @@ struct SessionOperatorRuntime {
     payment_channel_signer: Arc<Mutex<Option<Arc<dyn SolanaSigner>>>>,
     payment_channel_payer_signer: Arc<Mutex<Option<Arc<dyn SolanaSigner>>>>,
     committed_watermarks: Arc<Mutex<HashMap<String, u64>>>,
-    reserved_capacity: Arc<Mutex<HashMap<String, u64>>>,
+    capacity: CapacityLeaseCoordinator,
     delegated_voucher_lock: Arc<tokio::sync::Mutex<()>>,
     /// Channel id → on-chain settlement signature, recorded when the channel
     /// finalizes. Surfaced via the `/sessions/receipt/:channelId` poll so the
@@ -90,21 +91,14 @@ struct SessionOperatorRuntime {
 }
 
 impl SessionOperatorRuntime {
-    fn reserve_capacity(&self, channel_id: &str, amount: u64) -> bool {
-        let Ok(mut reservations) = self.reserved_capacity.lock() else {
-            return false;
-        };
-        if reservations.contains_key(channel_id) {
-            return false;
-        }
-        reservations.insert(channel_id.to_string(), amount);
-        true
+    async fn reserve_capacity(&self, channel_id: &str) -> Result<Option<CapacityLeaseToken>> {
+        self.capacity.try_acquire(channel_id).await
     }
-    fn release_capacity(&self, channel_id: &str) {
-        if let Ok(mut reservations) = self.reserved_capacity.lock() {
-            reservations.remove(channel_id);
-        }
+
+    fn release_capacity(&self, channel_id: &str, token: &CapacityLeaseToken) {
+        self.capacity.release(channel_id, token);
     }
+
     fn record_committed_watermark(&self, session_id: impl Into<String>, cumulative: u64) {
         if let Ok(mut watermarks) = self.committed_watermarks.lock() {
             let session_id = session_id.into();
@@ -455,11 +449,25 @@ fn close_voucher_required(onchain_settled: u64, latest_accepted: u64) -> bool {
 pub struct DelegatedCapacityLease {
     runtime: SessionOperatorRuntime,
     channel_id: String,
+    token: CapacityLeaseToken,
+}
+
+impl DelegatedCapacityLease {
+    /// False once the shared lease was lost (expired or taken over), so the
+    /// caller must stop the metered work this lease was protecting.
+    pub fn is_held(&self) -> bool {
+        self.token.is_held()
+    }
+
+    /// Resolves when the lease is lost; select on it to cancel in-flight work.
+    pub async fn lost(&self) {
+        self.token.lost().await;
+    }
 }
 
 impl Drop for DelegatedCapacityLease {
     fn drop(&mut self) {
-        self.runtime.release_capacity(&self.channel_id);
+        self.runtime.release_capacity(&self.channel_id, &self.token);
     }
 }
 
@@ -604,19 +612,31 @@ impl SessionLifecycleRunloop {
             // the reservation check atomic with the start of close: a request
             // already in flight defers close, while a close already in progress
             // prevents a new request from reserving stale capacity.
-            if !self.runtime.reserve_capacity(&channel_id, 0) {
-                self.last_activity.insert(channel_id, Instant::now());
-                continue;
-            }
+            let token = match self.runtime.reserve_capacity(&channel_id).await {
+                Ok(Some(token)) => token,
+                Ok(None) => {
+                    self.last_activity.insert(channel_id, Instant::now());
+                    continue;
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        channel_id,
+                        error = %error,
+                        "capacity lease unavailable; deferring auto-close"
+                    );
+                    self.last_activity.insert(channel_id, Instant::now());
+                    continue;
+                }
+            };
             let runtime = self.runtime.clone();
             closing.push(async move {
                 let result = runtime.operator_close_channel(&channel_id).await;
+                runtime.release_capacity(&channel_id, &token);
                 (channel_id, result)
             });
         }
 
         for (channel_id, close_result) in futures_util::future::join_all(closing).await {
-            self.runtime.release_capacity(&channel_id);
             match close_result {
                 Ok(SessionCloseResult::Closed { settled }) => {
                     tracing::info!(channel_id, settled, "operator auto-closed payment channel");
@@ -651,17 +671,26 @@ impl SessionLifecycleRunloop {
         let channels = self.last_activity.keys().cloned().collect::<Vec<_>>();
         let mut settlements = Vec::with_capacity(channels.len());
         for channel_id in channels {
-            if !self.runtime.reserve_capacity(&channel_id, 0) {
-                continue;
-            }
+            let token = match self.runtime.reserve_capacity(&channel_id).await {
+                Ok(Some(token)) => token,
+                Ok(None) => continue,
+                Err(error) => {
+                    tracing::warn!(
+                        channel_id,
+                        error = %error,
+                        "capacity lease unavailable; skipping watermark push"
+                    );
+                    continue;
+                }
+            };
             let runtime = self.runtime.clone();
             settlements.push(async move {
                 let result = runtime.operator_push_watermark(&channel_id).await;
+                runtime.release_capacity(&channel_id, &token);
                 (channel_id, result)
             });
         }
         for (channel_id, result) in futures_util::future::join_all(settlements).await {
-            self.runtime.release_capacity(&channel_id);
             if let Err(error) = result {
                 tracing::warn!(
                     channel_id,
@@ -739,12 +768,26 @@ impl SessionMpp {
         challenge_binding_secret: impl Into<String>,
         channel_store: Arc<dyn ChannelStore>,
     ) -> Self {
+        Self::new_with_stores(
+            config,
+            challenge_binding_secret,
+            channel_store,
+            CapacityLeaseCoordinator::local(),
+        )
+    }
+
+    /// Create with an explicit channel store and capacity coordinator.
+    pub fn new_with_stores(
+        config: SessionConfig,
+        challenge_binding_secret: impl Into<String>,
+        channel_store: Arc<dyn ChannelStore>,
+        capacity: CapacityLeaseCoordinator,
+    ) -> Self {
         let session_config = config.clone();
         let server = Arc::new(SessionServer::new(config, Arc::clone(&channel_store)));
         let payment_channel_signer = Arc::new(Mutex::new(None));
         let payment_channel_payer_signer = Arc::new(Mutex::new(None));
         let committed_watermarks = Arc::new(Mutex::new(HashMap::new()));
-        let reserved_capacity = Arc::new(Mutex::new(HashMap::new()));
         let delegated_voucher_lock = Arc::new(tokio::sync::Mutex::new(()));
         let settlement_signatures = Arc::new(Mutex::new(HashMap::new()));
         let pull_sessions = Arc::new(Mutex::new(HashSet::new()));
@@ -755,7 +798,7 @@ impl SessionMpp {
             payment_channel_signer: Arc::clone(&payment_channel_signer),
             payment_channel_payer_signer: Arc::clone(&payment_channel_payer_signer),
             committed_watermarks: Arc::clone(&committed_watermarks),
-            reserved_capacity: Arc::clone(&reserved_capacity),
+            capacity,
             delegated_voucher_lock,
             settlement_signatures: Arc::clone(&settlement_signatures),
             settlement_worker: Arc::new(tokio::sync::OnceCell::new()),
@@ -943,17 +986,77 @@ impl SessionMpp {
         Ok(accepted.cumulative)
     }
 
-    pub fn reserve_delegated_capacity(
+    pub async fn reserve_delegated_capacity(
         &self,
         channel_id: &str,
-        amount: u64,
-    ) -> Option<DelegatedCapacityLease> {
-        self.operator_runtime
-            .reserve_capacity(channel_id, amount)
-            .then(|| DelegatedCapacityLease {
+        _amount: u64,
+    ) -> Result<Option<DelegatedCapacityLease>> {
+        Ok(self
+            .operator_runtime
+            .reserve_capacity(channel_id)
+            .await?
+            .map(|token| DelegatedCapacityLease {
                 runtime: self.operator_runtime.clone(),
                 channel_id: channel_id.to_string(),
-            })
+                token,
+            }))
+    }
+
+    /// Seed watermark cache + lifecycle timers from the durable store (call once at boot).
+    pub async fn rehydrate_from_store(&self) -> Result<usize> {
+        let channels = self
+            .operator_runtime
+            .channel_store
+            .list_channels()
+            .await
+            .map_err(|error| {
+                Error::Mpp(format!("failed to list durable session channels: {error}"))
+            })?;
+        let mut restored = 0usize;
+        for state in channels {
+            if state.sealed {
+                continue;
+            }
+            self.record_committed_watermark(state.channel_id.clone(), state.cumulative);
+            self.touch_channel(state.channel_id);
+            restored += 1;
+        }
+        if restored > 0 {
+            tracing::info!(
+                restored,
+                "rehydrated open payment channels from durable session store"
+            );
+        }
+        Ok(restored)
+    }
+
+    /// Latest cumulative watermark from the local cache only.
+    pub fn committed_watermark(&self, session_id: &str) -> Option<u64> {
+        self.committed_watermarks
+            .lock()
+            .ok()
+            .and_then(|watermarks| watermarks.get(session_id).copied())
+    }
+
+    /// Always read the store and monotonically merge into the local watermark cache.
+    pub async fn refresh_committed_watermark(&self, session_id: &str) -> Option<u64> {
+        let state = self
+            .operator_runtime
+            .channel_store
+            .get_channel(session_id)
+            .await
+            .ok()
+            .flatten()?;
+        self.record_committed_watermark(session_id.to_string(), state.cumulative);
+        Some(state.cumulative)
+    }
+
+    /// Cache hit, else durable store (seeds the cache).
+    pub async fn load_committed_watermark(&self, session_id: &str) -> Option<u64> {
+        if let Some(cumulative) = self.committed_watermark(session_id) {
+            return Some(cumulative);
+        }
+        self.refresh_committed_watermark(session_id).await
     }
 
     /// Record channel activity so the lifecycle runloop can defer auto-close.
@@ -969,14 +1072,6 @@ impl SessionMpp {
         }
         self.lifecycle
             .send(SessionLifecycleCommand::Touch { channel_id });
-    }
-
-    /// Latest cumulative watermark accepted by this process for a session.
-    pub fn committed_watermark(&self, session_id: &str) -> Option<u64> {
-        self.committed_watermarks
-            .lock()
-            .ok()
-            .and_then(|watermarks| watermarks.get(session_id).copied())
     }
 
     /// On-chain settle signature for a finalized session channel, if recorded.
@@ -1153,6 +1248,7 @@ impl SessionMpp {
             SessionAction::Close(p) => {
                 let _lease = self
                     .reserve_delegated_capacity(&p.channel_id, 0)
+                    .await?
                     .ok_or_else(|| {
                         Error::Mpp(format!(
                             "Session channel {} is busy with another request",
@@ -1685,6 +1781,46 @@ mod tests {
         Box::new(MemorySigner::from_bytes(&kp).unwrap())
     }
 
+    #[tokio::test]
+    async fn rehydrate_restores_watermark_after_restart() {
+        let store: Arc<dyn ChannelStore> = Arc::new(MemoryChannelStore::new());
+        let first = SessionMpp::new_with_channel_store(
+            test_session_config(),
+            "test-secret",
+            Arc::clone(&store),
+        );
+        let challenge = first.challenge(CAP).unwrap();
+        let handle = SessionHandle::new(
+            solana_pubkey::Pubkey::new_unique(),
+            test_session_signer(),
+            challenge,
+        );
+        let open_header = handle.open_header(CAP, "open_sig").await.unwrap();
+        let SessionOutcome::Active { state: opened, .. } =
+            first.process(&open_header).await.unwrap()
+        else {
+            panic!("expected open");
+        };
+        let voucher_header = handle.voucher_header(75).await.unwrap();
+        first.process(&voucher_header).await.unwrap();
+        assert_eq!(first.committed_watermark(&opened.channel_id), Some(75));
+
+        // Simulate a gateway restart: new SessionMpp, same durable store.
+        let restarted = SessionMpp::new_with_channel_store(
+            test_session_config(),
+            "test-secret",
+            Arc::clone(&store),
+        );
+        assert_eq!(restarted.committed_watermark(&opened.channel_id), None);
+        let restored = restarted.rehydrate_from_store().await.unwrap();
+        assert_eq!(restored, 1);
+        assert_eq!(restarted.committed_watermark(&opened.channel_id), Some(75));
+        assert_eq!(
+            restarted.load_committed_watermark(&opened.channel_id).await,
+            Some(75)
+        );
+    }
+
     #[test]
     fn with_realm_updates_challenge_realm() {
         let session = test_session_mpp().with_realm("Custom Realm");
@@ -1827,6 +1963,8 @@ mod tests {
         let close_header = handle.close_header(Some(25)).await.unwrap();
         let competing_lease = session
             .reserve_delegated_capacity(&opened.channel_id, 0)
+            .await
+            .unwrap()
             .expect("test should reserve the channel");
         let error = session.process(&close_header).await.unwrap_err();
         assert!(
@@ -1972,21 +2110,31 @@ mod tests {
         );
     }
 
-    #[test]
-    fn delegated_capacity_lease_releases_on_drop() {
+    #[tokio::test]
+    async fn delegated_capacity_lease_releases_on_drop() {
         let session = test_session_mpp();
         let first = session
             .reserve_delegated_capacity("channel", CAP)
+            .await
+            .unwrap()
             .expect("first reservation should succeed");
         assert!(
-            session.reserve_delegated_capacity("channel", CAP).is_none(),
+            session
+                .reserve_delegated_capacity("channel", CAP)
+                .await
+                .unwrap()
+                .is_none(),
             "a live lease must exclude concurrent reservations"
         );
 
         drop(first);
 
         assert!(
-            session.reserve_delegated_capacity("channel", CAP).is_some(),
+            session
+                .reserve_delegated_capacity("channel", CAP)
+                .await
+                .unwrap()
+                .is_some(),
             "dropping the lease must release capacity"
         );
     }
@@ -2010,6 +2158,8 @@ mod tests {
         };
         let lease = session
             .reserve_delegated_capacity(&opened.channel_id, CAP)
+            .await
+            .unwrap()
             .expect("request should reserve channel capacity");
 
         tokio::time::sleep(Duration::from_millis(60)).await;
@@ -2396,5 +2546,128 @@ mod tests {
         assert!(session_close_needs_reconciliation(&close_pending));
         assert!(session_close_needs_reconciliation(&sealed));
         assert!(!session_close_needs_reconciliation(&missing));
+    }
+}
+
+#[cfg(all(test, feature = "redis-session-store"))]
+mod redis_e2e_tests {
+    use super::*;
+    use crate::client::session::SessionHandle;
+    use crate::server::session_capacity::CapacityLeaseCoordinator;
+    use pay_kit::mpp::solana_keychain::{SolanaSigner, memory::MemorySigner};
+    use pay_kit::mpp::store::RedisChannelStore;
+    use std::sync::Arc;
+
+    const CAP: u64 = 1_000_000;
+
+    fn redis_url() -> Option<String> {
+        std::env::var("PAY_SESSION_REDIS_URL")
+            .or_else(|_| std::env::var("PAY_KIT_TEST_REDIS_URL"))
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+    }
+
+    fn config() -> SessionConfig {
+        SessionConfig {
+            operator: solana_pubkey::Pubkey::new_unique().to_string(),
+            recipient: solana_pubkey::Pubkey::new_unique().to_string(),
+            max_cap: 5 * CAP,
+            currency: solana_pubkey::Pubkey::new_unique().to_string(),
+            network: "localnet".to_string(),
+            modes: vec![SessionMode::Push, SessionMode::Pull],
+            ..SessionConfig::default()
+        }
+    }
+
+    fn signer() -> Box<dyn SolanaSigner> {
+        use ed25519_dalek::SigningKey;
+        let sk = SigningKey::generate(&mut rand::thread_rng());
+        let vk = sk.verifying_key();
+        let mut kp = [0u8; 64];
+        kp[..32].copy_from_slice(sk.as_bytes());
+        kp[32..].copy_from_slice(vk.as_bytes());
+        Box::new(MemorySigner::from_bytes(&kp).unwrap())
+    }
+
+    #[tokio::test]
+    async fn redis_rehydrate_and_lease_across_replicas() {
+        let Some(url) = redis_url() else {
+            eprintln!("skipping: set PAY_SESSION_REDIS_URL or PAY_KIT_TEST_REDIS_URL");
+            return;
+        };
+        let prefix = format!("pay:test:session:{}:", uuid::Uuid::new_v4().simple());
+        let store: Arc<dyn ChannelStore> = Arc::new(
+            RedisChannelStore::connect(&url, prefix.clone())
+                .await
+                .expect("redis store"),
+        );
+        let first = SessionMpp::new_with_stores(
+            config(),
+            "redis-e2e",
+            Arc::clone(&store),
+            CapacityLeaseCoordinator::redis(&url, &prefix)
+                .await
+                .unwrap(),
+        );
+        let handle = SessionHandle::new(
+            solana_pubkey::Pubkey::new_unique(),
+            signer(),
+            first.challenge(CAP).unwrap(),
+        );
+        let open = handle.open_header(CAP, "open_sig").await.unwrap();
+        let SessionOutcome::Active { state: opened, .. } = first.process(&open).await.unwrap()
+        else {
+            panic!("expected open");
+        };
+        first
+            .process(&handle.voucher_header(88).await.unwrap())
+            .await
+            .unwrap();
+
+        let lease = first
+            .reserve_delegated_capacity(&opened.channel_id, 0)
+            .await
+            .unwrap()
+            .expect("first lease");
+        assert!(
+            first
+                .reserve_delegated_capacity(&opened.channel_id, 0)
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        let second = SessionMpp::new_with_stores(
+            config(),
+            "redis-e2e",
+            Arc::clone(&store),
+            CapacityLeaseCoordinator::redis(&url, &prefix)
+                .await
+                .unwrap(),
+        );
+        assert!(
+            second
+                .reserve_delegated_capacity(&opened.channel_id, 0)
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        drop(lease);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        assert!(second.rehydrate_from_store().await.unwrap() >= 1);
+        assert_eq!(
+            second.load_committed_watermark(&opened.channel_id).await,
+            Some(88)
+        );
+        assert!(
+            second
+                .reserve_delegated_capacity(&opened.channel_id, 0)
+                .await
+                .unwrap()
+                .is_some()
+        );
     }
 }
