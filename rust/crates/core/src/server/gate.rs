@@ -2005,7 +2005,9 @@ mod tests {
     fn gate_maps_lease_backend_error_to_503_not_402() {
         let Err(decision) = map_capacity_reservation(
             "ch",
-            Err(crate::Error::Mpp("capacity lease backend unavailable".into())),
+            Err(crate::Error::Mpp(
+                "capacity lease backend unavailable".into(),
+            )),
         ) else {
             panic!("backend error must map to a gate response");
         };

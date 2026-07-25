@@ -58,7 +58,10 @@ jobs:
         with:
           workspaces: rust
       - run: cargo fmt --check
-      - run: cargo clippy --workspace --all-targets --features "server,redis-session-store" -- -D warnings
+      - name: Clippy (default features)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Clippy (server + redis-session-store)
+        run: cargo clippy --workspace --all-targets --features "server,redis-session-store" -- -D warnings
   # ── Rust tests + coverage ──
   rust-test:
     name: Rust tests + coverage

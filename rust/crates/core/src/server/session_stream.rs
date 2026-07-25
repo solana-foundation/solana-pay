@@ -1353,8 +1353,7 @@ mod redis_stream_tests {
     use crate::server::session::SessionOutcome;
     use crate::server::session_capacity::CapacityLeaseCoordinator;
     use crate::server::session_capacity::redis_test_support::{
-        assert_no_overlapping_holders, await_released, del_lease_key, redis_test_url,
-        unique_prefix,
+        assert_no_overlapping_holders, await_released, del_lease_key, redis_test_url, unique_prefix,
     };
     use pay_kit::mpp::server::session::SessionConfig;
     use pay_kit::mpp::solana_keychain::{SolanaSigner, memory::MemorySigner};
@@ -1475,9 +1474,12 @@ mod redis_stream_tests {
 
         del_lease_key(&url, &prefix, &state.channel_id).await;
         assert_no_overlapping_holders(&peer, &state.channel_id).await;
-        tokio::time::timeout(ttl * 4, meter.forward.capacity_lease().expect("lease").lost())
-            .await
-            .expect("stream holder must observe lease loss");
+        tokio::time::timeout(
+            ttl * 4,
+            meter.forward.capacity_lease().expect("lease").lost(),
+        )
+        .await
+        .expect("stream holder must observe lease loss");
 
         // Drive the real proxy path. settle runs before yield, so a lost lease
         // must fail the stream instead of releasing unpaid bytes.

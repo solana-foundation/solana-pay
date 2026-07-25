@@ -496,20 +496,21 @@ mod tests {
     }
 }
 
-
 #[cfg(test)]
 mod required_coverage {
-    /// CI sets PAY_REQUIRE_REDIS_TESTS=1. If the feature is missing, the Redis
-    /// suite silently vanishes at compile time — fail loudly instead.
+    /// CI sets PAY_REQUIRE_REDIS_TESTS=1 on Redis-enabled jobs. If the feature
+    /// is missing, the Redis suite silently vanishes at compile time — fail
+    /// loudly instead. Keyed only on PAY_REQUIRE_REDIS_TESTS so default-feature
+    /// CI jobs can still run without Redis.
     #[test]
     fn redis_lease_suite_is_compiled_when_required() {
         let required = matches!(
             std::env::var("PAY_REQUIRE_REDIS_TESTS").as_deref(),
             Ok("1") | Ok("true")
-        ) || matches!(std::env::var("CI").as_deref(), Ok("true") | Ok("1"));
+        );
         assert!(
             !required || cfg!(feature = "redis-session-store"),
-            "PAY_REQUIRE_REDIS_TESTS/CI is set but this build has no \
+            "PAY_REQUIRE_REDIS_TESTS is set but this build has no \
              redis-session-store feature: the Redis lease tests did not run"
         );
     }
@@ -519,9 +520,8 @@ mod required_coverage {
 pub(crate) mod redis_test_support {
     //! Shared Redis lease-test helpers for pay-core.
     //!
-    //! Soft-skip when no URL is set locally. Under CI (`CI=true`) or
-    //! `PAY_REQUIRE_REDIS_TESTS=1`, a missing URL panics so coverage cannot go
-    //! vacuous.
+    //! Soft-skip when no URL is set locally. Under `PAY_REQUIRE_REDIS_TESTS=1`,
+    //! a missing URL panics so Redis-enabled CI jobs cannot go vacuous.
     //!
     //! Product ceilings intentionally out of scope for the harness:
     //! - no fencing token beyond the lease id / barrier pair
@@ -532,8 +532,10 @@ pub(crate) mod redis_test_support {
     use std::time::Duration;
 
     pub(crate) fn require_redis_tests() -> bool {
-        matches!(std::env::var("PAY_REQUIRE_REDIS_TESTS").as_deref(), Ok("1") | Ok("true"))
-            || matches!(std::env::var("CI").as_deref(), Ok("true") | Ok("1"))
+        matches!(
+            std::env::var("PAY_REQUIRE_REDIS_TESTS").as_deref(),
+            Ok("1") | Ok("true")
+        )
     }
 
     fn redis_url_optional() -> Option<String> {
@@ -551,7 +553,7 @@ pub(crate) mod redis_test_support {
             None if require_redis_tests() => {
                 panic!(
                     "PAY_SESSION_REDIS_URL or PAY_KIT_TEST_REDIS_URL is required when \
-                     CI=true or PAY_REQUIRE_REDIS_TESTS=1"
+                     PAY_REQUIRE_REDIS_TESTS=1"
                 );
             }
             None => None,
@@ -564,7 +566,12 @@ pub(crate) mod redis_test_support {
 
     pub(crate) async fn dual_coordinators(
         ttl: Duration,
-    ) -> Option<(String, String, CapacityLeaseCoordinator, CapacityLeaseCoordinator)> {
+    ) -> Option<(
+        String,
+        String,
+        CapacityLeaseCoordinator,
+        CapacityLeaseCoordinator,
+    )> {
         let url = redis_test_url()?;
         let prefix = unique_prefix("lease");
         let a = CapacityLeaseCoordinator::redis_with_ttl(&url, &prefix, ttl)
@@ -593,7 +600,10 @@ pub(crate) mod redis_test_support {
         channel_id: &str,
     ) {
         assert!(
-            peer.try_acquire(channel_id).await.expect("peer acquire").is_none(),
+            peer.try_acquire(channel_id)
+                .await
+                .expect("peer acquire")
+                .is_none(),
             "the takeover barrier must prevent overlapping holders"
         );
     }
@@ -617,7 +627,8 @@ pub(crate) mod redis_test_support {
             }
             assert!(
                 tokio::time::Instant::now() < deadline,
-                "the abandoned holder did not release within half the barrier TTL;                  a later acquisition would only prove barrier expiry"
+                "the abandoned holder did not release within half the barrier TTL; \
+                 a later acquisition would only prove barrier expiry"
             );
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
@@ -626,11 +637,11 @@ pub(crate) mod redis_test_support {
 
 #[cfg(all(test, feature = "redis-session-store"))]
 mod redis_tests {
-    use super::*;
     use super::redis_test_support::{
         assert_no_overlapping_holders, del_lease_key, dual_coordinators, redis_test_url,
         unique_prefix,
     };
+    use super::*;
 
     #[tokio::test]
     async fn redis_lease_exclusive_and_stale_release_safe() {
@@ -790,8 +801,7 @@ mod redis_tests {
 
     #[tokio::test]
     async fn early_deletion_after_renewal_cannot_overlap_holders() {
-        let Some((url, prefix, owner, peer)) =
-            dual_coordinators(Duration::from_millis(600)).await
+        let Some((url, prefix, owner, peer)) = dual_coordinators(Duration::from_millis(600)).await
         else {
             eprintln!("skipping: set PAY_SESSION_REDIS_URL or PAY_KIT_TEST_REDIS_URL");
             return;

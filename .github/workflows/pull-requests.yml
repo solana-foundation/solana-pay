@@ -100,10 +100,16 @@ jobs:
       - name: Format
         run: cargo fmt --check
 
-      - name: Lint
+      - name: Lint (default features)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Lint (server + redis-session-store)
         run: cargo clippy --workspace --all-targets --features "server,redis-session-store" -- -D warnings
 
-      - name: Test
+      - name: Test (default features)
+        run: cargo test --workspace
+
+      - name: Test (server + redis-session-store)
         env:
           PAY_SESSION_REDIS_URL: redis://127.0.0.1:6379
           PAY_REQUIRE_REDIS_TESTS: "1"

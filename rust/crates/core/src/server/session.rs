@@ -2579,18 +2579,15 @@ mod redis_e2e_tests {
     use crate::client::session::SessionHandle;
     use crate::server::gate::{SessionForward, settle_delegated_session};
     use crate::server::metering::{RequestProperties, UptoSettlementPlan};
+    use crate::server::session_capacity::CAPACITY_LEASE_TTL;
     use crate::server::session_capacity::CapacityLeaseCoordinator;
     use crate::server::session_capacity::redis_test_support::{
-        assert_no_overlapping_holders, await_released, del_lease_key, redis_test_url,
-        unique_prefix,
+        assert_no_overlapping_holders, await_released, del_lease_key, redis_test_url, unique_prefix,
     };
-    use crate::server::session_capacity::CAPACITY_LEASE_TTL;
     use http::HeaderMap;
     use pay_kit::mpp::solana_keychain::{SolanaSigner, memory::MemorySigner};
     use pay_kit::mpp::store::RedisChannelStore;
-    use pay_types::metering::{
-        BillingUnit, MeterDimension, MeterDirection, Metering, PriceTier,
-    };
+    use pay_types::metering::{BillingUnit, MeterDimension, MeterDirection, Metering, PriceTier};
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -2740,10 +2737,7 @@ mod redis_e2e_tests {
         await_released(&url, &prefix, &channel_id, CAPACITY_LEASE_TTL).await;
 
         assert!(second.rehydrate_from_store().await.unwrap() >= 1);
-        assert_eq!(
-            second.load_committed_watermark(&channel_id).await,
-            Some(88)
-        );
+        assert_eq!(second.load_committed_watermark(&channel_id).await, Some(88));
         assert!(
             second
                 .reserve_delegated_capacity(&channel_id, 0)
@@ -2797,7 +2791,9 @@ mod redis_e2e_tests {
             config(),
             "redis-e2e",
             Arc::clone(&first.operator_runtime.channel_store),
-            CapacityLeaseCoordinator::redis(&url, &prefix).await.unwrap(),
+            CapacityLeaseCoordinator::redis(&url, &prefix)
+                .await
+                .unwrap(),
         );
         assert_eq!(restarted.rehydrate_from_store().await.unwrap(), 0);
         assert_eq!(restarted.committed_watermark(&channel_id), None);
@@ -2814,8 +2810,7 @@ mod redis_e2e_tests {
         let peer_coordinator = CapacityLeaseCoordinator::redis_with_ttl(&url, &prefix, ttl)
             .await
             .unwrap();
-        let (first, second, channel_id, _) =
-            open_delegated_pair_with_ttl(&url, &prefix, ttl).await;
+        let (first, second, channel_id, _) = open_delegated_pair_with_ttl(&url, &prefix, ttl).await;
         let lease = first
             .reserve_delegated_capacity(&channel_id, CAP)
             .await
@@ -2907,8 +2902,7 @@ mod redis_e2e_tests {
         let peer_coordinator = CapacityLeaseCoordinator::redis_with_ttl(&url, &prefix, ttl)
             .await
             .unwrap();
-        let (session, peer, channel_id, _) =
-            open_delegated_pair_with_ttl(&url, &prefix, ttl).await;
+        let (session, peer, channel_id, _) = open_delegated_pair_with_ttl(&url, &prefix, ttl).await;
 
         // Drive the extracted close_channel_under_lease path (same wiring as
         // close_due_channels). Loss before the guarded close must abandon work
@@ -2927,12 +2921,9 @@ mod redis_e2e_tests {
             .await
             .expect("holder must observe lease loss");
 
-        let (closed_id, result) = close_channel_under_lease(
-            session.operator_runtime.clone(),
-            channel_id.clone(),
-            token,
-        )
-        .await;
+        let (closed_id, result) =
+            close_channel_under_lease(session.operator_runtime.clone(), channel_id.clone(), token)
+                .await;
         assert_eq!(closed_id, channel_id);
         let error = match result {
             Ok(_) => panic!("lost lease must abandon auto-close"),

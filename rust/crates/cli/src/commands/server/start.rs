@@ -84,7 +84,7 @@ async fn session_channel_store() -> pay_core::Result<(
                     ))
                 })?;
         tracing::info!("using durable Redis channel store and capacity leases for MPP sessions");
-        return Ok((Arc::new(store), capacity));
+        Ok((Arc::new(store), capacity))
     }
 
     #[cfg(not(feature = "redis-session-store"))]
