@@ -125,6 +125,7 @@ fn assert_unknown_402(outcome: RunOutcome, expected_header: &str) {
         RunOutcome::UnknownPaymentRequired {
             headers,
             resource_url,
+            ..
         } => {
             assert_eq!(resource_url, URL);
             assert!(
