@@ -71,19 +71,11 @@ jobs:
         run: pnpm --filter @solana/pay test
 
   # ── Rust CLI (rust/) ──
+  # Fast default-feature gate for PRs. Redis-backed lease/session coverage
+  # lives in ci.yml (rust-check / rust-test) so PRs do not pay for it twice.
   cli-check:
     name: CLI check
     runs-on: ubuntu-latest
-    services:
-      redis:
-        image: redis:7-alpine
-        ports:
-          - 6379:6379
-        options: >-
-          --health-cmd "redis-cli ping"
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 5
     defaults:
       run:
         working-directory: ./rust
@@ -100,17 +92,8 @@ jobs:
       - name: Format
         run: cargo fmt --check
 
-      - name: Lint (default features)
+      - name: Lint
         run: cargo clippy --workspace --all-targets -- -D warnings
 
-      - name: Lint (server + redis-session-store)
-        run: cargo clippy --workspace --all-targets --features "server,redis-session-store" -- -D warnings
-
-      - name: Test (default features)
+      - name: Test
         run: cargo test --workspace
-
-      - name: Test (server + redis-session-store)
-        env:
-          PAY_SESSION_REDIS_URL: redis://127.0.0.1:6379
-          PAY_REQUIRE_REDIS_TESTS: "1"
-        run: cargo test --workspace --features "server,redis-session-store"
