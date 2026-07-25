@@ -497,10 +497,27 @@ mod tests {
 }
 
 #[cfg(all(test, feature = "redis-session-store"))]
-mod redis_tests {
-    use super::*;
+pub(crate) mod redis_test_support {
+    //! Shared Redis lease-test helpers for pay-core.
+    //!
+    //! Soft-skip when no URL is set locally. Under CI (`CI=true`) or
+    //! `PAY_REQUIRE_REDIS_TESTS=1`, a missing URL panics so coverage cannot go
+    //! vacuous.
+    //!
+    //! Product ceilings intentionally out of scope for the harness:
+    //! - no fencing token beyond the lease id / barrier pair
+    //! - `last_activity` is per-process (no shared idle clock across replicas)
+    //! - lifecycle is "whoever holds the lease", not a leader election
 
-    fn redis_url() -> Option<String> {
+    use super::*;
+    use std::time::Duration;
+
+    pub(crate) fn require_redis_tests() -> bool {
+        matches!(std::env::var("PAY_REQUIRE_REDIS_TESTS").as_deref(), Ok("1") | Ok("true"))
+            || matches!(std::env::var("CI").as_deref(), Ok("true") | Ok("1"))
+    }
+
+    fn redis_url_optional() -> Option<String> {
         std::env::var("PAY_SESSION_REDIS_URL")
             .or_else(|_| std::env::var("PAY_KIT_TEST_REDIS_URL"))
             .ok()
@@ -508,20 +525,75 @@ mod redis_tests {
             .filter(|v| !v.is_empty())
     }
 
+    /// Soft-skip locally; panic in CI / when Redis tests are required.
+    pub(crate) fn redis_test_url() -> Option<String> {
+        match redis_url_optional() {
+            Some(url) => Some(url),
+            None if require_redis_tests() => {
+                panic!(
+                    "PAY_SESSION_REDIS_URL or PAY_KIT_TEST_REDIS_URL is required when \
+                     CI=true or PAY_REQUIRE_REDIS_TESTS=1"
+                );
+            }
+            None => None,
+        }
+    }
+
+    pub(crate) fn unique_prefix(kind: &str) -> String {
+        format!("pay:test:{kind}:{}:", uuid::Uuid::new_v4().simple())
+    }
+
+    pub(crate) async fn dual_coordinators(
+        ttl: Duration,
+    ) -> Option<(String, String, CapacityLeaseCoordinator, CapacityLeaseCoordinator)> {
+        let url = redis_test_url()?;
+        let prefix = unique_prefix("lease");
+        let a = CapacityLeaseCoordinator::redis_with_ttl(&url, &prefix, ttl)
+            .await
+            .expect("coordinator a");
+        let b = CapacityLeaseCoordinator::redis_with_ttl(&url, &prefix, ttl)
+            .await
+            .expect("coordinator b");
+        Some((url, prefix, a, b))
+    }
+
+    pub(crate) async fn del_lease_key(url: &str, prefix: &str, channel_id: &str) {
+        let client = redis::Client::open(url).expect("redis client");
+        let mut conn = client.get_connection_manager().await.expect("redis conn");
+        let _: () = redis::cmd("DEL")
+            .arg(format!("{prefix}lease:{channel_id}"))
+            .query_async(&mut conn)
+            .await
+            .expect("DEL lease key");
+    }
+
+    /// Peer must not acquire while the takeover barrier still proves the old hold.
+    /// Never assert success as "peer acquires while the original is still held".
+    pub(crate) async fn assert_no_overlapping_holders(
+        peer: &CapacityLeaseCoordinator,
+        channel_id: &str,
+    ) {
+        assert!(
+            peer.try_acquire(channel_id).await.expect("peer acquire").is_none(),
+            "the takeover barrier must prevent overlapping holders"
+        );
+    }
+}
+
+#[cfg(all(test, feature = "redis-session-store"))]
+mod redis_tests {
+    use super::*;
+    use super::redis_test_support::{
+        assert_no_overlapping_holders, del_lease_key, dual_coordinators, redis_test_url,
+        unique_prefix,
+    };
+
     #[tokio::test]
     async fn redis_lease_exclusive_and_stale_release_safe() {
-        let Some(url) = redis_url() else {
+        let Some((url, prefix, a, b)) = dual_coordinators(Duration::from_millis(600)).await else {
             eprintln!("skipping: set PAY_SESSION_REDIS_URL or PAY_KIT_TEST_REDIS_URL");
             return;
         };
-        let prefix = format!("pay:test:lease:{}:", uuid::Uuid::new_v4().simple());
-        let ttl = Duration::from_millis(600);
-        let a = CapacityLeaseCoordinator::redis_with_ttl(&url, &prefix, ttl)
-            .await
-            .unwrap();
-        let b = CapacityLeaseCoordinator::redis_with_ttl(&url, &prefix, ttl)
-            .await
-            .unwrap();
 
         let mut token_a = a.try_acquire("ch").await.unwrap().expect("a");
         assert!(b.try_acquire("ch").await.unwrap().is_none());
@@ -529,7 +601,8 @@ mod redis_tests {
         // Stop A's watchdog and wait for both of its keys to expire naturally.
         // Its local deadline is stale before B is allowed to acquire.
         token_a.redis.as_mut().expect("redis hold")._renewal.take();
-        tokio::time::sleep(barrier_ttl(ttl) + Duration::from_millis(100)).await;
+        tokio::time::sleep(barrier_ttl(Duration::from_millis(600)) + Duration::from_millis(100))
+            .await;
         assert!(!token_a.is_held());
 
         let token_b = b.try_acquire("ch").await.unwrap().expect("b");
@@ -553,11 +626,11 @@ mod redis_tests {
 
     #[tokio::test]
     async fn redis_lease_renews_past_its_ttl() {
-        let Some(url) = redis_url() else {
+        let Some(url) = redis_test_url() else {
             eprintln!("skipping: set PAY_SESSION_REDIS_URL or PAY_KIT_TEST_REDIS_URL");
             return;
         };
-        let prefix = format!("pay:test:lease:{}:", uuid::Uuid::new_v4().simple());
+        let prefix = unique_prefix("lease");
         let ttl = Duration::from_millis(600);
         let coordinator = CapacityLeaseCoordinator::redis_with_ttl(&url, &prefix, ttl)
             .await
@@ -583,7 +656,7 @@ mod redis_tests {
 
     #[tokio::test]
     async fn redis_backend_failure_is_an_error_not_contention() {
-        let Some(url) = redis_url() else {
+        let Some(url) = redis_test_url() else {
             eprintln!("skipping: set PAY_SESSION_REDIS_URL or PAY_KIT_TEST_REDIS_URL");
             return;
         };
@@ -602,31 +675,20 @@ mod redis_tests {
 
     #[tokio::test]
     async fn lost_redis_lease_marks_the_token_unheld() {
-        let Some(url) = redis_url() else {
+        let Some((url, prefix, coordinator, peer)) =
+            dual_coordinators(Duration::from_millis(600)).await
+        else {
             eprintln!("skipping: set PAY_SESSION_REDIS_URL or PAY_KIT_TEST_REDIS_URL");
             return;
         };
-        let prefix = format!("pay:test:lease:{}:", uuid::Uuid::new_v4().simple());
         let ttl = Duration::from_millis(600);
-        let coordinator = CapacityLeaseCoordinator::redis_with_ttl(&url, &prefix, ttl)
-            .await
-            .unwrap();
         let token = coordinator.try_acquire("ch").await.unwrap().expect("lease");
         assert!(token.is_held());
 
         // Delete only the lease key behind the holder's back. The barrier must
         // keep a peer out until the original holder observes the loss.
-        let client = redis::Client::open(url.as_str()).unwrap();
-        let mut conn = client.get_connection_manager().await.unwrap();
-        let _: () = redis::cmd("DEL")
-            .arg(format!("{prefix}lease:ch"))
-            .query_async(&mut conn)
-            .await
-            .unwrap();
-        assert!(
-            coordinator.try_acquire("ch").await.unwrap().is_none(),
-            "takeover barrier must block a peer after early lease deletion"
-        );
+        del_lease_key(&url, &prefix, "ch").await;
+        assert_no_overlapping_holders(&peer, "ch").await;
 
         tokio::time::timeout(ttl * 4, token.lost())
             .await
@@ -636,30 +698,22 @@ mod redis_tests {
             "renewal must tell the holder its lease is gone"
         );
         coordinator.release_async("ch", &token).await;
-        let peer = coordinator.try_acquire("ch").await.unwrap().expect("peer");
-        assert!(peer.is_held());
+        let peer_token = peer.try_acquire("ch").await.unwrap().expect("peer");
+        assert!(peer_token.is_held());
     }
 
     #[tokio::test]
     async fn loss_is_persisted_without_an_active_waiter() {
-        let Some(url) = redis_url() else {
+        let Some((url, prefix, coordinator, _)) =
+            dual_coordinators(Duration::from_millis(600)).await
+        else {
             eprintln!("skipping: set PAY_SESSION_REDIS_URL or PAY_KIT_TEST_REDIS_URL");
             return;
         };
-        let prefix = format!("pay:test:lease:{}:", uuid::Uuid::new_v4().simple());
         let ttl = Duration::from_millis(600);
-        let coordinator = CapacityLeaseCoordinator::redis_with_ttl(&url, &prefix, ttl)
-            .await
-            .unwrap();
         let token = coordinator.try_acquire("ch").await.unwrap().expect("lease");
 
-        let client = redis::Client::open(url.as_str()).unwrap();
-        let mut conn = client.get_connection_manager().await.unwrap();
-        let _: () = redis::cmd("DEL")
-            .arg(format!("{prefix}lease:ch"))
-            .query_async(&mut conn)
-            .await
-            .unwrap();
+        del_lease_key(&url, &prefix, "ch").await;
 
         // No receiver is active while the watchdog detects the loss.
         tokio::time::sleep(renew_interval(ttl) * 2).await;
@@ -692,18 +746,13 @@ mod redis_tests {
 
     #[tokio::test]
     async fn early_deletion_after_renewal_cannot_overlap_holders() {
-        let Some(url) = redis_url() else {
+        let Some((url, prefix, owner, peer)) =
+            dual_coordinators(Duration::from_millis(600)).await
+        else {
             eprintln!("skipping: set PAY_SESSION_REDIS_URL or PAY_KIT_TEST_REDIS_URL");
             return;
         };
-        let prefix = format!("pay:test:lease:{}:", uuid::Uuid::new_v4().simple());
         let ttl = Duration::from_millis(600);
-        let owner = CapacityLeaseCoordinator::redis_with_ttl(&url, &prefix, ttl)
-            .await
-            .unwrap();
-        let peer = CapacityLeaseCoordinator::redis_with_ttl(&url, &prefix, ttl)
-            .await
-            .unwrap();
         let token = owner.try_acquire("ch").await.unwrap().expect("owner");
 
         // Wait for proof that one renewal completed, then delete only the lease
@@ -727,18 +776,9 @@ mod redis_tests {
         .await
         .expect("renewal must complete");
 
-        let client = redis::Client::open(url.as_str()).unwrap();
-        let mut conn = client.get_connection_manager().await.unwrap();
-        let _: () = redis::cmd("DEL")
-            .arg(format!("{prefix}lease:ch"))
-            .query_async(&mut conn)
-            .await
-            .unwrap();
+        del_lease_key(&url, &prefix, "ch").await;
 
-        assert!(
-            peer.try_acquire("ch").await.unwrap().is_none(),
-            "the takeover barrier must prevent overlapping holders"
-        );
+        assert_no_overlapping_holders(&peer, "ch").await;
         tokio::time::timeout(ttl, token.lost())
             .await
             .expect("owner must detect the loss before the barrier expires");
@@ -748,27 +788,19 @@ mod redis_tests {
 
     #[tokio::test]
     async fn guard_abandons_in_flight_work_when_the_lease_is_lost() {
-        let Some(url) = redis_url() else {
+        let Some((url, prefix, coordinator, peer)) =
+            dual_coordinators(Duration::from_millis(600)).await
+        else {
             eprintln!("skipping: set PAY_SESSION_REDIS_URL or PAY_KIT_TEST_REDIS_URL");
             return;
         };
-        let prefix = format!("pay:test:lease:{}:", uuid::Uuid::new_v4().simple());
         let ttl = Duration::from_millis(600);
-        let coordinator = CapacityLeaseCoordinator::redis_with_ttl(&url, &prefix, ttl)
-            .await
-            .unwrap();
         let token = coordinator.try_acquire("ch").await.unwrap().expect("lease");
 
         // Delete only the lease key while guarded work is still running. A peer
         // remains blocked by the barrier until the holder cancels its work.
-        let client = redis::Client::open(url.as_str()).unwrap();
-        let mut conn = client.get_connection_manager().await.unwrap();
-        let _: () = redis::cmd("DEL")
-            .arg(format!("{prefix}lease:ch"))
-            .query_async(&mut conn)
-            .await
-            .unwrap();
-        assert!(coordinator.try_acquire("ch").await.unwrap().is_none());
+        del_lease_key(&url, &prefix, "ch").await;
+        assert_no_overlapping_holders(&peer, "ch").await;
 
         let work_finished = Arc::new(Mutex::new(false));
         let flag = Arc::clone(&work_finished);
@@ -788,8 +820,38 @@ mod redis_tests {
         );
         coordinator.release_async("ch", &token).await;
         assert!(
-            coordinator.try_acquire("ch").await.unwrap().is_some(),
+            peer.try_acquire("ch").await.unwrap().is_some(),
             "a peer may acquire only after the old holder has cancelled"
+        );
+    }
+
+    #[tokio::test]
+    async fn acquire_stampede_yields_exactly_one_holder() {
+        let Some(url) = redis_test_url() else {
+            eprintln!("skipping: set PAY_SESSION_REDIS_URL or PAY_KIT_TEST_REDIS_URL");
+            return;
+        };
+        let prefix = unique_prefix("stampede");
+        let ttl = Duration::from_millis(600);
+        let mut coordinators = Vec::new();
+        for _ in 0..8 {
+            coordinators.push(
+                CapacityLeaseCoordinator::redis_with_ttl(&url, &prefix, ttl)
+                    .await
+                    .unwrap(),
+            );
+        }
+        let mut tasks = Vec::new();
+        for coordinator in &coordinators {
+            let c = coordinator.clone();
+            tasks.push(async move { c.try_acquire("ch").await.unwrap() });
+        }
+        let results = futures_util::future::join_all(tasks).await;
+        let winners: Vec<_> = results.into_iter().flatten().collect();
+        assert_eq!(
+            winners.len(),
+            1,
+            "exactly one stampede participant may hold the lease"
         );
     }
 }
