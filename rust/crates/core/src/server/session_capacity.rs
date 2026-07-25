@@ -1,7 +1,7 @@
 //! Exclusive capacity leases for delegated MPP sessions.
 //!
-//! Local: process-private `HashSet`. Redis: `SET key token NX EX` + Lua
-//! compare-and-delete so a late Drop cannot steal a newer holder's key.
+//! Local: process-private `HashSet`. Redis: an expiring lease plus a slightly
+//! longer takeover barrier, both carrying the acquisition token.
 //!
 //! A Redis lease is renewed by a task owned by the returned
 //! [`CapacityLeaseToken`], so a lease stays exclusive for as long as the holder
@@ -25,6 +25,14 @@ const LEASE_IO_TIMEOUT: Duration = Duration::from_secs(2);
 #[cfg(feature = "redis-session-store")]
 fn renew_interval(ttl: Duration) -> Duration {
     (ttl / 3).max(Duration::from_millis(100))
+}
+
+/// Keep a replacement holder out until the old holder's expiry watchdog has
+/// fired. This closes the takeover gap if the lease key alone is deleted,
+/// evicted, or replaced between renewal probes.
+#[cfg(feature = "redis-session-store")]
+fn barrier_ttl(ttl: Duration) -> Duration {
+    ttl + renew_interval(ttl)
 }
 
 /// Keep the holder's Redis key alive; aborts when the token is dropped.
@@ -51,8 +59,17 @@ pub struct CapacityLeaseToken {
 #[cfg(feature = "redis-session-store")]
 struct RedisLeaseHold {
     id: String,
-    held: Arc<tokio::sync::watch::Sender<bool>>,
+    state: Arc<tokio::sync::watch::Sender<LeaseState>>,
     _renewal: Option<RenewalTask>,
+}
+
+/// Local proof of the last Redis renewal. The deadline lets a paused replica
+/// reject its stale token immediately on resume, even before its watchdog runs.
+#[cfg(feature = "redis-session-store")]
+#[derive(Clone, Copy)]
+struct LeaseState {
+    held: bool,
+    expires_at: tokio::time::Instant,
 }
 
 impl CapacityLeaseToken {
@@ -69,7 +86,8 @@ impl CapacityLeaseToken {
     pub fn is_held(&self) -> bool {
         #[cfg(feature = "redis-session-store")]
         if let Some(hold) = &self.redis {
-            return *hold.held.borrow();
+            let state = *hold.state.borrow();
+            return state.held && tokio::time::Instant::now() < state.expires_at;
         }
         true
     }
@@ -95,10 +113,23 @@ impl CapacityLeaseToken {
     pub async fn lost(&self) {
         #[cfg(feature = "redis-session-store")]
         if let Some(hold) = &self.redis {
-            let mut held = hold.held.subscribe();
-            // A closed channel means the holder itself is going away.
-            let _ = held.wait_for(|held| !*held).await;
-            return;
+            let mut state = hold.state.subscribe();
+            loop {
+                let current = *state.borrow();
+                if !current.held || tokio::time::Instant::now() >= current.expires_at {
+                    return;
+                }
+                tokio::select! {
+                    biased;
+                    () = tokio::time::sleep_until(current.expires_at) => return,
+                    changed = state.changed() => {
+                        // A closed channel means the holder itself is going away.
+                        if changed.is_err() {
+                            return;
+                        }
+                    }
+                }
+            }
         }
         // A local lease cannot be taken away while the holder keeps its token.
         std::future::pending().await
@@ -234,17 +265,38 @@ fn lease_error(error: impl std::fmt::Display) -> Error {
     Error::Mpp(format!("capacity lease backend unavailable: {error}"))
 }
 
-/// Both scripts act only while the key still holds the caller's token.
+/// Acquire both keys atomically. A surviving barrier prevents takeover when
+/// the lease key alone disappears before its holder observes the loss.
+#[cfg(feature = "redis-session-store")]
+const ACQUIRE_SCRIPT: &str = r"
+if redis.call('EXISTS', KEYS[1]) == 1 or redis.call('EXISTS', KEYS[2]) == 1 then
+  return 0
+end
+redis.call('PSETEX', KEYS[1], ARGV[2], ARGV[1])
+redis.call('PSETEX', KEYS[2], ARGV[3], ARGV[1])
+return 1
+";
+
+/// Renew only while both keys still prove ownership.
 #[cfg(feature = "redis-session-store")]
 const RENEW_SCRIPT: &str = r"
 if redis.call('GET', KEYS[1]) ~= ARGV[1] then return 0 end
-return redis.call('PEXPIRE', KEYS[1], ARGV[2])
+if redis.call('GET', KEYS[2]) ~= ARGV[1] then return 0 end
+redis.call('PEXPIRE', KEYS[1], ARGV[2])
+redis.call('PEXPIRE', KEYS[2], ARGV[3])
+return 1
 ";
 
 #[cfg(feature = "redis-session-store")]
 const RELEASE_SCRIPT: &str = r"
-if redis.call('GET', KEYS[1]) ~= ARGV[1] then return 0 end
-return redis.call('DEL', KEYS[1])
+local deleted = 0
+if redis.call('GET', KEYS[1]) == ARGV[1] then
+  deleted = deleted + redis.call('DEL', KEYS[1])
+end
+if redis.call('GET', KEYS[2]) == ARGV[1] then
+  deleted = deleted + redis.call('DEL', KEYS[2])
+end
+return deleted
 ";
 
 #[cfg(feature = "redis-session-store")]
@@ -253,36 +305,45 @@ impl RedisLease {
         format!("{}lease:{}", self.prefix, channel_id)
     }
 
+    fn barrier_key(&self, channel_id: &str) -> String {
+        format!("{}lease-barrier:{}", self.prefix, channel_id)
+    }
+
     async fn try_acquire(&self, channel_id: &str) -> Result<Option<CapacityLeaseToken>> {
         let id = uuid::Uuid::new_v4().to_string();
         let key = self.key(channel_id);
+        let barrier_key = self.barrier_key(channel_id);
         let mut conn = self.connection.clone();
         // Redis starts the clock when it runs the command, so date the deadline
         // from before we send: erring early keeps us inside the real TTL.
         let sent_at = tokio::time::Instant::now();
-        let acquired: Option<String> = with_lease_timeout(
+        let acquired: i32 = with_lease_timeout(
             "acquire",
-            redis::cmd("SET")
-                .arg(&key)
+            redis::Script::new(ACQUIRE_SCRIPT)
+                .key(&key)
+                .key(&barrier_key)
                 .arg(&id)
-                .arg("NX")
-                .arg("PX")
                 .arg(self.ttl.as_millis() as u64)
-                .query_async(&mut conn),
+                .arg(barrier_ttl(self.ttl).as_millis() as u64)
+                .invoke_async(&mut conn),
         )
         .await?
         .map_err(lease_error)?;
-        if acquired.is_none() {
+        if acquired == 0 {
             return Ok(None);
         }
-        let held = Arc::new(tokio::sync::watch::Sender::new(true));
+        let expires_at = sent_at + self.ttl;
+        let state = Arc::new(tokio::sync::watch::Sender::new(LeaseState {
+            held: true,
+            expires_at,
+        }));
         let renewal = self
-            .spawn_renewal(key, id.clone(), Arc::clone(&held), sent_at + self.ttl)
+            .spawn_renewal(key, barrier_key, id.clone(), Arc::clone(&state), expires_at)
             .map(RenewalTask);
         Ok(Some(CapacityLeaseToken {
             redis: Some(Box::new(RedisLeaseHold {
                 id,
-                held,
+                state,
                 _renewal: renewal,
             })),
         }))
@@ -298,8 +359,9 @@ impl RedisLease {
     fn spawn_renewal(
         &self,
         key: String,
+        barrier_key: String,
         id: String,
-        held: Arc<tokio::sync::watch::Sender<bool>>,
+        state: Arc<tokio::sync::watch::Sender<LeaseState>>,
         mut expires_at: tokio::time::Instant,
     ) -> Option<tokio::task::JoinHandle<()>> {
         let handle = tokio::runtime::Handle::try_current().ok()?;
@@ -315,8 +377,10 @@ impl RedisLease {
                         let call = with_lease_timeout("renew", async {
                             redis::Script::new(RENEW_SCRIPT)
                                 .key(&key)
+                                .key(&barrier_key)
                                 .arg(&id)
                                 .arg(ttl.as_millis() as u64)
+                                .arg(barrier_ttl(ttl).as_millis() as u64)
                                 .invoke_async::<i32>(&mut conn)
                                 .await
                         });
@@ -330,16 +394,28 @@ impl RedisLease {
 
                 let Some((sent_at, outcome)) = renewed else {
                     tracing::warn!(key, "capacity lease expired before it could be renewed");
-                    let _ = held.send(false);
+                    state.send_replace(LeaseState {
+                        held: false,
+                        expires_at,
+                    });
                     return;
                 };
                 match outcome {
                     Ok(Ok(0)) => {
                         tracing::warn!(key, "capacity lease lost; another holder may own it");
-                        let _ = held.send(false);
+                        state.send_replace(LeaseState {
+                            held: false,
+                            expires_at,
+                        });
                         return;
                     }
-                    Ok(Ok(_)) => expires_at = sent_at + ttl,
+                    Ok(Ok(_)) => {
+                        expires_at = sent_at + ttl;
+                        state.send_replace(LeaseState {
+                            held: true,
+                            expires_at,
+                        });
+                    }
                     // Keep trying until the deadline arm above fires.
                     Ok(Err(error)) => {
                         tracing::warn!(key, error = %error, "capacity lease renewal failed");
@@ -354,11 +430,13 @@ impl RedisLease {
 
     async fn release_now(&self, channel_id: &str, id: &str) {
         let key = self.key(channel_id);
+        let barrier_key = self.barrier_key(channel_id);
         let mut conn = self.connection.clone();
         // The TTL cleans up after a failed release, so never block on one.
         let _ = with_lease_timeout("release", async {
             redis::Script::new(RELEASE_SCRIPT)
                 .key(&key)
+                .key(&barrier_key)
                 .arg(id)
                 .invoke_async::<i32>(&mut conn)
                 .await
@@ -368,6 +446,7 @@ impl RedisLease {
 
     fn release_spawn(&self, channel_id: &str, id: &str) {
         let key = self.key(channel_id);
+        let barrier_key = self.barrier_key(channel_id);
         let id = id.to_string();
         let mut conn = self.connection.clone();
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
@@ -375,6 +454,7 @@ impl RedisLease {
                 let _ = with_lease_timeout("release", async {
                     redis::Script::new(RELEASE_SCRIPT)
                         .key(&key)
+                        .key(&barrier_key)
                         .arg(&id)
                         .invoke_async::<i32>(&mut conn)
                         .await
@@ -435,26 +515,29 @@ mod redis_tests {
             return;
         };
         let prefix = format!("pay:test:lease:{}:", uuid::Uuid::new_v4().simple());
-        let a = CapacityLeaseCoordinator::redis(&url, &prefix)
+        let ttl = Duration::from_millis(600);
+        let a = CapacityLeaseCoordinator::redis_with_ttl(&url, &prefix, ttl)
             .await
             .unwrap();
-        let b = CapacityLeaseCoordinator::redis(&url, &prefix)
+        let b = CapacityLeaseCoordinator::redis_with_ttl(&url, &prefix, ttl)
             .await
             .unwrap();
 
-        let token_a = a.try_acquire("ch").await.unwrap().expect("a");
+        let mut token_a = a.try_acquire("ch").await.unwrap().expect("a");
         assert!(b.try_acquire("ch").await.unwrap().is_none());
 
-        // Simulate TTL expiry, then B acquires; A's stale release must not win.
+        // Stop A's watchdog and wait for both of its keys to expire naturally.
+        // Its local deadline is stale before B is allowed to acquire.
+        token_a.redis.as_mut().expect("redis hold")._renewal.take();
+        tokio::time::sleep(barrier_ttl(ttl) + Duration::from_millis(100)).await;
+        assert!(!token_a.is_held());
+
+        let token_b = b.try_acquire("ch").await.unwrap().expect("b");
         let key = format!("{prefix}lease:ch");
         let client = redis::Client::open(url.as_str()).unwrap();
         let mut conn = client.get_connection_manager().await.unwrap();
-        let _: () = redis::cmd("DEL")
-            .arg(&key)
-            .query_async(&mut conn)
-            .await
-            .unwrap();
-        let token_b = b.try_acquire("ch").await.unwrap().expect("b");
+
+        // A's late release must not delete B's token.
         a.release_async("ch", &token_a).await;
         let value: Option<String> = redis::cmd("GET")
             .arg(&key)
@@ -531,7 +614,8 @@ mod redis_tests {
         let token = coordinator.try_acquire("ch").await.unwrap().expect("lease");
         assert!(token.is_held());
 
-        // Expire the key behind the holder's back and let a peer take over.
+        // Delete only the lease key behind the holder's back. The barrier must
+        // keep a peer out until the original holder observes the loss.
         let client = redis::Client::open(url.as_str()).unwrap();
         let mut conn = client.get_connection_manager().await.unwrap();
         let _: () = redis::cmd("DEL")
@@ -539,7 +623,10 @@ mod redis_tests {
             .query_async(&mut conn)
             .await
             .unwrap();
-        let peer = coordinator.try_acquire("ch").await.unwrap().expect("peer");
+        assert!(
+            coordinator.try_acquire("ch").await.unwrap().is_none(),
+            "takeover barrier must block a peer after early lease deletion"
+        );
 
         tokio::time::timeout(ttl * 4, token.lost())
             .await
@@ -548,7 +635,115 @@ mod redis_tests {
             !token.is_held(),
             "renewal must tell the holder its lease is gone"
         );
+        coordinator.release_async("ch", &token).await;
+        let peer = coordinator.try_acquire("ch").await.unwrap().expect("peer");
         assert!(peer.is_held());
+    }
+
+    #[tokio::test]
+    async fn loss_is_persisted_without_an_active_waiter() {
+        let Some(url) = redis_url() else {
+            eprintln!("skipping: set PAY_SESSION_REDIS_URL or PAY_KIT_TEST_REDIS_URL");
+            return;
+        };
+        let prefix = format!("pay:test:lease:{}:", uuid::Uuid::new_v4().simple());
+        let ttl = Duration::from_millis(600);
+        let coordinator = CapacityLeaseCoordinator::redis_with_ttl(&url, &prefix, ttl)
+            .await
+            .unwrap();
+        let token = coordinator.try_acquire("ch").await.unwrap().expect("lease");
+
+        let client = redis::Client::open(url.as_str()).unwrap();
+        let mut conn = client.get_connection_manager().await.unwrap();
+        let _: () = redis::cmd("DEL")
+            .arg(format!("{prefix}lease:ch"))
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+
+        // No receiver is active while the watchdog detects the loss.
+        tokio::time::sleep(renew_interval(ttl) * 2).await;
+        assert!(!token.is_held(), "loss must persist in the watch value");
+        assert!(
+            token.guard(async { 7 }).await.is_err(),
+            "work started after detection must fail immediately"
+        );
+    }
+
+    #[tokio::test]
+    async fn expired_local_deadline_rejects_a_stale_token() {
+        let token = CapacityLeaseToken {
+            redis: Some(Box::new(RedisLeaseHold {
+                id: "stale".to_string(),
+                state: Arc::new(tokio::sync::watch::Sender::new(LeaseState {
+                    held: true,
+                    expires_at: tokio::time::Instant::now(),
+                })),
+                _renewal: None,
+            })),
+        };
+
+        assert!(!token.is_held());
+        assert!(
+            token.guard(async { 7 }).await.is_err(),
+            "a paused replica must reject an expired token on resume"
+        );
+    }
+
+    #[tokio::test]
+    async fn early_deletion_after_renewal_cannot_overlap_holders() {
+        let Some(url) = redis_url() else {
+            eprintln!("skipping: set PAY_SESSION_REDIS_URL or PAY_KIT_TEST_REDIS_URL");
+            return;
+        };
+        let prefix = format!("pay:test:lease:{}:", uuid::Uuid::new_v4().simple());
+        let ttl = Duration::from_millis(600);
+        let owner = CapacityLeaseCoordinator::redis_with_ttl(&url, &prefix, ttl)
+            .await
+            .unwrap();
+        let peer = CapacityLeaseCoordinator::redis_with_ttl(&url, &prefix, ttl)
+            .await
+            .unwrap();
+        let token = owner.try_acquire("ch").await.unwrap().expect("owner");
+
+        // Wait for proof that one renewal completed, then delete only the lease
+        // key just after it. Sleeping for one interval is not synchronization.
+        let initial_expiry = token
+            .redis
+            .as_ref()
+            .expect("redis hold")
+            .state
+            .borrow()
+            .expires_at;
+        let mut state = token.redis.as_ref().expect("redis hold").state.subscribe();
+        tokio::time::timeout(ttl, async {
+            loop {
+                if state.borrow().expires_at > initial_expiry {
+                    break;
+                }
+                state.changed().await.unwrap();
+            }
+        })
+        .await
+        .expect("renewal must complete");
+
+        let client = redis::Client::open(url.as_str()).unwrap();
+        let mut conn = client.get_connection_manager().await.unwrap();
+        let _: () = redis::cmd("DEL")
+            .arg(format!("{prefix}lease:ch"))
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+
+        assert!(
+            peer.try_acquire("ch").await.unwrap().is_none(),
+            "the takeover barrier must prevent overlapping holders"
+        );
+        tokio::time::timeout(ttl, token.lost())
+            .await
+            .expect("owner must detect the loss before the barrier expires");
+        owner.release_async("ch", &token).await;
+        assert!(peer.try_acquire("ch").await.unwrap().is_some());
     }
 
     #[tokio::test]
@@ -564,7 +759,8 @@ mod redis_tests {
             .unwrap();
         let token = coordinator.try_acquire("ch").await.unwrap().expect("lease");
 
-        // Hand the channel to a peer while the guarded work is still running.
+        // Delete only the lease key while guarded work is still running. A peer
+        // remains blocked by the barrier until the holder cancels its work.
         let client = redis::Client::open(url.as_str()).unwrap();
         let mut conn = client.get_connection_manager().await.unwrap();
         let _: () = redis::cmd("DEL")
@@ -572,7 +768,7 @@ mod redis_tests {
             .query_async(&mut conn)
             .await
             .unwrap();
-        let _peer = coordinator.try_acquire("ch").await.unwrap().expect("peer");
+        assert!(coordinator.try_acquire("ch").await.unwrap().is_none());
 
         let work_finished = Arc::new(Mutex::new(false));
         let flag = Arc::clone(&work_finished);
@@ -589,6 +785,11 @@ mod redis_tests {
         assert!(
             !*work_finished.lock().unwrap(),
             "guarded work must not run to completion after the lease is lost"
+        );
+        coordinator.release_async("ch", &token).await;
+        assert!(
+            coordinator.try_acquire("ch").await.unwrap().is_some(),
+            "a peer may acquire only after the old holder has cancelled"
         );
     }
 }
