@@ -2569,20 +2569,22 @@ mod tests {
 mod redis_e2e_tests {
     use super::*;
     use crate::client::session::SessionHandle;
+    use crate::server::gate::{SessionForward, settle_delegated_session};
+    use crate::server::metering::{RequestProperties, UptoSettlementPlan};
     use crate::server::session_capacity::CapacityLeaseCoordinator;
+    use crate::server::session_capacity::redis_test_support::{
+        assert_no_overlapping_holders, del_lease_key, redis_test_url, unique_prefix,
+    };
+    use http::HeaderMap;
     use pay_kit::mpp::solana_keychain::{SolanaSigner, memory::MemorySigner};
     use pay_kit::mpp::store::RedisChannelStore;
+    use pay_types::metering::{
+        BillingUnit, MeterDimension, MeterDirection, Metering, PriceTier,
+    };
     use std::sync::Arc;
+    use std::time::Duration;
 
     const CAP: u64 = 1_000_000;
-
-    fn redis_url() -> Option<String> {
-        std::env::var("PAY_SESSION_REDIS_URL")
-            .or_else(|_| std::env::var("PAY_KIT_TEST_REDIS_URL"))
-            .ok()
-            .map(|v| v.trim().to_string())
-            .filter(|v| !v.is_empty())
-    }
 
     fn config() -> SessionConfig {
         SessionConfig {
@@ -2606,26 +2608,70 @@ mod redis_e2e_tests {
         Box::new(MemorySigner::from_bytes(&kp).unwrap())
     }
 
-    #[tokio::test]
-    async fn redis_rehydrate_and_lease_across_replicas() {
-        let Some(url) = redis_url() else {
-            eprintln!("skipping: set PAY_SESSION_REDIS_URL or PAY_KIT_TEST_REDIS_URL");
-            return;
-        };
-        let prefix = format!("pay:test:session:{}:", uuid::Uuid::new_v4().simple());
+    fn output_bytes_plan() -> UptoSettlementPlan {
+        UptoSettlementPlan {
+            metering: Metering {
+                dimensions: vec![MeterDimension {
+                    direction: MeterDirection::Output,
+                    unit: BillingUnit::Tokens,
+                    scale: 1,
+                    period: None,
+                    tiers: vec![PriceTier {
+                        up_to: None,
+                        price_usd: 0.000001,
+                        condition: None,
+                        notes: None,
+                        splits: vec![],
+                    }],
+                    meter: None,
+                }],
+                variants: vec![],
+                sku_tiers: vec![],
+                splits: vec![],
+                schemes: None,
+                min_usd: None,
+                upto: None,
+            },
+            variant_hint: None,
+            request_properties: RequestProperties::default(),
+            ceiling_usd: 0.001,
+            inferred_usage: Some(crate::InferenceUsage {
+                model: None,
+                streamed: false,
+                ttft_ms: None,
+                tokens_prompt: None,
+                tokens_completion: Some(10),
+                tokens_per_sec: None,
+            }),
+        }
+    }
+
+    async fn open_delegated_pair(
+        url: &str,
+        prefix: &str,
+    ) -> (Arc<SessionMpp>, Arc<SessionMpp>, String, SessionHandle) {
         let store: Arc<dyn ChannelStore> = Arc::new(
-            RedisChannelStore::connect(&url, prefix.clone())
+            RedisChannelStore::connect(url, prefix.to_string())
                 .await
                 .expect("redis store"),
         );
-        let first = SessionMpp::new_with_stores(
+        let ttl = Duration::from_millis(600);
+        let first = Arc::new(SessionMpp::new_with_stores(
             config(),
             "redis-e2e",
             Arc::clone(&store),
-            CapacityLeaseCoordinator::redis(&url, &prefix)
+            CapacityLeaseCoordinator::redis_with_ttl(url, prefix, ttl)
                 .await
                 .unwrap(),
-        );
+        ));
+        let second = Arc::new(SessionMpp::new_with_stores(
+            config(),
+            "redis-e2e",
+            Arc::clone(&store),
+            CapacityLeaseCoordinator::redis_with_ttl(url, prefix, ttl)
+                .await
+                .unwrap(),
+        ));
         let handle = SessionHandle::new(
             solana_pubkey::Pubkey::new_unique(),
             signer(),
@@ -2636,35 +2682,37 @@ mod redis_e2e_tests {
         else {
             panic!("expected open");
         };
+        (first, second, opened.channel_id, handle)
+    }
+
+    #[tokio::test]
+    async fn redis_rehydrate_and_lease_across_replicas() {
+        let Some(url) = redis_test_url() else {
+            eprintln!("skipping: set PAY_SESSION_REDIS_URL or PAY_KIT_TEST_REDIS_URL");
+            return;
+        };
+        let prefix = unique_prefix("session");
+        let (first, second, channel_id, handle) = open_delegated_pair(&url, &prefix).await;
         first
             .process(&handle.voucher_header(88).await.unwrap())
             .await
             .unwrap();
 
         let lease = first
-            .reserve_delegated_capacity(&opened.channel_id, 0)
+            .reserve_delegated_capacity(&channel_id, 0)
             .await
             .unwrap()
             .expect("first lease");
         assert!(
             first
-                .reserve_delegated_capacity(&opened.channel_id, 0)
+                .reserve_delegated_capacity(&channel_id, 0)
                 .await
                 .unwrap()
                 .is_none()
         );
-
-        let second = SessionMpp::new_with_stores(
-            config(),
-            "redis-e2e",
-            Arc::clone(&store),
-            CapacityLeaseCoordinator::redis(&url, &prefix)
-                .await
-                .unwrap(),
-        );
         assert!(
             second
-                .reserve_delegated_capacity(&opened.channel_id, 0)
+                .reserve_delegated_capacity(&channel_id, 0)
                 .await
                 .unwrap()
                 .is_none()
@@ -2675,12 +2723,167 @@ mod redis_e2e_tests {
 
         assert!(second.rehydrate_from_store().await.unwrap() >= 1);
         assert_eq!(
-            second.load_committed_watermark(&opened.channel_id).await,
+            second.load_committed_watermark(&channel_id).await,
             Some(88)
         );
         assert!(
             second
-                .reserve_delegated_capacity(&opened.channel_id, 0)
+                .reserve_delegated_capacity(&channel_id, 0)
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn dual_replica_watermark_refresh_sees_peer_commit() {
+        let Some(url) = redis_test_url() else {
+            eprintln!("skipping: set PAY_SESSION_REDIS_URL or PAY_KIT_TEST_REDIS_URL");
+            return;
+        };
+        let prefix = unique_prefix("watermark");
+        let (first, second, channel_id, handle) = open_delegated_pair(&url, &prefix).await;
+        first
+            .process(&handle.voucher_header(42).await.unwrap())
+            .await
+            .unwrap();
+        assert_eq!(first.committed_watermark(&channel_id), Some(42));
+        assert_eq!(second.committed_watermark(&channel_id), None);
+        assert_eq!(
+            second.refresh_committed_watermark(&channel_id).await,
+            Some(42)
+        );
+        assert_eq!(second.committed_watermark(&channel_id), Some(42));
+    }
+
+    #[tokio::test]
+    async fn rehydrate_skips_sealed_channels() {
+        let Some(url) = redis_test_url() else {
+            eprintln!("skipping: set PAY_SESSION_REDIS_URL or PAY_KIT_TEST_REDIS_URL");
+            return;
+        };
+        let prefix = unique_prefix("rehydrate-sealed");
+        let (first, second, channel_id, _) = open_delegated_pair(&url, &prefix).await;
+        first
+            .operator_runtime
+            .channel_store
+            .mark_sealed(&channel_id)
+            .await
+            .expect("seal");
+        assert_eq!(second.rehydrate_from_store().await.unwrap(), 0);
+        assert_eq!(second.committed_watermark(&channel_id), None);
+    }
+
+    #[tokio::test]
+    async fn settle_delegated_session_abandons_when_lease_lost() {
+        let Some(url) = redis_test_url() else {
+            eprintln!("skipping: set PAY_SESSION_REDIS_URL or PAY_KIT_TEST_REDIS_URL");
+            return;
+        };
+        let prefix = unique_prefix("settle-loss");
+        let ttl = Duration::from_millis(600);
+        let (first, second, channel_id, _) = open_delegated_pair(&url, &prefix).await;
+        let lease = first
+            .reserve_delegated_capacity(&channel_id, CAP)
+            .await
+            .unwrap()
+            .expect("lease");
+        assert_no_overlapping_holders(
+            &CapacityLeaseCoordinator::redis_with_ttl(&url, &prefix, ttl)
+                .await
+                .unwrap(),
+            &channel_id,
+        )
+        .await;
+
+        del_lease_key(&url, &prefix, &channel_id).await;
+        assert_no_overlapping_holders(
+            &CapacityLeaseCoordinator::redis_with_ttl(&url, &prefix, ttl)
+                .await
+                .unwrap(),
+            &channel_id,
+        )
+        .await;
+        tokio::time::timeout(ttl * 4, lease.lost())
+            .await
+            .expect("holder must observe lease loss");
+
+        let forward = SessionForward::delegated(
+            Arc::clone(&first),
+            channel_id.clone(),
+            0,
+            output_bytes_plan(),
+            CAP,
+            lease,
+        );
+        let error = match settle_delegated_session(forward, &HeaderMap::new(), Some(b"hello-world"))
+            .await
+        {
+            Ok(ok) => panic!(
+                "lost lease must abandon settlement, got Ok(is_some={})",
+                ok.is_some()
+            ),
+            Err(error) => error,
+        };
+        assert!(
+            error.contains("capacity lease was lost"),
+            "unexpected settle error: {error}"
+        );
+        // Peer remains blocked until the abandoned holder's Drop releases.
+        // After settle returns Err, forward (and lease) were dropped.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            second
+                .reserve_delegated_capacity(&channel_id, 0)
+                .await
+                .unwrap()
+                .is_some(),
+            "peer may acquire only after the abandoned holder released"
+        );
+    }
+
+    #[tokio::test]
+    async fn lifecycle_auto_close_abandons_when_lease_lost() {
+        let Some(url) = redis_test_url() else {
+            eprintln!("skipping: set PAY_SESSION_REDIS_URL or PAY_KIT_TEST_REDIS_URL");
+            return;
+        };
+        let prefix = unique_prefix("lifecycle-loss");
+        let ttl = Duration::from_millis(600);
+        let (session, peer, channel_id, _) = open_delegated_pair(&url, &prefix).await;
+
+        // Mimic close_due_channels: reserve, then guard close-shaped work. Loss
+        // mid-guard must abandon before a peer can take over.
+        let lease = session
+            .reserve_delegated_capacity(&channel_id, 0)
+            .await
+            .unwrap()
+            .expect("lifecycle lease");
+        let peer_coordinator = CapacityLeaseCoordinator::redis_with_ttl(&url, &prefix, ttl)
+            .await
+            .unwrap();
+        assert_no_overlapping_holders(&peer_coordinator, &channel_id).await;
+
+        del_lease_key(&url, &prefix, &channel_id).await;
+        assert_no_overlapping_holders(&peer_coordinator, &channel_id).await;
+
+        let work_finished = Arc::new(std::sync::Mutex::new(false));
+        let flag = Arc::clone(&work_finished);
+        let guarded = lease.guard(async move {
+            tokio::time::sleep(ttl * 10).await;
+            *flag.lock().unwrap() = true;
+            Ok::<(), crate::Error>(())
+        });
+        let error = tokio::time::timeout(ttl * 4, guarded)
+            .await
+            .expect("guard must return on lease loss")
+            .expect_err("lost lease must abandon auto-close work");
+        assert!(error.to_string().contains("capacity lease was lost"));
+        assert!(!*work_finished.lock().unwrap());
+        drop(lease);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            peer.reserve_delegated_capacity(&channel_id, 0)
                 .await
                 .unwrap()
                 .is_some()

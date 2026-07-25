@@ -1343,3 +1343,159 @@ data: {"type":"message_delta","usage":{"output_tokens":5}}
         );
     }
 }
+
+#[cfg(all(test, feature = "redis-session-store"))]
+mod redis_stream_tests {
+    use super::*;
+    use crate::client::session::SessionHandle;
+    use crate::server::gate::SessionForward;
+    use crate::server::metering::{RequestProperties, UptoSettlementPlan};
+    use crate::server::session::SessionOutcome;
+    use crate::server::session_capacity::CapacityLeaseCoordinator;
+    use crate::server::session_capacity::redis_test_support::{
+        assert_no_overlapping_holders, del_lease_key, redis_test_url, unique_prefix,
+    };
+    use pay_kit::mpp::server::session::SessionConfig;
+    use pay_kit::mpp::solana_keychain::{SolanaSigner, memory::MemorySigner};
+    use pay_kit::mpp::store::{ChannelStore, RedisChannelStore};
+    use pay_kit::mpp::{SessionMode, SessionSettlementAuthority};
+    use pay_types::metering::{BillingUnit, MeterDimension, MeterDirection, Metering, PriceTier};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    fn stream_metering() -> Metering {
+        Metering {
+            dimensions: vec![MeterDimension {
+                direction: MeterDirection::Output,
+                unit: BillingUnit::Tokens,
+                scale: 1,
+                period: None,
+                tiers: vec![PriceTier {
+                    up_to: None,
+                    price_usd: 0.000001,
+                    condition: None,
+                    notes: None,
+                    splits: vec![],
+                }],
+                meter: None,
+            }],
+            variants: vec![],
+            sku_tiers: vec![],
+            splits: vec![],
+            schemes: None,
+            min_usd: None,
+            upto: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn delegated_stream_authorize_cancels_when_lease_lost() {
+        let Some(url) = redis_test_url() else {
+            eprintln!("skipping: set PAY_SESSION_REDIS_URL or PAY_KIT_TEST_REDIS_URL");
+            return;
+        };
+        let prefix = unique_prefix("stream-loss");
+        let ttl = Duration::from_millis(600);
+        let store: Arc<dyn ChannelStore> = Arc::new(
+            RedisChannelStore::connect(&url, prefix.clone())
+                .await
+                .expect("redis store"),
+        );
+
+        use ed25519_dalek::SigningKey;
+        let signing_key = SigningKey::generate(&mut rand::thread_rng());
+        let verifying_key = signing_key.verifying_key();
+        let mut operator_keypair = [0_u8; 64];
+        operator_keypair[..32].copy_from_slice(signing_key.as_bytes());
+        operator_keypair[32..].copy_from_slice(verifying_key.as_bytes());
+        let operator: Arc<dyn SolanaSigner> =
+            Arc::new(MemorySigner::from_bytes(&operator_keypair).unwrap());
+        let client_operator: Box<dyn SolanaSigner> =
+            Box::new(MemorySigner::from_bytes(&operator_keypair).unwrap());
+
+        let mut config = SessionConfig {
+            operator: operator.pubkey().to_string(),
+            recipient: solana_pubkey::Pubkey::new_unique().to_string(),
+            max_cap: 1_000,
+            currency: solana_pubkey::Pubkey::new_unique().to_string(),
+            network: "localnet".to_string(),
+            min_voucher_delta: 1,
+            modes: vec![SessionMode::Push],
+            ..SessionConfig::default()
+        };
+        config.settlement_authority = SessionSettlementAuthority::Delegated;
+
+        let session = Arc::new(
+            SessionMpp::new_with_stores(
+                config,
+                "delegated-stream-redis",
+                Arc::clone(&store),
+                CapacityLeaseCoordinator::redis_with_ttl(&url, &prefix, ttl)
+                    .await
+                    .unwrap(),
+            )
+            .with_payment_channel_signer(operator),
+        );
+        let handle = SessionHandle::new(
+            solana_pubkey::Pubkey::new_unique(),
+            client_operator,
+            session.challenge(1_000).unwrap(),
+        );
+        let open_header = handle.open_header(1_000, "open_sig").await.unwrap();
+        let SessionOutcome::Active { state, .. } = session.process(&open_header).await.unwrap()
+        else {
+            panic!("expected an active delegated session");
+        };
+        let reservation = session
+            .reserve_delegated_capacity(&state.channel_id, 1_000)
+            .await
+            .unwrap()
+            .expect("session capacity should be available");
+
+        let peer = CapacityLeaseCoordinator::redis_with_ttl(&url, &prefix, ttl)
+            .await
+            .unwrap();
+        assert_no_overlapping_holders(&peer, &state.channel_id).await;
+
+        // Build the same SessionForward / meter path the proxy uses, then lose
+        // the lease before authorize — matching DelegatedSessionStreamMeter::settle.
+        let forward = SessionForward::delegated(
+            session.clone(),
+            state.channel_id.clone(),
+            0,
+            UptoSettlementPlan {
+                metering: stream_metering(),
+                variant_hint: None,
+                request_properties: RequestProperties::default(),
+                ceiling_usd: 0.001,
+                inferred_usage: None,
+            },
+            10,
+            reservation,
+        );
+        let meter = DelegatedSessionStreamMeter::from_forward(forward).unwrap();
+
+        del_lease_key(&url, &prefix, &state.channel_id).await;
+        assert_no_overlapping_holders(&peer, &state.channel_id).await;
+        let lease = meter.forward.capacity_lease().expect("lease");
+        tokio::time::timeout(ttl * 4, lease.lost())
+            .await
+            .expect("stream holder must observe lease loss");
+
+        let authorize = session.authorize_delegated_usage(&state.channel_id, 1);
+        let err = lease
+            .guard(authorize)
+            .await
+            .expect_err("lost lease must cancel stream authorize");
+        assert!(
+            err.to_string().contains("capacity lease was lost"),
+            "unexpected error: {err}"
+        );
+        drop(meter);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            peer.try_acquire(&state.channel_id).await.unwrap().is_some(),
+            "peer may acquire only after the abandoned stream meter released"
+        );
+    }
+}

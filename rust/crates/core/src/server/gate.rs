@@ -1521,6 +1521,41 @@ fn session_receipt_annotation(network: &str, reference: String) -> ReceiptAnnota
     }
 }
 
+/// Map a capacity-reservation outcome onto gate responses.
+///
+/// Contention stays on the payment-required path (402). Backend failure must
+/// never look like "pay again" — it is our outage (503).
+#[allow(clippy::result_large_err)] // Err carries the existing GateDecision tree
+fn map_capacity_reservation(
+    channel_id: &str,
+    reservation: crate::Result<Option<DelegatedCapacityLease>>,
+) -> Result<DelegatedCapacityLease, GateDecision> {
+    match reservation {
+        Ok(Some(reservation)) => Ok(reservation),
+        Ok(None) => Err(GateDecision::Respond(GateResponse::json(
+            StatusCode::PAYMENT_REQUIRED,
+            Bytes::from_static(
+                br#"{"error":"session_capacity_reserved","message":"Another request is currently using this session capacity."}"#,
+            ),
+        ))),
+        // A lease backend outage is our failure, not the payer's: keep it out of
+        // the payment-required path so retries stay meaningful.
+        Err(error) => {
+            tracing::error!(
+                channel_id = %channel_id,
+                error = %error,
+                "session capacity lease backend unavailable"
+            );
+            Err(GateDecision::Respond(GateResponse::json(
+                StatusCode::SERVICE_UNAVAILABLE,
+                Bytes::from_static(
+                    br#"{"error":"session_capacity_unavailable","message":"Session capacity coordination is temporarily unavailable; retry shortly."}"#,
+                ),
+            )))
+        }
+    }
+}
+
 /// Process a session credential and map the outcome to a [`GateDecision`].
 async fn session_authorized(
     sm: &SessionMpp,
@@ -1569,30 +1604,14 @@ async fn session_authorized(
                     .unwrap_or_default(),
                 ));
             }
-            let reservation = match handle
-                .reserve_delegated_capacity(&state.channel_id, available_base_units)
-                .await
-            {
-                Ok(Some(reservation)) => reservation,
-                Ok(None) => {
-                    return GateDecision::Respond(GateResponse::json(
-                        StatusCode::PAYMENT_REQUIRED,
-                        Bytes::from_static(br#"{"error":"session_capacity_reserved","message":"Another request is currently using this session capacity."}"#),
-                    ));
-                }
-                // A lease backend outage is our failure, not the payer's: keep it
-                // out of the payment-required path so retries stay meaningful.
-                Err(error) => {
-                    tracing::error!(
-                        channel_id = %state.channel_id,
-                        error = %error,
-                        "session capacity lease backend unavailable"
-                    );
-                    return GateDecision::Respond(GateResponse::json(
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        Bytes::from_static(br#"{"error":"session_capacity_unavailable","message":"Session capacity coordination is temporarily unavailable; retry shortly."}"#),
-                    ));
-                }
+            let reservation = match map_capacity_reservation(
+                &state.channel_id,
+                handle
+                    .reserve_delegated_capacity(&state.channel_id, available_base_units)
+                    .await,
+            ) {
+                Ok(reservation) => reservation,
+                Err(decision) => return decision,
             };
             let props = metering::RequestProperties {
                 body_size: req.content_length,
@@ -1963,5 +1982,42 @@ mod tests {
             gate.evaluate(&req(&Method::GET, "v1/anything")).await,
             GateDecision::Passthrough
         ));
+    }
+
+    #[test]
+    fn gate_maps_lease_contention_to_402_not_503() {
+        let Err(decision) = map_capacity_reservation("ch", Ok(None)) else {
+            panic!("contention must map to a gate response");
+        };
+        let GateDecision::Respond(response) = decision else {
+            panic!("expected Respond");
+        };
+        assert_eq!(response.status, StatusCode::PAYMENT_REQUIRED);
+        let body = String::from_utf8_lossy(&response.body);
+        assert!(
+            body.contains("session_capacity_reserved"),
+            "contention must stay on the payment-required path: {body}"
+        );
+        assert!(!body.contains("session_capacity_unavailable"));
+    }
+
+    #[test]
+    fn gate_maps_lease_backend_error_to_503_not_402() {
+        let Err(decision) = map_capacity_reservation(
+            "ch",
+            Err(crate::Error::Mpp("capacity lease backend unavailable".into())),
+        ) else {
+            panic!("backend error must map to a gate response");
+        };
+        let GateDecision::Respond(response) = decision else {
+            panic!("expected Respond");
+        };
+        assert_eq!(response.status, StatusCode::SERVICE_UNAVAILABLE);
+        let body = String::from_utf8_lossy(&response.body);
+        assert!(
+            body.contains("session_capacity_unavailable"),
+            "backend failure must not look like payment-required: {body}"
+        );
+        assert!(!body.contains("session_capacity_reserved"));
     }
 }
