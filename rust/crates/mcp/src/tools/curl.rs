@@ -487,18 +487,15 @@ fn is_binary_content_type(mime: &str) -> bool {
 
 fn write_body_to_tempfile(body: &[u8], mime: &str) -> std::io::Result<String> {
     use std::io::Write;
+
     let extension = extension_for_mime(mime);
-    let mut path = std::env::temp_dir();
-    let name = format!(
-        "pay-curl-{}{extension}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0)
-    );
-    path.push(name);
-    let mut file = std::fs::File::create(&path)?;
+    let mut file = tempfile::Builder::new()
+        .prefix("pay-curl-")
+        .suffix(&extension)
+        .tempfile()?;
     file.write_all(body)?;
+    file.flush()?;
+    let (_file, path) = file.keep().map_err(|err| err.error)?;
     Ok(path.to_string_lossy().into_owned())
 }
 
@@ -1664,6 +1661,45 @@ mod tests {
         let on_disk = std::fs::read(path).expect("tempfile readable");
         assert_eq!(on_disk, body);
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn binary_spills_are_unique_and_private_under_concurrency() {
+        let writes = (0..32_u8)
+            .map(|byte| {
+                std::thread::spawn(move || {
+                    let body = vec![byte; 64];
+                    let path = write_body_to_tempfile(&body, "application/octet-stream")
+                        .expect("concurrent spill should succeed");
+                    (path, body)
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let mut paths = std::collections::HashSet::new();
+        for write in writes {
+            let (path, expected) = write.join().expect("spill thread should not panic");
+            assert!(paths.insert(path.clone()), "spill paths must be unique");
+            assert_eq!(
+                std::fs::read(&path).expect("spilled file should be readable"),
+                expected,
+                "concurrent spills must not overwrite each other"
+            );
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mode = std::fs::metadata(&path)
+                    .expect("spilled file metadata should be readable")
+                    .permissions()
+                    .mode();
+                assert_eq!(
+                    mode & 0o077,
+                    0,
+                    "spilled files must not be group/world-readable"
+                );
+            }
+            let _ = std::fs::remove_file(path);
+        }
     }
 
     #[test]

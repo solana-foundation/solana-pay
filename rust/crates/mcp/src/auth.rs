@@ -82,6 +82,7 @@ pub async fn confirm_file_upload(
 /// `elicitation/create` instead of a platform biometric prompt.
 pub struct ElicitationAuth {
     peer: Peer<RoleServer>,
+    timeout: Duration,
 }
 
 impl ElicitationAuth {
@@ -91,7 +92,16 @@ impl ElicitationAuth {
     /// usually take a clone out of the rmcp tool-call context and hand it
     /// here per signing operation.
     pub fn new(peer: Peer<RoleServer>) -> Self {
-        Self { peer }
+        Self::with_timeout(peer, ELICITATION_TIMEOUT)
+    }
+
+    /// Construct a gate with an explicit elicitation deadline.
+    ///
+    /// The default constructor allows five minutes for a human response. A
+    /// shorter deadline is useful for bounded transports and deterministic
+    /// integration tests. Timeouts always fail closed as `AuthDenied`.
+    pub fn with_timeout(peer: Peer<RoleServer>, timeout: Duration) -> Self {
+        Self { peer, timeout }
     }
 }
 
@@ -99,6 +109,7 @@ impl AuthGate for ElicitationAuth {
     fn authenticate(&self, intent: &AuthIntent) -> Result<(), KeystoreError> {
         let params = build_request(intent);
         let peer = self.peer.clone();
+        let timeout = self.timeout;
 
         // Bridge sync → async. `block_in_place` permits blocking on the
         // current multi-threaded runtime worker without starving other
@@ -108,11 +119,9 @@ impl AuthGate for ElicitationAuth {
         let outcome: Result<CreateElicitationResult, rmcp::ServiceError> =
             tokio::task::block_in_place(|| {
                 Handle::current().block_on(async move {
-                    tokio::time::timeout(ELICITATION_TIMEOUT, peer.create_elicitation(params))
+                    tokio::time::timeout(timeout, peer.create_elicitation(params))
                         .await
-                        .map_err(|_| rmcp::ServiceError::Timeout {
-                            timeout: ELICITATION_TIMEOUT,
-                        })?
+                        .map_err(|_| rmcp::ServiceError::Timeout { timeout })?
                 })
             });
 

@@ -59,6 +59,133 @@ jobs:
           workspaces: rust
       - run: cargo fmt --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
+
+  # Compile opt-in network coverage without making a public-network request.
+  rust-network-test-feature-compile:
+    name: Rust network_tests feature compile (no run)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ./rust
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+      - name: Compile the OpenAPI smoke behind network_tests
+        run: >-
+          cargo test -p pay-core --test openapi_resolve_smoke
+          --features network_tests --no-run
+
+  rust-release-pdb-assets:
+    name: Build release PDB assets
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+      - name: Build PDB frontend
+        working-directory: ./web-ui
+        run: pnpm install --frozen-lockfile && pnpm build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pay-pr-pdb-dist
+          path: web-ui/dist
+          retention-days: 1
+
+  # Build and link every target shipped by the release workflow before merge.
+  rust-native-platform-build:
+    name: Rust release target (${{ matrix.target }})
+    needs: rust-release-pdb-assets
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            run-native-tests: true
+          - target: x86_64-apple-darwin
+            os: macos-latest
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            run-native-tests: true
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            use-cross: true
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            run-native-tests: true
+          - target: aarch64-pc-windows-msvc
+            os: windows-latest
+    defaults:
+      run:
+        working-directory: ./rust
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: pay-pr-pdb-dist
+          path: rust/pdb-dist
+      - name: Install cross
+        if: matrix.use-cross
+        run: cargo install cross --locked
+      - name: Configure cross environment
+        if: matrix.use-cross
+        run: |
+          cat > Cross.toml <<'EOF'
+          [build.env]
+          passthrough = ["PAY_PDB_DIST"]
+          EOF
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+          key: pr-${{ matrix.target }}
+      - name: Build release target
+        if: ${{ !matrix.use-cross }}
+        env:
+          PAY_PDB_DIST: ${{ github.workspace }}/rust/pdb-dist
+        run: cargo build --release --locked -p pay --target ${{ matrix.target }}
+      - name: Build release target (cross)
+        if: matrix.use-cross
+        env:
+          PAY_PDB_DIST: /project/pdb-dist
+        run: >-
+          cross build --release --locked -p pay
+          --target ${{ matrix.target }}
+          --features vendored-openssl
+      - name: Verify release binary
+        shell: bash
+        run: test -s "target/${{ matrix.target }}/release/${{ runner.os == 'Windows' && 'pay.exe' || 'pay' }}"
+      - name: Test native keystore paths
+        if: matrix.run-native-tests
+        run: cargo test -p pay-keystore
+      - name: Test native command lookup
+        if: matrix.run-native-tests
+        run: cargo test -p pay-core --lib
+      - name: Test native proxy paths
+        if: matrix.run-native-tests
+        run: cargo test -p pay-proxy --lib
+
+  native-release-artifact-contract:
+    name: Native release artifact contract
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+      - name: Check npm, release, and PR build targets match
+        run: node scripts/check-native-release-artifacts.mjs
+
   # ── Rust tests + coverage ──
   rust-test:
     name: Rust tests + coverage

@@ -451,7 +451,10 @@ impl InferenceCommand {
         // `rt` stays alive so the watch/cleanup/axum/bridge tasks keep
         // running for the life of the gateway.
 
+        #[cfg(unix)]
         let use_tui = !self.no_tui && std::io::IsTerminal::is_terminal(&std::io::stderr());
+        #[cfg(not(unix))]
+        let use_tui = false;
         if !use_tui {
             // Headless: Pingora owns the main thread (it must run without an
             // ambient tokio runtime, which is true here after block_on).

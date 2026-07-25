@@ -82,17 +82,13 @@
             "artifact": "pay-aarch64-unknown-linux-gnu.tar.gz",
             "binary": "pay"
         },
-        "aarch64-unknown-linux-musl": {
-            "artifact": "pay-aarch64-unknown-linux-musl.tar.gz",
-            "binary": "pay"
-        },
         "x86_64-unknown-linux-gnu": {
             "artifact": "pay-x86_64-unknown-linux-gnu.tar.gz",
             "binary": "pay"
         },
-        "x86_64-unknown-linux-musl": {
-            "artifact": "pay-x86_64-unknown-linux-musl.tar.gz",
-            "binary": "pay"
+        "aarch64-pc-windows-msvc": {
+            "artifact": "pay-aarch64-pc-windows-msvc.zip",
+            "binary": "pay.exe"
         },
         "x86_64-pc-windows-msvc": {
             "artifact": "pay-x86_64-pc-windows-msvc.zip",

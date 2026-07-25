@@ -1,13 +1,13 @@
 //! End-to-end test for the elicitation-backed auth gate.
 //!
-//! Wires `ElicitationAuth` against a real rmcp client/server pair on an
-//! in-memory duplex transport. The client auto-accepts (or declines) the
+//! Wires `ElicitationAuth` against a real rmcp client/server pair on a
+//! bounded in-memory duplex connection. The client auto-accepts (or declines) the
 //! elicitation, the server-side gate calls `authenticate()`, and we
 //! assert the result.
 //!
-//! This proves the full plumbing — that the `AuthGate::authenticate`
-//! sync call correctly bridges into the async `peer.create_elicitation`
-//! round-trip — without needing a real Pay account, real signing, or any
+//! This proves the full plumbing: the `AuthGate::authenticate` sync call
+//! correctly bridges into the async `peer.create_elicitation` round-trip,
+//! without needing a real Pay account, real signing, or any
 //! out-of-process server.
 
 use std::sync::Arc;
@@ -22,7 +22,11 @@ use rmcp::{
 };
 use tokio::sync::Mutex;
 
-/// Minimal server with no tools — we only need it to be alive so we can
+const STEP_TIMEOUT: Duration = Duration::from_secs(5);
+const CLEANUP_TIMEOUT: Duration = Duration::from_secs(2);
+const AUTH_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Minimal server with no tools. We only need it to be alive so we can
 /// take its peer and feed it to `ElicitationAuth`.
 #[derive(Default, Clone)]
 struct BareServer;
@@ -46,6 +50,13 @@ impl ConfigurableClient {
 }
 
 impl ClientHandler for ConfigurableClient {
+    fn get_info(&self) -> ClientInfo {
+        ClientInfo {
+            capabilities: ClientCapabilities::builder().enable_elicitation().build(),
+            ..ClientInfo::default()
+        }
+    }
+
     async fn create_elicitation(
         &self,
         request: CreateElicitationRequestParam,
@@ -72,26 +83,37 @@ async fn run_with_action(
 ) {
     let (server_transport, client_transport) = tokio::io::duplex(8192);
 
-    let server = BareServer
-        .serve(server_transport)
-        .await
-        .expect("server should serve");
-    let client_handler = ConfigurableClient::new(action);
-    let client = client_handler
-        .clone()
-        .serve(client_transport)
-        .await
-        .expect("client should serve");
+    // `serve()` performs the MCP initialize handshake before it returns. The
+    // server side must therefore run concurrently with the client side. The old
+    // harness awaited it before starting the client, which deadlocked at
+    // initialization.
+    let server_task = tokio::spawn(async move {
+        tokio::time::timeout(STEP_TIMEOUT, BareServer.serve(server_transport))
+            .await
+            .expect("server initialize handshake timed out")
+            .expect("server should serve")
+    });
 
-    // Let the initialize handshake finish before we send elicitation.
-    // 1s is generous enough for CI runners under load — rmcp 0.9's
-    // server-side `on_initialized` hook is unreliable under this duplex
-    // setup, so we fall back to a fixed delay. The outer 30s timeout in
-    // each test wraps this so a stuck handshake fails loudly.
-    tokio::time::sleep(Duration::from_secs(1)).await;
+    let client_handler = ConfigurableClient::new(action);
+    let client = tokio::time::timeout(STEP_TIMEOUT, client_handler.clone().serve(client_transport))
+        .await
+        .expect("client initialize handshake timed out")
+        .expect("client should serve");
+    let server = tokio::time::timeout(STEP_TIMEOUT, server_task)
+        .await
+        .expect("server task timed out after client initialized")
+        .expect("server task should not panic");
+    assert!(
+        server
+            .peer()
+            .peer_info()
+            .and_then(|info| info.capabilities.elicitation.as_ref())
+            .is_some(),
+        "test client must advertise elicitation support"
+    );
 
     let server_peer = server.peer().clone();
-    let auth = ElicitationAuth::new(server_peer);
+    let auth = ElicitationAuth::with_timeout(server_peer, AUTH_TIMEOUT);
     let intent = AuthIntent::authorize_payment("$0.50", "test API call");
 
     // ElicitationAuth's `authenticate` is sync and bridges to async via
@@ -99,32 +121,42 @@ async fn run_with_action(
     // test attribute selects. Run it via spawn_blocking to match the
     // shape of the real call site (`do_paid_fetch` inside
     // `tokio::task::spawn_blocking`).
-    let result = tokio::task::spawn_blocking(move || auth.authenticate(&intent))
-        .await
-        .expect("join handle");
+    let mut auth_task = tokio::task::spawn_blocking(move || auth.authenticate(&intent));
+    let result = match tokio::time::timeout(STEP_TIMEOUT, &mut auth_task).await {
+        Ok(join_result) => join_result.expect("auth task should not panic"),
+        Err(_) => {
+            // A started `spawn_blocking` task cannot be aborted. Close both
+            // transports, then prove the task unwinds within the cleanup budget.
+            // The gate's explicit two-second deadline is the final fail-closed
+            // bound if the transport does not respond to cancellation.
+            let _ = tokio::time::timeout(CLEANUP_TIMEOUT, client.cancel()).await;
+            let _ = tokio::time::timeout(CLEANUP_TIMEOUT, server.cancel()).await;
+            let cleanup_result = tokio::time::timeout(CLEANUP_TIMEOUT, &mut auth_task)
+                .await
+                .expect("timed-out auth task did not unwind after transport cancellation")
+                .expect("timed-out auth task should not panic");
+            assert!(
+                cleanup_result.is_err(),
+                "timed-out authorization must fail closed after cancellation"
+            );
+            panic!("elicitation auth round-trip timed out");
+        }
+    };
 
     let received = client_handler.last_request.lock().await.clone();
 
-    let _ = client.cancel().await;
-    let _ = server.cancel().await;
+    tokio::time::timeout(CLEANUP_TIMEOUT, client.cancel())
+        .await
+        .expect("client cleanup timed out")
+        .expect("client service should stop cleanly");
+    tokio::time::timeout(CLEANUP_TIMEOUT, server.cancel())
+        .await
+        .expect("server cleanup timed out")
+        .expect("server service should stop cleanly");
 
     (result, received)
 }
 
-// These three tests reliably hang under rmcp 0.9's `tokio::io::duplex`
-// transport — `peer.create_elicitation` never receives its response —
-// and that hang reproduces both locally and on CI runners regardless of
-// any code in this PR (verified by stashing every PR-local change and
-// re-running). The test file was added in `569c317 feat: enable
-// elicitation` but its CI never executed (no Rust workflow ran on that
-// commit), so the hang has been latent since day one.
-//
-// Ignored until we either (a) upgrade rmcp to a version where the duplex
-// roundtrip works, (b) replace the in-memory duplex with a real socket
-// pair, or (c) drive the I/O loops manually. The protocol-level builder
-// tests (in `src/auth.rs`) still exercise schema + message construction.
-
-#[ignore = "rmcp 0.9 duplex transport hangs on elicitation roundtrip — see file comment"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn auth_succeeds_when_client_accepts() {
     let (result, received) = run_with_action(ElicitationAction::Accept).await;
@@ -147,7 +179,6 @@ async fn auth_succeeds_when_client_accepts() {
     );
 }
 
-#[ignore = "rmcp 0.9 duplex transport hangs on elicitation roundtrip — see file comment"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn auth_fails_closed_when_client_declines() {
     let (result, received) = run_with_action(ElicitationAction::Decline).await;
@@ -159,13 +190,13 @@ async fn auth_fails_closed_when_client_declines() {
     assert!(received.is_some(), "client should have seen the request");
 }
 
-#[ignore = "rmcp 0.9 duplex transport hangs on elicitation roundtrip — see file comment"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn auth_fails_closed_when_client_cancels() {
-    let (result, _received) = run_with_action(ElicitationAction::Cancel).await;
+    let (result, received) = run_with_action(ElicitationAction::Cancel).await;
     let err = result.expect_err("authenticate() should error when client cancels");
     assert!(
         matches!(err, pay_keystore::Error::AuthDenied(_)),
         "cancel should map to AuthDenied; got {err:?}"
     );
+    assert!(received.is_some(), "client should have seen the request");
 }
