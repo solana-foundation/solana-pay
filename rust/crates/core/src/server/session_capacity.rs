@@ -496,6 +496,25 @@ mod tests {
     }
 }
 
+
+#[cfg(test)]
+mod required_coverage {
+    /// CI sets PAY_REQUIRE_REDIS_TESTS=1. If the feature is missing, the Redis
+    /// suite silently vanishes at compile time — fail loudly instead.
+    #[test]
+    fn redis_lease_suite_is_compiled_when_required() {
+        let required = matches!(
+            std::env::var("PAY_REQUIRE_REDIS_TESTS").as_deref(),
+            Ok("1") | Ok("true")
+        ) || matches!(std::env::var("CI").as_deref(), Ok("true") | Ok("1"));
+        assert!(
+            !required || cfg!(feature = "redis-session-store"),
+            "PAY_REQUIRE_REDIS_TESTS/CI is set but this build has no \
+             redis-session-store feature: the Redis lease tests did not run"
+        );
+    }
+}
+
 #[cfg(all(test, feature = "redis-session-store"))]
 pub(crate) mod redis_test_support {
     //! Shared Redis lease-test helpers for pay-core.
@@ -577,6 +596,31 @@ pub(crate) mod redis_test_support {
             peer.try_acquire(channel_id).await.expect("peer acquire").is_none(),
             "the takeover barrier must prevent overlapping holders"
         );
+    }
+
+    /// Release is fire-and-forget; poll until both keys are gone, but require
+    /// that to happen inside half the barrier TTL so barrier expiry cannot
+    /// masquerade as a successful release.
+    pub(crate) async fn await_released(url: &str, prefix: &str, channel_id: &str, ttl: Duration) {
+        let deadline = tokio::time::Instant::now() + barrier_ttl(ttl) / 2;
+        let client = redis::Client::open(url).expect("redis client");
+        let mut conn = client.get_connection_manager().await.expect("redis conn");
+        loop {
+            let live: i64 = redis::cmd("EXISTS")
+                .arg(format!("{prefix}lease:{channel_id}"))
+                .arg(format!("{prefix}lease-barrier:{channel_id}"))
+                .query_async(&mut conn)
+                .await
+                .expect("EXISTS");
+            if live == 0 {
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the abandoned holder did not release within half the barrier TTL;                  a later acquisition would only prove barrier expiry"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
     }
 }
 

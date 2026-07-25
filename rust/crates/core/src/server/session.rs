@@ -512,6 +512,21 @@ struct SessionLifecycleRunloop {
     last_activity: HashMap<String, Instant>,
 }
 
+/// Close one channel under an already-held lease. Extracted so composition
+/// tests can drive the same guard → release wiring as `close_due_channels`.
+async fn close_channel_under_lease(
+    runtime: SessionOperatorRuntime,
+    channel_id: String,
+    token: CapacityLeaseToken,
+) -> (String, Result<SessionCloseResult>) {
+    let result = token
+        .guard(runtime.operator_close_channel(&channel_id))
+        .await
+        .and_then(|closed| closed);
+    runtime.release_capacity(&channel_id, &token);
+    (channel_id, result)
+}
+
 impl SessionLifecycleRunloop {
     fn new(
         runtime: SessionOperatorRuntime,
@@ -634,14 +649,7 @@ impl SessionLifecycleRunloop {
                 }
             };
             let runtime = self.runtime.clone();
-            closing.push(async move {
-                let result = token
-                    .guard(runtime.operator_close_channel(&channel_id))
-                    .await
-                    .and_then(|closed| closed);
-                runtime.release_capacity(&channel_id, &token);
-                (channel_id, result)
-            });
+            closing.push(close_channel_under_lease(runtime, channel_id, token));
         }
 
         for (channel_id, close_result) in futures_util::future::join_all(closing).await {
@@ -2573,8 +2581,10 @@ mod redis_e2e_tests {
     use crate::server::metering::{RequestProperties, UptoSettlementPlan};
     use crate::server::session_capacity::CapacityLeaseCoordinator;
     use crate::server::session_capacity::redis_test_support::{
-        assert_no_overlapping_holders, del_lease_key, redis_test_url, unique_prefix,
+        assert_no_overlapping_holders, await_released, del_lease_key, redis_test_url,
+        unique_prefix,
     };
+    use crate::server::session_capacity::CAPACITY_LEASE_TTL;
     use http::HeaderMap;
     use pay_kit::mpp::solana_keychain::{SolanaSigner, memory::MemorySigner};
     use pay_kit::mpp::store::RedisChannelStore;
@@ -2646,16 +2656,16 @@ mod redis_e2e_tests {
         }
     }
 
-    async fn open_delegated_pair(
+    async fn open_delegated_pair_with_ttl(
         url: &str,
         prefix: &str,
+        ttl: Duration,
     ) -> (Arc<SessionMpp>, Arc<SessionMpp>, String, SessionHandle) {
         let store: Arc<dyn ChannelStore> = Arc::new(
             RedisChannelStore::connect(url, prefix.to_string())
                 .await
                 .expect("redis store"),
         );
-        let ttl = Duration::from_millis(600);
         let first = Arc::new(SessionMpp::new_with_stores(
             config(),
             "redis-e2e",
@@ -2683,6 +2693,14 @@ mod redis_e2e_tests {
             panic!("expected open");
         };
         (first, second, opened.channel_id, handle)
+    }
+
+    /// Default to the production TTL: only loss-injection tests want a short one.
+    async fn open_delegated_pair(
+        url: &str,
+        prefix: &str,
+    ) -> (Arc<SessionMpp>, Arc<SessionMpp>, String, SessionHandle) {
+        open_delegated_pair_with_ttl(url, prefix, CAPACITY_LEASE_TTL).await
     }
 
     #[tokio::test]
@@ -2719,7 +2737,7 @@ mod redis_e2e_tests {
         );
 
         drop(lease);
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        await_released(&url, &prefix, &channel_id, CAPACITY_LEASE_TTL).await;
 
         assert!(second.rehydrate_from_store().await.unwrap() >= 1);
         assert_eq!(
@@ -2764,14 +2782,25 @@ mod redis_e2e_tests {
         };
         let prefix = unique_prefix("rehydrate-sealed");
         let (first, second, channel_id, _) = open_delegated_pair(&url, &prefix).await;
+        assert_eq!(
+            second.rehydrate_from_store().await.unwrap(),
+            1,
+            "open channel must be present before sealing"
+        );
         first
             .operator_runtime
             .channel_store
             .mark_sealed(&channel_id)
             .await
             .expect("seal");
-        assert_eq!(second.rehydrate_from_store().await.unwrap(), 0);
-        assert_eq!(second.committed_watermark(&channel_id), None);
+        let restarted = SessionMpp::new_with_stores(
+            config(),
+            "redis-e2e",
+            Arc::clone(&first.operator_runtime.channel_store),
+            CapacityLeaseCoordinator::redis(&url, &prefix).await.unwrap(),
+        );
+        assert_eq!(restarted.rehydrate_from_store().await.unwrap(), 0);
+        assert_eq!(restarted.committed_watermark(&channel_id), None);
     }
 
     #[tokio::test]
@@ -2781,29 +2810,21 @@ mod redis_e2e_tests {
             return;
         };
         let prefix = unique_prefix("settle-loss");
-        let ttl = Duration::from_millis(600);
-        let (first, second, channel_id, _) = open_delegated_pair(&url, &prefix).await;
+        let ttl = Duration::from_secs(2);
+        let peer_coordinator = CapacityLeaseCoordinator::redis_with_ttl(&url, &prefix, ttl)
+            .await
+            .unwrap();
+        let (first, second, channel_id, _) =
+            open_delegated_pair_with_ttl(&url, &prefix, ttl).await;
         let lease = first
             .reserve_delegated_capacity(&channel_id, CAP)
             .await
             .unwrap()
             .expect("lease");
-        assert_no_overlapping_holders(
-            &CapacityLeaseCoordinator::redis_with_ttl(&url, &prefix, ttl)
-                .await
-                .unwrap(),
-            &channel_id,
-        )
-        .await;
+        assert_no_overlapping_holders(&peer_coordinator, &channel_id).await;
 
         del_lease_key(&url, &prefix, &channel_id).await;
-        assert_no_overlapping_holders(
-            &CapacityLeaseCoordinator::redis_with_ttl(&url, &prefix, ttl)
-                .await
-                .unwrap(),
-            &channel_id,
-        )
-        .await;
+        assert_no_overlapping_holders(&peer_coordinator, &channel_id).await;
         tokio::time::timeout(ttl * 4, lease.lost())
             .await
             .expect("holder must observe lease loss");
@@ -2829,9 +2850,7 @@ mod redis_e2e_tests {
             error.contains("capacity lease was lost"),
             "unexpected settle error: {error}"
         );
-        // Peer remains blocked until the abandoned holder's Drop releases.
-        // After settle returns Err, forward (and lease) were dropped.
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        await_released(&url, &prefix, &channel_id, ttl).await;
         assert!(
             second
                 .reserve_delegated_capacity(&channel_id, 0)
@@ -2843,45 +2862,87 @@ mod redis_e2e_tests {
     }
 
     #[tokio::test]
+    async fn auto_close_defers_when_a_peer_holds_the_lease() {
+        let Some(url) = redis_test_url() else {
+            eprintln!("skipping: set PAY_SESSION_REDIS_URL or PAY_KIT_TEST_REDIS_URL");
+            return;
+        };
+        let prefix = unique_prefix("lifecycle-contention");
+        let (session, peer, channel_id, _) = open_delegated_pair(&url, &prefix).await;
+
+        let _peer_lease = peer
+            .reserve_delegated_capacity(&channel_id, 0)
+            .await
+            .unwrap()
+            .expect("peer lease");
+
+        let (_tx, rx) = mpsc::unbounded_channel();
+        let mut runloop = SessionLifecycleRunloop::new(session.operator_runtime.clone(), rx);
+        runloop.close_delay = Some(Duration::ZERO);
+        runloop
+            .last_activity
+            .insert(channel_id.clone(), Instant::now() - Duration::from_secs(1));
+
+        runloop.close_due_channels().await;
+
+        assert!(
+            runloop.last_activity.contains_key(&channel_id),
+            "a channel held by a peer must be rescheduled, not dropped"
+        );
+        assert_eq!(
+            session.refresh_committed_watermark(&channel_id).await,
+            Some(0),
+            "a deferred close must not touch the durable channel state"
+        );
+    }
+
+    #[tokio::test]
     async fn lifecycle_auto_close_abandons_when_lease_lost() {
         let Some(url) = redis_test_url() else {
             eprintln!("skipping: set PAY_SESSION_REDIS_URL or PAY_KIT_TEST_REDIS_URL");
             return;
         };
         let prefix = unique_prefix("lifecycle-loss");
-        let ttl = Duration::from_millis(600);
-        let (session, peer, channel_id, _) = open_delegated_pair(&url, &prefix).await;
-
-        // Mimic close_due_channels: reserve, then guard close-shaped work. Loss
-        // mid-guard must abandon before a peer can take over.
-        let lease = session
-            .reserve_delegated_capacity(&channel_id, 0)
-            .await
-            .unwrap()
-            .expect("lifecycle lease");
+        let ttl = Duration::from_secs(2);
         let peer_coordinator = CapacityLeaseCoordinator::redis_with_ttl(&url, &prefix, ttl)
             .await
             .unwrap();
+        let (session, peer, channel_id, _) =
+            open_delegated_pair_with_ttl(&url, &prefix, ttl).await;
+
+        // Drive the extracted close_channel_under_lease path (same wiring as
+        // close_due_channels). Loss before the guarded close must abandon work
+        // and release so a peer can take over.
+        let token = session
+            .operator_runtime
+            .reserve_capacity(&channel_id)
+            .await
+            .unwrap()
+            .expect("lifecycle lease");
         assert_no_overlapping_holders(&peer_coordinator, &channel_id).await;
 
         del_lease_key(&url, &prefix, &channel_id).await;
         assert_no_overlapping_holders(&peer_coordinator, &channel_id).await;
-
-        let work_finished = Arc::new(std::sync::Mutex::new(false));
-        let flag = Arc::clone(&work_finished);
-        let guarded = lease.guard(async move {
-            tokio::time::sleep(ttl * 10).await;
-            *flag.lock().unwrap() = true;
-            Ok::<(), crate::Error>(())
-        });
-        let error = tokio::time::timeout(ttl * 4, guarded)
+        tokio::time::timeout(ttl * 4, token.lost())
             .await
-            .expect("guard must return on lease loss")
-            .expect_err("lost lease must abandon auto-close work");
-        assert!(error.to_string().contains("capacity lease was lost"));
-        assert!(!*work_finished.lock().unwrap());
-        drop(lease);
-        tokio::time::sleep(Duration::from_millis(50)).await;
+            .expect("holder must observe lease loss");
+
+        let (closed_id, result) = close_channel_under_lease(
+            session.operator_runtime.clone(),
+            channel_id.clone(),
+            token,
+        )
+        .await;
+        assert_eq!(closed_id, channel_id);
+        let error = match result {
+            Ok(_) => panic!("lost lease must abandon auto-close"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("capacity lease was lost"),
+            "unexpected close error: {error}"
+        );
+        await_released(&url, &prefix, &channel_id, ttl).await;
         assert!(
             peer.reserve_delegated_capacity(&channel_id, 0)
                 .await

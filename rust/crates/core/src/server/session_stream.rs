@@ -1353,7 +1353,8 @@ mod redis_stream_tests {
     use crate::server::session::SessionOutcome;
     use crate::server::session_capacity::CapacityLeaseCoordinator;
     use crate::server::session_capacity::redis_test_support::{
-        assert_no_overlapping_holders, del_lease_key, redis_test_url, unique_prefix,
+        assert_no_overlapping_holders, await_released, del_lease_key, redis_test_url,
+        unique_prefix,
     };
     use pay_kit::mpp::server::session::SessionConfig;
     use pay_kit::mpp::solana_keychain::{SolanaSigner, memory::MemorySigner};
@@ -1395,7 +1396,10 @@ mod redis_stream_tests {
             return;
         };
         let prefix = unique_prefix("stream-loss");
-        let ttl = Duration::from_millis(600);
+        let ttl = Duration::from_secs(2);
+        let peer = CapacityLeaseCoordinator::redis_with_ttl(&url, &prefix, ttl)
+            .await
+            .unwrap();
         let store: Arc<dyn ChannelStore> = Arc::new(
             RedisChannelStore::connect(&url, prefix.clone())
                 .await
@@ -1451,14 +1455,8 @@ mod redis_stream_tests {
             .await
             .unwrap()
             .expect("session capacity should be available");
-
-        let peer = CapacityLeaseCoordinator::redis_with_ttl(&url, &prefix, ttl)
-            .await
-            .unwrap();
         assert_no_overlapping_holders(&peer, &state.channel_id).await;
 
-        // Build the same SessionForward / meter path the proxy uses, then lose
-        // the lease before authorize — matching DelegatedSessionStreamMeter::settle.
         let forward = SessionForward::delegated(
             session.clone(),
             state.channel_id.clone(),
@@ -1477,22 +1475,40 @@ mod redis_stream_tests {
 
         del_lease_key(&url, &prefix, &state.channel_id).await;
         assert_no_overlapping_holders(&peer, &state.channel_id).await;
-        let lease = meter.forward.capacity_lease().expect("lease");
-        tokio::time::timeout(ttl * 4, lease.lost())
+        tokio::time::timeout(ttl * 4, meter.forward.capacity_lease().expect("lease").lost())
             .await
             .expect("stream holder must observe lease loss");
 
-        let authorize = session.authorize_delegated_usage(&state.channel_id, 1);
-        let err = lease
-            .guard(authorize)
+        // Drive the real proxy path. settle runs before yield, so a lost lease
+        // must fail the stream instead of releasing unpaid bytes.
+        let upstream = async_stream::stream! {
+            yield Ok::<_, std::io::Error>(Bytes::from_static(
+                b"data: {\"choices\":[{\"delta\":{\"content\":\"one two three\"}}]}\n\n",
+            ));
+        };
+        let metered = meter_delegated_response_stream(upstream, meter, true);
+        futures_util::pin_mut!(metered);
+
+        let first = tokio::time::timeout(ttl * 4, metered.next())
             .await
-            .expect_err("lost lease must cancel stream authorize");
+            .expect("a lost lease must terminate the stream, not hang")
+            .expect("the stream must surface the loss as an item");
+        let err = first.expect_err("a lost lease must not release chargeable bytes");
         assert!(
             err.to_string().contains("capacity lease was lost"),
-            "unexpected error: {err}"
+            "unexpected stream error: {err}"
         );
-        drop(meter);
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            metered.next().await.is_none(),
+            "the metered stream must end after abandoning the charge"
+        );
+        assert_eq!(
+            session.refresh_committed_watermark(&state.channel_id).await,
+            Some(0),
+            "an abandoned stream must not advance the durable watermark"
+        );
+        drop(metered);
+        await_released(&url, &prefix, &state.channel_id, ttl).await;
         assert!(
             peer.try_acquire(&state.channel_id).await.unwrap().is_some(),
             "peer may acquire only after the abandoned stream meter released"
