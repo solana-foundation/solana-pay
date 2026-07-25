@@ -74,6 +74,16 @@ jobs:
   cli-check:
     name: CLI check
     runs-on: ubuntu-latest
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 5
     defaults:
       run:
         working-directory: ./rust
@@ -91,7 +101,10 @@ jobs:
         run: cargo fmt --check
 
       - name: Lint
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets --features "server,redis-session-store" -- -D warnings
 
       - name: Test
-        run: cargo test --workspace
+        env:
+          PAY_SESSION_REDIS_URL: redis://127.0.0.1:6379
+          PAY_REQUIRE_REDIS_TESTS: "1"
+        run: cargo test --workspace --features "server,redis-session-store"

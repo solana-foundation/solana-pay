@@ -58,11 +58,24 @@ jobs:
         with:
           workspaces: rust
       - run: cargo fmt --check
-      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo clippy --workspace --all-targets --features "server,redis-session-store" -- -D warnings
   # ── Rust tests + coverage ──
   rust-test:
     name: Rust tests + coverage
     runs-on: ubuntu-latest
+    # Redis leases + durable session store tests require a live backend.
+    # Soft-skip locally; PAY_REQUIRE_REDIS_TESTS (set below) fails CI if the
+    # URL is missing so redis-session-store coverage cannot go vacuous.
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 5
     defaults:
       run:
         working-directory: ./rust
@@ -86,7 +99,9 @@ jobs:
       - name: Run tests with coverage
         env:
           SURFPOOL_REPORT: "1"
-        run: cargo llvm-cov --workspace --features server --exclude pay --ignore-filename-regex 'crates/cli/' --json --output-path coverage.json
+          PAY_SESSION_REDIS_URL: redis://127.0.0.1:6379
+          PAY_REQUIRE_REDIS_TESTS: "1"
+        run: cargo llvm-cov --workspace --features "server,redis-session-store" --exclude pay --ignore-filename-regex 'crates/cli/' --json --output-path coverage.json
       - name: Upload Rust coverage
         if: always()
         uses: actions/upload-artifact@v4
