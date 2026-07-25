@@ -1481,33 +1481,35 @@ mod redis_stream_tests {
 
         // Drive the real proxy path. settle runs before yield, so a lost lease
         // must fail the stream instead of releasing unpaid bytes.
-        let upstream = async_stream::stream! {
-            yield Ok::<_, std::io::Error>(Bytes::from_static(
-                b"data: {\"choices\":[{\"delta\":{\"content\":\"one two three\"}}]}\n\n",
-            ));
-        };
-        let metered = meter_delegated_response_stream(upstream, meter, true);
-        futures_util::pin_mut!(metered);
+        {
+            let upstream = async_stream::stream! {
+                yield Ok::<_, std::io::Error>(Bytes::from_static(
+                    b"data: {\"choices\":[{\"delta\":{\"content\":\"one two three\"}}]}\n\n",
+                ));
+            };
+            let metered = meter_delegated_response_stream(upstream, meter, true);
+            futures_util::pin_mut!(metered);
 
-        let first = tokio::time::timeout(ttl * 4, metered.next())
-            .await
-            .expect("a lost lease must terminate the stream, not hang")
-            .expect("the stream must surface the loss as an item");
-        let err = first.expect_err("a lost lease must not release chargeable bytes");
-        assert!(
-            err.to_string().contains("capacity lease was lost"),
-            "unexpected stream error: {err}"
-        );
-        assert!(
-            metered.next().await.is_none(),
-            "the metered stream must end after abandoning the charge"
-        );
-        assert_eq!(
-            session.refresh_committed_watermark(&state.channel_id).await,
-            Some(0),
-            "an abandoned stream must not advance the durable watermark"
-        );
-        drop(metered);
+            let first = tokio::time::timeout(ttl * 4, metered.next())
+                .await
+                .expect("a lost lease must terminate the stream, not hang")
+                .expect("the stream must surface the loss as an item");
+            let err = first.expect_err("a lost lease must not release chargeable bytes");
+            assert!(
+                err.to_string().contains("capacity lease was lost"),
+                "unexpected stream error: {err}"
+            );
+            assert!(
+                metered.next().await.is_none(),
+                "the metered stream must end after abandoning the charge"
+            );
+            assert_eq!(
+                session.refresh_committed_watermark(&state.channel_id).await,
+                Some(0),
+                "an abandoned stream must not advance the durable watermark"
+            );
+        }
+        // Ending the stream scope drops the owned meter and releases its lease.
         await_released(&url, &prefix, &state.channel_id, ttl).await;
         assert!(
             peer.try_acquire(&state.channel_id).await.unwrap().is_some(),
