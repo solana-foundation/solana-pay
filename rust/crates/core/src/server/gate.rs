@@ -233,11 +233,16 @@ pub async fn settle_delegated_session(
         return Ok(None);
     }
 
-    let cumulative = pending
+    let authorize = pending
         .handle
-        .authorize_delegated_usage(&pending.channel_id, actual.base_units)
-        .await
-        .map_err(|error| error.to_string())?;
+        .authorize_delegated_usage(&pending.channel_id, actual.base_units);
+    // Losing the lease means another replica owns the channel, so drop this
+    // charge instead of racing its voucher into the store.
+    let cumulative = match pending.capacity_lease() {
+        Some(lease) => lease.guard(authorize).await.map_err(|e| e.to_string())?,
+        None => authorize.await,
+    }
+    .map_err(|error| error.to_string())?;
     tracing::info!(
         channel = %pending.channel_id,
         amount = actual.base_units,

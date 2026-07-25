@@ -463,6 +463,11 @@ impl DelegatedCapacityLease {
     pub async fn lost(&self) {
         self.token.lost().await;
     }
+
+    /// Run `work` under this lease, abandoning it if the lease is lost first.
+    pub async fn guard<T>(&self, work: impl std::future::Future<Output = T>) -> Result<T> {
+        self.token.guard(work).await
+    }
 }
 
 impl Drop for DelegatedCapacityLease {
@@ -630,7 +635,10 @@ impl SessionLifecycleRunloop {
             };
             let runtime = self.runtime.clone();
             closing.push(async move {
-                let result = runtime.operator_close_channel(&channel_id).await;
+                let result = token
+                    .guard(runtime.operator_close_channel(&channel_id))
+                    .await
+                    .and_then(|closed| closed);
                 runtime.release_capacity(&channel_id, &token);
                 (channel_id, result)
             });
@@ -685,7 +693,10 @@ impl SessionLifecycleRunloop {
             };
             let runtime = self.runtime.clone();
             settlements.push(async move {
-                let result = runtime.operator_push_watermark(&channel_id).await;
+                let result = token
+                    .guard(runtime.operator_push_watermark(&channel_id))
+                    .await
+                    .and_then(|pushed| pushed);
                 runtime.release_capacity(&channel_id, &token);
                 (channel_id, result)
             });
@@ -1246,7 +1257,7 @@ impl SessionMpp {
             }
 
             SessionAction::Close(p) => {
-                let _lease = self
+                let lease = self
                     .reserve_delegated_capacity(&p.channel_id, 0)
                     .await?
                     .ok_or_else(|| {
@@ -1255,57 +1266,62 @@ impl SessionMpp {
                             p.channel_id
                         ))
                     })?;
-                let params = match self.server.process_close(p).await {
-                    Ok(params) => params,
-                    Err(error) if session_close_needs_reconciliation(&error) => self
-                        .server
-                        .seal_params(&p.channel_id)
-                        .await
-                        .map_err(|e| Error::Mpp(format!("Failed to get seal params: {e}")))?,
-                    Err(error) => {
-                        return Err(Error::Mpp(format!("Session close failed: {error}")));
-                    }
-                };
-                self.record_committed_watermark(params.channel_id.to_string(), params.settled);
-                let settlement = self.submit_payment_channel_settlement(&params).await;
-                let signature = match settlement {
-                    Ok(signature) => signature,
-                    Err(_error)
-                        if self
-                            .operator_runtime
-                            .channel_is_tombstoned_on_chain(&params.channel_id.to_string())
-                            .await =>
-                    {
-                        self.server
-                            .mark_sealed(&params.channel_id.to_string())
-                            .await
-                            .map_err(|e| {
-                                Error::Mpp(format!("Failed to mark session sealed: {e}"))
-                            })?;
-                        None
-                    }
-                    Err(error) => return Err(error),
-                };
-                if let Some(signature) = signature.as_ref() {
-                    self.server
-                        .mark_sealed(&params.channel_id.to_string())
-                        .await
-                        .map_err(|e| Error::Mpp(format!("Failed to mark session sealed: {e}")))?;
-                    self.operator_runtime.record_settlement_signature(
-                        params.channel_id.to_string(),
-                        signature.clone(),
-                    );
-                    tracing::info!(
-                        monotonic_counter.pay_payment_channels_closed_total = 1_u64,
-                        %signature,
-                        channel = %params.channel_id,
-                        "payment-channel settlement confirmed"
-                    );
-                }
-                self.unschedule_channel_close(params.channel_id.to_string());
-                Ok(SessionOutcome::Closed { params, signature })
+                lease.guard(self.close_session_channel(p)).await?
             }
         }
+    }
+
+    /// Settle, seal, and record a client-initiated close. Callers hold the
+    /// channel's capacity lease for the whole sequence.
+    async fn close_session_channel(
+        &self,
+        p: &pay_kit::mpp::ClosePayload,
+    ) -> Result<SessionOutcome> {
+        let params = match self.server.process_close(p).await {
+            Ok(params) => params,
+            Err(error) if session_close_needs_reconciliation(&error) => self
+                .server
+                .seal_params(&p.channel_id)
+                .await
+                .map_err(|e| Error::Mpp(format!("Failed to get seal params: {e}")))?,
+            Err(error) => {
+                return Err(Error::Mpp(format!("Session close failed: {error}")));
+            }
+        };
+        self.record_committed_watermark(params.channel_id.to_string(), params.settled);
+        let settlement = self.submit_payment_channel_settlement(&params).await;
+        let signature = match settlement {
+            Ok(signature) => signature,
+            Err(_error)
+                if self
+                    .operator_runtime
+                    .channel_is_tombstoned_on_chain(&params.channel_id.to_string())
+                    .await =>
+            {
+                self.server
+                    .mark_sealed(&params.channel_id.to_string())
+                    .await
+                    .map_err(|e| Error::Mpp(format!("Failed to mark session sealed: {e}")))?;
+                None
+            }
+            Err(error) => return Err(error),
+        };
+        if let Some(signature) = signature.as_ref() {
+            self.server
+                .mark_sealed(&params.channel_id.to_string())
+                .await
+                .map_err(|e| Error::Mpp(format!("Failed to mark session sealed: {e}")))?;
+            self.operator_runtime
+                .record_settlement_signature(params.channel_id.to_string(), signature.clone());
+            tracing::info!(
+                monotonic_counter.pay_payment_channels_closed_total = 1_u64,
+                %signature,
+                channel = %params.channel_id,
+                "payment-channel settlement confirmed"
+            );
+        }
+        self.unschedule_channel_close(params.channel_id.to_string());
+        Ok(SessionOutcome::Closed { params, signature })
     }
 
     /// Retrieve settle+seal parameters for an open channel.

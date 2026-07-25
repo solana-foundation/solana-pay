@@ -296,18 +296,7 @@ impl DelegatedSessionStreamMeter {
         // Losing the lease mid-authorization means another replica now owns the
         // channel, so abandon this charge rather than race it to the store.
         let accepted = match self.forward.capacity_lease() {
-            Some(lease) => {
-                tokio::select! {
-                    biased;
-                    () = lease.lost() => {
-                        return Err(box_error(std::io::Error::other(format!(
-                            "delegated session {} lost its capacity lease",
-                            self.forward.channel_id
-                        ))));
-                    }
-                    accepted = authorize => accepted,
-                }
-            }
+            Some(lease) => lease.guard(authorize).await.map_err(box_error)?,
             None => authorize.await,
         }
         .map_err(box_error)?;
