@@ -190,6 +190,15 @@ impl AuthIntent {
         Self::OpenSession("authorize opening a pay session".to_string())
     }
 
+    pub fn authorize_spend_up_to(amount: Option<&str>, limit: &str, url: &str) -> Self {
+        let limit = truncate_detail(&prompt_detail(limit), 48);
+        let url = truncate_detail(&prompt_detail(url), 128);
+        Self::AuthorizePayment {
+            message: format!("allow pay to spend up to {limit} on requests to {url}"),
+            limit: amount.and_then(PaymentLimit::from_amount),
+        }
+    }
+
     pub fn use_gateway_fee_payer() -> Self {
         Self::UseGatewayFeePayer("use your pay account as the gateway fee payer".to_string())
     }
@@ -435,6 +444,19 @@ mod tests {
     }
 
     #[test]
+    fn session_prompt_names_spending_limit_and_url() {
+        assert_eq!(
+            AuthIntent::authorize_spend_up_to(
+                Some("$1.00"),
+                "$1.00 USD (1 USDC)",
+                "https://modelstudio.alibaba.gateway-402.com",
+            )
+            .prompt_message(),
+            "allow pay to spend up to $1.00 USD (1 USDC) on requests to https://modelstudio.alibaba.gateway-402.com"
+        );
+    }
+
+    #[test]
     fn payment_details_render_touch_id_context() {
         assert_eq!(
             AuthIntent::authorize_payment_details("$1.00", "Run a SQL query", "gateway-402.com")
@@ -598,6 +620,19 @@ mod tests {
             AuthIntent::from_reason("authorize payment of $0.0501 for accessing API")
                 .payment_limit(),
             Some(PaymentLimit::Usd01)
+        );
+    }
+
+    #[test]
+    fn session_budget_uses_existing_payment_limit_bucket() {
+        assert_eq!(
+            AuthIntent::authorize_spend_up_to(
+                Some("$1.00"),
+                "$1.00 USD (1 USDC)",
+                "https://api.example.com",
+            )
+            .payment_limit(),
+            Some(PaymentLimit::Usd1)
         );
     }
 

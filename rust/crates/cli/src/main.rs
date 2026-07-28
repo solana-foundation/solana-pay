@@ -227,10 +227,10 @@ fn main() {
         unsafe { std::env::set_var("PAY_PROTOCOL_ENFORCED", "mpp") };
     }
 
-    // ── Legacy keypair source for non-payment commands ─────────────────────
+    // ── Legacy signer fallback for non-payment commands ────────────────────
     //
-    // `pay topup` and server commands still use the original
-    // keystore-source-string flow.
+    // Server commands resolve accounts after reading the spec's network; this
+    // value is only their raw pay.toml/platform-keystore fallback.
     // Launcher commands (`pay claude`/`pay codex`) pass only an explicit
     // `--account` through to the MCP server and must not resolve an account
     // before the first-run setup hook below.
@@ -262,7 +262,9 @@ fn main() {
                 | Command::Mcp
         ) {
         None
-    } else if matches!(command, Command::Server { .. } | Command::Topup(_)) {
+    } else if matches!(command, Command::Server { .. }) {
+        config.legacy_keypair_source()
+    } else if matches!(command, Command::Topup(_)) {
         config.default_active_account_name()
     } else {
         resolve_keypair(&config)

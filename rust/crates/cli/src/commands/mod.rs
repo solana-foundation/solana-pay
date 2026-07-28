@@ -243,7 +243,9 @@ impl Command {
             }
             Command::Setup(cmd) => return cmd.run(),
             Command::Topup(cmd) => return cmd.run(),
-            Command::Server { command } => return command.run(keypair_override, sandbox),
+            Command::Server { command } => {
+                return command.run(keypair_override, account_override, sandbox);
+            }
             Command::Mcp => {
                 let rt = tokio::runtime::Builder::new_multi_thread()
                     .enable_all()
@@ -572,6 +574,7 @@ fn handle_outcome(
                 return pay_session_and_retry(
                     &challenge,
                     req.as_ref(),
+                    &resource_url,
                     tool,
                     output_fmt,
                     fetch_headers,
@@ -1672,6 +1675,7 @@ fn pay_x402_siwx_and_retry(
 fn pay_session_and_retry(
     challenge: &mpp::Challenge,
     req: Option<&SessionRequest>,
+    resource_url: &str,
     tool: &Tool,
     output_fmt: Option<OutputFormat>,
     fetch_headers: Option<Vec<(String, String)>>,
@@ -1742,6 +1746,7 @@ fn pay_session_and_retry(
                         account_override,
                         deposit,
                         SessionMode::Pull,
+                        resource_url,
                         sandbox,
                     )?;
                 header
@@ -1769,6 +1774,7 @@ fn pay_session_and_retry(
                 network_override,
                 account_override,
                 deposit,
+                resource_url,
                 sandbox,
             )?;
             header

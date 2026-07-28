@@ -113,6 +113,8 @@ pub struct PayerUpstream {
 struct PayerState {
     /// Upstream base URL without a trailing slash.
     upstream: String,
+    /// Logical provider URL shown in session spending authorization.
+    authorization_url: String,
     host_header: Option<HeaderValue>,
     dialect: Dialect,
     /// Chat-completions path without a leading slash (translation target).
@@ -152,6 +154,12 @@ impl PayerState {
             .map(HeaderValue::from_str)
             .transpose()
             .map_err(|e| pay_core::Error::Config(format!("payer proxy Host header: {e}")))?;
+        let parsed_upstream = reqwest::Url::parse(&upstream.base_url)
+            .map_err(|e| pay_core::Error::Config(format!("payer proxy upstream URL: {e}")))?;
+        let authorization_url = match upstream.host_header.as_deref() {
+            Some(host) => format!("{}://{host}", parsed_upstream.scheme()),
+            None => upstream.base_url.clone(),
+        };
         // Do not impose a total request timeout: streamed completions may stay
         // open for minutes. Bound connection setup and silent read stalls so a
         // hung provider cannot retain the session mutex forever.
@@ -164,6 +172,7 @@ impl PayerState {
             .map_err(|e| pay_core::Error::Config(format!("payer proxy HTTP client: {e}")))?;
         Ok(Self {
             upstream: upstream.base_url.trim_end_matches('/').to_string(),
+            authorization_url,
             host_header,
             dialect: upstream.dialect,
             chat_path: upstream.chat_path.trim_start_matches('/').to_string(),
@@ -830,6 +839,7 @@ fn build_session_authorization(
         state.network_override.as_deref(),
         state.account_override.as_deref(),
         deposit,
+        &state.authorization_url,
         sandbox,
     )?;
 
