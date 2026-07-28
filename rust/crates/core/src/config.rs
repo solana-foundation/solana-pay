@@ -94,12 +94,20 @@ impl Config {
             }
         }
 
-        // 3. Config file keypair field
+        self.legacy_keypair_source()
+    }
+
+    /// Resolve only legacy raw signer configuration.
+    ///
+    /// Unlike [`Self::default_active_account_name`], this deliberately skips
+    /// `accounts.yml` and `PAY_ACTIVE_ACCOUNT`; callers that need account
+    /// policy must resolve those names through the network-aware signer path.
+    pub fn legacy_keypair_source(&self) -> Option<String> {
         if let Some(path) = self.keypair_path() {
             return Some(expand_path(path).to_string());
         }
 
-        // 4. Legacy: probe platform-native keystores directly (no
+        // Legacy: probe platform-native keystores directly (no
         // accounts.yml yet). Do not probe 1Password here: `op item get`
         // can show a desktop auth prompt just to answer "does this item
         // exist?", which is surprising for commands like `pay claude` on a

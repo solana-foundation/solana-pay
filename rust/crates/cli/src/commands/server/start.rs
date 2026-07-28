@@ -578,7 +578,12 @@ fn x402_upto_beneficiary_pubkey(
 }
 
 impl StartCommand {
-    pub fn run(self, active_account_name: Option<&str>, sandbox: bool) -> pay_core::Result<()> {
+    pub fn run(
+        self,
+        legacy_signer_source: Option<&str>,
+        account_override: Option<&str>,
+        sandbox: bool,
+    ) -> pay_core::Result<()> {
         let debugger = self.debugger || sandbox;
         let expanded = shellexpand::tilde(&self.spec);
         let contents = std::fs::read_to_string(expanded.as_ref())
@@ -715,7 +720,8 @@ impl StartCommand {
 
         let fee_payer = op.map(|o| o.fee_payer).unwrap_or(false);
         let signer_cfg = op.and_then(|o| o.signer.clone());
-        let active_account_name_owned = active_account_name.map(|s| s.to_string());
+        let legacy_signer_source = legacy_signer_source.map(str::to_string);
+        let account_override = account_override.map(str::to_string);
 
         // Create the runtime first — everything async runs inside it so
         // background tasks (like GCP auth token refresh) stay alive. Worker
@@ -769,7 +775,12 @@ impl StartCommand {
                 Some(signer)
             } else if let Some(ref cfg) = signer_cfg {
                 Some(resolve_signer(cfg).await?)
-            } else if let Some(ref source) = active_account_name_owned {
+            } else if let Some(signer) = super::load_account_or_legacy_signer(
+                network.slug(),
+                account_override.as_deref(),
+                legacy_signer_source.as_deref(),
+                &pay_core::keystore::AuthIntent::use_gateway_fee_payer(),
+            )? {
                 // Mainnet (or unknown network) with no `operator.signer`
                 // block but a default keypair from `pay setup` —
                 // typically `keychain:default`. Load it once at startup
@@ -777,8 +788,6 @@ impl StartCommand {
                 // tells the user *why* it's being asked. The same
                 // signer is then used as both the fee-payer and the
                 // recipient-pubkey source (no second load).
-                let intent = pay_core::keystore::AuthIntent::use_gateway_fee_payer();
-                let signer = pay_core::signer::load_signer_with_intent(source, &intent)?;
                 Some(Arc::new(signer) as Arc<dyn SolanaSigner>)
             } else {
                 None
@@ -792,7 +801,7 @@ impl StartCommand {
             //   3. PAY_PAYMENT_RECIPIENT env var
             //   4. fee_payer_signer's pubkey — covers sandbox, throwaway-
             //      network smart default, explicit operator.signer block,
-            //      and the active_account_name fallback (all four set
+            //      and the resolved signer fallback (all four set
             //      fee_payer_signer above).
             let recipient = if let Some(r) = op.and_then(|o| o.recipient.as_ref()) {
                 r.clone()
