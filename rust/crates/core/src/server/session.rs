@@ -1345,6 +1345,9 @@ impl SessionMpp {
                     telemetry::record_payment_channel_opened(
                         &payload_for_open.signature,
                         &state.channel_id.to_string(),
+                        self.currency(),
+                        self.network(),
+                        state.deposit,
                     );
                 }
 
