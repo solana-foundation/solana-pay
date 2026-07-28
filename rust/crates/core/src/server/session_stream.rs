@@ -6,7 +6,7 @@
 
 use std::error::Error as StdError;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use axum::body::Bytes;
 use futures_util::{Stream, StreamExt};
@@ -26,6 +26,7 @@ use crate::server::session_metering::{
 
 const COMMIT_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
 const COMMIT_POLL_INTERVAL: Duration = Duration::from_millis(50);
+const LIFECYCLE_TOUCH_INTERVAL: Duration = Duration::from_secs(30);
 
 type BoxError = Box<dyn StdError + Send + Sync>;
 
@@ -73,8 +74,9 @@ impl SessionStreamContext {
         self.session_mpp.min_voucher_delta()
     }
 
-    pub fn touch_channel(&self) {
-        self.session_mpp.touch_channel(self.session_id.clone());
+    pub fn touch_channel_unconfirmed(&self) {
+        self.session_mpp
+            .touch_channel_unconfirmed(self.session_id.clone());
     }
 }
 
@@ -148,6 +150,7 @@ pub struct SessionStreamMeter {
     gate: SessionUsageGate,
     accumulator: StreamUsageAccumulator,
     current: UsageObservation,
+    next_lifecycle_touch: Instant,
 }
 
 /// Server-authorized meter for a delegated session response stream.
@@ -163,6 +166,7 @@ pub(crate) struct DelegatedSessionStreamMeter {
     priced_context_length: Option<u64>,
     clamp_reprice_to_authorized: bool,
     authorization_exhausted: bool,
+    next_lifecycle_touch: Instant,
 }
 
 impl DelegatedSessionStreamMeter {
@@ -200,6 +204,7 @@ impl DelegatedSessionStreamMeter {
             priced_context_length,
             clamp_reprice_to_authorized: false,
             authorization_exhausted: false,
+            next_lifecycle_touch: Instant::now() + LIFECYCLE_TOUCH_INTERVAL,
         })
     }
 
@@ -331,6 +336,17 @@ impl DelegatedSessionStreamMeter {
         self.clamp_reprice_to_authorized = usage_only_chunk;
         Ok(())
     }
+
+    fn touch_channel_if_due(&mut self) {
+        let now = Instant::now();
+        if now < self.next_lifecycle_touch {
+            return;
+        }
+        self.forward
+            .handle
+            .touch_channel_unconfirmed(self.forward.channel_id.clone());
+        self.next_lifecycle_touch = now + LIFECYCLE_TOUCH_INTERVAL;
+    }
 }
 
 impl SessionStreamMeter {
@@ -351,6 +367,7 @@ impl SessionStreamMeter {
             gate,
             accumulator: StreamUsageAccumulator::new(spec, hints),
             current,
+            next_lifecycle_touch: Instant::now() + LIFECYCLE_TOUCH_INTERVAL,
         })
     }
 
@@ -382,8 +399,13 @@ impl SessionStreamMeter {
         self.gate.record_commit(committed_base_units);
     }
 
-    fn touch_channel(&self) {
-        self.context.touch_channel();
+    fn touch_channel_if_due(&mut self) {
+        let now = Instant::now();
+        if now < self.next_lifecycle_touch {
+            return;
+        }
+        self.context.touch_channel_unconfirmed();
+        self.next_lifecycle_touch = now + LIFECYCLE_TOUCH_INTERVAL;
     }
 }
 
@@ -400,7 +422,7 @@ where
         futures_util::pin_mut!(stream);
         while let Some(next) = stream.next().await {
             let chunk = next.map_err(box_error)?;
-            meter.touch_channel();
+            meter.touch_channel_if_due();
             let decision = meter.observe_chunk(&chunk, is_sse).map_err(box_error)?;
             if let Some(decision) = decision {
                 settle_decision(&mut meter, decision).await?;
@@ -434,6 +456,7 @@ where
         futures_util::pin_mut!(stream);
         while let Some(next) = stream.next().await {
             let chunk = next.map_err(box_error)?;
+            meter.touch_channel_if_due();
             let decision = meter.observe_chunk(&chunk, is_sse)?;
             if let Some(decision) = decision {
                 meter.settle(decision).await?;
@@ -1221,6 +1244,8 @@ data: {"type":"message_delta","usage":{"output_tokens":5}}
         };
         let reservation = session
             .reserve_delegated_capacity(&state.channel_id, 1_000)
+            .await
+            .unwrap()
             .expect("session capacity should be available");
         let forward = SessionForward::delegated(
             session.clone(),

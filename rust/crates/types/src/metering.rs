@@ -866,6 +866,12 @@ pub struct SessionSpec {
     /// Defaults to `15000` when omitted. Set to `0` to disable automatic close.
     #[serde(default = "default_session_close_delay_ms")]
     pub close_delay_ms: u64,
+    /// Boundary used to group idle channel closes into settlement batches.
+    ///
+    /// The close deadline is rounded up to the next boundary. Defaults to
+    /// `60000` (one minute). Must be non-zero when automatic close is enabled.
+    #[serde(default = "default_session_close_batch_interval_ms")]
+    pub close_batch_interval_ms: u64,
     /// Interval between operator pushes of the latest accepted cumulative
     /// watermark to the payment-channel program.
     ///
@@ -896,6 +902,10 @@ fn default_session_batch_open_interval_ms() -> u64 {
 
 fn default_session_close_delay_ms() -> u64 {
     15_000
+}
+
+fn default_session_close_batch_interval_ms() -> u64 {
+    60_000
 }
 
 fn default_session_settlement_interval_ms() -> u64 {
@@ -1642,6 +1652,15 @@ pub fn validate_api_spec(spec: &ApiSpec) -> Vec<String> {
     // Channel distribution splits from a top-level `session:` block.
     if let Some(session) = &spec.session {
         validate_session_splits(session, &spec.recipients, &mut errs);
+        if session.close_delay_ms > 0
+            && (session.close_batch_interval_ms < 60_000
+                || session.close_batch_interval_ms % 60_000 != 0)
+        {
+            errs.push(
+                "session.close_batch_interval_ms must be a whole number of minutes when automatic close is enabled"
+                    .to_string(),
+            );
+        }
     }
 
     errs
@@ -2535,11 +2554,31 @@ mod tests {
 
         assert_eq!(session.batch_open_interval_ms, 400);
         assert_eq!(session.close_delay_ms, 15_000);
+        assert_eq!(session.close_batch_interval_ms, 60_000);
         assert_eq!(session.settlement_interval_ms, 5_000);
         assert_eq!(
             session.settlement_authority,
             SessionSettlementAuthority::ClientVoucher
         );
+    }
+
+    #[test]
+    fn validate_session_close_batch_interval_uses_whole_minutes() {
+        let mut spec = test_spec(vec![]);
+        let mut session: SessionSpec = serde_json::from_str(r#"{"cap_usdc":10.0}"#).unwrap();
+        session.close_batch_interval_ms = 15_000;
+        spec.session = Some(session);
+
+        let errors = validate_api_spec(&spec);
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("whole number of minutes")),
+            "got: {errors:?}"
+        );
+
+        spec.session.as_mut().unwrap().close_batch_interval_ms = 120_000;
+        assert!(validate_api_spec(&spec).is_empty());
     }
 
     #[test]
@@ -3739,6 +3778,7 @@ value_from_env: PAY_SIGNER_KEYPAIR
             pull_voucher_strategy: SessionPullVoucherStrategy::Disabled,
             batch_open_interval_ms: 400,
             close_delay_ms: 15_000,
+            close_batch_interval_ms: 60_000,
             settlement_interval_ms: 5_000,
             splits: vec![],
         });
@@ -3905,6 +3945,7 @@ value_from_env: PAY_SIGNER_KEYPAIR
             pull_voucher_strategy: SessionPullVoucherStrategy::Disabled,
             batch_open_interval_ms: 400,
             close_delay_ms: 15_000,
+            close_batch_interval_ms: 60_000,
             settlement_interval_ms: 5_000,
             splits,
         });

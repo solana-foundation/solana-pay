@@ -9,7 +9,7 @@ use axum::routing::{any, get, post};
 use owo_colors::OwoColorize;
 use pay_core::PaymentState;
 use pay_core::accounts::AccountsStore;
-use pay_core::server::session::SessionMpp;
+use pay_core::server::session::{SessionLifecycleReconciliation, SessionMpp};
 use pay_core::server::telemetry::FeePayerWallet;
 use pay_kit::mpp::server::Mpp;
 use pay_kit::mpp::solana_keychain::SolanaSigner;
@@ -47,14 +47,18 @@ fn default_bind() -> String {
     }
 }
 
-async fn session_channel_store() -> pay_core::Result<Arc<dyn pay_kit::mpp::store::ChannelStore>> {
+async fn session_channel_store()
+-> pay_core::Result<(Arc<dyn pay_kit::mpp::store::ChannelStore>, bool)> {
     let redis_url = std::env::var("PAY_SESSION_REDIS_URL")
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty());
 
     let Some(redis_url) = redis_url else {
-        return Ok(Arc::new(pay_kit::mpp::store::MemoryChannelStore::new()));
+        return Ok((
+            Arc::new(pay_kit::mpp::store::MemoryChannelStore::new()),
+            false,
+        ));
     };
 
     #[cfg(feature = "redis-session-store")]
@@ -70,7 +74,7 @@ async fn session_channel_store() -> pay_core::Result<Arc<dyn pay_kit::mpp::store
                 pay_core::Error::Config(format!("failed to connect session Redis store: {error}"))
             })?;
         tracing::info!("using durable Redis channel store for MPP sessions");
-        return Ok(Arc::new(store));
+        return Ok((Arc::new(store), true));
     }
 
     #[cfg(not(feature = "redis-session-store"))]
@@ -1082,7 +1086,8 @@ impl StartCommand {
                         .await?;
                 }
 
-                let session_channel_store = session_channel_store().await?;
+                let (session_channel_store, durable_session_store) =
+                    session_channel_store().await?;
                 let mut session_mpps = Vec::with_capacity(currency_configs.len());
                 for (_currency, session_mpp_currency, session_decimals) in &currency_configs {
                     let cap_base =
@@ -1121,9 +1126,15 @@ impl StartCommand {
                     }
 
                     let smpp = Arc::new(smpp);
-                    smpp.start_lifecycle_runloop_with_settlement(
+                    smpp.start_lifecycle_runloop_with_settlement_and_batching(
                         Duration::from_millis(sess.close_delay_ms),
+                        Duration::from_millis(sess.close_batch_interval_ms),
                         Duration::from_millis(sess.settlement_interval_ms),
+                        if durable_session_store {
+                            SessionLifecycleReconciliation::External
+                        } else {
+                            SessionLifecycleReconciliation::Embedded
+                        },
                     );
                     session_mpps.push(smpp);
                 }

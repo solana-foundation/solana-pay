@@ -227,7 +227,11 @@ pub async fn settle_delegated_session(
     )
     .map_err(|error| error.to_string())?;
     if actual.base_units == 0 {
-        pending.handle.touch_channel(pending.channel_id.clone());
+        pending
+            .handle
+            .touch_channel(pending.channel_id.clone())
+            .await
+            .map_err(|error| error.to_string())?;
         tracing::info!(
             channel = %pending.channel_id,
             "delegated MPP session response rated at zero"
@@ -1722,13 +1726,28 @@ async fn session_authorized(
                     .unwrap_or_default(),
                 ));
             }
-            let Some(reservation) =
-                handle.reserve_delegated_capacity(&state.channel_id, available_base_units)
-            else {
-                return GateDecision::Respond(GateResponse::json(
-                    StatusCode::PAYMENT_REQUIRED,
-                    Bytes::from_static(br#"{"error":"session_capacity_reserved","message":"Another request is currently using this session capacity."}"#),
-                ));
+            let reservation = match handle
+                .reserve_delegated_capacity(&state.channel_id, available_base_units)
+                .await
+            {
+                Ok(Some(reservation)) => reservation,
+                Ok(None) => {
+                    return GateDecision::Respond(GateResponse::json(
+                        StatusCode::PAYMENT_REQUIRED,
+                        Bytes::from_static(br#"{"error":"session_capacity_reserved","message":"Another request is currently using this session capacity."}"#),
+                    ));
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        channel_id = %state.channel_id,
+                        %error,
+                        "failed to wake delegated session channel"
+                    );
+                    return GateDecision::Respond(GateResponse::json(
+                        StatusCode::PAYMENT_REQUIRED,
+                        Bytes::from_static(br#"{"error":"session_close_pending","message":"The session channel is closing; open a new session."}"#),
+                    ));
+                }
             };
             let props = metering::RequestProperties {
                 body_size: req.content_length,

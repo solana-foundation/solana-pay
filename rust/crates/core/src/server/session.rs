@@ -20,7 +20,7 @@ use pay_kit::mpp::blockhash::{BlockhashCache, CachedBlockhash};
 use pay_kit::mpp::server::session::{SealParams, SessionConfig, SessionServer};
 use pay_kit::mpp::settlement::worker::{RpcBroadcaster, SettlementConfig, SettlementHandle, spawn};
 use pay_kit::mpp::solana_keychain::SolanaSigner;
-use pay_kit::mpp::store::{ChannelState, ChannelStore, MemoryChannelStore};
+use pay_kit::mpp::store::{ChannelLifecycle, ChannelState, ChannelStore, MemoryChannelStore};
 use pay_kit::mpp::{
     Base64UrlJson, CommitReceipt, OpenPayload, PaymentChallenge, SessionAction, SessionMode,
     SessionPullVoucherStrategy, SessionSettlementAuthority, SignedVoucher, VoucherData,
@@ -29,7 +29,8 @@ use pay_kit::mpp::{
 use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
-use tokio::sync::mpsc;
+use std::time::{SystemTime, UNIX_EPOCH};
+use tokio::sync::{mpsc, oneshot};
 use tokio::time::{Duration, Instant};
 
 use crate::server::telemetry;
@@ -470,29 +471,64 @@ impl SessionLifecycleHandle {
             tracing::debug!("session lifecycle runloop is not accepting events");
         }
     }
+
+    async fn touch(&self, channel_id: String, touched_at_ms: u64) -> Result<Option<ChannelState>> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.tx
+            .send(SessionLifecycleCommand::Touch {
+                channel_id,
+                touched_at_ms,
+                response: response_tx,
+            })
+            .map_err(|_| Error::Mpp("session lifecycle runloop is unavailable".to_string()))?;
+        response_rx
+            .await
+            .map_err(|_| Error::Mpp("session lifecycle touch was cancelled".to_string()))?
+            .map_err(Error::Mpp)
+    }
+
+    fn touch_unconfirmed(&self, channel_id: String, touched_at_ms: u64) {
+        let (response, _discarded) = oneshot::channel();
+        self.send(SessionLifecycleCommand::Touch {
+            channel_id,
+            touched_at_ms,
+            response,
+        });
+    }
 }
 
 #[derive(Debug)]
 enum SessionLifecycleCommand {
     Configure {
         close_delay: Option<Duration>,
+        close_batch_interval: Duration,
         settlement_interval: Option<Duration>,
+        reconciliation: SessionLifecycleReconciliation,
     },
     Touch {
         channel_id: String,
+        touched_at_ms: u64,
+        response: oneshot::Sender<std::result::Result<Option<ChannelState>, String>>,
     },
-    Remove {
-        channel_id: String,
-    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionLifecycleReconciliation {
+    /// This process owns the lifecycle clock and closes due channels.
+    Embedded,
+    /// This process only persists touches; an external worker owns the clock.
+    External,
 }
 
 struct SessionLifecycleRunloop {
     runtime: SessionOperatorRuntime,
+    owner: String,
     close_delay: Option<Duration>,
+    close_batch_interval: Duration,
     settlement_interval: Option<Duration>,
     next_settlement: Option<Instant>,
+    reconciliation: SessionLifecycleReconciliation,
     rx: mpsc::UnboundedReceiver<SessionLifecycleCommand>,
-    last_activity: HashMap<String, Instant>,
 }
 
 impl SessionLifecycleRunloop {
@@ -502,78 +538,122 @@ impl SessionLifecycleRunloop {
     ) -> Self {
         Self {
             runtime,
+            owner: uuid::Uuid::new_v4().to_string(),
             close_delay: None,
+            close_batch_interval: Duration::from_secs(60),
             settlement_interval: None,
             next_settlement: None,
+            reconciliation: SessionLifecycleReconciliation::Embedded,
             rx,
-            last_activity: HashMap::new(),
         }
     }
 
     async fn run(mut self) {
         loop {
-            if let Some(deadline) = self.next_wakeup() {
+            if let Some(delay) = self.next_wakeup_delay() {
                 tokio::select! {
                     command = self.rx.recv() => {
-                        if !self.handle_command(command) {
+                        if !self.handle_command(command).await {
                             break;
                         }
                     }
-                    _ = tokio::time::sleep_until(deadline) => {
-                        self.close_due_channels().await;
+                    _ = tokio::time::sleep(delay) => {
+                        if self.reconciliation == SessionLifecycleReconciliation::Embedded {
+                            self.close_due_channels().await;
+                        }
                         self.push_due_watermarks().await;
                     }
                 }
             } else {
                 let command = self.rx.recv().await;
-                if !self.handle_command(command) {
+                if !self.handle_command(command).await {
                     break;
                 }
             }
         }
     }
 
-    fn handle_command(&mut self, command: Option<SessionLifecycleCommand>) -> bool {
+    async fn handle_command(&mut self, command: Option<SessionLifecycleCommand>) -> bool {
         match command {
             Some(SessionLifecycleCommand::Configure {
                 close_delay,
+                close_batch_interval,
                 settlement_interval,
+                reconciliation,
             }) => {
                 self.close_delay = close_delay;
+                self.close_batch_interval = close_batch_interval;
                 self.settlement_interval = settlement_interval;
-                self.next_settlement = settlement_interval
-                    .filter(|_| !self.last_activity.is_empty())
-                    .map(|interval| Instant::now() + interval);
+                self.next_settlement =
+                    settlement_interval.map(|interval| Instant::now() + interval);
+                self.reconciliation = reconciliation;
                 true
             }
-            Some(SessionLifecycleCommand::Touch { channel_id }) => {
-                self.last_activity.insert(channel_id, Instant::now());
-                if self.next_settlement.is_none()
-                    && let Some(interval) = self.settlement_interval
-                {
-                    self.next_settlement = Some(Instant::now() + interval);
+            Some(SessionLifecycleCommand::Touch {
+                channel_id,
+                touched_at_ms,
+                response,
+            }) => {
+                let result = self
+                    .persist_touch(&channel_id, touched_at_ms)
+                    .await
+                    .map_err(|error| error.to_string());
+                if let Err(error) = &result {
+                    tracing::warn!(
+                        channel_id,
+                        error,
+                        "failed to persist payment-channel lifecycle touch"
+                    );
                 }
-                true
-            }
-            Some(SessionLifecycleCommand::Remove { channel_id }) => {
-                self.last_activity.remove(&channel_id);
-                if self.last_activity.is_empty() {
-                    self.next_settlement = None;
-                }
+                let _ = response.send(result);
                 true
             }
             None => false,
         }
     }
 
-    fn next_wakeup(&self) -> Option<Instant> {
-        let close = self.close_delay.and_then(|delay| {
-            self.last_activity
-                .values()
-                .map(|last_activity| *last_activity + delay)
-                .min()
-        });
-        match (close, self.next_settlement) {
+    async fn persist_touch(
+        &self,
+        channel_id: &str,
+        touched_at_ms: u64,
+    ) -> Result<Option<ChannelState>> {
+        let Some(close_delay) = self.close_delay else {
+            return Ok(None);
+        };
+        let idle_deadline = touched_at_ms.saturating_add(duration_millis(close_delay));
+        let close_after =
+            round_up_timestamp(idle_deadline, duration_millis(self.close_batch_interval));
+        let state = self
+            .runtime
+            .channel_store
+            .touch_channel_lifecycle(
+                channel_id,
+                ChannelLifecycle {
+                    owner: self.owner.clone(),
+                    close_after,
+                },
+            )
+            .await
+            .map_err(|error| {
+                Error::Mpp(format!(
+                    "failed to persist lifecycle deadline for {channel_id}: {error}"
+                ))
+            })?;
+        Ok(Some(state))
+    }
+
+    fn next_wakeup_delay(&self) -> Option<Duration> {
+        let close = if self.reconciliation == SessionLifecycleReconciliation::Embedded
+            && self.close_delay.is_some()
+        {
+            Some(duration_until_next_boundary(self.close_batch_interval))
+        } else {
+            None
+        };
+        let settlement = self
+            .next_settlement
+            .map(|deadline| deadline.saturating_duration_since(Instant::now()));
+        match (close, settlement) {
             (Some(close), Some(settlement)) => Some(close.min(settlement)),
             (Some(close), None) => Some(close),
             (None, Some(settlement)) => Some(settlement),
@@ -582,26 +662,41 @@ impl SessionLifecycleRunloop {
     }
 
     async fn close_due_channels(&mut self) {
-        let Some(close_delay) = self.close_delay else {
+        if self.close_delay.is_none() {
             return;
+        }
+        let now_ms = unix_millis();
+        let states = match self.runtime.channel_store.list_channels().await {
+            Ok(states) => states,
+            Err(error) => {
+                tracing::warn!(%error, "failed to enumerate payment-channel lifecycle state");
+                return;
+            }
         };
-        let now = Instant::now();
-        let due = self
-            .last_activity
-            .iter()
-            .filter(|(_, last_activity)| **last_activity + close_delay <= now)
-            .map(|(channel_id, _)| channel_id.clone())
+        let due = states
+            .into_iter()
+            .filter(|state| !state.sealed && state.close_requested_at.is_none())
+            .filter_map(|state| {
+                state
+                    .lifecycle
+                    .as_ref()
+                    .filter(|lifecycle| {
+                        lifecycle.owner == self.owner && lifecycle.close_after <= now_ms
+                    })
+                    .map(|_| state.channel_id)
+            })
             .collect::<Vec<_>>();
 
         let mut closing = Vec::with_capacity(due.len());
         for channel_id in due {
-            self.last_activity.remove(&channel_id);
             // Closing and serving both claim the same channel slot. This makes
             // the reservation check atomic with the start of close: a request
             // already in flight defers close, while a close already in progress
             // prevents a new request from reserving stale capacity.
             if !self.runtime.reserve_capacity(&channel_id, 0) {
-                self.last_activity.insert(channel_id, Instant::now());
+                if let Err(error) = self.persist_touch(&channel_id, now_ms).await {
+                    tracing::warn!(channel_id, %error, "failed to defer busy channel close");
+                }
                 continue;
             }
             let runtime = self.runtime.clone();
@@ -626,7 +721,13 @@ impl SessionLifecycleRunloop {
                         error = %error,
                         "operator auto-close failed; retrying after delay"
                     );
-                    self.last_activity.insert(channel_id, Instant::now());
+                    if let Err(touch_error) = self.persist_touch(&channel_id, unix_millis()).await {
+                        tracing::warn!(
+                            channel_id,
+                            error = %touch_error,
+                            "failed to reschedule payment-channel close"
+                        );
+                    }
                 }
             }
         }
@@ -642,9 +743,25 @@ impl SessionLifecycleRunloop {
             return;
         }
 
-        // Idle channels were removed (or rescheduled after an error) by
-        // `close_due_channels`; everything left here should remain open.
-        let channels = self.last_activity.keys().cloned().collect::<Vec<_>>();
+        let states = match self.runtime.channel_store.list_channels().await {
+            Ok(states) => states,
+            Err(error) => {
+                tracing::warn!(%error, "failed to enumerate active payment channels");
+                self.next_settlement = Some(now + interval);
+                return;
+            }
+        };
+        let channels = states
+            .into_iter()
+            .filter(|state| !state.sealed && state.close_requested_at.is_none())
+            .filter(|state| {
+                state
+                    .lifecycle
+                    .as_ref()
+                    .is_some_and(|lifecycle| lifecycle.owner == self.owner)
+            })
+            .map(|state| state.channel_id)
+            .collect::<Vec<_>>();
         let mut settlements = Vec::with_capacity(channels.len());
         for channel_id in channels {
             if !self.runtime.reserve_capacity(&channel_id, 0) {
@@ -667,8 +784,37 @@ impl SessionLifecycleRunloop {
             }
         }
 
-        self.next_settlement = (!self.last_activity.is_empty()).then(|| now + interval);
+        self.next_settlement = Some(now + interval);
     }
+}
+
+fn duration_millis(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+fn unix_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(duration_millis)
+        .unwrap_or_default()
+}
+
+fn round_up_timestamp(timestamp_ms: u64, interval_ms: u64) -> u64 {
+    if interval_ms == 0 {
+        return timestamp_ms;
+    }
+    let remainder = timestamp_ms % interval_ms;
+    if remainder == 0 {
+        timestamp_ms
+    } else {
+        timestamp_ms.saturating_add(interval_ms - remainder)
+    }
+}
+
+fn duration_until_next_boundary(interval: Duration) -> Duration {
+    let now = unix_millis();
+    let next = round_up_timestamp(now.saturating_add(1), duration_millis(interval));
+    Duration::from_millis(next.saturating_sub(now))
 }
 
 enum SessionCloseResult {
@@ -826,7 +972,12 @@ impl SessionMpp {
     /// The runloop is intentionally centralized: request handlers only record
     /// activity, while this task owns the close/settle/distribute sequence.
     pub fn start_lifecycle_runloop(&self, close_delay: Duration) {
-        self.start_lifecycle_runloop_with_settlement(close_delay, Duration::ZERO);
+        self.start_lifecycle_runloop_with_settlement_and_batching(
+            close_delay,
+            close_delay,
+            Duration::ZERO,
+            SessionLifecycleReconciliation::Embedded,
+        );
     }
 
     /// Configure the lifecycle runloop to reconcile active channels' latest
@@ -837,15 +988,46 @@ impl SessionMpp {
         close_delay: Duration,
         settlement_interval: Duration,
     ) {
-        let close_delay = (!close_delay.is_zero()).then_some(close_delay);
-        let settlement_interval = (!settlement_interval.is_zero()).then_some(settlement_interval);
-        self.lifecycle.send(SessionLifecycleCommand::Configure {
+        self.start_lifecycle_runloop_with_settlement_and_batching(
+            close_delay,
             close_delay,
             settlement_interval,
+            SessionLifecycleReconciliation::Embedded,
+        );
+    }
+
+    /// Configure store-backed lifecycle scheduling.
+    ///
+    /// Every request persists its rounded idle deadline through
+    /// [`ChannelStore`]. In external mode this process does not own the clock;
+    /// a durable reconciliation worker closes due channels.
+    pub fn start_lifecycle_runloop_with_settlement_and_batching(
+        &self,
+        close_delay: Duration,
+        close_batch_interval: Duration,
+        settlement_interval: Duration,
+        reconciliation: SessionLifecycleReconciliation,
+    ) {
+        let close_delay = (!close_delay.is_zero()).then_some(close_delay);
+        let close_batch_interval = if close_batch_interval.is_zero() {
+            Duration::from_secs(60)
+        } else {
+            close_batch_interval
+        };
+        let settlement_interval = (reconciliation == SessionLifecycleReconciliation::Embedded
+            && !settlement_interval.is_zero())
+        .then_some(settlement_interval);
+        self.lifecycle.send(SessionLifecycleCommand::Configure {
+            close_delay,
+            close_batch_interval,
+            settlement_interval,
+            reconciliation,
         });
         tracing::info!(
             close_delay_ms = close_delay.map(|delay| delay.as_millis()),
+            close_batch_interval_ms = close_batch_interval.as_millis(),
             settlement_interval_ms = settlement_interval.map(|interval| interval.as_millis()),
+            reconciliation = ?reconciliation,
             "started session lifecycle runloop"
         );
     }
@@ -935,25 +1117,51 @@ impl SessionMpp {
             .await
             .map_err(|e| Error::PaymentRejected(e.to_string()))?;
         self.record_committed_watermark(channel_id.to_string(), accepted.cumulative);
-        self.touch_channel(channel_id.to_string());
+        self.touch_channel(channel_id.to_string()).await?;
         Ok(accepted.cumulative)
     }
 
-    pub fn reserve_delegated_capacity(
+    pub async fn reserve_delegated_capacity(
         &self,
         channel_id: &str,
         amount: u64,
-    ) -> Option<DelegatedCapacityLease> {
-        self.operator_runtime
+    ) -> Result<Option<DelegatedCapacityLease>> {
+        self.touch_channel(channel_id.to_string()).await?;
+        Ok(self
+            .operator_runtime
             .reserve_capacity(channel_id, amount)
             .then(|| DelegatedCapacityLease {
                 runtime: self.operator_runtime.clone(),
                 channel_id: channel_id.to_string(),
-            })
+            }))
     }
 
     /// Record channel activity so the lifecycle runloop can defer auto-close.
-    pub fn touch_channel(&self, channel_id: impl Into<String>) {
+    pub async fn touch_channel(&self, channel_id: impl Into<String>) -> Result<()> {
+        let channel_id = channel_id.into();
+        if self
+            .pull_sessions
+            .lock()
+            .map(|sessions| sessions.contains(&channel_id))
+            .unwrap_or(false)
+        {
+            return Ok(());
+        }
+        if let Some(state) = self.lifecycle.touch(channel_id, unix_millis()).await?
+            && (state.sealed || state.close_requested_at.is_some())
+        {
+            return Err(Error::PaymentRejected(
+                "payment channel close is pending".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Queue a best-effort lifecycle extension for a request that has already
+    /// performed a confirmed wake-up. Streaming paths use this to avoid a
+    /// Redis round trip per response chunk while still extending long-lived
+    /// requests.
+    pub fn touch_channel_unconfirmed(&self, channel_id: impl Into<String>) {
         let channel_id = channel_id.into();
         if self
             .pull_sessions
@@ -963,8 +1171,7 @@ impl SessionMpp {
         {
             return;
         }
-        self.lifecycle
-            .send(SessionLifecycleCommand::Touch { channel_id });
+        self.lifecycle.touch_unconfirmed(channel_id, unix_millis());
     }
 
     /// Latest cumulative watermark accepted by this process for a session.
@@ -1096,7 +1303,7 @@ impl SessionMpp {
                     self.record_pull_session(state.channel_id.clone());
                 }
                 self.record_committed_watermark(state.channel_id.clone(), state.cumulative);
-                self.touch_channel(state.channel_id.clone());
+                self.touch_channel(state.channel_id.clone()).await?;
                 Ok(SessionOutcome::Active {
                     state,
                     signature: Some(payload_for_open.signature.clone()),
@@ -1112,7 +1319,7 @@ impl SessionMpp {
                     .cumulative;
                 let channel_id = p.voucher.data.channel_id.clone();
                 self.record_committed_watermark(channel_id.clone(), cumulative);
-                self.touch_channel(channel_id.clone());
+                self.touch_channel(channel_id.clone()).await?;
                 Ok(SessionOutcome::Voucher {
                     channel_id,
                     cumulative,
@@ -1128,7 +1335,7 @@ impl SessionMpp {
                 if let Ok(cumulative) = receipt.cumulative.parse::<u64>() {
                     self.record_committed_watermark(receipt.session_id.clone(), cumulative);
                 }
-                self.touch_channel(receipt.session_id.clone());
+                self.touch_channel(receipt.session_id.clone()).await?;
                 Ok(SessionOutcome::Commit(receipt))
             }
 
@@ -1139,7 +1346,7 @@ impl SessionMpp {
                     .await
                     .map_err(|e| Error::Mpp(format!("TopUp failed: {e}")))?;
                 self.record_committed_watermark(state.channel_id.clone(), state.cumulative);
-                self.touch_channel(state.channel_id.clone());
+                self.touch_channel(state.channel_id.clone()).await?;
                 Ok(SessionOutcome::Active {
                     state,
                     signature: Some(p.signature.clone()),
@@ -1149,6 +1356,7 @@ impl SessionMpp {
             SessionAction::Close(p) => {
                 let _lease = self
                     .reserve_delegated_capacity(&p.channel_id, 0)
+                    .await?
                     .ok_or_else(|| {
                         Error::Mpp(format!(
                             "Session channel {} is busy with another request",
@@ -1200,7 +1408,6 @@ impl SessionMpp {
                         &params.channel_id.to_string(),
                     );
                 }
-                self.unschedule_channel_close(params.channel_id.to_string());
                 Ok(SessionOutcome::Closed { params, signature })
             }
         }
@@ -1230,17 +1437,11 @@ impl SessionMpp {
             .begin_delivery(request)
             .await
             .map_err(|e| Error::Mpp(format!("Failed to reserve session delivery: {e}")))?;
-        self.touch_channel(session_id);
+        self.touch_channel(session_id).await?;
         Ok(directive)
     }
 
     // ── Private helpers ──────────────────────────────────────────────────────
-
-    fn unschedule_channel_close(&self, channel_id: impl Into<String>) {
-        self.lifecycle.send(SessionLifecycleCommand::Remove {
-            channel_id: channel_id.into(),
-        });
-    }
 
     fn record_committed_watermark(&self, session_id: impl Into<String>, cumulative: u64) {
         self.operator_runtime
@@ -1821,6 +2022,8 @@ mod tests {
         let close_header = handle.close_header(Some(25)).await.unwrap();
         let competing_lease = session
             .reserve_delegated_capacity(&opened.channel_id, 0)
+            .await
+            .unwrap()
             .expect("test should reserve the channel");
         let error = session.process(&close_header).await.unwrap_err();
         assert!(
@@ -1967,20 +2170,114 @@ mod tests {
     }
 
     #[test]
-    fn delegated_capacity_lease_releases_on_drop() {
+    fn lifecycle_deadlines_round_up_to_batch_boundary() {
+        assert_eq!(round_up_timestamp(120_000, 60_000), 120_000);
+        assert_eq!(round_up_timestamp(120_001, 60_000), 180_000);
+        assert_eq!(round_up_timestamp(u64::MAX - 10, 60_000), u64::MAX);
+        assert_eq!(round_up_timestamp(123, 0), 123);
+    }
+
+    #[tokio::test]
+    async fn external_lifecycle_persists_deadline_without_closing_locally() {
+        let session = Arc::new(test_session_mpp());
+        session.start_lifecycle_runloop_with_settlement_and_batching(
+            Duration::from_millis(10),
+            Duration::from_millis(10),
+            Duration::ZERO,
+            SessionLifecycleReconciliation::External,
+        );
+        let challenge = session.challenge(CAP).unwrap();
+        let handle = SessionHandle::new(
+            solana_pubkey::Pubkey::new_unique(),
+            test_session_signer(),
+            challenge,
+        );
+
+        let open_header = handle.open_header(CAP, "open_sig").await.unwrap();
+        let SessionOutcome::Active { state: opened, .. } =
+            session.process(&open_header).await.unwrap()
+        else {
+            panic!("expected open to return active session");
+        };
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let persisted = session
+                    .operator_runtime
+                    .channel_store
+                    .get_channel(&opened.channel_id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                if persisted.lifecycle.is_some() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("lifecycle touch should be persisted");
+
+        tokio::time::sleep(Duration::from_millis(60)).await;
+
+        let persisted = session
+            .operator_runtime
+            .channel_store
+            .get_channel(&opened.channel_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(persisted.lifecycle.is_some());
+        assert!(
+            persisted.close_requested_at.is_none(),
+            "external mode must leave close ownership to the worker"
+        );
+
+        session
+            .operator_runtime
+            .channel_store
+            .update_channel(
+                &opened.channel_id,
+                Box::new(|state| {
+                    let mut state = state.unwrap();
+                    state.close_requested_at = Some(1);
+                    Ok(state)
+                }),
+            )
+            .await
+            .unwrap();
+        let error = session
+            .touch_channel(opened.channel_id)
+            .await
+            .expect_err("a worker-claimed close cannot be woken");
+        assert!(error.to_string().contains("close is pending"));
+    }
+
+    #[tokio::test]
+    async fn delegated_capacity_lease_releases_on_drop() {
         let session = test_session_mpp();
         let first = session
             .reserve_delegated_capacity("channel", CAP)
+            .await
+            .unwrap()
             .expect("first reservation should succeed");
         assert!(
-            session.reserve_delegated_capacity("channel", CAP).is_none(),
+            session
+                .reserve_delegated_capacity("channel", CAP)
+                .await
+                .unwrap()
+                .is_none(),
             "a live lease must exclude concurrent reservations"
         );
 
         drop(first);
 
         assert!(
-            session.reserve_delegated_capacity("channel", CAP).is_some(),
+            session
+                .reserve_delegated_capacity("channel", CAP)
+                .await
+                .unwrap()
+                .is_some(),
             "dropping the lease must release capacity"
         );
     }
@@ -2004,6 +2301,8 @@ mod tests {
         };
         let lease = session
             .reserve_delegated_capacity(&opened.channel_id, CAP)
+            .await
+            .unwrap()
             .expect("request should reserve channel capacity");
 
         tokio::time::sleep(Duration::from_millis(60)).await;
