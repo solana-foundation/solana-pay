@@ -300,7 +300,7 @@ pub enum GateDecision {
     /// `receipt` is applied to the response. For x402 `upto`, `upto` carries the
     /// opened channel the adapter settles *after* the response.
     Forward {
-        session: Option<SessionForward>,
+        session: Option<Box<SessionForward>>,
         receipt: Option<ReceiptAnnotation>,
         upto: Option<Box<UptoForward>>,
         paid_request: Option<PaidRequestTelemetry>,
@@ -1744,14 +1744,14 @@ async fn session_authorized(
                 inferred_usage: None,
             };
             GateDecision::Forward {
-                session: Some(SessionForward::delegated(
+                session: Some(Box::new(SessionForward::delegated(
                     handle,
                     state.channel_id,
                     state.cumulative,
                     settlement,
                     available_base_units,
                     reservation,
-                )),
+                ))),
                 receipt: signature
                     .map(|reference| session_receipt_annotation(sm.network(), reference)),
                 upto: None,
@@ -1766,13 +1766,15 @@ async fn session_authorized(
             channel_id,
             cumulative,
         }) => GateDecision::Forward {
-            session: handle.map(|h| SessionForward {
-                handle: h,
-                channel_id,
-                committed_base_units: cumulative,
-                settlement: None,
-                available_base_units: 0,
-                _reservation: None,
+            session: handle.map(|h| {
+                Box::new(SessionForward {
+                    handle: h,
+                    channel_id,
+                    committed_base_units: cumulative,
+                    settlement: None,
+                    available_base_units: 0,
+                    _reservation: None,
+                })
             }),
             receipt: None,
             upto: None,

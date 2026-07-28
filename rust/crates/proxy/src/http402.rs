@@ -688,7 +688,7 @@ impl<S: PaymentState> ProxyHttp for Http402Gate<S> {
                         telemetry: u.telemetry,
                     }
                 });
-                ctx.session = session_forward;
+                ctx.session = session_forward.map(|pending| *pending);
                 // Delegated sessions always settle before releasing a
                 // successful response, including fixed-price endpoints. x402
                 // `upto` only needs this path when pricing consumes response

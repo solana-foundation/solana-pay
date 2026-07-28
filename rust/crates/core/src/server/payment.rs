@@ -95,7 +95,8 @@ async fn gate_adapter<S: PaymentState>(state: S, req: Request<Body>, next: Next)
         } => {
             let mut req = req;
             let mut delegated_session = None;
-            if let Some(mut sf) = session {
+            if let Some(sf) = session {
+                let mut sf = *sf;
                 if sf.settlement.is_some() {
                     // Delegated sessions are settled from the completed
                     // response below. The client-voucher stream context waits
