@@ -24,6 +24,7 @@ pub const METRIC_FEE_PAYER_BALANCE_ERRORS: &str = "pay_fee_payer_balance_errors_
 pub const METRIC_PAYMENT_CHANNELS_OPENED: &str = "pay_payment_channels_opened_total";
 pub const METRIC_PAYMENT_CHANNELS_CLOSED: &str = "pay_payment_channels_closed_total";
 pub const METRIC_PAYMENT_CHANNEL_ESCROWED: &str = "pay_payment_channel_escrowed_base_units";
+pub const METRIC_PAYMENT_CHANNEL_CLIENT: &str = "pay_payment_channel_client";
 pub const METRIC_PAYMENT_CHANNEL_VOUCHER_CUMULATIVE: &str =
     "pay_payment_channel_voucher_cumulative_base_units";
 
@@ -417,6 +418,7 @@ pub fn record_payment_channel_closed(signature: &str, channel: &str) {
 pub fn record_payment_channel_opened(
     signature: &str,
     channel: &str,
+    client_id: &str,
     currency: &str,
     network: &str,
     escrowed: u64,
@@ -437,6 +439,13 @@ pub fn record_payment_channel_opened(
         protocol = "mpp/session",
         metric = METRIC_PAYMENT_CHANNEL_ESCROWED,
         "payment-channel escrow confirmed",
+    );
+    tracing::info!(
+        gauge.pay_payment_channel_client = 1_u64,
+        client_id,
+        protocol = "mpp/session",
+        metric = METRIC_PAYMENT_CHANNEL_CLIENT,
+        "payment-channel client confirmed",
     );
     tracing::info!(
         signature = %signature,

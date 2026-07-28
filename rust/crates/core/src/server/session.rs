@@ -1300,9 +1300,13 @@ impl SessionMpp {
                 // open, while `Err` is propagated so an unavailable RPC can
                 // never cause Redis state to be created or deleted.
                 let payment_channel_open = p.mode == SessionMode::Push || client_voucher_pull;
-                let account_confirmed = if let (true, Some(rpc_url)) =
+                let (account_confirmed, client_id) = if let (true, Some(rpc_url)) =
                     (payment_channel_open, self.rpc_url.as_deref())
                 {
+                    let client_id = self
+                        .payment_channel_open_params(payload_for_open)?
+                        .payer
+                        .to_string();
                     let signature = payload_for_open.signature.as_str();
                     let channel_id = payload_for_open
                         .session_id()
@@ -1319,9 +1323,9 @@ impl SessionMpp {
                             "payment-channel open transaction is confirmed, but channel {channel_id} is absent on-chain"
                         )));
                     }
-                    true
+                    (true, Some(client_id))
                 } else {
-                    false
+                    (false, None)
                 };
 
                 // The host has independently validated, co-signed, submitted,
@@ -1341,10 +1345,14 @@ impl SessionMpp {
                 .map_err(|e| Error::Mpp(format!("Session open failed: {e}")))?;
                 let state = acceptance.state;
 
-                if !acceptance.replay && account_confirmed {
+                if !acceptance.replay
+                    && account_confirmed
+                    && let Some(client_id) = client_id.as_deref()
+                {
                     telemetry::record_payment_channel_opened(
                         &payload_for_open.signature,
                         &state.channel_id.to_string(),
+                        client_id,
                         self.currency(),
                         self.network(),
                         state.deposit,
