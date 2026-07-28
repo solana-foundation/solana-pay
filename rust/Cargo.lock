@@ -6406,6 +6406,7 @@ dependencies = [
  "base64 0.22.1",
  "bincode",
  "blake3",
+ "borsh 1.7.0",
  "bs58",
  "bytes 1.12.0",
  "chrono",

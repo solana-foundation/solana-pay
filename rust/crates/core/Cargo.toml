@@ -84,6 +84,7 @@ five8_core = { version = "=0.1.2", features = ["std"] }
 libc = "0.2"
 
 [dev-dependencies]
+borsh = "1"
 serde_yml = { workspace = true }
 toml = { workspace = true }
 reqwest = { workspace = true }
