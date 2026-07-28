@@ -21,6 +21,7 @@ pub const METRIC_CHALLENGE_AMOUNT_USD: &str = "pay_402_challenge_amount_usd";
 pub const METRIC_FEE_PAYER_WALLET_SOL: &str = "pay_fee_payer_wallet_sol";
 pub const METRIC_FEE_PAID_SOL: &str = "pay_fee_paid_sol_total";
 pub const METRIC_FEE_PAYER_BALANCE_ERRORS: &str = "pay_fee_payer_balance_errors_total";
+pub const METRIC_PAYMENT_CHANNELS_OPENED: &str = "pay_payment_channels_opened_total";
 pub const METRIC_PAYMENT_CHANNELS_CLOSED: &str = "pay_payment_channels_closed_total";
 
 #[derive(Debug, Clone)]
@@ -385,6 +386,20 @@ pub fn record_payment_channel_closed(signature: &str, channel: &str) {
         signature = %signature,
         channel = %channel,
         "payment-channel settlement details",
+    );
+}
+
+pub fn record_payment_channel_opened(signature: &str, channel: &str) {
+    tracing::info!(
+        monotonic_counter.pay_payment_channels_opened_total = 1_u64,
+        protocol = "mpp/session",
+        metric = METRIC_PAYMENT_CHANNELS_OPENED,
+        "payment-channel open confirmed",
+    );
+    tracing::info!(
+        signature = %signature,
+        channel = %channel,
+        "payment-channel open details",
     );
 }
 

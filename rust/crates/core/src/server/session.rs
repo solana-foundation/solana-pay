@@ -1288,15 +1288,23 @@ impl SessionMpp {
                 // broadcasts. Persist those opens without asking a second RPC
                 // client to rediscover the same signature. Opens received by
                 // any other integration retain PayKit's standard verification.
-                let state = if submitted_open.is_some() {
-                    self.server.process_preverified_open(payload_for_open).await
+                let acceptance = if submitted_open.is_some() {
+                    self.server
+                        .process_preverified_open_with_outcome(payload_for_open)
+                        .await
                 } else {
-                    self.server.process_open(payload_for_open).await
+                    self.server
+                        .process_open_with_outcome(payload_for_open)
+                        .await
                 }
                 .map_err(|e| Error::Mpp(format!("Session open failed: {e}")))?;
+                let state = acceptance.state;
 
-                if let Some(signature) = &submitted_open {
-                    tracing::info!(%signature, "payment-channel open transaction confirmed");
+                if !acceptance.replay {
+                    telemetry::record_payment_channel_opened(
+                        &payload_for_open.signature,
+                        &state.channel_id.to_string(),
+                    );
                 }
 
                 if p.mode == SessionMode::Pull && !client_voucher_pull {
