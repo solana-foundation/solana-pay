@@ -23,6 +23,8 @@ pub const METRIC_FEE_PAID_SOL: &str = "pay_fee_paid_sol_total";
 pub const METRIC_FEE_PAYER_BALANCE_ERRORS: &str = "pay_fee_payer_balance_errors_total";
 pub const METRIC_PAYMENT_CHANNELS_OPENED: &str = "pay_payment_channels_opened_total";
 pub const METRIC_PAYMENT_CHANNELS_CLOSED: &str = "pay_payment_channels_closed_total";
+pub const METRIC_PAYMENT_CHANNEL_VOUCHER_CUMULATIVE: &str =
+    "pay_payment_channel_voucher_cumulative_base_units";
 
 /// Create the bounded session-lifecycle counter series before the server
 /// accepts traffic. The CLI force-flushes these zero values so Prometheus has
@@ -31,6 +33,8 @@ pub fn record_metric_baselines() {
     tracing::info!(
         monotonic_counter.pay_payment_channels_opened_total = 0_u64,
         protocol = "mpp/session",
+        channel_kind = "payment_channel",
+        verification = "account_confirmed",
         metric = METRIC_PAYMENT_CHANNELS_OPENED,
         "payment-channel open confirmed",
     );
@@ -413,6 +417,8 @@ pub fn record_payment_channel_opened(signature: &str, channel: &str) {
     tracing::info!(
         monotonic_counter.pay_payment_channels_opened_total = 1_u64,
         protocol = "mpp/session",
+        channel_kind = "payment_channel",
+        verification = "account_confirmed",
         metric = METRIC_PAYMENT_CHANNELS_OPENED,
         "payment-channel open confirmed",
     );
@@ -420,6 +426,27 @@ pub fn record_payment_channel_opened(signature: &str, channel: &str) {
         signature = %signature,
         channel = %channel,
         "payment-channel open details",
+    );
+}
+
+/// Record the latest cumulative voucher only after it has been accepted and
+/// persisted. The channel id is intentionally a metric attribute: the
+/// settlement dashboard pairs this proxy-side watermark with the worker's
+/// confirmed on-chain watermark to derive the value still at risk.
+pub fn record_payment_channel_voucher_cumulative(
+    channel_id: &str,
+    currency: &str,
+    network: &str,
+    cumulative: u64,
+) {
+    tracing::info!(
+        gauge.pay_payment_channel_voucher_cumulative_base_units = cumulative,
+        channel_id,
+        currency,
+        network,
+        protocol = "mpp/session",
+        metric = METRIC_PAYMENT_CHANNEL_VOUCHER_CUMULATIVE,
+        "payment-channel voucher persisted",
     );
 }
 

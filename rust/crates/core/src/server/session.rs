@@ -1116,6 +1116,12 @@ impl SessionMpp {
             })
             .await
             .map_err(|e| Error::PaymentRejected(e.to_string()))?;
+        telemetry::record_payment_channel_voucher_cumulative(
+            channel_id,
+            self.currency(),
+            self.network(),
+            accepted.cumulative,
+        );
         self.record_committed_watermark(channel_id.to_string(), accepted.cumulative);
         self.touch_channel(channel_id.to_string()).await?;
         Ok(accepted.cumulative)
@@ -1283,6 +1289,41 @@ impl SessionMpp {
                     p
                 };
 
+                // A replayed transaction signature can remain confirmed long
+                // after its channel account has been reclaimed. Solana RPC may
+                // return "already processed" on re-submission, and signature
+                // confirmation alone cannot distinguish that stale replay
+                // from a newly landed open. Before creating durable state,
+                // require the channel itself to exist at confirmed commitment.
+                //
+                // Keep absence and RPC failure distinct: `Ok(None)` is a stale
+                // open, while `Err` is propagated so an unavailable RPC can
+                // never cause Redis state to be created or deleted.
+                let payment_channel_open = p.mode == SessionMode::Push || client_voucher_pull;
+                let account_confirmed = if let (true, Some(rpc_url)) =
+                    (payment_channel_open, self.rpc_url.as_deref())
+                {
+                    let signature = payload_for_open.signature.as_str();
+                    let channel_id = payload_for_open
+                        .session_id()
+                        .map_err(|e| Error::Mpp(format!("Invalid session channel: {e}")))?;
+                    wait_for_transaction_confirmed(rpc_url, signature, "payment-channel open")
+                        .await?;
+                    if self
+                        .operator_runtime
+                        .fetch_payment_channel(channel_id)
+                        .await?
+                        .is_none()
+                    {
+                        return Err(Error::Mpp(format!(
+                            "payment-channel open transaction is confirmed, but channel {channel_id} is absent on-chain"
+                        )));
+                    }
+                    true
+                } else {
+                    false
+                };
+
                 // The host has independently validated, co-signed, submitted,
                 // and observed a successful status for transactions it
                 // broadcasts. Persist those opens without asking a second RPC
@@ -1300,7 +1341,7 @@ impl SessionMpp {
                 .map_err(|e| Error::Mpp(format!("Session open failed: {e}")))?;
                 let state = acceptance.state;
 
-                if !acceptance.replay {
+                if !acceptance.replay && account_confirmed {
                     telemetry::record_payment_channel_opened(
                         &payload_for_open.signature,
                         &state.channel_id.to_string(),
@@ -1326,6 +1367,12 @@ impl SessionMpp {
                     .map_err(|e| Error::PaymentRejected(e.to_string()))?
                     .cumulative;
                 let channel_id = p.voucher.data.channel_id.clone();
+                telemetry::record_payment_channel_voucher_cumulative(
+                    &channel_id,
+                    self.currency(),
+                    self.network(),
+                    cumulative,
+                );
                 self.record_committed_watermark(channel_id.clone(), cumulative);
                 self.touch_channel(channel_id.clone()).await?;
                 Ok(SessionOutcome::Voucher {
@@ -1341,6 +1388,12 @@ impl SessionMpp {
                     .await
                     .map_err(|e| Error::PaymentRejected(e.to_string()))?;
                 if let Ok(cumulative) = receipt.cumulative.parse::<u64>() {
+                    telemetry::record_payment_channel_voucher_cumulative(
+                        &receipt.session_id,
+                        self.currency(),
+                        self.network(),
+                        cumulative,
+                    );
                     self.record_committed_watermark(receipt.session_id.clone(), cumulative);
                 }
                 self.touch_channel(receipt.session_id.clone()).await?;
@@ -1382,6 +1435,12 @@ impl SessionMpp {
                         return Err(Error::Mpp(format!("Session close failed: {error}")));
                     }
                 };
+                telemetry::record_payment_channel_voucher_cumulative(
+                    &params.channel_id.to_string(),
+                    self.currency(),
+                    self.network(),
+                    params.settled,
+                );
                 self.record_committed_watermark(params.channel_id.to_string(), params.settled);
                 let settlement = self.submit_payment_channel_settlement(&params).await;
                 let signature = match settlement {
