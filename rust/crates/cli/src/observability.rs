@@ -56,6 +56,11 @@ pub(crate) fn init_otlp(sidecar: &str, filter: EnvFilter) -> Result<OtelGuard, S
         .with(OpenTelemetryLayer::new(tracer))
         .init();
 
+    pay_core::server::telemetry::record_metric_baselines();
+    meter_provider
+        .force_flush()
+        .map_err(|error| format!("failed to export initial metric baselines: {error:?}"))?;
+
     Ok(OtelGuard {
         tracer_provider,
         meter_provider,
@@ -123,6 +128,8 @@ fn init_meter_provider(endpoints: &OtlpEndpoints) -> Result<SdkMeterProvider, St
 
 fn resource() -> Resource {
     let service_name = std::env::var("K_SERVICE").unwrap_or_else(|_| "pay-server".to_string());
+    let revision = std::env::var("K_REVISION").unwrap_or_else(|_| "local".to_string());
+    let instance_id = format!("{revision}:{}", uuid::Uuid::new_v4());
     let deployment = std::env::var("PAY_ENV").unwrap_or_else(|_| {
         std::env::var("K_REVISION")
             .map(|_| "cloud-run".to_string())
@@ -134,6 +141,7 @@ fn resource() -> Resource {
         .with_schema_url(
             [
                 KeyValue::new(SERVICE_VERSION, env!("CARGO_PKG_VERSION")),
+                KeyValue::new("service.instance.id", instance_id),
                 KeyValue::new("deployment.environment", deployment),
             ],
             SCHEMA_URL,

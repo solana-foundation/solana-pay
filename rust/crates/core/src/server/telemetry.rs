@@ -24,6 +24,27 @@ pub const METRIC_FEE_PAYER_BALANCE_ERRORS: &str = "pay_fee_payer_balance_errors_
 pub const METRIC_PAYMENT_CHANNELS_OPENED: &str = "pay_payment_channels_opened_total";
 pub const METRIC_PAYMENT_CHANNELS_CLOSED: &str = "pay_payment_channels_closed_total";
 
+/// Create the bounded session-lifecycle counter series before the server
+/// accepts traffic. The CLI force-flushes these zero values so Prometheus has
+/// a real baseline even when the first request opens a channel immediately.
+pub fn record_metric_baselines() {
+    tracing::info!(
+        monotonic_counter.pay_payment_channels_opened_total = 0_u64,
+        protocol = "mpp/session",
+        metric = METRIC_PAYMENT_CHANNELS_OPENED,
+        "payment-channel open confirmed",
+    );
+    for retryable in [true, false] {
+        tracing::info!(
+            monotonic_counter.pay_payment_settlement_errors_total = 0_u64,
+            protocol = "mpp/session",
+            retryable,
+            metric = METRIC_SETTLEMENT_ERRORS,
+            "payment settlement failed",
+        );
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct PaymentAmount {
     pub currency: String,
@@ -344,7 +365,6 @@ pub fn record_settlement_error(
     tracing::warn!(
         monotonic_counter.pay_payment_settlement_errors_total = 1_u64,
         protocol,
-        subdomain = %subdomain,
         retryable,
         metric = METRIC_SETTLEMENT_ERRORS,
         "payment settlement failed",
