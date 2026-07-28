@@ -91,6 +91,7 @@ async fn gate_adapter<S: PaymentState>(state: S, req: Request<Body>, next: Next)
             session,
             receipt,
             upto,
+            paid_request,
         } => {
             let mut req = req;
             let mut delegated_session = None;
@@ -148,6 +149,7 @@ async fn gate_adapter<S: PaymentState>(state: S, req: Request<Body>, next: Next)
                                     served_ok,
                                     &parts.headers,
                                     Some(&bytes),
+                                    uf.telemetry,
                                 )
                                 .await
                                 {
@@ -163,9 +165,14 @@ async fn gate_adapter<S: PaymentState>(state: S, req: Request<Body>, next: Next)
                                 );
                                 let mut builder =
                                     Response::builder().status(StatusCode::BAD_GATEWAY);
-                                if let Some((n, v)) =
-                                    crate::server::gate::settle_upto(&state, *uf.open, 0, false)
-                                        .await
+                                if let Some((n, v)) = crate::server::gate::settle_upto(
+                                    &state,
+                                    *uf.open,
+                                    0,
+                                    false,
+                                    uf.telemetry,
+                                )
+                                .await
                                 {
                                     builder = builder.header(n, v);
                                 }
@@ -184,14 +191,20 @@ async fn gate_adapter<S: PaymentState>(state: S, req: Request<Body>, next: Next)
                         served_ok,
                         response.headers(),
                         None,
+                        uf.telemetry,
                     )
                     .await
                     {
                         response.headers_mut().append(n, v);
                     }
-                } else if let Some((n, v)) =
-                    crate::server::gate::settle_upto(&state, *uf.open, uf.settle_amount, served_ok)
-                        .await
+                } else if let Some((n, v)) = crate::server::gate::settle_upto(
+                    &state,
+                    *uf.open,
+                    uf.settle_amount,
+                    served_ok,
+                    uf.telemetry,
+                )
+                .await
                 {
                     response.headers_mut().append(n, v);
                 }
@@ -203,6 +216,15 @@ async fn gate_adapter<S: PaymentState>(state: S, req: Request<Body>, next: Next)
                 if let Some(reference) = ann.reference {
                     tracing::Span::current().record("tx_sig", reference.as_str());
                 }
+            }
+            if let Some(paid_request) = paid_request {
+                telemetry::record_paid_request_completed(
+                    paid_request.protocol,
+                    &paid_request.subdomain,
+                    &path,
+                    response.status(),
+                    paid_request.payment.as_ref(),
+                );
             }
             response
         }

@@ -32,6 +32,7 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 use tokio::time::{Duration, Instant};
 
+use crate::server::telemetry;
 use crate::{Error, Result};
 
 const INTENT: &str = "session";
@@ -271,12 +272,7 @@ impl SessionOperatorRuntime {
             // Retain the settle signature so `/sessions/receipt/:channelId` can
             // surface the on-chain receipt URL (sessions settle out-of-band).
             self.record_settlement_signature(params.channel_id.to_string(), signature.clone());
-            tracing::info!(
-                monotonic_counter.pay_payment_channels_closed_total = 1_u64,
-                %signature,
-                channel = %params.channel_id,
-                "payment-channel settlement confirmed"
-            );
+            telemetry::record_payment_channel_closed(&signature, &params.channel_id.to_string());
         }
 
         Ok(SessionCloseResult::Closed {
@@ -1199,11 +1195,9 @@ impl SessionMpp {
                         params.channel_id.to_string(),
                         signature.clone(),
                     );
-                    tracing::info!(
-                        monotonic_counter.pay_payment_channels_closed_total = 1_u64,
-                        %signature,
-                        channel = %params.channel_id,
-                        "payment-channel settlement confirmed"
+                    telemetry::record_payment_channel_closed(
+                        signature,
+                        &params.channel_id.to_string(),
                     );
                 }
                 self.unschedule_channel_close(params.channel_id.to_string());
