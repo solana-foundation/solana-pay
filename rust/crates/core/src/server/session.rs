@@ -2361,6 +2361,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn delegated_capacity_reservation_persists_idle_deadline_before_returning() {
+        let session = Arc::new(test_session_mpp());
+        let close_delay = Duration::from_secs(120);
+        session.start_lifecycle_runloop_with_settlement_and_batching(
+            close_delay,
+            Duration::from_secs(60),
+            Duration::ZERO,
+            SessionLifecycleReconciliation::External,
+        );
+        let challenge = session.challenge(CAP).unwrap();
+        let handle = SessionHandle::new(
+            solana_pubkey::Pubkey::new_unique(),
+            test_session_signer(),
+            challenge,
+        );
+
+        let open_header = handle.open_header(CAP, "open_sig").await.unwrap();
+        let SessionOutcome::Active { state: opened, .. } =
+            session.process(&open_header).await.unwrap()
+        else {
+            panic!("expected open to return active session");
+        };
+        session
+            .operator_runtime
+            .channel_store
+            .update_channel(
+                &opened.channel_id,
+                Box::new(|state| {
+                    let mut state = state.unwrap();
+                    state.lifecycle.as_mut().unwrap().close_after = 1;
+                    Ok(state)
+                }),
+            )
+            .await
+            .unwrap();
+
+        let touched_after = unix_millis();
+        let _lease = session
+            .reserve_delegated_capacity(&opened.channel_id, CAP)
+            .await
+            .unwrap()
+            .expect("request should reserve channel capacity");
+
+        let persisted = session
+            .operator_runtime
+            .channel_store
+            .get_channel(&opened.channel_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            persisted.lifecycle.unwrap().close_after
+                >= touched_after.saturating_add(duration_millis(close_delay)),
+            "capacity reservation must persist the request-start deadline before forwarding"
+        );
+    }
+
+    #[tokio::test]
     async fn delegated_capacity_lease_defers_idle_close() {
         let session = Arc::new(test_session_mpp());
         session.start_lifecycle_runloop(Duration::from_millis(10));
