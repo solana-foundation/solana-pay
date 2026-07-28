@@ -1,0 +1,34 @@
+# AG9 Palm authorization demo for an MPP subscription activation.
+#
+# Copy this file before running it: `pay server start` writes the published
+# sandbox Plan fields into the spec after the first launch.
+
+name: ag9-subscription-demo
+subdomain: ag9-subscription-demo
+title: "AG9 Subscription Authorization Demo"
+description: "A no-mainnet-funds demo of Palm-gated MPP subscription activation."
+category: ai_ml
+version: v1
+
+routing:
+  type: respond
+
+accounting: pooled
+
+operator:
+  currencies:
+    usd: ["USDC"]
+  network: "localnet"
+  fee_payer: true
+  challenge_binding_secret: "${MPP_SECRET_KEY}"
+  realm: "ag9-subscription-demo"
+
+endpoints:
+  - method: GET
+    path: "api/v1/ag9-feed"
+    resource: "ag9-feed"
+    description: "Palm-authorized news feed subscription — 0.10 USDC per day."
+    subscription:
+      period: "1d"
+      price_usd: 0.10
+      currency: "USDC"

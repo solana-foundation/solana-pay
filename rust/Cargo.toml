@@ -14,6 +14,7 @@ pay-core = { path = "crates/core" }
 pay-acp = { path = "crates/acp" }
 pay-types = { path = "crates/types" }
 pay-keystore = { path = "crates/keystore" }
+pay-auth-ag9 = { path = "crates/auth-ag9" }
 pay-mcp = { path = "crates/mcp" }
 pay-pdb = { path = "crates/pdb" }
 pay-proxy = { path = "crates/proxy" }

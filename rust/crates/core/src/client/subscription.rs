@@ -31,6 +31,7 @@ use crate::accounts::{
     resolve_account_for_network,
 };
 use crate::client::mpp::Challenge;
+use crate::keystore::SubscriptionAuthorization;
 use crate::{Error, Result};
 
 /// Parsed subscription challenge, useful for both the dispatcher (deciding
@@ -118,6 +119,8 @@ pub fn is_subscription_challenge(challenge: &Challenge) -> bool {
 /// challenge JSON, `methodDetails`, mapped period bounds) so the caller can
 /// surface clear errors before prompting Touch ID.
 pub fn decode(challenge: &Challenge) -> Result<DecodedSubscriptionChallenge> {
+    ensure_challenge_active(challenge)?;
+
     let request: SubscriptionRequest = challenge
         .request
         .decode()
@@ -129,22 +132,17 @@ pub fn decode(challenge: &Challenge) -> Result<DecodedSubscriptionChallenge> {
         .ok_or_else(|| Error::Mpp("Subscription challenge is missing methodDetails".into()))?;
     let method_details = SubscriptionMethodDetails::from_json(&method_details_value)
         .map_err(|e| Error::Mpp(format!("Invalid subscription methodDetails: {e}")))?;
-
-    // The Solana profile uses on-chain Plan PDAs; the SDK reads `planId` from
-    // methodDetails. We keep validation strict so a misconfigured challenge
-    // fails before the user pays.
-    if method_details.plan_id.is_empty() {
-        return Err(Error::Mpp(
-            "Subscription challenge missing methodDetails.planId".into(),
-        ));
-    }
+    method_details
+        .validate()
+        .map_err(|e| Error::Mpp(format!("Invalid subscription methodDetails: {e}")))?;
 
     let period_count = request
         .parse_period_count()
         .map_err(|e| Error::Mpp(e.to_string()))?;
-    let _ = request
+    let period_hours = request
         .period_hours()
         .map_err(|e| Error::Mpp(e.to_string()))?;
+    validate_authorized_terms(&request, &method_details, period_hours)?;
 
     let network = method_details_value
         .get("network")
@@ -152,10 +150,7 @@ pub fn decode(challenge: &Challenge) -> Result<DecodedSubscriptionChallenge> {
         .unwrap_or("mainnet")
         .to_string();
 
-    let decimals = method_details_value
-        .get("decimals")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(6) as u8;
+    let decimals = method_details.decimals.unwrap_or(6);
 
     // The challenge stores the mint b58 in `currency`. For display we prefer
     // a known stablecoin symbol; otherwise fall back to a short prefix of the
@@ -180,6 +175,115 @@ pub fn decode(challenge: &Challenge) -> Result<DecodedSubscriptionChallenge> {
         decimals,
         currency_label,
     })
+}
+
+/// Ensure the terms shown to the user are the same terms the PayKit builder
+/// will place in the activation transaction. PayKit consumes several values
+/// from `methodDetails`, while the prompt historically consumed the parent
+/// request; accepting a mismatch would authorize one action and sign another.
+fn validate_authorized_terms(
+    request: &SubscriptionRequest,
+    details: &SubscriptionMethodDetails,
+    period_hours: u64,
+) -> Result<()> {
+    if request.currency != details.mint {
+        return Err(Error::Mpp(
+            "Subscription request currency does not match methodDetails.mint".into(),
+        ));
+    }
+
+    match details.amount.as_deref() {
+        Some(amount) if amount == request.amount => {}
+        Some(_) => {
+            return Err(Error::Mpp(
+                "Subscription request amount does not match methodDetails.amount".into(),
+            ));
+        }
+        None => {
+            return Err(Error::Mpp(
+                "Subscription challenge missing methodDetails.amount".into(),
+            ));
+        }
+    }
+
+    let transaction_recipient = details.recipient.as_deref().unwrap_or(&details.puller);
+    if request.recipient != transaction_recipient {
+        return Err(Error::Mpp(
+            "Subscription request recipient does not match methodDetails recipient".into(),
+        ));
+    }
+
+    match details.expected_period_hours {
+        Some(hours) if hours == period_hours => {}
+        Some(_) => {
+            return Err(Error::Mpp(
+                "Subscription request cadence does not match methodDetails.expectedPeriodHours"
+                    .into(),
+            ));
+        }
+        None => {
+            return Err(Error::Mpp(
+                "Subscription challenge missing methodDetails.expectedPeriodHours".into(),
+            ));
+        }
+    }
+
+    if details.plan_id_numeric.is_none() {
+        return Err(Error::Mpp(
+            "Subscription challenge missing methodDetails.planIdNumeric".into(),
+        ));
+    }
+    if details.plan_bump.is_none() {
+        return Err(Error::Mpp(
+            "Subscription challenge missing methodDetails.planBump".into(),
+        ));
+    }
+    if details.expected_created_at.is_none() {
+        return Err(Error::Mpp(
+            "Subscription challenge missing methodDetails.expectedCreatedAt".into(),
+        ));
+    }
+
+    Ok(())
+}
+
+fn subscription_authorization(
+    challenge: &Challenge,
+    decoded: &DecodedSubscriptionChallenge,
+) -> SubscriptionAuthorization {
+    let details = &decoded.method_details;
+    SubscriptionAuthorization {
+        version: 1,
+        challenge_id: challenge.id.clone(),
+        challenge_realm: challenge.realm.clone(),
+        challenge_expires: challenge.expires.clone(),
+        challenge_digest: challenge.digest.clone(),
+        network: decoded.network.clone(),
+        plan_id: details.plan_id.clone(),
+        plan_id_numeric: details.plan_id_numeric,
+        plan_bump: details.plan_bump,
+        plan_created_at: details.expected_created_at,
+        recipient: details
+            .recipient
+            .clone()
+            .unwrap_or_else(|| details.puller.clone()),
+        puller: details.puller.clone(),
+        merchant: details.merchant.clone(),
+        mint: details.mint.clone(),
+        token_program: details.token_program.clone(),
+        program_id: details.program_id.clone(),
+        amount_base_units: decoded.amount_base_units.clone(),
+        decimals: decoded.decimals,
+        period_unit: period_unit_name(decoded.period_unit).to_string(),
+        period_count: decoded.period_count,
+        expected_period_hours: details.expected_period_hours,
+        subscription_expires: decoded.request.subscription_expires.clone(),
+        external_id: decoded.request.external_id.clone(),
+        fee_payer: details.fee_payer,
+        fee_payer_key: details.fee_payer_key.clone(),
+        account: None,
+        subscriber: None,
+    }
 }
 
 /// Build a signed activation credential and return the `Authorization`
@@ -269,10 +373,11 @@ pub fn build_credential_with_authenticate_and_override(
         "Recurring subscription — {amount_label} {currency} every {period_label}",
         currency = decoded.currency_label
     );
-    let auth_intent = crate::keystore::AuthIntent::authorize_payment_details(
+    let auth_intent = crate::keystore::AuthIntent::authorize_subscription(
         &amount_label,
         &intent_reason,
         &prompt_context.operator,
+        subscription_authorization(challenge, &decoded),
     );
 
     // Same intent-vs-network check as charge — refuse to sign if the user
@@ -289,7 +394,7 @@ pub fn build_credential_with_authenticate_and_override(
         .unwrap_or_else(|| decoded.network.clone());
 
     let (signer, ephemeral_notice) =
-        crate::signer::load_signer_for_network_payment_with_intent_and_override(
+        crate::signer::load_signer_for_network_subscription_with_intent_and_override(
             &network,
             store,
             account_override,
@@ -298,6 +403,11 @@ pub fn build_credential_with_authenticate_and_override(
             auth_override,
         )?;
     let subscriber = signer.pubkey().to_string();
+
+    // Human approval can outlive the server's challenge. Re-check after the
+    // gate returns so an expired challenge never reaches transaction signing,
+    // even though we refresh the Solana blockhash below.
+    ensure_challenge_active(challenge)?;
 
     let rpc_url = resolve_rpc_url(&network, embedded_blockhash);
     // `confirmed` (not the default `finalized`) — the interactive 402
@@ -337,11 +447,22 @@ pub fn build_credential_with_authenticate_and_override(
         }
     }
 
+    // A remote approval can exceed Solana's ~60-90 second blockhash window.
+    // Keep using the challenge's blockhash to resolve the intended RPC, but
+    // refresh the liveness value after approval and immediately before the
+    // transaction is built and signed. Durable subscription terms remain
+    // unchanged and are what the AuthIntent binds.
+    let fresh_blockhash = rpc
+        .get_latest_blockhash()
+        .map_err(|e| Error::Mpp(format!("Failed to refresh activation blockhash: {e}")))?;
+    let activation_details =
+        with_recent_blockhash(&decoded.method_details, fresh_blockhash.to_string());
+
     let payload = rt
         .block_on(build_subscription_activation_transaction_with_options(
             &signer,
             &rpc,
-            &decoded.method_details,
+            &activation_details,
             BuildSubscriptionActivationOptions {
                 external_id: decoded.request.external_id.clone(),
                 ..Default::default()
@@ -389,6 +510,24 @@ pub fn build_credential_with_authenticate_and_override(
         authenticate_token,
         authenticate_expires_at,
     })
+}
+
+fn with_recent_blockhash(
+    details: &SubscriptionMethodDetails,
+    recent_blockhash: String,
+) -> SubscriptionMethodDetails {
+    let mut details = details.clone();
+    details.recent_blockhash = Some(recent_blockhash);
+    details
+}
+
+fn ensure_challenge_active(challenge: &Challenge) -> Result<()> {
+    if challenge.is_expired() {
+        return Err(Error::Mpp(
+            "Subscription challenge is expired or has an invalid expiration timestamp".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// Sign a SIWMPP `authenticate` challenge with the same signer the
@@ -726,8 +865,8 @@ mod tests {
     const RECIPIENT: &str = "9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin";
     const TOKEN_PROGRAM: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
 
-    fn subscription_challenge(network: &str) -> Challenge {
-        let request = serde_json::json!({
+    fn subscription_request(network: &str) -> serde_json::Value {
+        serde_json::json!({
             "amount": "10000000",
             "currency": MINT,
             "periodUnit": "day",
@@ -740,16 +879,29 @@ mod tests {
                 "mint": MINT,
                 "tokenProgram": TOKEN_PROGRAM,
                 "puller": PULLER,
+                "recipient": RECIPIENT,
+                "amount": "10000000",
                 "decimals": 6,
                 "network": network,
+                "planIdNumeric": 42,
+                "planBump": 254,
+                "expectedPeriodHours": 720,
+                "expectedCreatedAt": 1770000000,
             },
-        });
+        })
+    }
+
+    fn challenge_from_request(request: serde_json::Value) -> Challenge {
         let b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&request).unwrap());
         let header = format!(
             "Payment id=\"sub-1\", realm=\"test\", method=\"solana\", \
              intent=\"subscription\", request=\"{b64}\""
         );
         crate::client::mpp::parse(&header).unwrap()
+    }
+
+    fn subscription_challenge(network: &str) -> Challenge {
+        challenge_from_request(subscription_request(network))
     }
 
     #[test]
@@ -800,6 +952,90 @@ mod tests {
         // USDC mainnet mint resolves to the symbol.
         assert_eq!(decoded.currency_label, "USDC");
         assert_eq!(decoded.decimals, 6);
+    }
+
+    #[test]
+    fn decode_rejects_expired_or_invalid_challenge_before_authorization() {
+        let mut expired = subscription_challenge("mainnet");
+        expired.expires = Some("1970-01-01T00:00:00Z".to_string());
+        assert!(
+            decode(&expired)
+                .unwrap_err()
+                .to_string()
+                .contains("expired")
+        );
+
+        let mut invalid = subscription_challenge("mainnet");
+        invalid.expires = Some("not-a-timestamp".to_string());
+        assert!(
+            decode(&invalid)
+                .unwrap_err()
+                .to_string()
+                .contains("expired")
+        );
+    }
+
+    #[test]
+    fn authorization_context_binds_durable_subscription_terms() {
+        let challenge = subscription_challenge("mainnet");
+        let decoded = decode(&challenge).expect("decode");
+        let authorization = subscription_authorization(&challenge, &decoded);
+
+        assert_eq!(authorization.version, 1);
+        assert_eq!(authorization.challenge_id, "sub-1");
+        assert_eq!(authorization.challenge_realm, "test");
+        assert_eq!(authorization.network, "mainnet");
+        assert_eq!(authorization.plan_id, PLAN);
+        assert_eq!(authorization.plan_id_numeric, Some(42));
+        assert_eq!(authorization.plan_bump, Some(254));
+        assert_eq!(authorization.recipient, RECIPIENT);
+        assert_eq!(authorization.puller, PULLER);
+        assert_eq!(authorization.mint, MINT);
+        assert_eq!(authorization.amount_base_units, "10000000");
+        assert_eq!(authorization.period_unit, "day");
+        assert_eq!(authorization.period_count, 30);
+        assert_eq!(authorization.expected_period_hours, Some(720));
+        assert_eq!(authorization.account, None);
+        assert_eq!(authorization.subscriber, None);
+    }
+
+    #[test]
+    fn decode_rejects_amount_mismatch_before_authorization() {
+        let mut request = subscription_request("mainnet");
+        request["methodDetails"]["amount"] = serde_json::json!("99999999");
+        let err = decode(&challenge_from_request(request)).unwrap_err();
+        assert!(err.to_string().contains("amount does not match"));
+    }
+
+    #[test]
+    fn decode_rejects_recipient_mismatch_before_authorization() {
+        let mut request = subscription_request("mainnet");
+        request["methodDetails"]["recipient"] = serde_json::json!(PULLER);
+        let err = decode(&challenge_from_request(request)).unwrap_err();
+        assert!(err.to_string().contains("recipient does not match"));
+    }
+
+    #[test]
+    fn decode_rejects_cadence_mismatch_before_authorization() {
+        let mut request = subscription_request("mainnet");
+        request["methodDetails"]["expectedPeriodHours"] = serde_json::json!(24);
+        let err = decode(&challenge_from_request(request)).unwrap_err();
+        assert!(err.to_string().contains("cadence does not match"));
+    }
+
+    #[test]
+    fn activation_replaces_stale_blockhash_without_mutating_bound_terms() {
+        let decoded = decode(&subscription_challenge("mainnet")).expect("decode");
+        let mut stale = decoded.method_details.clone();
+        stale.recent_blockhash = Some("stale".to_string());
+
+        let fresh = with_recent_blockhash(&stale, "fresh".to_string());
+
+        assert_eq!(stale.recent_blockhash.as_deref(), Some("stale"));
+        assert_eq!(fresh.recent_blockhash.as_deref(), Some("fresh"));
+        assert_eq!(fresh.plan_id, stale.plan_id);
+        assert_eq!(fresh.amount, stale.amount);
+        assert_eq!(fresh.recipient, stale.recipient);
     }
 
     #[test]
@@ -856,8 +1092,14 @@ mod tests {
                 "mint": "Bonk1111111111111111111111111111111111111111",
                 "tokenProgram": TOKEN_PROGRAM,
                 "puller": PULLER,
+                "recipient": RECIPIENT,
+                "amount": "1",
                 "decimals": 5,
                 "network": "mainnet",
+                "planIdNumeric": 42,
+                "planBump": 254,
+                "expectedPeriodHours": 720,
+                "expectedCreatedAt": 1770000000,
             },
         });
         let b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&request).unwrap());

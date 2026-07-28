@@ -113,7 +113,8 @@ async fn polkit_authenticate(action: &str) -> Result<()> {
 
 fn polkit_action_for_intent(intent: &AuthIntent) -> &'static str {
     match intent {
-        AuthIntent::AuthorizePayment { limit, .. } => limit
+        AuthIntent::AuthorizePayment { limit, .. }
+        | AuthIntent::AuthorizeSubscription { limit, .. } => limit
             .map(polkit_payment_limit_action)
             .unwrap_or(POLKIT_ACTION_PAYMENT),
         // A batch is "a series of payments" like a session budget; reuse the

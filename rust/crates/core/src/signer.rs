@@ -111,21 +111,52 @@ pub fn load_signer_for_network_with_intent_and_override(
     intent: &AuthIntent,
     auth_override: AuthOverride,
 ) -> Result<(MemorySigner, Option<ResolvedEphemeral>)> {
+    load_signer_for_network_with_intent_and_override_policy(
+        network,
+        store,
+        account_override,
+        intent,
+        auth_override,
+        false,
+    )
+}
+
+fn load_signer_for_network_with_intent_and_override_policy(
+    network: &str,
+    store: &dyn AccountsStore,
+    account_override: Option<&str>,
+    intent: &AuthIntent,
+    auth_override: AuthOverride,
+    authorize_ephemeral: bool,
+) -> Result<(MemorySigner, Option<ResolvedEphemeral>)> {
     let file = store.load()?;
     if let Some(name) = account_override {
         if let Some(account) = file.named_account_for_network(network, name).cloned() {
-            let signer = load_signer_from_account_with_intent_and_override(
-                &account,
-                name,
-                network,
-                intent,
-                auth_override,
-            )?;
+            let signer = if authorize_ephemeral && account.keystore == Keystore::Ephemeral {
+                signer_from_ephemeral_with_override(&account, name, intent, auth_override)?
+            } else {
+                load_signer_from_account_with_intent_and_override(
+                    &account,
+                    name,
+                    network,
+                    intent,
+                    auth_override,
+                )?
+            };
             return Ok((signer, None));
         }
         if is_lazy_ephemeral_network(network) {
             let resolved = load_or_create_ephemeral_for_network_as(network, name, store)?;
-            let signer = signer_from_ephemeral(&resolved.account)?;
+            let signer = if authorize_ephemeral {
+                signer_from_ephemeral_with_override(
+                    &resolved.account,
+                    &resolved.account_name,
+                    intent,
+                    auth_override,
+                )?
+            } else {
+                signer_from_ephemeral(&resolved.account)?
+            };
             return Ok((signer, Some(resolved)));
         }
         return Err(Error::Config(format!(
@@ -134,19 +165,32 @@ pub fn load_signer_for_network_with_intent_and_override(
     }
     match resolve_account_for_network(network, &file) {
         AccountChoice::Resolved { name, account } => {
-            let signer = load_signer_from_account_with_intent_and_override(
-                &account,
-                &name,
-                network,
-                intent,
-                auth_override,
-            )?;
+            let signer = if authorize_ephemeral && account.keystore == Keystore::Ephemeral {
+                signer_from_ephemeral_with_override(&account, &name, intent, auth_override)?
+            } else {
+                load_signer_from_account_with_intent_and_override(
+                    &account,
+                    &name,
+                    network,
+                    intent,
+                    auth_override,
+                )?
+            };
             Ok((signer, None))
         }
         AccountChoice::Missing => {
             if is_lazy_ephemeral_network(network) {
                 let resolved = load_or_create_ephemeral_for_network(network, store)?;
-                let signer = signer_from_ephemeral(&resolved.account)?;
+                let signer = if authorize_ephemeral {
+                    signer_from_ephemeral_with_override(
+                        &resolved.account,
+                        &resolved.account_name,
+                        intent,
+                        auth_override,
+                    )?
+                } else {
+                    signer_from_ephemeral(&resolved.account)?
+                };
                 Ok((signer, Some(resolved)))
             } else {
                 Err(Error::Config(format!(
@@ -213,6 +257,34 @@ pub fn load_signer_for_network_payment_with_intent_and_override(
     })
 }
 
+/// Subscription activations grant standing payment authority. When a remote
+/// gate is explicitly supplied, apply it even to sandbox/devnet ephemeral
+/// accounts so the full approval flow can be exercised without mainnet funds.
+/// Ordinary one-off payments retain the existing ephemeral behavior.
+pub fn load_signer_for_network_subscription_with_intent_and_override(
+    network: &str,
+    store: &dyn AccountsStore,
+    account_override: Option<&str>,
+    amount: &str,
+    intent: &AuthIntent,
+    auth_override: AuthOverride,
+) -> Result<(MemorySigner, Option<ResolvedEphemeral>)> {
+    load_signer_for_network_with_intent_and_override_policy(
+        network,
+        store,
+        account_override,
+        intent,
+        auth_override,
+        true,
+    )
+    .map_err(|e| match e {
+        Error::PaymentRejected(where_) => {
+            Error::PaymentRejected(format!("{amount} subscription authorization was {where_}"))
+        }
+        other => other,
+    })
+}
+
 /// Networks where missing-entry → auto-generate-an-ephemeral is a safe
 /// default. Real money networks are NOT in this list — we refuse to
 /// silently create a mainnet wallet.
@@ -252,7 +324,7 @@ pub fn load_keypair_bytes_from_account_with_intent_and_override(
     intent: &AuthIntent,
     auth_override: AuthOverride,
 ) -> Result<crate::keystore::Zeroizing<Vec<u8>>> {
-    let account_intent = intent.with_account_context(name);
+    let account_intent = intent.with_account_context_and_pubkey(name, account.pubkey.as_deref());
     if account.keystore == Keystore::Ephemeral {
         let _ = auth_override;
         return account
@@ -442,6 +514,21 @@ fn signer_from_ephemeral(account: &Account) -> Result<MemorySigner> {
     })?;
     MemorySigner::from_bytes(&bytes)
         .map_err(|e| Error::Config(format!("Invalid ephemeral keypair bytes: {e}")))
+}
+
+fn signer_from_ephemeral_with_override(
+    account: &Account,
+    name: &str,
+    intent: &AuthIntent,
+    auth_override: AuthOverride,
+) -> Result<MemorySigner> {
+    if let Some(gate) = auth_override {
+        let account_intent =
+            intent.with_account_context_and_pubkey(name, account.pubkey.as_deref());
+        gate.authenticate(&account_intent)
+            .map_err(map_file_auth_error)?;
+    }
+    signer_from_ephemeral(account)
 }
 
 /// Apply a file-backed account's auth policy before reading its keypair.
@@ -915,6 +1002,26 @@ mod tests {
 
             assert_eq!(&*bytes, &expected);
         }
+    }
+
+    #[test]
+    fn ephemeral_subscription_uses_explicit_auth_override() {
+        let mut file = AccountsFile::default();
+        file.upsert("localnet", "default", fresh_ephemeral_account());
+        let store = MemoryAccountsStore::with_file(file);
+
+        let err = load_signer_for_network_subscription_with_intent_and_override(
+            "localnet",
+            &store,
+            None,
+            "$1.00",
+            &AuthIntent::default_payment(),
+            Some(Box::new(DenyAuth)),
+        )
+        .unwrap_err();
+
+        assert!(matches!(err, Error::PaymentRejected(_)));
+        assert!(err.to_string().contains("subscription authorization"));
     }
 
     #[test]

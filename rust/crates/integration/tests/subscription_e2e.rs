@@ -37,9 +37,9 @@ fn spec() -> SubscriptionEndpoint {
         currency: "USDC".into(),
         expires_at: None,
         plan_id: Some(PLAN.into()),
-        plan_id_numeric: None,
-        plan_bump: None,
-        plan_created_at: None,
+        plan_id_numeric: Some(42),
+        plan_bump: Some(254),
+        plan_created_at: Some(1_770_000_000),
         puller: None,
         recipient: None,
         free_trial_days: None,
@@ -57,6 +57,26 @@ fn defaults<'a>() -> sub_server::OperatorDefaults<'a> {
         fee_payer: false,
         fee_payer_signer: None,
     }
+}
+
+#[test]
+fn ag9_demo_spec_is_valid_and_sandbox_only() {
+    let spec: pay_types::metering::ApiSpec =
+        serde_yml::from_str(include_str!("../../../ag9-subscription-demo.yaml"))
+            .expect("demo spec should parse");
+    assert!(pay_types::metering::validate_api_spec(&spec).is_empty());
+    assert_eq!(
+        spec.operator
+            .as_ref()
+            .and_then(|operator| operator.network.as_deref()),
+        Some("localnet")
+    );
+    let subscription = spec.endpoints[0]
+        .subscription
+        .as_ref()
+        .expect("subscription endpoint");
+    assert_eq!(subscription.period, "1d");
+    assert_eq!(subscription.price_usd, Some(0.10));
 }
 
 #[test]
