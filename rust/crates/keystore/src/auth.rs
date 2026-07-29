@@ -45,6 +45,28 @@ pub enum PaymentLimit {
     AboveUsd50,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PaymentAmountKind {
+    Exact,
+    Maximum,
+}
+
+impl PaymentAmountKind {
+    const fn headline(self) -> &'static str {
+        match self {
+            Self::Exact => "authorize a payment.",
+            Self::Maximum => "authorize a series of payments.",
+        }
+    }
+
+    const fn field_label(self) -> &'static str {
+        match self {
+            Self::Exact => "amount",
+            Self::Maximum => "up to",
+        }
+    }
+}
+
 impl PaymentLimit {
     const BUCKETS: &[(u64, Self)] = &[
         (1, Self::Usd00001),
@@ -127,20 +149,13 @@ impl AuthIntent {
     }
 
     pub fn authorize_payment_details(amount: &str, reason: &str, operator: &str) -> Self {
-        let mut message = format!("authorize a payment of {amount}.");
-        message.push_str("\n\nreason: ");
-        message.push_str(&truncate_detail(&prompt_detail(reason), 64));
-        // Skip the "operator: ..." line when we don't have a meaningful
-        // domain (e.g. localhost/loopback requests where the prompt would
-        // render the placeholder "unknown" or an empty value). Keeps the
-        // Touch ID panel tight instead of advertising a blank field.
-        if let Some(label) = meaningful_operator(operator) {
-            message.push_str("\n\noperator: ");
-            message.push_str(&label);
-        }
-
         Self::AuthorizePayment {
-            message,
+            message: payment_authorization_message(
+                PaymentAmountKind::Exact,
+                amount,
+                Some(reason),
+                operator,
+            ),
             limit: PaymentLimit::from_amount(amount),
         }
     }
@@ -190,11 +205,14 @@ impl AuthIntent {
         Self::OpenSession("authorize opening a pay session".to_string())
     }
 
-    pub fn authorize_spend_up_to(amount: Option<&str>, limit: &str, url: &str) -> Self {
-        let limit = truncate_detail(&prompt_detail(limit), 48);
-        let url = truncate_detail(&prompt_detail(url), 128);
+    pub fn authorize_spend_up_to(amount: Option<&str>, limit: &str, operator: &str) -> Self {
         Self::AuthorizePayment {
-            message: format!("allow pay to spend up to {limit} on requests to {url}"),
+            message: payment_authorization_message(
+                PaymentAmountKind::Maximum,
+                limit,
+                None,
+                operator,
+            ),
             limit: amount.and_then(PaymentLimit::from_amount),
         }
     }
@@ -318,8 +336,37 @@ fn truncate_detail(value: &str, max_chars: usize) -> String {
     }
 }
 
+fn payment_authorization_message(
+    amount_kind: PaymentAmountKind,
+    amount: &str,
+    reason: Option<&str>,
+    operator: &str,
+) -> String {
+    let mut message = amount_kind.headline().to_string();
+    message.push_str("\n\n");
+    message.push_str(amount_kind.field_label());
+    message.push_str(": ");
+    message.push_str(&truncate_detail(&prompt_detail(amount), 48));
+
+    if let Some(reason) = reason {
+        message.push_str("\n\nreason: ");
+        message.push_str(&truncate_detail(&prompt_detail(reason), 64));
+    }
+
+    if let Some(label) = meaningful_operator(operator) {
+        message.push_str("\n\noperator: ");
+        message.push_str(&label);
+    }
+
+    message
+}
+
 fn payment_message_with_account(message: &str, account: &str) -> String {
-    if !message.trim_start().starts_with("authorize a payment of ") {
+    let trimmed = message.trim_start();
+    if !trimmed.starts_with("authorize a payment of ")
+        && !trimmed.starts_with("authorize a payment.")
+        && !trimmed.starts_with("authorize a series of payments.")
+    {
         return message.to_string();
     }
 
@@ -444,15 +491,29 @@ mod tests {
     }
 
     #[test]
-    fn session_prompt_names_spending_limit_and_url() {
+    fn session_prompt_names_spending_limit_and_operator() {
         assert_eq!(
             AuthIntent::authorize_spend_up_to(
                 Some("$1.00"),
                 "$1.00 USD (1 USDC)",
-                "https://modelstudio.alibaba.gateway-402.com",
+                "modelstudio.alibaba.gateway-402.com",
             )
             .prompt_message(),
-            "allow pay to spend up to $1.00 USD (1 USDC) on requests to https://modelstudio.alibaba.gateway-402.com"
+            "authorize a series of payments.\n\nup to: $1.00 USD (1 USDC)\n\noperator: modelstudio.alibaba.gateway-402.com"
+        );
+    }
+
+    #[test]
+    fn session_prompt_includes_account_on_first_sentence() {
+        assert_eq!(
+            AuthIntent::authorize_spend_up_to(
+                Some("$1.00"),
+                "$1.00 USD (1 USDC)",
+                "modelstudio.alibaba.gateway-402.com",
+            )
+            .with_account_context("default")
+            .prompt_message(),
+            "authorize a series of payments from default.\n\nup to: $1.00 USD (1 USDC)\n\noperator: modelstudio.alibaba.gateway-402.com"
         );
     }
 
@@ -461,7 +522,7 @@ mod tests {
         assert_eq!(
             AuthIntent::authorize_payment_details("$1.00", "Run a SQL query", "gateway-402.com")
                 .prompt_message(),
-            "authorize a payment of $1.00.\n\nreason: Run a SQL query\n\noperator: gateway-402.com"
+            "authorize a payment.\n\namount: $1.00\n\nreason: Run a SQL query\n\noperator: gateway-402.com"
         );
     }
 
@@ -471,7 +532,7 @@ mod tests {
             AuthIntent::authorize_payment_details("$0.30", "Send USDC", "gateway-402.com")
                 .with_account_context("test")
                 .prompt_message(),
-            "authorize a payment of $0.30 from test.\n\nreason: Send USDC\n\noperator: gateway-402.com"
+            "authorize a payment from test.\n\namount: $0.30\n\nreason: Send USDC\n\noperator: gateway-402.com"
         );
     }
 
@@ -484,7 +545,7 @@ mod tests {
                 .prompt_message();
 
         assert!(message.starts_with(
-            "authorize a payment of $0.30 from aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa..."
+            "authorize a payment from aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa..."
         ));
     }
 
@@ -506,7 +567,7 @@ mod tests {
 
         assert_eq!(
             message,
-            "authorize a payment of $1.00.\n\nreason: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa...\n\noperator: gateway-402.com"
+            "authorize a payment.\n\namount: $1.00\n\nreason: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa...\n\noperator: gateway-402.com"
         );
         assert_eq!(
             message
@@ -629,7 +690,7 @@ mod tests {
             AuthIntent::authorize_spend_up_to(
                 Some("$1.00"),
                 "$1.00 USD (1 USDC)",
-                "https://api.example.com",
+                "api.example.com",
             )
             .payment_limit(),
             Some(PaymentLimit::Usd1)

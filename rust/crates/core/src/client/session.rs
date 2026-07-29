@@ -319,12 +319,13 @@ pub fn open_payment_channel_session_header_with_mode(
             .clone()
             .unwrap_or_else(|| "mainnet".to_string())
     });
-    let authorization_origin = canonical_session_origin(resource_url)?;
+    canonical_session_origin(resource_url)?;
+    let prompt_context = crate::client::prompt::payment_prompt_context(None, &[Some(resource_url)]);
     let limit = session_spend_limit(deposit, request);
     let intent = crate::keystore::AuthIntent::authorize_spend_up_to(
         limit.usd_amount.as_deref(),
         &limit.display,
-        &authorization_origin,
+        &prompt_context.operator,
     );
     let (signer, ephemeral_notice) = crate::signer::load_signer_for_network_with_intent(
         &network,
