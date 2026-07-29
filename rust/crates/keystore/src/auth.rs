@@ -62,7 +62,7 @@ impl PaymentAmountKind {
     const fn field_label(self) -> &'static str {
         match self {
             Self::Exact => "amount",
-            Self::Maximum => "up to",
+            Self::Maximum => "total allowance",
         }
     }
 }
@@ -499,7 +499,7 @@ mod tests {
                 "modelstudio.alibaba.gateway-402.com",
             )
             .prompt_message(),
-            "authorize a series of payments.\n\nup to: $1.00\n\noperator: modelstudio.alibaba.gateway-402.com"
+            "authorize a series of payments.\n\ntotal allowance: $1.00\n\noperator: modelstudio.alibaba.gateway-402.com"
         );
     }
 
@@ -513,7 +513,7 @@ mod tests {
             )
             .with_account_context("default")
             .prompt_message(),
-            "authorize a series of payments from default.\n\nup to: $1.00\n\noperator: modelstudio.alibaba.gateway-402.com"
+            "authorize a series of payments from default.\n\ntotal allowance: $1.00\n\noperator: modelstudio.alibaba.gateway-402.com"
         );
     }
 
