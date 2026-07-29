@@ -6363,6 +6363,7 @@ dependencies = [
  "opentelemetry-semantic-conventions 0.31.0",
  "opentelemetry_sdk 0.31.0",
  "owo-colors",
+ "pay-acp",
  "pay-core",
  "pay-keystore",
  "pay-mcp",
@@ -6395,6 +6396,15 @@ dependencies = [
  "urlencoding",
  "uuid",
  "webbrowser",
+]
+
+[[package]]
+name = "pay-acp"
+version = "0.25.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "uuid",
 ]
 
 [[package]]

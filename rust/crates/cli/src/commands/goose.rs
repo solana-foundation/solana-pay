@@ -88,7 +88,10 @@ fn launch_goose(
     Ok(status.code().unwrap_or(1))
 }
 
-fn goose_provider_env(alternate: &AlternateProvider, model: &str) -> Vec<(String, String)> {
+pub(crate) fn goose_provider_env(
+    alternate: &AlternateProvider,
+    model: &str,
+) -> Vec<(String, String)> {
     vec![
         (GOOSE_PROVIDER_ENV.to_string(), "openai".to_string()),
         (GOOSE_MODEL_ENV.to_string(), model.to_string()),

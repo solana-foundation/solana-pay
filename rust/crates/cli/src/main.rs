@@ -259,6 +259,7 @@ fn main() {
                 | Command::Wget(_)
                 | Command::Http(_)
                 | Command::Fetch(_)
+                | Command::Acp(_)
                 | Command::Mcp
         ) {
         None
@@ -292,6 +293,14 @@ fn main() {
     // cryptic "no account configured" error mid-flight. Sandbox flows
     // generate ephemeral wallets on first use, so they're exempt.
     if command.requires_account() && !sandbox_mode && !has_any_account() {
+        if matches!(command, Command::Acp(_)) {
+            eprintln!(
+                "{}",
+                "No pay account configured. Run `pay setup` in a terminal before starting an ACP client."
+                    .dimmed()
+            );
+            std::process::exit(1);
+        }
         eprintln!(
             "{}",
             "No pay account configured — running `pay setup` first…".dimmed()
@@ -655,6 +664,32 @@ mod tests {
                 assert_eq!(cmd.args, ["--model", "qwen3.7-plus"]);
             }
             _ => panic!("expected goose command"),
+        }
+    }
+
+    #[test]
+    fn acp_parses_headless_provider_and_model_without_adapter_leakage() {
+        let opts = Opts::try_parse_from([
+            "pay",
+            "acp",
+            "goose",
+            "--provider",
+            "modelstudio",
+            "--model",
+            "qwen3.7-plus",
+            "--",
+            "--debug",
+        ])
+        .unwrap();
+
+        match opts.command {
+            Some(Command::Acp(cmd)) => {
+                assert_eq!(cmd.harness, commands::acp::AcpHarness::Goose);
+                assert_eq!(cmd.provider.as_deref(), Some("modelstudio"));
+                assert_eq!(cmd.model.as_deref(), Some("qwen3.7-plus"));
+                assert_eq!(cmd.args, ["--debug"]);
+            }
+            _ => panic!("expected acp command"),
         }
     }
 

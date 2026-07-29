@@ -18,6 +18,7 @@ redis-session-store = ["pay-core/redis-session-store", "pay-kit/redis-store"]
 async-trait = "0.1"
 axum = { workspace = true }
 pay-core = { workspace = true, features = ["server", "otel"] }
+pay-acp = { workspace = true }
 pay-proxy = { path = "../proxy" }
 pay-keystore = { workspace = true }
 pay-types = { workspace = true }

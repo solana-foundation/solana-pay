@@ -28,7 +28,7 @@ pub struct SetupCommand {
     #[arg(long, hide = true)]
     pub vault: Option<String>,
 
-    /// Re-install MCP configs and agent skill without creating a new account.
+    /// Re-install integrations, including MCP configs, agent skill, and Buzz.
     #[arg(long)]
     pub update: bool,
 
@@ -86,6 +86,7 @@ impl SetupCommand {
                 ),
             );
             eprintln!();
+            super::buzz_setup::maybe_configure();
             return Ok(());
         }
 
@@ -105,6 +106,7 @@ impl SetupCommand {
             self.vault.as_deref(),
             self.force,
         )?;
+        super::buzz_setup::maybe_configure();
 
         let config = pay_core::Config::load().unwrap_or_default();
         let rpc_url = config
@@ -158,6 +160,7 @@ impl SetupCommand {
             )?;
             (pk, false)
         };
+        super::buzz_setup::maybe_configure();
 
         // 2. POST to pay-api's `/v1/redeem`. Honors `PAY_API_URL` via
         //    the same helper the `/v1/send` client uses, so override
@@ -401,11 +404,12 @@ fn shorten_pubkey(pk: &str) -> String {
     format!("{}…{}", &pk[..4], &pk[pk.len() - 4..])
 }
 
-/// `pay setup --update`: re-install MCP configs and agent skill.
+/// `pay setup --update`: refresh agent integrations without creating an account.
 fn run_update() -> pay_core::Result<()> {
     eprintln!();
     maybe_install_skill();
     install_mcp_configs();
+    super::buzz_setup::maybe_configure();
     eprintln!("  {}", "Update complete.".dimmed());
     eprintln!();
     Ok(())

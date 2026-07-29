@@ -233,6 +233,15 @@ pub(crate) struct AlternateProvider {
     pub model: Option<String>,
 }
 
+/// Provider metadata used by setup-time integrations that need a deterministic,
+/// headless `pay --alt` route without starting the payer proxy yet.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct AlternateProviderOption {
+    pub slug: String,
+    pub title: String,
+    pub models: Vec<String>,
+}
+
 #[derive(Clone, Copy)]
 enum AlternateRouteKind {
     Hosted,
@@ -248,20 +257,19 @@ pub(crate) fn prepare_alternate_provider(
     network_override: Option<&str>,
     account_override: Option<&str>,
 ) -> pay_core::Result<AlternateProvider> {
+    prepare_alternate_provider_for(client, args, network_override, account_override, None)
+}
+
+pub(crate) fn prepare_alternate_provider_for(
+    client: AlternateClient,
+    args: &[String],
+    network_override: Option<&str>,
+    account_override: Option<&str>,
+    requested_provider: Option<&str>,
+) -> pay_core::Result<AlternateProvider> {
     let agent = client.name();
     let requested_model = model_arg(args);
-    let gateway_up = gateway_listening();
-    let mut providers = discover_local_providers()?;
-    if gateway_up {
-        let gateway_providers = gateway_provider_summaries();
-        if !gateway_providers.is_empty() {
-            apply_gateway_provider_summaries(&mut providers, &gateway_providers);
-        } else {
-            apply_gateway_proxy_fallback(&mut providers);
-        }
-    }
-    providers.extend(discover_catalog_providers());
-    providers.retain(|provider| client.provider_supported(provider));
+    let (providers, gateway_up) = discover_compatible_providers(client)?;
 
     let choice = if providers.is_empty() {
         None
@@ -270,6 +278,7 @@ pub(crate) fn prepare_alternate_provider(
             agent,
             providers,
             requested_model.as_deref(),
+            requested_provider,
         )?)
     };
 
@@ -349,6 +358,41 @@ pub(crate) fn prepare_alternate_provider(
         base_url: client.payer_base_url(&payer.base_url),
         model,
     })
+}
+
+/// Discover providers that can back an ACP runtime without launching a payer
+/// proxy. Buzz setup uses this to persist a provider and model for its
+/// headless custom-harness process.
+pub(crate) fn discover_acp_provider_options(
+    client: AlternateClient,
+) -> pay_core::Result<Vec<AlternateProviderOption>> {
+    let (providers, _) = discover_compatible_providers(client)?;
+    Ok(providers
+        .into_iter()
+        .map(|provider| AlternateProviderOption {
+            slug: provider.slug().to_string(),
+            title: provider.title().to_string(),
+            models: provider.models,
+        })
+        .collect())
+}
+
+fn discover_compatible_providers(
+    client: AlternateClient,
+) -> pay_core::Result<(Vec<DiscoveredProvider>, bool)> {
+    let gateway_up = gateway_listening();
+    let mut providers = discover_local_providers()?;
+    if gateway_up {
+        let gateway_providers = gateway_provider_summaries();
+        if !gateway_providers.is_empty() {
+            apply_gateway_provider_summaries(&mut providers, &gateway_providers);
+        } else {
+            apply_gateway_proxy_fallback(&mut providers);
+        }
+    }
+    providers.extend(discover_catalog_providers());
+    providers.retain(|provider| client.provider_supported(provider));
+    Ok((providers, gateway_up))
 }
 
 fn print_alternate_route(
@@ -531,7 +575,37 @@ fn select_provider_choice(
     agent: &str,
     providers: Vec<DiscoveredProvider>,
     requested_model: Option<&str>,
+    requested_provider: Option<&str>,
 ) -> pay_core::Result<crate::tui::ProviderChoice> {
+    if let Some(requested_provider) = requested_provider {
+        let available = providers
+            .iter()
+            .map(DiscoveredProvider::slug)
+            .collect::<Vec<_>>()
+            .join(", ");
+        let provider = providers
+            .into_iter()
+            .find(|provider| {
+                provider.slug().eq_ignore_ascii_case(requested_provider)
+                    || provider.title().eq_ignore_ascii_case(requested_provider)
+            })
+            .ok_or_else(|| {
+                pay_core::Error::Config(format!(
+                    "provider `{requested_provider}` is not available for {agent}; available providers: {available}"
+                ))
+            })?;
+        let model = requested_model
+            .map(str::to_string)
+            .or_else(|| provider.models.first().cloned())
+            .ok_or_else(|| {
+                pay_core::Error::Config(format!(
+                    "provider `{}` did not report any models; pass `--model <MODEL>`",
+                    provider.slug()
+                ))
+            })?;
+        return Ok(crate::tui::ProviderChoice { provider, model });
+    }
+
     match select_provider(agent, providers, requested_model)
         .map_err(|e| pay_core::Error::Config(format!("Provider selection failed: {e}")))?
     {
@@ -737,7 +811,7 @@ fn claude_args_with_model(args: &[String], model: Option<&str>) -> Vec<String> {
     out
 }
 
-fn claude_env(base_url: &str, model: Option<&str>) -> Vec<(String, String)> {
+pub(crate) fn claude_env(base_url: &str, model: Option<&str>) -> Vec<(String, String)> {
     let mut env = vec![
         (ANTHROPIC_BASE_URL_ENV.to_string(), base_url.to_string()),
         (ANTHROPIC_API_KEY_ENV.to_string(), String::new()),

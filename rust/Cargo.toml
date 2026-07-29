@@ -11,6 +11,7 @@ license = "MIT"
 [workspace.dependencies]
 # Internal crates
 pay-core = { path = "crates/core" }
+pay-acp = { path = "crates/acp" }
 pay-types = { path = "crates/types" }
 pay-keystore = { path = "crates/keystore" }
 pay-mcp = { path = "crates/mcp" }
