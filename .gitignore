@@ -1,6 +1,7 @@
 .idea
 .vscode
 .DS_Store
+.worktrees/
 
 # TypeScript
 node_modules
