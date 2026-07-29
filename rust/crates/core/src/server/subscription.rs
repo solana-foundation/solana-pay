@@ -646,7 +646,7 @@ mod tests {
 
     #[test]
     fn generated_plan_id_survives_canonical_json_without_rounding() {
-        let id = compute_plan_id_numeric("merchant", "api/v1/ag9-feed");
+        let id = compute_plan_id_numeric("merchant", "api/v1/very-feed");
         assert!((1..=MAX_SAFE_JSON_PLAN_ID).contains(&id));
         let encoded =
             pay_kit::mpp::Base64UrlJson::from_typed(&serde_json::json!({ "planIdNumeric": id }))

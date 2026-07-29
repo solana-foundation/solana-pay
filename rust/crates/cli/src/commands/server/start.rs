@@ -3202,14 +3202,14 @@ mod tests {
     fn existing_plan_metadata_is_persisted_for_a_pristine_subscription_spec() {
         let yaml = r#"endpoints:
   - method: GET
-    path: "api/v1/ag9-feed"
+    path: "api/v1/very-feed"
     subscription:
       period: "1d"
       price_usd: 0.10
       currency: "USDC"
 "#;
         let publication = pay_core::server::subscription::PublishedPlan {
-            endpoint_path: "api/v1/ag9-feed".to_string(),
+            endpoint_path: "api/v1/very-feed".to_string(),
             plan_id_numeric: 42,
             plan_pda: "8tWbqLkUJoYy7zXc5h2EvCRoaQEv2xnQjUuYhc3rzCgT".to_string(),
             plan_bump: 254,

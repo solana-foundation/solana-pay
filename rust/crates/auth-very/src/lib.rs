@@ -1,8 +1,8 @@
-//! Device-independent AG9 Palm authorization for Pay subscription activation.
+//! Device-independent Very Palm authorization for Pay subscription activation.
 //!
 //! This crate is intentionally optional. Pay's core emits a typed
 //! [`SubscriptionAuthorization`]; this backend binds those durable terms to a
-//! fresh AG9 approval, verifies the returned Ed25519 JWT locally, and only then
+//! fresh Very approval, verifies the returned Ed25519 JWT locally, and only then
 //! lets the keystore unlock the subscriber key.
 
 use std::io::Read;
@@ -22,6 +22,8 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use uuid::Uuid;
 
+// Very's attestation service still uses this legacy wire hostname and issuer.
+// Keep both exact until the service migrates its endpoints and issued claims.
 const DEFAULT_API_BASE_URL: &str = "https://api.ag9.ai";
 const DEFAULT_ISSUER: &str = "api.ag9.ai";
 const DEFAULT_AUDIENCE: &str = "pay.sh";
@@ -34,9 +36,9 @@ const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 const CLOCK_SKEW_SECONDS: i64 = 60;
 const MAX_RESPONSE_BYTES: u64 = 1_048_576;
 
-/// Runtime settings for a registered AG9 agent identity.
+/// Runtime settings for a registered Very device identity.
 #[derive(Debug, Clone)]
-pub struct Ag9Config {
+pub struct VeryConfig {
     pub api_base_url: String,
     pub jwks_url: String,
     pub issuer: String,
@@ -49,24 +51,23 @@ pub struct Ag9Config {
     pub request_timeout: Duration,
 }
 
-impl Ag9Config {
-    /// Load the AG9 backend from environment variables.
+impl VeryConfig {
+    /// Load the Very backend from environment variables.
     ///
-    /// Required: `AG9_DEVICE_ID` and `AG9_PUBLIC_KEY` (the existing demo
-    /// aliases `AG9_DEMO_DEVICE_ID` / `AG9_DEMO_PUBLIC_KEY` also work).
-    pub fn from_env() -> Result<Self, Ag9Error> {
-        let api_base_url = first_env(&["PAY_AG9_API_BASE_URL", "AG9_API_BASE_URL"])
+    /// Required: `VERY_DEVICE_ID` and `VERY_PUBLIC_KEY`.
+    pub fn from_env() -> Result<Self, VeryError> {
+        let api_base_url = first_env(&["PAY_VERY_API_BASE_URL", "VERY_API_BASE_URL"])
             .unwrap_or_else(|| DEFAULT_API_BASE_URL.to_string())
             .trim_end_matches('/')
             .to_string();
-        let jwks_url = first_env(&["PAY_AG9_JWKS_URL", "AG9_JWKS_URL"])
+        let jwks_url = first_env(&["PAY_VERY_JWKS_URL", "VERY_JWKS_URL"])
             .unwrap_or_else(|| format!("{api_base_url}/.well-known/jwks.json"));
-        let issuer = first_env(&["PAY_AG9_ISSUER", "AG9_ISSUER"])
+        let issuer = first_env(&["PAY_VERY_ISSUER", "VERY_ISSUER"])
             .unwrap_or_else(|| DEFAULT_ISSUER.to_string());
-        let audience = first_env(&["PAY_AG9_AUDIENCE", "AG9_AUDIENCE"])
+        let audience = first_env(&["PAY_VERY_AUDIENCE", "VERY_AUDIENCE"])
             .unwrap_or_else(|| DEFAULT_AUDIENCE.to_string());
-        let device_id = required_env(&["AG9_DEVICE_ID", "AG9_DEMO_DEVICE_ID"])?;
-        let public_key = required_env(&["AG9_PUBLIC_KEY", "AG9_DEMO_PUBLIC_KEY"])?;
+        let device_id = required_env("VERY_DEVICE_ID")?;
+        let public_key = required_env("VERY_PUBLIC_KEY")?;
 
         Ok(Self {
             api_base_url,
@@ -75,42 +76,42 @@ impl Ag9Config {
             audience,
             device_id,
             public_key,
-            timeout: duration_env("PAY_AG9_TIMEOUT_SECONDS", DEFAULT_TIMEOUT)?,
-            poll_interval: duration_env_millis("PAY_AG9_POLL_INTERVAL_MS", DEFAULT_POLL_INTERVAL)?,
-            max_attestation_age: duration_env("PAY_AG9_MAX_AGE_SECONDS", DEFAULT_MAX_AGE)?,
+            timeout: duration_env("PAY_VERY_TIMEOUT_SECONDS", DEFAULT_TIMEOUT)?,
+            poll_interval: duration_env_millis("PAY_VERY_POLL_INTERVAL_MS", DEFAULT_POLL_INTERVAL)?,
+            max_attestation_age: duration_env("PAY_VERY_MAX_AGE_SECONDS", DEFAULT_MAX_AGE)?,
             request_timeout: duration_env(
-                "PAY_AG9_REQUEST_TIMEOUT_SECONDS",
+                "PAY_VERY_REQUEST_TIMEOUT_SECONDS",
                 DEFAULT_REQUEST_TIMEOUT,
             )?,
         })
     }
 }
 
-/// Build an auth gate only when `PAY_AUTH_BACKEND=ag9` is explicitly set.
+/// Build an auth gate only when `PAY_AUTH_BACKEND=very` is explicitly set.
 /// `platform`, `local`, and an unset value retain Pay's existing behavior.
-pub fn configured_gate_from_env() -> Result<Option<Box<dyn AuthGate>>, Ag9Error> {
+pub fn configured_gate_from_env() -> Result<Option<Box<dyn AuthGate>>, VeryError> {
     let Some(backend) = std::env::var("PAY_AUTH_BACKEND").ok() else {
         return Ok(None);
     };
     match backend.trim().to_ascii_lowercase().as_str() {
         "" | "platform" | "local" => Ok(None),
-        "ag9" => Ok(Some(Box::new(
-            Ag9AuthGate::try_new(Ag9Config::from_env()?)?,
-        ))),
-        other => Err(Ag9Error::Configuration(format!(
-            "unsupported PAY_AUTH_BACKEND `{other}`; expected `platform` or `ag9`"
+        "very" => Ok(Some(Box::new(VeryAuthGate::try_new(
+            VeryConfig::from_env()?,
+        )?))),
+        other => Err(VeryError::Configuration(format!(
+            "unsupported PAY_AUTH_BACKEND `{other}`; expected `platform` or `very`"
         ))),
     }
 }
 
-/// AG9-backed implementation of Pay's synchronous auth gate.
-pub struct Ag9AuthGate {
-    config: Ag9Config,
+/// Very-backed implementation of Pay's synchronous auth gate.
+pub struct VeryAuthGate {
+    config: VeryConfig,
     client: Client,
 }
 
-impl Ag9AuthGate {
-    pub fn try_new(config: Ag9Config) -> Result<Self, Ag9Error> {
+impl VeryAuthGate {
+    pub fn try_new(config: VeryConfig) -> Result<Self, VeryError> {
         let client = Client::builder()
             .timeout(config.request_timeout)
             // These endpoints establish the authorization result and its
@@ -118,11 +119,11 @@ impl Ag9AuthGate {
             // trust origin.
             .redirect(Policy::none())
             .build()
-            .map_err(|e| Ag9Error::Configuration(format!("could not build HTTP client: {e}")))?;
+            .map_err(|e| VeryError::Configuration(format!("could not build HTTP client: {e}")))?;
         Ok(Self { config, client })
     }
 
-    fn authorize(&self, intent: &AuthIntent) -> Result<(), Ag9Error> {
+    fn authorize(&self, intent: &AuthIntent) -> Result<(), VeryError> {
         let now = now_unix()?;
         let prepared = prepare_action(intent, &self.config, now, Uuid::new_v4().to_string())?;
         let init: InitResponse = read_json(
@@ -139,27 +140,27 @@ impl Ag9AuthGate {
                     action_description: &prepared.description,
                 })
                 .send()
-                .map_err(|e| Ag9Error::Http(format!("could not start approval: {e}")))?,
-            "start AG9 approval",
+                .map_err(|e| VeryError::Http(format!("could not start approval: {e}")))?,
+            "start Very approval",
         )?;
 
         if init.session_id.trim().is_empty() || init.verification_url.trim().is_empty() {
-            return Err(Ag9Error::Protocol(
-                "AG9 approval response omitted session_id or verification_url".into(),
+            return Err(VeryError::Protocol(
+                "Very approval response omitted session_id or verification_url".into(),
             ));
         }
         let verification_url =
             validate_verification_url(&self.config.api_base_url, &init.verification_url)?;
 
         eprintln!(
-            "\nAG9 Palm approval required for this subscription:\n{}\n",
+            "\nVery Palm approval required for this subscription:\n{}\n",
             verification_url
         );
 
         let jwt = self.wait_for_attestation(&init.session_id)?;
         let verification_time = now_unix()?;
         if verification_time >= prepared.authorization_expires_at {
-            return Err(Ag9Error::Verification(
+            return Err(VeryError::Verification(
                 "authorization action expired while waiting for approval".into(),
             ));
         }
@@ -167,8 +168,8 @@ impl Ag9AuthGate {
             self.client
                 .get(&self.config.jwks_url)
                 .send()
-                .map_err(|e| Ag9Error::Http(format!("could not fetch AG9 JWKS: {e}")))?,
-            "fetch AG9 JWKS",
+                .map_err(|e| VeryError::Http(format!("could not fetch Very JWKS: {e}")))?,
+            "fetch Very JWKS",
         )?;
         verify_attestation_jwt(
             &jwt,
@@ -179,41 +180,43 @@ impl Ag9AuthGate {
         )
     }
 
-    fn wait_for_attestation(&self, session_id: &str) -> Result<String, Ag9Error> {
+    fn wait_for_attestation(&self, session_id: &str) -> Result<String, VeryError> {
         let deadline = std::time::Instant::now() + self.config.timeout;
         loop {
             if std::time::Instant::now() >= deadline {
-                return Err(Ag9Error::Timeout);
+                return Err(VeryError::Timeout);
             }
             let status: StatusResponse = read_json(
                 self.client
                     .get(status_url(&self.config.api_base_url, session_id)?)
                     .send()
-                    .map_err(|e| Ag9Error::Http(format!("could not poll approval: {e}")))?,
-                "poll AG9 approval",
+                    .map_err(|e| VeryError::Http(format!("could not poll approval: {e}")))?,
+                "poll Very approval",
             )?;
 
             match status.status.as_str() {
                 "completed" => {
                     return status.attestation_jwt.ok_or_else(|| {
-                        Ag9Error::Protocol("completed AG9 approval omitted attestation_jwt".into())
+                        VeryError::Protocol(
+                            "completed Very approval omitted attestation_jwt".into(),
+                        )
                     });
                 }
                 "rejected" | "cancelled" => {
-                    return Err(Ag9Error::Denied(status.status));
+                    return Err(VeryError::Denied(status.status));
                 }
-                "expired" => return Err(Ag9Error::Timeout),
+                "expired" => return Err(VeryError::Timeout),
                 "failed" => {
-                    return Err(Ag9Error::Protocol(
-                        "AG9 approval failed before an attestation was issued".into(),
+                    return Err(VeryError::Protocol(
+                        "Very approval failed before an attestation was issued".into(),
                     ));
                 }
                 "pending" | "created" | "waiting" | "scanning" => {
                     thread::sleep(self.config.poll_interval);
                 }
                 other => {
-                    return Err(Ag9Error::Protocol(format!(
-                        "AG9 returned unknown approval status `{other}`"
+                    return Err(VeryError::Protocol(format!(
+                        "Very returned unknown approval status `{other}`"
                     )));
                 }
             }
@@ -221,7 +224,7 @@ impl Ag9AuthGate {
     }
 }
 
-impl AuthGate for Ag9AuthGate {
+impl AuthGate for VeryAuthGate {
     fn authenticate(&self, intent: &AuthIntent) -> Result<(), KeystoreError> {
         self.authorize(intent).map_err(map_auth_error)
     }
@@ -231,15 +234,15 @@ impl AuthGate for Ag9AuthGate {
     }
 }
 
-fn map_auth_error(error: Ag9Error) -> KeystoreError {
+fn map_auth_error(error: VeryError) -> KeystoreError {
     match error {
-        Ag9Error::Denied(status) => KeystoreError::AuthDenied(format!("AG9 approval {status}")),
-        other => KeystoreError::Backend(format!("AG9 authorization failed: {other}")),
+        VeryError::Denied(status) => KeystoreError::AuthDenied(format!("Very approval {status}")),
+        other => KeystoreError::Backend(format!("Very authorization failed: {other}")),
     }
 }
 
 #[derive(Debug, Error)]
-pub enum Ag9Error {
+pub enum VeryError {
     #[error("configuration error: {0}")]
     Configuration(String),
     #[error("HTTP error: {0}")]
@@ -296,26 +299,26 @@ struct PreparedAction {
 
 fn prepare_action(
     intent: &AuthIntent,
-    config: &Ag9Config,
+    config: &VeryConfig,
     now: i64,
     nonce: String,
-) -> Result<PreparedAction, Ag9Error> {
+) -> Result<PreparedAction, VeryError> {
     let subscription = intent.subscription_authorization().ok_or_else(|| {
-        Ag9Error::Verification(
-            "AG9 is restricted to typed MPP subscription activation intents".into(),
+        VeryError::Verification(
+            "Very is restricted to typed MPP subscription activation intents".into(),
         )
     })?;
     if subscription.subscriber.as_deref().is_none_or(str::is_empty) {
-        return Err(Ag9Error::Verification(
+        return Err(VeryError::Verification(
             "subscription authorization is missing the subscriber wallet".into(),
         ));
     }
 
     let max_age = i64::try_from(config.max_attestation_age.as_secs())
-        .map_err(|_| Ag9Error::Configuration("PAY_AG9_MAX_AGE_SECONDS is too large".into()))?;
+        .map_err(|_| VeryError::Configuration("PAY_VERY_MAX_AGE_SECONDS is too large".into()))?;
     let authorization_expires_at = now
         .checked_add(max_age)
-        .ok_or_else(|| Ag9Error::Protocol("authorization expiry overflowed".into()))?;
+        .ok_or_else(|| VeryError::Protocol("authorization expiry overflowed".into()))?;
     let request_context = intent.message();
     let action = ActionEnvelope {
         namespace: "pay.mpp.subscription_activation",
@@ -328,7 +331,7 @@ fn prepare_action(
         subscription,
     };
     let value = serde_json::to_value(&action)
-        .map_err(|e| Ag9Error::Protocol(format!("could not encode action: {e}")))?;
+        .map_err(|e| VeryError::Protocol(format!("could not encode action: {e}")))?;
     let canonical = canonical_json(&value)?;
     let action_hash = URL_SAFE_NO_PAD.encode(Sha256::digest(canonical.as_bytes()));
     let expiry_description = subscription
@@ -397,13 +400,13 @@ fn prepare_action(
     })
 }
 
-fn canonical_json(value: &Value) -> Result<String, Ag9Error> {
+fn canonical_json(value: &Value) -> Result<String, VeryError> {
     match value {
         Value::Null => Ok("null".to_string()),
         Value::Bool(value) => Ok(value.to_string()),
         Value::Number(value) => Ok(value.to_string()),
         Value::String(value) => serde_json::to_string(value)
-            .map_err(|e| Ag9Error::Protocol(format!("could not encode string: {e}"))),
+            .map_err(|e| VeryError::Protocol(format!("could not encode string: {e}"))),
         Value::Array(values) => {
             let values = values
                 .iter()
@@ -418,12 +421,12 @@ fn canonical_json(value: &Value) -> Result<String, Ag9Error> {
                 .into_iter()
                 .map(|key| {
                     let encoded_key = serde_json::to_string(key).map_err(|e| {
-                        Ag9Error::Protocol(format!("could not encode object key: {e}"))
+                        VeryError::Protocol(format!("could not encode object key: {e}"))
                     })?;
                     let value = canonical_json(&values[key])?;
                     Ok(format!("{encoded_key}:{value}"))
                 })
-                .collect::<Result<Vec<_>, Ag9Error>>()?;
+                .collect::<Result<Vec<_>, VeryError>>()?;
             Ok(format!("{{{}}}", fields.join(",")))
         }
     }
@@ -467,17 +470,17 @@ struct Jwk {
 fn verify_attestation_jwt(
     jwt: &str,
     jwks: &Jwks,
-    config: &Ag9Config,
+    config: &VeryConfig,
     expected_action_hash: &str,
     now: i64,
-) -> Result<(), Ag9Error> {
+) -> Result<(), VeryError> {
     let parts = jwt.split('.').collect::<Vec<_>>();
     if parts.len() != 3 {
-        return Err(Ag9Error::Verification("invalid JWT format".into()));
+        return Err(VeryError::Verification("invalid JWT format".into()));
     }
     let header: JwtHeader = decode_json_segment(parts[0], "JWT header")?;
     if header.alg != "EdDSA" {
-        return Err(Ag9Error::Verification(format!(
+        return Err(VeryError::Verification(format!(
             "unexpected JWT alg `{}`",
             header.alg
         )));
@@ -485,10 +488,10 @@ fn verify_attestation_jwt(
     let claims: HumanClaims = decode_json_segment(parts[1], "JWT claims")?;
     let signature_bytes = URL_SAFE_NO_PAD
         .decode(parts[2])
-        .map_err(|e| Ag9Error::Verification(format!("invalid JWT signature encoding: {e}")))?;
+        .map_err(|e| VeryError::Verification(format!("invalid JWT signature encoding: {e}")))?;
     let signature_bytes: [u8; 64] = signature_bytes
         .try_into()
-        .map_err(|_| Ag9Error::Verification("JWT signature must be 64 bytes".into()))?;
+        .map_err(|_| VeryError::Verification("JWT signature must be 64 bytes".into()))?;
     let signature = Signature::from_bytes(&signature_bytes);
     let signing_input = format!("{}.{}", parts[0], parts[1]);
 
@@ -520,51 +523,51 @@ fn verify_attestation_jwt(
             .is_ok()
     });
     if eligible_keys == 0 {
-        return Err(Ag9Error::Verification(
-            "AG9 JWKS contained no eligible Ed25519 key".into(),
+        return Err(VeryError::Verification(
+            "Very JWKS contained no eligible Ed25519 key".into(),
         ));
     }
     if !signature_valid {
-        return Err(Ag9Error::Verification(
-            "AG9 JWT signature verification failed".into(),
+        return Err(VeryError::Verification(
+            "Very JWT signature verification failed".into(),
         ));
     }
 
     if claims.iss != config.issuer {
-        return Err(Ag9Error::Verification("issuer mismatch".into()));
+        return Err(VeryError::Verification("issuer mismatch".into()));
     }
     if claims.sub != HUMAN_SUBJECT {
-        return Err(Ag9Error::Verification("subject mismatch".into()));
+        return Err(VeryError::Verification("subject mismatch".into()));
     }
     if !audience_matches(&claims.aud, &config.audience) {
-        return Err(Ag9Error::Verification("audience mismatch".into()));
+        return Err(VeryError::Verification("audience mismatch".into()));
     }
     if claims.human_id.trim().is_empty() {
-        return Err(Ag9Error::Verification("human_id is missing".into()));
+        return Err(VeryError::Verification("human_id is missing".into()));
     }
     if claims.device_id != config.device_id {
-        return Err(Ag9Error::Verification("device_id mismatch".into()));
+        return Err(VeryError::Verification("device_id mismatch".into()));
     }
     if claims.action_hash != expected_action_hash {
-        return Err(Ag9Error::Verification("action_hash mismatch".into()));
+        return Err(VeryError::Verification("action_hash mismatch".into()));
     }
     if claims.verification_method != PALM_METHOD {
-        return Err(Ag9Error::Verification(
+        return Err(VeryError::Verification(
             "verification_method is not Palm".into(),
         ));
     }
     if claims.exp <= now {
-        return Err(Ag9Error::Verification("attestation is expired".into()));
+        return Err(VeryError::Verification("attestation is expired".into()));
     }
     if claims.iat > now + CLOCK_SKEW_SECONDS {
-        return Err(Ag9Error::Verification(
+        return Err(VeryError::Verification(
             "attestation iat is in the future".into(),
         ));
     }
     let max_age = i64::try_from(config.max_attestation_age.as_secs())
-        .map_err(|_| Ag9Error::Configuration("PAY_AG9_MAX_AGE_SECONDS is too large".into()))?;
+        .map_err(|_| VeryError::Configuration("PAY_VERY_MAX_AGE_SECONDS is too large".into()))?;
     if now.saturating_sub(claims.iat) > max_age {
-        return Err(Ag9Error::Verification("attestation is too old".into()));
+        return Err(VeryError::Verification("attestation is too old".into()));
     }
     Ok(())
 }
@@ -577,21 +580,21 @@ fn audience_matches(claim: &Value, expected: &str) -> bool {
     }
 }
 
-fn decode_json_segment<T: DeserializeOwned>(segment: &str, label: &str) -> Result<T, Ag9Error> {
+fn decode_json_segment<T: DeserializeOwned>(segment: &str, label: &str) -> Result<T, VeryError> {
     let bytes = URL_SAFE_NO_PAD
         .decode(segment)
-        .map_err(|e| Ag9Error::Verification(format!("invalid {label} encoding: {e}")))?;
+        .map_err(|e| VeryError::Verification(format!("invalid {label} encoding: {e}")))?;
     serde_json::from_slice(&bytes)
-        .map_err(|e| Ag9Error::Verification(format!("invalid {label}: {e}")))
+        .map_err(|e| VeryError::Verification(format!("invalid {label}: {e}")))
 }
 
-fn read_json<T: DeserializeOwned>(response: Response, operation: &str) -> Result<T, Ag9Error> {
+fn read_json<T: DeserializeOwned>(response: Response, operation: &str) -> Result<T, VeryError> {
     let status = response.status();
     if response
         .content_length()
         .is_some_and(|length| length > MAX_RESPONSE_BYTES)
     {
-        return Err(Ag9Error::Protocol(format!(
+        return Err(VeryError::Protocol(format!(
             "{operation} response exceeded {MAX_RESPONSE_BYTES} bytes"
         )));
     }
@@ -599,9 +602,9 @@ fn read_json<T: DeserializeOwned>(response: Response, operation: &str) -> Result
     response
         .take(MAX_RESPONSE_BYTES + 1)
         .read_to_end(&mut body)
-        .map_err(|e| Ag9Error::Http(format!("{operation} response could not be read: {e}")))?;
+        .map_err(|e| VeryError::Http(format!("{operation} response could not be read: {e}")))?;
     if body.len() as u64 > MAX_RESPONSE_BYTES {
-        return Err(Ag9Error::Protocol(format!(
+        return Err(VeryError::Protocol(format!(
             "{operation} response exceeded {MAX_RESPONSE_BYTES} bytes"
         )));
     }
@@ -611,40 +614,40 @@ fn read_json<T: DeserializeOwned>(response: Response, operation: &str) -> Result
             .filter(|character| !character.is_control())
             .take(300)
             .collect::<String>();
-        return Err(Ag9Error::Http(format!(
+        return Err(VeryError::Http(format!(
             "{operation} returned HTTP {status}: {preview}"
         )));
     }
     serde_json::from_slice(&body)
-        .map_err(|e| Ag9Error::Protocol(format!("{operation} returned invalid JSON: {e}")))
+        .map_err(|e| VeryError::Protocol(format!("{operation} returned invalid JSON: {e}")))
 }
 
-fn validate_verification_url(api_base_url: &str, raw: &str) -> Result<Url, Ag9Error> {
+fn validate_verification_url(api_base_url: &str, raw: &str) -> Result<Url, VeryError> {
     let base = Url::parse(api_base_url)
-        .map_err(|e| Ag9Error::Configuration(format!("invalid AG9 API base URL: {e}")))?;
+        .map_err(|e| VeryError::Configuration(format!("invalid Very API base URL: {e}")))?;
     let verification = Url::parse(raw)
-        .map_err(|e| Ag9Error::Protocol(format!("invalid AG9 verification URL: {e}")))?;
+        .map_err(|e| VeryError::Protocol(format!("invalid Very verification URL: {e}")))?;
     if !matches!(verification.scheme(), "https" | "http") {
-        return Err(Ag9Error::Protocol(
-            "AG9 verification URL must use HTTP or HTTPS".into(),
+        return Err(VeryError::Protocol(
+            "Very verification URL must use HTTP or HTTPS".into(),
         ));
     }
     if verification.origin() != base.origin() {
-        return Err(Ag9Error::Protocol(
-            "AG9 verification URL changed the configured API origin".into(),
+        return Err(VeryError::Protocol(
+            "Very verification URL changed the configured API origin".into(),
         ));
     }
     Ok(verification)
 }
 
-fn status_url(api_base_url: &str, session_id: &str) -> Result<Url, Ag9Error> {
+fn status_url(api_base_url: &str, session_id: &str) -> Result<Url, VeryError> {
     let mut url = Url::parse(&format!(
         "{}/v1/human/attestation",
         api_base_url.trim_end_matches('/')
     ))
-    .map_err(|e| Ag9Error::Configuration(format!("invalid AG9 API base URL: {e}")))?;
+    .map_err(|e| VeryError::Configuration(format!("invalid Very API base URL: {e}")))?;
     url.path_segments_mut()
-        .map_err(|_| Ag9Error::Configuration("AG9 API base URL cannot be a base".into()))?
+        .map_err(|_| VeryError::Configuration("Very API base URL cannot be a base".into()))?
         .push(session_id)
         .push("status");
     Ok(url)
@@ -658,50 +661,52 @@ fn first_env(names: &[&str]) -> Option<String> {
     })
 }
 
-fn required_env(names: &[&str]) -> Result<String, Ag9Error> {
-    first_env(names)
-        .ok_or_else(|| Ag9Error::Configuration(format!("one of {} is required", names.join(", "))))
+fn required_env(name: &str) -> Result<String, VeryError> {
+    std::env::var(name)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| VeryError::Configuration(format!("{name} is required")))
 }
 
-fn duration_env(name: &str, default: Duration) -> Result<Duration, Ag9Error> {
+fn duration_env(name: &str, default: Duration) -> Result<Duration, VeryError> {
     let Some(raw) = std::env::var(name).ok() else {
         return Ok(default);
     };
     let seconds = raw.parse::<u64>().map_err(|_| {
-        Ag9Error::Configuration(format!(
+        VeryError::Configuration(format!(
             "{name} must be a positive integer number of seconds"
         ))
     })?;
     if seconds == 0 {
-        return Err(Ag9Error::Configuration(format!(
+        return Err(VeryError::Configuration(format!(
             "{name} must be greater than zero"
         )));
     }
     Ok(Duration::from_secs(seconds))
 }
 
-fn duration_env_millis(name: &str, default: Duration) -> Result<Duration, Ag9Error> {
+fn duration_env_millis(name: &str, default: Duration) -> Result<Duration, VeryError> {
     let Some(raw) = std::env::var(name).ok() else {
         return Ok(default);
     };
     let millis = raw.parse::<u64>().map_err(|_| {
-        Ag9Error::Configuration(format!(
+        VeryError::Configuration(format!(
             "{name} must be a positive integer number of milliseconds"
         ))
     })?;
     if millis == 0 {
-        return Err(Ag9Error::Configuration(format!(
+        return Err(VeryError::Configuration(format!(
             "{name} must be greater than zero"
         )));
     }
     Ok(Duration::from_millis(millis))
 }
 
-fn now_unix() -> Result<i64, Ag9Error> {
+fn now_unix() -> Result<i64, VeryError> {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs() as i64)
-        .map_err(|e| Ag9Error::Protocol(format!("system clock is before Unix epoch: {e}")))
+        .map_err(|e| VeryError::Protocol(format!("system clock is before Unix epoch: {e}")))
 }
 
 #[cfg(test)]
@@ -711,8 +716,8 @@ mod tests {
     use rand::rngs::OsRng;
     use std::net::{TcpListener, TcpStream};
 
-    fn config() -> Ag9Config {
-        Ag9Config {
+    fn config() -> VeryConfig {
+        VeryConfig {
             api_base_url: "https://api.ag9.ai".to_string(),
             jwks_url: "https://api.ag9.ai/.well-known/jwks.json".to_string(),
             issuer: DEFAULT_ISSUER.to_string(),
@@ -1028,7 +1033,7 @@ mod tests {
         test_config.timeout = Duration::from_secs(5);
         test_config.poll_interval = Duration::from_millis(1);
         test_config.request_timeout = Duration::from_secs(5);
-        let gate = Ag9AuthGate::try_new(test_config).unwrap();
+        let gate = VeryAuthGate::try_new(test_config).unwrap();
 
         gate.authenticate(&intent(authorization())).unwrap();
         server.join().unwrap();
@@ -1037,15 +1042,15 @@ mod tests {
     #[test]
     fn distinguishes_human_denial_from_backend_failure() {
         assert!(matches!(
-            map_auth_error(Ag9Error::Denied("rejected".to_string())),
+            map_auth_error(VeryError::Denied("rejected".to_string())),
             KeystoreError::AuthDenied(_)
         ));
         assert!(matches!(
-            map_auth_error(Ag9Error::Timeout),
+            map_auth_error(VeryError::Timeout),
             KeystoreError::Backend(_)
         ));
         assert!(matches!(
-            map_auth_error(Ag9Error::Verification("wrong action".to_string())),
+            map_auth_error(VeryError::Verification("wrong action".to_string())),
             KeystoreError::Backend(_)
         ));
     }

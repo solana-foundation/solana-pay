@@ -6487,7 +6487,7 @@ dependencies = [
  "opentelemetry_sdk 0.31.0",
  "owo-colors",
  "pay-acp",
- "pay-auth-ag9",
+ "pay-auth-very",
  "pay-core",
  "pay-keystore",
  "pay-mcp",
@@ -6613,7 +6613,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "pay-auth-ag9"
+name = "pay-auth-very"
 version = "0.28.0"
 dependencies = [
  "base64 0.22.1",
@@ -6789,7 +6789,7 @@ dependencies = [
  "crc32fast",
  "flate2",
  "mime_guess",
- "pay-auth-ag9",
+ "pay-auth-very",
  "pay-core",
  "pay-keystore",
  "pay-types",

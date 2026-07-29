@@ -1,5 +1,5 @@
 [package]
-name = "pay-auth-ag9"
+name = "pay-auth-very"
 edition.workspace = true
 version.workspace = true
 license.workspace = true

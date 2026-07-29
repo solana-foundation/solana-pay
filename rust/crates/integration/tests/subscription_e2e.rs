@@ -10,7 +10,7 @@
 //! - `AccountsFile::upsert_subscription` round-trips the persisted entry.
 //!
 //! The live on-chain activation broadcast and Palm interaction require
-//! external Surfpool and AG9 identities, so they remain a separate demo step.
+//! external Surfpool and Very identities, so they remain a separate demo step.
 
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -58,9 +58,9 @@ fn defaults<'a>() -> sub_server::OperatorDefaults<'a> {
 }
 
 #[test]
-fn ag9_demo_spec_is_valid_and_sandbox_only() {
+fn very_integration_demo_spec_is_valid_and_sandbox_only() {
     let spec: pay_types::metering::ApiSpec =
-        serde_yml::from_str(include_str!("../../../ag9-subscription-demo.yaml"))
+        serde_yml::from_str(include_str!("../../../very-integration-demo.yaml"))
             .expect("demo spec should parse");
     assert!(pay_types::metering::validate_api_spec(&spec).is_empty());
     assert_eq!(

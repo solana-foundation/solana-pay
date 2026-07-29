@@ -1127,22 +1127,23 @@ fn do_paid_fetch(
 }
 
 fn subscription_auth_override() -> Result<pay_core::signer::AuthOverride, pay_core::Error> {
-    #[cfg(feature = "ag9")]
+    #[cfg(feature = "very")]
     {
-        pay_auth_ag9::configured_gate_from_env().map_err(|e| pay_core::Error::Config(e.to_string()))
+        pay_auth_very::configured_gate_from_env()
+            .map_err(|e| pay_core::Error::Config(e.to_string()))
     }
 
-    #[cfg(not(feature = "ag9"))]
+    #[cfg(not(feature = "very"))]
     {
         let backend = std::env::var("PAY_AUTH_BACKEND").unwrap_or_default();
         match backend.trim().to_ascii_lowercase().as_str() {
             "" | "platform" | "local" => Ok(None),
-            "ag9" => Err(pay_core::Error::Config(
-                "PAY_AUTH_BACKEND=ag9 requires a Pay binary built with `--features ag9`"
+            "very" => Err(pay_core::Error::Config(
+                "PAY_AUTH_BACKEND=very requires a Pay binary built with `--features very`"
                     .to_string(),
             )),
             other => Err(pay_core::Error::Config(format!(
-                "Unsupported PAY_AUTH_BACKEND `{other}`; expected `platform` or `ag9`"
+                "Unsupported PAY_AUTH_BACKEND `{other}`; expected `platform` or `very`"
             ))),
         }
     }

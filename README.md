@@ -101,7 +101,7 @@ A [public debugger](https://debugger.pay.sh) is also available.
 
 When a command, Claude Code, Codex, or another MCP client hits a paid endpoint, `pay` prepares the payment locally and asks your wallet backend to authorize the signature. On macOS, that means Touch ID via Keychain. On Windows, Windows Hello. On Linux, GNOME Keyring / polkit. If you reject the prompt, the payment is not signed and the request does not go through.
 
-An experimental, feature-gated [AG9 Palm authorization backend](docs/ag9-subscription-auth.md)
+An experimental, feature-gated [Very integration](docs/very-integration.md)
 is also available for action-bound MPP subscription activation.
 
   
