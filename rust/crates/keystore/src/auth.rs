@@ -495,11 +495,11 @@ mod tests {
         assert_eq!(
             AuthIntent::authorize_spend_up_to(
                 Some("$1.00"),
-                "$1.00 USD (1 USDC)",
+                "$1.00",
                 "modelstudio.alibaba.gateway-402.com",
             )
             .prompt_message(),
-            "authorize a series of payments.\n\nup to: $1.00 USD (1 USDC)\n\noperator: modelstudio.alibaba.gateway-402.com"
+            "authorize a series of payments.\n\nup to: $1.00\n\noperator: modelstudio.alibaba.gateway-402.com"
         );
     }
 
@@ -508,12 +508,12 @@ mod tests {
         assert_eq!(
             AuthIntent::authorize_spend_up_to(
                 Some("$1.00"),
-                "$1.00 USD (1 USDC)",
+                "$1.00",
                 "modelstudio.alibaba.gateway-402.com",
             )
             .with_account_context("default")
             .prompt_message(),
-            "authorize a series of payments from default.\n\nup to: $1.00 USD (1 USDC)\n\noperator: modelstudio.alibaba.gateway-402.com"
+            "authorize a series of payments from default.\n\nup to: $1.00\n\noperator: modelstudio.alibaba.gateway-402.com"
         );
     }
 
@@ -687,12 +687,8 @@ mod tests {
     #[test]
     fn session_budget_uses_existing_payment_limit_bucket() {
         assert_eq!(
-            AuthIntent::authorize_spend_up_to(
-                Some("$1.00"),
-                "$1.00 USD (1 USDC)",
-                "api.example.com",
-            )
-            .payment_limit(),
+            AuthIntent::authorize_spend_up_to(Some("$1.00"), "$1.00", "api.example.com",)
+                .payment_limit(),
             Some(PaymentLimit::Usd1)
         );
     }

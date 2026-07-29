@@ -490,7 +490,7 @@ fn session_spend_limit(deposit: u64, request: &SessionRequest) -> SessionSpendLi
         };
         let usd_amount = format!("${usd}");
         SessionSpendLimit {
-            display: format!("{usd_amount} USD ({amount} {})", stablecoin.symbol()),
+            display: usd_amount.clone(),
             usd_amount: Some(usd_amount),
         }
     } else {
@@ -609,12 +609,12 @@ mod tests {
     }
 
     #[test]
-    fn spend_limit_names_usd_amount_and_stablecoin() {
+    fn spend_limit_displays_usd_amount() {
         let mut request = test_request();
         request.currency = "USDC".to_string();
         request.decimals = Some(6);
         let limit = session_spend_limit(1_000_000, &request);
-        assert_eq!(limit.display, "$1.00 USD (1 USDC)");
+        assert_eq!(limit.display, "$1.00");
         assert_eq!(limit.usd_amount.as_deref(), Some("$1.00"));
     }
 
@@ -626,7 +626,7 @@ mod tests {
 
         let limit = session_spend_limit(1_000_000, &request);
 
-        assert_eq!(limit.display, "$1.00 USD (1 USDC)");
+        assert_eq!(limit.display, "$1.00");
         assert_eq!(limit.usd_amount.as_deref(), Some("$1.00"));
     }
 
