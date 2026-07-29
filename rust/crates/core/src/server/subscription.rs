@@ -4,12 +4,8 @@
 //! (`pay_types::metering::SubscriptionEndpoint`) and the SDK's
 //! `pay_kit::mpp::server::SubscriptionServer`.
 //!
-//! v0 covers challenge emission. The activation-credential verification
-//! path is delegated to a follow-up because pay-kit's Rust SDK does not yet
-//! ship a verify implementation for the subscription intent — the
-//! TypeScript SDK does, and a port is queued. Until then,
-//! [`verify_activation`] returns a `not_implemented` error that the
-//! middleware surfaces as a 501.
+//! Covers challenge emission and activation-credential verification through
+//! pay-kit's Rust subscription server.
 
 use std::str::FromStr;
 
@@ -196,8 +192,8 @@ pub fn build_handler(
         },
         store: None,
         // The on-chain Plan terms (numeric id, bump, created_at) are
-        // populated by pay-side spec/yaml plumbing; for now we leave
-        // them None and the client falls back to RPC-fetching the Plan.
+        // populated by pay-side spec/YAML plumbing before this handler is
+        // built. The client validates that every field is present.
         plan_id_numeric: spec.plan_id_numeric,
         plan_bump: spec.plan_bump,
         plan_created_at: spec.plan_created_at,
@@ -257,18 +253,23 @@ pub enum PlanStatus {
     WrongOwner { actual_owner: String },
 }
 
+/// Largest integer that RFC 8785/JCS can serialize without IEEE-754 rounding.
+/// Subscription methodDetails travel through canonical JSON, so Plan IDs must
+/// stay within this range or the client receives a different PDA seed.
+pub const MAX_SAFE_JSON_PLAN_ID: u64 = (1_u64 << 53) - 1;
+
 /// Deterministic numeric `plan_id` derived from `(operator, endpoint_path)`.
 /// Stable across runs so the same YAML always points at the same on-chain
-/// Plan. FNV-1a 64-bit — no extra dependency, plenty of mixing for path
-/// strings.
+/// Plan. FNV-1a supplies the mixing; the result is constrained to the largest
+/// integer that survives RFC 8785/JCS canonicalization exactly.
 pub fn compute_plan_id_numeric(operator: &str, endpoint_path: &str) -> u64 {
     let mut hash: u64 = 0xcbf29ce484222325;
     for byte in operator.bytes().chain(*b"/").chain(endpoint_path.bytes()) {
         hash ^= byte as u64;
         hash = hash.wrapping_mul(0x100000001b3);
     }
-    // Never return zero — the program treats plan_id=0 as a reserved
-    // sentinel in some validators.
+    let hash = hash & MAX_SAFE_JSON_PLAN_ID;
+    // Never return zero — the program treats plan_id=0 as a reserved sentinel.
     if hash == 0 { 1 } else { hash }
 }
 
@@ -409,10 +410,10 @@ pub async fn publish_plan(
     })
 }
 
-/// Read just the `created_at` (i64 LE) out of a freshly-published Plan
+/// Read just the `created_at` (i64 LE) out of an existing or freshly-published Plan
 /// account at the canonical offset. Avoids vendoring the full Plan
 /// account decoder for the one field `pay gate api` actually needs.
-async fn fetch_plan_created_at(rpc_url: &str, plan_pda: &solana_pubkey::Pubkey) -> Result<i64> {
+pub async fn fetch_plan_created_at(rpc_url: &str, plan_pda: &solana_pubkey::Pubkey) -> Result<i64> {
     let url = rpc_url.to_string();
     let pda = *plan_pda;
     tokio::task::spawn_blocking(move || -> Result<i64> {
@@ -421,30 +422,34 @@ async fn fetch_plan_created_at(rpc_url: &str, plan_pda: &solana_pubkey::Pubkey) 
         let account = rpc
             .get_account(&pda)
             .map_err(|e| Error::Mpp(format!("Could not fetch Plan account {pda}: {e}")))?;
-        // Plan layout:
-        //   0   discriminator (u8)
-        //   1   owner (32B)
-        //   33  bump (u8)
-        //   34  status (u8)
-        //   35  data.plan_id (u64)
-        //   43  data.mint (32B)
-        //   75  data.terms.amount (u64)
-        //   83  data.terms.period_hours (u64)
-        //   91  data.terms.created_at (i64)  ← our target
-        const CREATED_AT_OFFSET: usize = 91;
-        if account.data.len() < CREATED_AT_OFFSET + 8 {
-            return Err(Error::Mpp(format!(
-                "Plan account is too short ({} bytes)",
-                account.data.len()
-            )));
-        }
-        let bytes: [u8; 8] = account.data[CREATED_AT_OFFSET..CREATED_AT_OFFSET + 8]
-            .try_into()
-            .map_err(|_| Error::Mpp("Plan.created_at slice".into()))?;
-        Ok(i64::from_le_bytes(bytes))
+        decode_plan_created_at(&account.data)
     })
     .await
     .map_err(|e| Error::Mpp(format!("RPC task join: {e}")))?
+}
+
+fn decode_plan_created_at(data: &[u8]) -> Result<i64> {
+    // Plan layout:
+    //   0   discriminator (u8)
+    //   1   owner (32B)
+    //   33  bump (u8)
+    //   34  status (u8)
+    //   35  data.plan_id (u64)
+    //   43  data.mint (32B)
+    //   75  data.terms.amount (u64)
+    //   83  data.terms.period_hours (u64)
+    //   91  data.terms.created_at (i64)  ← our target
+    const CREATED_AT_OFFSET: usize = 91;
+    if data.len() < CREATED_AT_OFFSET + 8 {
+        return Err(Error::Mpp(format!(
+            "Plan account is too short ({} bytes)",
+            data.len()
+        )));
+    }
+    let bytes: [u8; 8] = data[CREATED_AT_OFFSET..CREATED_AT_OFFSET + 8]
+        .try_into()
+        .map_err(|_| Error::Mpp("Plan.created_at slice".into()))?;
+    Ok(i64::from_le_bytes(bytes))
 }
 
 /// Sign a one-or-more-instruction transaction with the operator's signer
@@ -627,6 +632,38 @@ mod tests {
             Ok(_) => panic!("expected month period to be rejected"),
             Err(e) => assert!(format!("{e}").to_lowercase().contains("month")),
         }
+    }
+
+    #[test]
+    fn decode_plan_created_at_reads_the_on_chain_layout() {
+        let expected = 1_770_000_123_i64;
+        let mut data = vec![0_u8; 99];
+        data[91..99].copy_from_slice(&expected.to_le_bytes());
+
+        assert_eq!(decode_plan_created_at(&data).unwrap(), expected);
+        assert!(decode_plan_created_at(&data[..98]).is_err());
+    }
+
+    #[test]
+    fn generated_plan_id_survives_canonical_json_without_rounding() {
+        let id = compute_plan_id_numeric("merchant", "api/v1/ag9-feed");
+        assert!((1..=MAX_SAFE_JSON_PLAN_ID).contains(&id));
+        let encoded =
+            pay_kit::mpp::Base64UrlJson::from_typed(&serde_json::json!({ "planIdNumeric": id }))
+                .expect("canonical JSON");
+        assert_eq!(
+            encoded.decode_value().unwrap()["planIdNumeric"].as_u64(),
+            Some(id)
+        );
+
+        let unsafe_id = 18_360_896_155_494_901_300_u64;
+        let rounded = pay_kit::mpp::Base64UrlJson::from_typed(
+            &serde_json::json!({ "planIdNumeric": unsafe_id }),
+        )
+        .expect("canonical JSON")
+        .decode_value()
+        .unwrap();
+        assert_ne!(rounded["planIdNumeric"].as_u64(), Some(unsafe_id));
     }
 
     #[tokio::test(flavor = "multi_thread")]

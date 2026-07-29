@@ -19,7 +19,7 @@ envelope containing:
 - the server challenge identity and expiry;
 - network, program, Plan, mint, token program, merchant, puller, and recipient;
 - amount in base units, decimals, cadence, and subscription expiry;
-- fee-payer terms, Pay account name, and subscriber wallet;
+- request/operator context, fee-payer terms, Pay account name, and subscriber wallet;
 - a fresh authorization nonce and short authorization expiry.
 
 Pay sends AG9 the registered device id and public key, audience, action hash,
@@ -69,8 +69,9 @@ as aliases. Optional overrides are:
 If the binary was built without `--features ag9`, selecting the backend returns
 a configuration error. Leaving `PAY_AUTH_BACKEND` unset preserves the platform
 default. The override applies to sandbox ephemeral wallets and to auth-enabled
-Apple Keychain, GNOME Keyring, Windows Hello, and file accounts. 1Password
-continues to enforce its own `op` CLI authorization.
+Apple Keychain, GNOME Keyring, Windows Hello, file, and 1Password accounts.
+For 1Password, AG9 authorizes the subscription action first and the existing
+`op` CLI flow then unlocks the stored key, so expect both approvals.
 
 ## No-mainnet demo
 

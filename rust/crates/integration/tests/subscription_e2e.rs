@@ -1,7 +1,6 @@
 //! End-to-end-shaped tests for the subscription intent.
 //!
-//! v0 covers the pieces pay owns end-to-end without an on-chain settlement
-//! step:
+//! Covers the deterministic, credential-free pieces of the subscription flow:
 //!
 //! - Server builds a 402 challenge from a `SubscriptionEndpoint` config.
 //! - Client classifies the challenge as `SubscriptionChallenge`.
@@ -10,9 +9,8 @@
 //!   `Payment-Receipt` header.
 //! - `AccountsFile::upsert_subscription` round-trips the persisted entry.
 //!
-//! The on-chain activation broadcast + server-side verify path are not yet
-//! implemented — when they land, this file is the natural home for a true
-//! Surfpool-backed flow.
+//! The live on-chain activation broadcast and Palm interaction require
+//! external Surfpool and AG9 identities, so they remain a separate demo step.
 
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;

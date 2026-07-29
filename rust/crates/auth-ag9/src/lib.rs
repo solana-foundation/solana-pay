@@ -199,8 +199,14 @@ impl Ag9AuthGate {
                         Ag9Error::Protocol("completed AG9 approval omitted attestation_jwt".into())
                     });
                 }
-                "failed" | "rejected" | "expired" | "cancelled" => {
+                "rejected" | "cancelled" => {
                     return Err(Ag9Error::Denied(status.status));
+                }
+                "expired" => return Err(Ag9Error::Timeout),
+                "failed" => {
+                    return Err(Ag9Error::Protocol(
+                        "AG9 approval failed before an attestation was issued".into(),
+                    ));
                 }
                 "pending" | "created" | "waiting" | "scanning" => {
                     thread::sleep(self.config.poll_interval);
@@ -217,12 +223,18 @@ impl Ag9AuthGate {
 
 impl AuthGate for Ag9AuthGate {
     fn authenticate(&self, intent: &AuthIntent) -> Result<(), KeystoreError> {
-        self.authorize(intent)
-            .map_err(|e| KeystoreError::AuthDenied(format!("AG9 authorization failed: {e}")))
+        self.authorize(intent).map_err(map_auth_error)
     }
 
     fn is_available(&self) -> bool {
         true
+    }
+}
+
+fn map_auth_error(error: Ag9Error) -> KeystoreError {
+    match error {
+        Ag9Error::Denied(status) => KeystoreError::AuthDenied(format!("AG9 approval {status}")),
+        other => KeystoreError::Backend(format!("AG9 authorization failed: {other}")),
     }
 }
 
@@ -271,6 +283,7 @@ struct ActionEnvelope<'a> {
     agent_device_id: &'a str,
     authorization_nonce: String,
     authorization_expires_at: i64,
+    request_context: &'a str,
     subscription: &'a SubscriptionAuthorization,
 }
 
@@ -303,6 +316,7 @@ fn prepare_action(
     let authorization_expires_at = now
         .checked_add(max_age)
         .ok_or_else(|| Ag9Error::Protocol("authorization expiry overflowed".into()))?;
+    let request_context = intent.message();
     let action = ActionEnvelope {
         namespace: "pay.mpp.subscription_activation",
         version: 1,
@@ -310,14 +324,55 @@ fn prepare_action(
         agent_device_id: &config.device_id,
         authorization_nonce: nonce,
         authorization_expires_at,
+        request_context,
         subscription,
     };
     let value = serde_json::to_value(&action)
         .map_err(|e| Ag9Error::Protocol(format!("could not encode action: {e}")))?;
     let canonical = canonical_json(&value)?;
     let action_hash = URL_SAFE_NO_PAD.encode(Sha256::digest(canonical.as_bytes()));
+    let expiry_description = subscription
+        .subscription_expires
+        .as_deref()
+        .filter(|expires| !expires.trim().is_empty())
+        .map_or_else(
+            || "subscription continues until cancelled".to_string(),
+            |expires| format!("subscription expires at {expires}"),
+        );
+    let fee_payer_description = match (
+        subscription.fee_payer,
+        subscription
+            .fee_payer_key
+            .as_deref()
+            .filter(|key| !key.trim().is_empty()),
+    ) {
+        (true, Some(key)) => format!("activation transaction fee payer {key}"),
+        (true, None) => {
+            "activation transaction uses a sponsor, but its fee-payer key is missing".to_string()
+        }
+        (false, _) => "subscriber is the activation transaction fee payer".to_string(),
+    };
+    let external_reference = subscription
+        .external_id
+        .as_deref()
+        .filter(|external_id| !external_id.trim().is_empty())
+        .map_or_else(String::new, |external_id| {
+            format!("; external reference {external_id}")
+        });
+    let subscription_program = subscription
+        .program_id
+        .as_deref()
+        .filter(|program_id| !program_id.trim().is_empty())
+        .unwrap_or("canonical default");
+    let merchant = subscription
+        .merchant
+        .as_deref()
+        .filter(|merchant| !merchant.trim().is_empty())
+        .unwrap_or("derived from plan");
     let description = format!(
-        "Approve Pay MPP subscription: {} base units ({} decimals) of mint {} every {} {}(s), recipient {}, puller {}, plan {}, network {}, subscriber {}.",
+        "Approve Pay MPP subscription for challenge realm {}. Request context: {}. Terms: {} base units ({} decimals) of mint {} every {} {}(s), recipient {}, puller {}, merchant {}, plan {}, subscription program {}, token program {}, network {}, subscriber {}; {}; {}{}.",
+        subscription.challenge_realm,
+        request_context,
         subscription.amount_base_units,
         subscription.decimals,
         subscription.mint,
@@ -325,9 +380,15 @@ fn prepare_action(
         subscription.period_unit,
         subscription.recipient,
         subscription.puller,
+        merchant,
         subscription.plan_id,
+        subscription_program,
+        subscription.token_program,
         subscription.network,
         subscription.subscriber.as_deref().unwrap_or("unknown"),
+        expiry_description,
+        fee_payer_description,
+        external_reference,
     );
     Ok(PreparedAction {
         action_hash,
@@ -648,6 +709,7 @@ mod tests {
     use super::*;
     use ed25519_dalek::{Signer, SigningKey};
     use rand::rngs::OsRng;
+    use std::net::{TcpListener, TcpStream};
 
     fn config() -> Ag9Config {
         Ag9Config {
@@ -691,18 +753,18 @@ mod tests {
             external_id: Some("customer-plan".to_string()),
             fee_payer: false,
             fee_payer_key: None,
-            account: Some("primary".to_string()),
-            subscriber: Some("subscriber".to_string()),
+            account: None,
+            subscriber: None,
         }
     }
 
     fn intent(authorization: SubscriptionAuthorization) -> AuthIntent {
-        AuthIntent::authorize_subscription(
-            "$1.00",
-            "Recurring subscription",
-            "merchant.example",
-            authorization,
-        )
+        intent_with_reason(authorization, "Recurring subscription")
+    }
+
+    fn intent_with_reason(authorization: SubscriptionAuthorization, reason: &str) -> AuthIntent {
+        AuthIntent::authorize_subscription("$1.00", reason, "merchant.example", authorization)
+            .with_account_context_and_pubkey("primary", Some("subscriber"))
     }
 
     fn jwks(signing_key: &SigningKey) -> Jwks {
@@ -740,6 +802,50 @@ mod tests {
         })
     }
 
+    fn read_http_request(stream: &mut TcpStream) -> (String, Vec<u8>) {
+        let mut request = Vec::new();
+        let header_end = loop {
+            let mut buffer = [0; 1024];
+            let count = std::io::Read::read(stream, &mut buffer).unwrap();
+            assert_ne!(count, 0, "connection closed before HTTP headers");
+            request.extend_from_slice(&buffer[..count]);
+            if let Some(end) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+                break end + 4;
+            }
+        };
+        let headers = std::str::from_utf8(&request[..header_end]).unwrap();
+        let request_line = headers.lines().next().unwrap().to_string();
+        let content_length = headers
+            .lines()
+            .find_map(|line| {
+                line.split_once(':').and_then(|(name, value)| {
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().unwrap())
+                })
+            })
+            .unwrap_or(0);
+        while request.len() < header_end + content_length {
+            let mut buffer = [0; 1024];
+            let count = std::io::Read::read(stream, &mut buffer).unwrap();
+            assert_ne!(count, 0, "connection closed before HTTP body");
+            request.extend_from_slice(&buffer[..count]);
+        }
+        (
+            request_line,
+            request[header_end..header_end + content_length].to_vec(),
+        )
+    }
+
+    fn write_json_response(stream: &mut TcpStream, status: &str, body: &Value) {
+        let body = serde_json::to_vec(body).unwrap();
+        let response = format!(
+            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        std::io::Write::write_all(stream, response.as_bytes()).unwrap();
+        std::io::Write::write_all(stream, &body).unwrap();
+    }
+
     #[test]
     fn action_hash_is_deterministic_and_sensitive_to_terms() {
         let config = config();
@@ -763,6 +869,185 @@ mod tests {
         let second =
             prepare_action(&intent(authorization()), &config, 100, "nonce-2".into()).unwrap();
         assert_ne!(first.action_hash, second.action_hash);
+    }
+
+    #[test]
+    fn action_hash_is_sensitive_to_account_bound_request_context() {
+        let config = config();
+        let first_intent = intent_with_reason(authorization(), "Recurring subscription");
+        let changed_intent = intent_with_reason(
+            authorization(),
+            "Recurring subscription requested by a delegated agent",
+        );
+        assert_eq!(
+            first_intent.subscription_authorization(),
+            changed_intent.subscription_authorization()
+        );
+        assert_ne!(first_intent.message(), changed_intent.message());
+
+        let first = prepare_action(&first_intent, &config, 100, "nonce".into()).unwrap();
+        let changed = prepare_action(&changed_intent, &config, 100, "nonce".into()).unwrap();
+
+        assert_ne!(first.action_hash, changed.action_hash);
+    }
+
+    #[test]
+    fn approval_description_surfaces_duration_and_fee_payer_terms() {
+        let config = config();
+        let mut expiring = authorization();
+        expiring.subscription_expires = Some("2027-07-28T12:00:00Z".to_string());
+        expiring.fee_payer = true;
+        expiring.fee_payer_key = Some("fee-payer".to_string());
+        let expiring = prepare_action(&intent(expiring), &config, 100, "nonce".into()).unwrap();
+
+        assert!(
+            expiring
+                .description
+                .contains("challenge realm merchant.example")
+        );
+        assert!(
+            expiring
+                .description
+                .contains("Request context: authorize a payment from primary.")
+        );
+        assert!(
+            expiring
+                .description
+                .contains("reason: Recurring subscription")
+        );
+        assert!(expiring.description.contains("amount: $1.00"));
+        assert!(expiring.description.contains("operator: merchant.example"));
+        assert!(expiring.description.contains("merchant merchant"));
+        assert!(
+            expiring
+                .description
+                .contains("subscription program subscription-program")
+        );
+        assert!(expiring.description.contains("token program token-program"));
+        assert!(
+            expiring
+                .description
+                .contains("subscription expires at 2027-07-28T12:00:00Z")
+        );
+        assert!(
+            expiring
+                .description
+                .contains("activation transaction fee payer fee-payer")
+        );
+        assert!(
+            expiring
+                .description
+                .contains("external reference customer-plan")
+        );
+
+        let mut ongoing = authorization();
+        ongoing.external_id = None;
+        let ongoing = prepare_action(&intent(ongoing), &config, 100, "nonce".into()).unwrap();
+
+        assert!(
+            ongoing
+                .description
+                .contains("subscription continues until cancelled")
+        );
+        assert!(
+            ongoing
+                .description
+                .contains("subscriber is the activation transaction fee payer")
+        );
+        assert!(!ongoing.description.contains("external reference"));
+    }
+
+    #[test]
+    fn authenticates_through_init_status_and_jwks_http_flow() {
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let base_url = format!("http://{address}");
+        let server_base_url = base_url.clone();
+        let server = std::thread::spawn(move || {
+            let (mut init_stream, _) = listener.accept().unwrap();
+            let (request_line, body) = read_http_request(&mut init_stream);
+            assert_eq!(request_line, "POST /v1/human/attestation/init HTTP/1.1");
+            let init: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(init.as_object().unwrap().len(), 5);
+            assert_eq!(init["device_id"], "device-1");
+            assert_eq!(init["public_key"], "public-key");
+            assert_eq!(init["audience"], DEFAULT_AUDIENCE);
+            let action_hash = init["action_hash"].as_str().unwrap().to_string();
+            let description = init["action_description"].as_str().unwrap();
+            assert!(description.contains("challenge realm merchant.example"));
+            assert!(description.contains("authorize a payment from primary"));
+            assert!(description.contains("amount: $1.00"));
+            assert!(description.contains("subscription continues until cancelled"));
+            write_json_response(
+                &mut init_stream,
+                "201 Created",
+                &serde_json::json!({
+                    "session_id": "session-1",
+                    "verification_url": format!("{server_base_url}/verify/session-1"),
+                }),
+            );
+
+            let (mut status_stream, _) = listener.accept().unwrap();
+            let (request_line, _) = read_http_request(&mut status_stream);
+            assert_eq!(
+                request_line,
+                "GET /v1/human/attestation/session-1/status HTTP/1.1"
+            );
+            let jwt = sign_jwt(&signing_key, claims(now_unix().unwrap(), &action_hash));
+            write_json_response(
+                &mut status_stream,
+                "200 OK",
+                &serde_json::json!({
+                    "status": "completed",
+                    "attestation_jwt": jwt,
+                }),
+            );
+
+            let (mut jwks_stream, _) = listener.accept().unwrap();
+            let (request_line, _) = read_http_request(&mut jwks_stream);
+            assert_eq!(request_line, "GET /.well-known/jwks.json HTTP/1.1");
+            write_json_response(
+                &mut jwks_stream,
+                "200 OK",
+                &serde_json::json!({
+                    "keys": [{
+                        "kty": "OKP",
+                        "crv": "Ed25519",
+                        "x": URL_SAFE_NO_PAD.encode(signing_key.verifying_key().to_bytes()),
+                        "use": "sig",
+                        "alg": "EdDSA",
+                    }],
+                }),
+            );
+        });
+
+        let mut test_config = config();
+        test_config.api_base_url = base_url.clone();
+        test_config.jwks_url = format!("{base_url}/.well-known/jwks.json");
+        test_config.timeout = Duration::from_secs(5);
+        test_config.poll_interval = Duration::from_millis(1);
+        test_config.request_timeout = Duration::from_secs(5);
+        let gate = Ag9AuthGate::try_new(test_config).unwrap();
+
+        gate.authenticate(&intent(authorization())).unwrap();
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn distinguishes_human_denial_from_backend_failure() {
+        assert!(matches!(
+            map_auth_error(Ag9Error::Denied("rejected".to_string())),
+            KeystoreError::AuthDenied(_)
+        ));
+        assert!(matches!(
+            map_auth_error(Ag9Error::Timeout),
+            KeystoreError::Backend(_)
+        ));
+        assert!(matches!(
+            map_auth_error(Ag9Error::Verification("wrong action".to_string())),
+            KeystoreError::Backend(_)
+        ));
     }
 
     #[test]
