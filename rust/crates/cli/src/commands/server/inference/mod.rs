@@ -366,7 +366,8 @@ fn usage_to_info(usage: &pay_core::InferenceUsage) -> InferenceInfo {
 impl InferenceCommand {
     pub fn run(
         self,
-        active_account_name: Option<&str>,
+        legacy_signer_source: Option<&str>,
+        account_override: Option<&str>,
         global_sandbox: bool,
     ) -> pay_core::Result<()> {
         let sandbox = self.sandbox || global_sandbox;
@@ -408,17 +409,23 @@ impl InferenceCommand {
             let signer = if let Some(signer) = state.fee_payer_signer.clone() {
                 signer
             } else {
-                let source = active_account_name.ok_or_else(|| {
+                let intent = pay_core::keystore::AuthIntent::from_reason(
+                    "register your inference service in the pay provider registry",
+                );
+                let network = if sandbox { "localnet" } else { "mainnet" };
+                let signer = super::load_account_or_legacy_signer(
+                    network,
+                    account_override,
+                    legacy_signer_source,
+                    &intent,
+                )?
+                .ok_or_else(|| {
                     pay_core::Error::Config(
                         "provider registration requires an active account; pass --no-register to serve without publishing"
                             .to_string(),
                     )
                 })?;
-                let intent = pay_core::keystore::AuthIntent::from_reason(
-                    "register your inference service in the pay provider registry",
-                );
-                Arc::new(pay_core::signer::load_signer_with_intent(source, &intent)?)
-                    as Arc<dyn SolanaSigner>
+                Arc::new(signer) as Arc<dyn SolanaSigner>
             };
             let registration = super::provider_registration::ServiceRegistration::new(
                 "inference",

@@ -265,6 +265,7 @@ pub fn open_session_header(
 ///
 /// The transaction is signed by the payer and fee-payer/cosigned by the server
 /// when it processes the `open` action.
+#[allow(clippy::too_many_arguments)]
 pub fn open_payment_channel_session_header(
     challenge: &PaymentChallenge,
     request: &pay_kit::mpp::SessionRequest,
@@ -272,6 +273,7 @@ pub fn open_payment_channel_session_header(
     network_override: Option<&str>,
     account_override: Option<&str>,
     deposit: u64,
+    resource_url: &str,
     sandbox: bool,
 ) -> Result<(SessionHandle, String)> {
     open_payment_channel_session_header_with_mode(
@@ -282,11 +284,12 @@ pub fn open_payment_channel_session_header(
         account_override,
         deposit,
         pay_kit::mpp::SessionMode::Push,
+        resource_url,
         sandbox,
     )
 }
 
-/// Open a payment-channel session with an explicit submission mode.
+/// Open a payment-channel session in `submission_mode`.
 #[allow(clippy::too_many_arguments)]
 pub fn open_payment_channel_session_header_with_mode(
     challenge: &PaymentChallenge,
@@ -296,6 +299,7 @@ pub fn open_payment_channel_session_header_with_mode(
     account_override: Option<&str>,
     deposit: u64,
     submission_mode: pay_kit::mpp::SessionMode,
+    resource_url: &str,
     sandbox: bool,
 ) -> Result<(SessionHandle, String)> {
     use pay_kit::mpp::client::{
@@ -315,7 +319,14 @@ pub fn open_payment_channel_session_header_with_mode(
             .clone()
             .unwrap_or_else(|| "mainnet".to_string())
     });
-    let intent = crate::keystore::AuthIntent::open_session();
+    canonical_session_origin(resource_url)?;
+    let prompt_context = crate::client::prompt::payment_prompt_context(None, &[Some(resource_url)]);
+    let limit = session_spend_limit(deposit, request);
+    let intent = crate::keystore::AuthIntent::authorize_spend_up_to(
+        limit.usd_amount.as_deref(),
+        &limit.display,
+        &prompt_context.operator,
+    );
     let (signer, ephemeral_notice) = crate::signer::load_signer_for_network_with_intent(
         &network,
         store,
@@ -440,6 +451,56 @@ pub fn voucher_header_sync(handle: &SessionHandle, amount: u64) -> Result<String
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
+pub(crate) fn canonical_session_origin(resource_url: &str) -> Result<String> {
+    let url = reqwest::Url::parse(resource_url)
+        .map_err(|e| Error::Mpp(format!("invalid session authorization URL: {e}")))?;
+    if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+        return Err(Error::Mpp(
+            "session authorization URL must be an absolute HTTP(S) URL".to_string(),
+        ));
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(Error::Mpp(
+            "session authorization URL must not contain credentials".to_string(),
+        ));
+    }
+    Ok(url.origin().ascii_serialization())
+}
+
+struct SessionSpendLimit {
+    display: String,
+    usd_amount: Option<String>,
+}
+
+fn session_spend_limit(deposit: u64, request: &SessionRequest) -> SessionSpendLimit {
+    let stablecoin = pay_types::Stablecoin::from_mint(&request.currency)
+        .or_else(|| pay_types::Stablecoin::parse_symbol(&request.currency));
+
+    if let Some(stablecoin) = stablecoin {
+        let amount = crate::client::send::format_token_amount(deposit, stablecoin.decimals());
+        let usd = if !amount.contains('.') {
+            format!("{amount}.00")
+        } else if amount
+            .split_once('.')
+            .is_some_and(|(_, fraction)| fraction.len() == 1)
+        {
+            format!("{amount}0")
+        } else {
+            amount.clone()
+        };
+        let usd_amount = format!("${usd}");
+        SessionSpendLimit {
+            display: usd_amount.clone(),
+            usd_amount: Some(usd_amount),
+        }
+    } else {
+        SessionSpendLimit {
+            display: format!("{deposit} base units of {}", request.currency),
+            usd_amount: None,
+        }
+    }
+}
+
 fn build_header(challenge: &PaymentChallenge, action: &SessionAction) -> Result<String> {
     let credential = PaymentCredential::new(challenge.to_echo(), action);
     format_authorization(&credential)
@@ -519,6 +580,68 @@ mod tests {
         let non_session = test_challenge("charge").to_header().unwrap();
         assert!(SessionHandle::parse_challenge(&non_session).is_none());
         assert!(SessionHandle::parse_challenge("not a challenge").is_none());
+    }
+
+    #[test]
+    fn canonical_origin_normalizes_paths_case_and_default_ports() {
+        assert_eq!(
+            canonical_session_origin("HTTPS://Example.COM:443/v1/chat?model=test").unwrap(),
+            "https://example.com"
+        );
+        assert_eq!(
+            canonical_session_origin("http://localhost:1402/v1/chat").unwrap(),
+            "http://localhost:1402"
+        );
+    }
+
+    #[test]
+    fn canonical_origin_rejects_relative_non_http_and_credential_urls() {
+        for invalid in [
+            "/v1/chat",
+            "file:///tmp/provider",
+            "https://user:secret@example.com/v1/chat",
+        ] {
+            assert!(
+                canonical_session_origin(invalid).is_err(),
+                "accepted invalid session URL: {invalid}"
+            );
+        }
+    }
+
+    #[test]
+    fn spend_limit_displays_usd_amount() {
+        let mut request = test_request();
+        request.currency = "USDC".to_string();
+        request.decimals = Some(6);
+        let limit = session_spend_limit(1_000_000, &request);
+        assert_eq!(limit.display, "$1.00");
+        assert_eq!(limit.usd_amount.as_deref(), Some("$1.00"));
+    }
+
+    #[test]
+    fn spend_limit_uses_canonical_stablecoin_decimals() {
+        let mut request = test_request();
+        request.currency = "USDC".to_string();
+        request.decimals = Some(18);
+
+        let limit = session_spend_limit(1_000_000, &request);
+
+        assert_eq!(limit.display, "$1.00");
+        assert_eq!(limit.usd_amount.as_deref(), Some("$1.00"));
+    }
+
+    #[test]
+    fn spend_limit_does_not_trust_unknown_asset_decimals() {
+        let mut request = test_request();
+        request.decimals = Some(u8::MAX);
+
+        let limit = session_spend_limit(1_000_000, &request);
+
+        assert_eq!(
+            limit.display,
+            format!("1000000 base units of {}", request.currency)
+        );
+        assert_eq!(limit.usd_amount, None);
     }
 
     #[tokio::test]

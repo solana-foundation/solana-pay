@@ -105,6 +105,14 @@ pub struct ReceiptAnnotation {
     pub reference: Option<String>,
 }
 
+/// Bounded telemetry context carried from payment verification to the adapter's
+/// final upstream response. Authentication-only forwards leave this absent.
+pub struct PaidRequestTelemetry {
+    pub protocol: &'static str,
+    pub subdomain: String,
+    pub payment: Option<telemetry::PaymentAmount>,
+}
+
 /// Session-stream metering context for a forwarded session request. The
 /// adapter attaches it so the response-stream metering layer can debit the
 /// channel as bytes flow back.
@@ -219,7 +227,11 @@ pub async fn settle_delegated_session(
     )
     .map_err(|error| error.to_string())?;
     if actual.base_units == 0 {
-        pending.handle.touch_channel(pending.channel_id.clone());
+        pending
+            .handle
+            .touch_channel(pending.channel_id.clone())
+            .await
+            .map_err(|error| error.to_string())?;
         tracing::info!(
             channel = %pending.channel_id,
             "delegated MPP session response rated at zero"
@@ -270,6 +282,15 @@ pub struct UptoForward {
     /// Response-metered settlement plan. `None` preserves the legacy fixed
     /// success amount above.
     pub settlement: Option<metering::UptoSettlementPlan>,
+    /// Stable context needed to attribute the amount actually debited after
+    /// the upstream response has been metered.
+    pub telemetry: UptoPaymentTelemetry,
+}
+
+pub struct UptoPaymentTelemetry {
+    pub subdomain: String,
+    pub path: String,
+    pub ceiling_usd: f64,
 }
 
 /// The outcome of gating a request.
@@ -283,9 +304,10 @@ pub enum GateDecision {
     /// `receipt` is applied to the response. For x402 `upto`, `upto` carries the
     /// opened channel the adapter settles *after* the response.
     Forward {
-        session: Option<SessionForward>,
+        session: Option<Box<SessionForward>>,
         receipt: Option<ReceiptAnnotation>,
         upto: Option<Box<UptoForward>>,
+        paid_request: Option<PaidRequestTelemetry>,
     },
     /// Not gated (discovery / free / unknown) — let normal routing handle it
     /// (forward to the default upstream, or serve a control-plane route).
@@ -554,12 +576,16 @@ impl<S: PaymentState> PaymentGate<S> {
                         }
                     }
                     Err(e) => {
-                        tracing::error!(currency = sm.currency(), error = %e, "session challenge generation failed");
+                        telemetry::record_challenge_error(
+                            "mpp/session",
+                            sm.currency(),
+                            &e.to_string(),
+                        );
                         return gen_failed();
                     }
                 }
             }
-            advertised.push("session");
+            advertised.push("mpp/session");
         }
 
         if accepted.contains(&Scheme::MppCharge) {
@@ -590,7 +616,7 @@ impl<S: PaymentState> PaymentGate<S> {
                         Ok(c) => challenges.push(c),
                         Err(e) => {
                             telemetry::record_challenge_error(
-                                "mpp",
+                                "mpp/charge",
                                 mpp.currency(),
                                 &e.to_string(),
                             );
@@ -605,7 +631,7 @@ impl<S: PaymentState> PaymentGate<S> {
                                 challenge_headers.push((header::WWW_AUTHENTICATE, hv));
                             }
                         }
-                        advertised.push("mpp");
+                        advertised.push("mpp/charge");
                     }
                     Err(_) => return gen_failed(),
                 }
@@ -646,11 +672,17 @@ impl<S: PaymentState> PaymentGate<S> {
                         HeaderValue::from_str(&value),
                     ) {
                         challenge_headers.push((n, v));
-                        advertised.push("x402");
+                        advertised.push("x402/exact");
                     }
                 }
                 // Drop only the x402 challenge on error — MPP clients are unaffected.
-                Err(e) => tracing::warn!(error = %e, "x402 challenge generation failed"),
+                Err(e) => {
+                    telemetry::record_challenge_error(
+                        "x402/exact",
+                        x402.currency(),
+                        &e.to_string(),
+                    );
+                }
             }
         }
 
@@ -669,10 +701,12 @@ impl<S: PaymentState> PaymentGate<S> {
                         HeaderValue::from_str(&value),
                     ) {
                         challenge_headers.push((n, v));
-                        advertised.push("x402-upto");
+                        advertised.push("x402/upto");
                     }
                 }
-                Err(e) => tracing::warn!(error = %e, "x402 upto challenge generation failed"),
+                Err(e) => {
+                    telemetry::record_challenge_error("x402/upto", "configured", &e.to_string());
+                }
             }
         }
 
@@ -687,10 +721,12 @@ impl<S: PaymentState> PaymentGate<S> {
                         HeaderValue::from_str(&value),
                     ) {
                         challenge_headers.push((n, v));
-                        advertised.push("x402-batch");
+                        advertised.push("x402/batch");
                     }
                 }
-                Err(e) => tracing::warn!(error = %e, "x402 batch challenge generation failed"),
+                Err(e) => {
+                    telemetry::record_challenge_error("x402/batch", "configured", &e.to_string());
+                }
             }
         }
 
@@ -709,8 +745,13 @@ impl<S: PaymentState> PaymentGate<S> {
             .as_ref()
             .and_then(|p| p.dimensions.first())
             .map(|d| d.price_usd / d.scale.max(1) as f64);
+        let challenge_protocol = if advertised.len() == 1 {
+            advertised[0]
+        } else {
+            "mixed"
+        };
         telemetry::record_402_challenge_sent(
-            "mpp",
+            challenge_protocol,
             subdomain,
             path,
             req.method.as_str(),
@@ -767,8 +808,15 @@ impl<S: PaymentState> PaymentGate<S> {
         let amount = crate::server::payment::charge_amount_from_price(
             metering::resolve_price(meter, &props, variant.as_deref(), None).as_ref(),
         );
+        let payment = amount
+            .parse()
+            .ok()
+            .map(|ui_amount| telemetry::PaymentAmount {
+                currency: x402.currency().to_string(),
+                ui_amount,
+            });
         let reject = |msg: String| {
-            telemetry::record_settlement_error("x402", subdomain, path, &msg, true);
+            telemetry::record_settlement_error("x402/exact", subdomain, path, &msg, true);
             GateDecision::Respond(GateResponse::json(
                 StatusCode::PAYMENT_REQUIRED,
                 serde_json::to_vec(&json!({"error":"verification_failed","message":msg}))
@@ -806,7 +854,13 @@ impl<S: PaymentState> PaymentGate<S> {
         };
         match x402.settle_exact(verified, signer.as_ref()).await {
             Ok(reference) => {
-                telemetry::record_payment_collected("x402", subdomain, path, None, &reference);
+                telemetry::record_payment_collected(
+                    "x402/exact",
+                    subdomain,
+                    path,
+                    payment.as_ref(),
+                    &reference,
+                );
                 let mut headers = Vec::new();
                 if let Ok(n) = HeaderName::from_bytes(PAYMENT_RESPONSE_HEADER.as_bytes())
                     && let Ok(v) = HeaderValue::from_str(&reference)
@@ -820,6 +874,11 @@ impl<S: PaymentState> PaymentGate<S> {
                         reference: Some(reference),
                     }),
                     upto: None,
+                    paid_request: Some(PaidRequestTelemetry {
+                        protocol: "x402/exact",
+                        subdomain: subdomain.to_string(),
+                        payment,
+                    }),
                 }
             }
             Err(e) => reject(e.to_string()),
@@ -867,11 +926,27 @@ impl<S: PaymentState> PaymentGate<S> {
                         open: Box::new(open),
                         settle_amount,
                         settlement,
+                        telemetry: UptoPaymentTelemetry {
+                            subdomain: subdomain.to_string(),
+                            path: path.to_string(),
+                            ceiling_usd,
+                        },
                     })),
+                    paid_request: Some(PaidRequestTelemetry {
+                        protocol: "x402/upto",
+                        subdomain: subdomain.to_string(),
+                        payment: None,
+                    }),
                 }
             }
             Err(e) => {
-                telemetry::record_settlement_error("x402", subdomain, path, &e.to_string(), true);
+                telemetry::record_settlement_error(
+                    "x402/upto",
+                    subdomain,
+                    path,
+                    &e.to_string(),
+                    true,
+                );
                 GateDecision::Respond(GateResponse::json(
                     StatusCode::PAYMENT_REQUIRED,
                     serde_json::to_vec(
@@ -904,6 +979,13 @@ impl<S: PaymentState> PaymentGate<S> {
         let amount = crate::server::payment::charge_amount_from_price(
             metering::resolve_price(meter, &props, variant.as_deref(), None).as_ref(),
         );
+        let payment = amount
+            .parse()
+            .ok()
+            .map(|ui_amount| telemetry::PaymentAmount {
+                currency: "USD".to_string(),
+                ui_amount,
+            });
         match batch.verify_payment(pay_header, &amount).await {
             Ok(outcome) => {
                 let mut headers = Vec::new();
@@ -922,12 +1004,23 @@ impl<S: PaymentState> PaymentGate<S> {
                     .map(|c| c.channel_id.clone());
                 if outcome.serve {
                     if let Some(r) = &reference {
-                        telemetry::record_payment_collected("x402", subdomain, path, None, r);
+                        telemetry::record_payment_collected(
+                            "x402/batch",
+                            subdomain,
+                            path,
+                            payment.as_ref(),
+                            r,
+                        );
                     }
                     GateDecision::Forward {
                         session: None,
                         receipt: Some(ReceiptAnnotation { headers, reference }),
                         upto: None,
+                        paid_request: Some(PaidRequestTelemetry {
+                            protocol: "x402/batch",
+                            subdomain: subdomain.to_string(),
+                            payment,
+                        }),
                     }
                 } else {
                     // Cooperative refund / channel close — acknowledge, don't serve.
@@ -940,7 +1033,13 @@ impl<S: PaymentState> PaymentGate<S> {
                 }
             }
             Err(e) => {
-                telemetry::record_settlement_error("x402", subdomain, path, &e.to_string(), true);
+                telemetry::record_settlement_error(
+                    "x402/batch",
+                    subdomain,
+                    path,
+                    &e.to_string(),
+                    true,
+                );
                 GateDecision::Respond(GateResponse::json(
                     StatusCode::PAYMENT_REQUIRED,
                     serde_json::to_vec(
@@ -1020,7 +1119,11 @@ impl<S: PaymentState> PaymentGate<S> {
                     }
                 }
                 Err(e) => {
-                    tracing::error!(error = %e, "subscription challenge generation failed");
+                    telemetry::record_challenge_error(
+                        "mpp/subscription",
+                        "configured",
+                        &e.to_string(),
+                    );
                     return GateDecision::Respond(GateResponse::json(
                         StatusCode::INTERNAL_SERVER_ERROR,
                         Bytes::from_static(br#"{"error":"subscription_misconfigured"}"#),
@@ -1036,12 +1139,12 @@ impl<S: PaymentState> PaymentGate<S> {
                 headers.push((header::WWW_AUTHENTICATE, v));
             }
             telemetry::record_402_challenge_sent(
-                "mpp-subscription",
+                "mpp/subscription",
                 subdomain,
                 path,
                 req.method.as_str(),
                 None,
-                "subscription",
+                "mpp/subscription",
                 1,
             );
             let body = match error {
@@ -1090,6 +1193,11 @@ impl<S: PaymentState> PaymentGate<S> {
                     session: None,
                     receipt: None,
                     upto: None,
+                    paid_request: Some(PaidRequestTelemetry {
+                        protocol: "mpp/subscription",
+                        subdomain: subdomain.to_string(),
+                        payment: None,
+                    }),
                 };
             }
             return challenge_402(None);
@@ -1134,11 +1242,16 @@ impl<S: PaymentState> PaymentGate<S> {
                         reference: Some(receipt_kind.base().reference.clone()),
                     }),
                     upto: None,
+                    paid_request: Some(PaidRequestTelemetry {
+                        protocol: "mpp/subscription",
+                        subdomain: subdomain.to_string(),
+                        payment: None,
+                    }),
                 }
             }
             Err(e) => {
                 telemetry::record_settlement_error(
-                    "mpp-subscription",
+                    "mpp/subscription",
                     subdomain,
                     path,
                     &e.message,
@@ -1201,7 +1314,7 @@ impl<S: PaymentState> PaymentGate<S> {
         let external_id = match mpp_charge_payment_external_id(&credential, resource) {
             Ok(external_id) => external_id,
             Err(e) => {
-                telemetry::record_settlement_error("mpp", subdomain, path, &e, false);
+                telemetry::record_settlement_error("mpp/charge", subdomain, path, &e, false);
                 return GateDecision::Respond(GateResponse::json(
                     StatusCode::PAYMENT_REQUIRED,
                     serde_json::to_vec(&json!({
@@ -1259,7 +1372,7 @@ impl<S: PaymentState> PaymentGate<S> {
                         mpp.decimals() as u8,
                     );
                     telemetry::record_payment_collected(
-                        "mpp",
+                        "mpp/charge",
                         subdomain,
                         path,
                         payment.as_ref(),
@@ -1289,6 +1402,11 @@ impl<S: PaymentState> PaymentGate<S> {
                             reference: Some(reference),
                         }),
                         upto: None,
+                        paid_request: Some(PaidRequestTelemetry {
+                            protocol: "mpp/charge",
+                            subdomain: subdomain.to_string(),
+                            payment,
+                        }),
                     };
                 }
                 Err(e) => last_error = Some(e),
@@ -1297,7 +1415,13 @@ impl<S: PaymentState> PaymentGate<S> {
 
         let error = last_error.unwrap_or_else(|| VerificationError::new("MPP not configured"));
         let message = crate::server::payment::readable_verification_message(&error);
-        telemetry::record_settlement_error("mpp", subdomain, path, &message, error.retryable);
+        telemetry::record_settlement_error(
+            "mpp/charge",
+            subdomain,
+            path,
+            &message,
+            error.retryable,
+        );
         GateDecision::Respond(GateResponse::json(
             StatusCode::PAYMENT_REQUIRED,
             serde_json::to_vec(&json!({
@@ -1351,6 +1475,7 @@ pub async fn settle_upto<S: PaymentState>(
     open: VerifiedUptoOpen,
     settle_amount: u64,
     served_ok: bool,
+    telemetry_context: UptoPaymentTelemetry,
 ) -> Option<(HeaderName, HeaderValue)> {
     let upto = state.x402_upto()?;
     // Settle the configured voucher (clamped to the ceiling) on success, full
@@ -1360,22 +1485,49 @@ pub async fn settle_upto<S: PaymentState>(
     } else {
         0
     };
+    let amount_usd = served_ok
+        .then(|| upto_collected_amount_usd(telemetry_context.ceiling_usd, amount, open.max_amount))
+        .flatten();
     match upto.settle_actual_deferred(&open, amount).await {
         Ok(settlement) => {
             tracing::Span::current().record("tx_sig", settlement.transaction.as_str());
+            if let Some(ui_amount) = amount_usd {
+                telemetry::record_payment_collected(
+                    "x402/upto",
+                    &telemetry_context.subdomain,
+                    &telemetry_context.path,
+                    Some(&telemetry::PaymentAmount {
+                        currency: "USD".to_string(),
+                        ui_amount,
+                    }),
+                    &settlement.transaction,
+                );
+            }
             match upto.settlement_header(&settlement) {
                 Ok((name, value)) => Some((
                     HeaderName::from_bytes(name.as_bytes()).ok()?,
                     HeaderValue::from_str(&value).ok()?,
                 )),
                 Err(e) => {
-                    tracing::warn!(error = %e, "x402 upto settlement header generation failed");
+                    telemetry::record_settlement_error(
+                        "x402/upto",
+                        &telemetry_context.subdomain,
+                        &telemetry_context.path,
+                        &e.to_string(),
+                        true,
+                    );
                     None
                 }
             }
         }
         Err(e) => {
-            tracing::error!(error = %e, "x402 upto settlement failed; channel left for sweep");
+            telemetry::record_settlement_error(
+                "x402/upto",
+                &telemetry_context.subdomain,
+                &telemetry_context.path,
+                &e.to_string(),
+                true,
+            );
             None
         }
     }
@@ -1393,9 +1545,10 @@ pub async fn settle_upto_metered<S: PaymentState>(
     served_ok: bool,
     response_headers: &http::HeaderMap,
     response_body: Option<&[u8]>,
+    telemetry_context: UptoPaymentTelemetry,
 ) -> Option<(HeaderName, HeaderValue)> {
     if !served_ok {
-        return settle_upto(state, open, 0, false).await;
+        return settle_upto(state, open, 0, false, telemetry_context).await;
     }
 
     let amount = match metering::upto_actual_amount_from_response(
@@ -1406,12 +1559,27 @@ pub async fn settle_upto_metered<S: PaymentState>(
     ) {
         Ok(actual) => actual.base_units,
         Err(e) => {
-            tracing::warn!(error = %e, "x402 upto response-metered settlement failed; refunding");
+            telemetry::record_settlement_error(
+                "x402/upto",
+                &telemetry_context.subdomain,
+                &telemetry_context.path,
+                &e.to_string(),
+                false,
+            );
             0
         }
     };
 
-    settle_upto(state, open, amount, true).await
+    settle_upto(state, open, amount, true, telemetry_context).await
+}
+
+fn upto_collected_amount_usd(
+    ceiling_usd: f64,
+    settled_base_units: u64,
+    maximum_base_units: u64,
+) -> Option<f64> {
+    (settled_base_units > 0 && maximum_base_units > 0)
+        .then_some(ceiling_usd * settled_base_units as f64 / maximum_base_units as f64)
 }
 
 /// Reconstruct a minimal URI from path + query for split-rule resolution.
@@ -1558,13 +1726,28 @@ async fn session_authorized(
                     .unwrap_or_default(),
                 ));
             }
-            let Some(reservation) =
-                handle.reserve_delegated_capacity(&state.channel_id, available_base_units)
-            else {
-                return GateDecision::Respond(GateResponse::json(
-                    StatusCode::PAYMENT_REQUIRED,
-                    Bytes::from_static(br#"{"error":"session_capacity_reserved","message":"Another request is currently using this session capacity."}"#),
-                ));
+            let reservation = match handle
+                .reserve_delegated_capacity(&state.channel_id, available_base_units)
+                .await
+            {
+                Ok(Some(reservation)) => reservation,
+                Ok(None) => {
+                    return GateDecision::Respond(GateResponse::json(
+                        StatusCode::PAYMENT_REQUIRED,
+                        Bytes::from_static(br#"{"error":"session_capacity_reserved","message":"Another request is currently using this session capacity."}"#),
+                    ));
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        channel_id = %state.channel_id,
+                        %error,
+                        "failed to wake delegated session channel"
+                    );
+                    return GateDecision::Respond(GateResponse::json(
+                        StatusCode::PAYMENT_REQUIRED,
+                        Bytes::from_static(br#"{"error":"session_close_pending","message":"The session channel is closing; open a new session."}"#),
+                    ));
+                }
             };
             let props = metering::RequestProperties {
                 body_size: req.content_length,
@@ -1580,47 +1763,50 @@ async fn session_authorized(
                 inferred_usage: None,
             };
             GateDecision::Forward {
-                session: Some(SessionForward::delegated(
+                session: Some(Box::new(SessionForward::delegated(
                     handle,
                     state.channel_id,
                     state.cumulative,
                     settlement,
                     available_base_units,
                     reservation,
-                )),
+                ))),
                 receipt: signature
                     .map(|reference| session_receipt_annotation(sm.network(), reference)),
                 upto: None,
+                paid_request: Some(PaidRequestTelemetry {
+                    protocol: "mpp/session",
+                    subdomain: subdomain.to_string(),
+                    payment: None,
+                }),
             }
         }
         Ok(SessionOutcome::Voucher {
             channel_id,
             cumulative,
         }) => GateDecision::Forward {
-            session: handle.map(|h| SessionForward {
-                handle: h,
-                channel_id,
-                committed_base_units: cumulative,
-                settlement: None,
-                available_base_units: 0,
-                _reservation: None,
+            session: handle.map(|h| {
+                Box::new(SessionForward {
+                    handle: h,
+                    channel_id,
+                    committed_base_units: cumulative,
+                    settlement: None,
+                    available_base_units: 0,
+                    _reservation: None,
+                })
             }),
             receipt: None,
             upto: None,
+            paid_request: Some(PaidRequestTelemetry {
+                protocol: "mpp/session",
+                subdomain: subdomain.to_string(),
+                payment: None,
+            }),
         },
-        Ok(SessionOutcome::Commit(receipt)) => {
-            telemetry::record_paid_request_completed(
-                "session",
-                subdomain,
-                path,
-                StatusCode::OK,
-                None,
-            );
-            GateDecision::Respond(GateResponse::json(
-                StatusCode::OK,
-                serde_json::to_vec(&receipt).unwrap_or_default(),
-            ))
-        }
+        Ok(SessionOutcome::Commit(receipt)) => GateDecision::Respond(GateResponse::json(
+            StatusCode::OK,
+            serde_json::to_vec(&receipt).unwrap_or_default(),
+        )),
         Ok(SessionOutcome::Closed { signature, .. }) => {
             let receipt_url = signature
                 .as_deref()
@@ -1641,7 +1827,13 @@ async fn session_authorized(
             GateDecision::Respond(resp)
         }
         Err(e) => {
-            telemetry::record_settlement_error("session", subdomain, path, &e.to_string(), true);
+            telemetry::record_settlement_error(
+                "mpp/session",
+                subdomain,
+                path,
+                &e.to_string(),
+                true,
+            );
             GateDecision::Respond(GateResponse::json(
                 StatusCode::PAYMENT_REQUIRED,
                 serde_json::to_vec(&json!({
@@ -1726,6 +1918,16 @@ mod tests {
             upto_settle_amount(Some(0.01), 0.0, CEILING_BASE),
             CEILING_BASE
         );
+    }
+
+    #[test]
+    fn upto_collected_amount_reports_the_debited_fraction_of_the_ceiling() {
+        assert_eq!(
+            upto_collected_amount_usd(0.10, 25_000, 100_000),
+            Some(0.025)
+        );
+        assert_eq!(upto_collected_amount_usd(0.10, 0, 100_000), None);
+        assert_eq!(upto_collected_amount_usd(0.10, 1, 0), None);
     }
 
     #[test]

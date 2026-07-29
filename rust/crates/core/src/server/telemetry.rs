@@ -21,6 +21,35 @@ pub const METRIC_CHALLENGE_AMOUNT_USD: &str = "pay_402_challenge_amount_usd";
 pub const METRIC_FEE_PAYER_WALLET_SOL: &str = "pay_fee_payer_wallet_sol";
 pub const METRIC_FEE_PAID_SOL: &str = "pay_fee_paid_sol_total";
 pub const METRIC_FEE_PAYER_BALANCE_ERRORS: &str = "pay_fee_payer_balance_errors_total";
+pub const METRIC_PAYMENT_CHANNELS_OPENED: &str = "pay_payment_channels_opened_total";
+pub const METRIC_PAYMENT_CHANNELS_CLOSED: &str = "pay_payment_channels_closed_total";
+pub const METRIC_PAYMENT_CHANNEL_ESCROWED: &str = "pay_payment_channel_escrowed_base_units";
+pub const METRIC_PAYMENT_CHANNEL_CLIENT: &str = "pay_payment_channel_client";
+pub const METRIC_PAYMENT_CHANNEL_VOUCHER_CUMULATIVE: &str =
+    "pay_payment_channel_voucher_cumulative_base_units";
+
+/// Create the bounded session-lifecycle counter series before the server
+/// accepts traffic. The CLI force-flushes these zero values so Prometheus has
+/// a real baseline even when the first request opens a channel immediately.
+pub fn record_metric_baselines() {
+    tracing::info!(
+        monotonic_counter.pay_payment_channels_opened_total = 0_u64,
+        protocol = "mpp/session",
+        channel_kind = "payment_channel",
+        verification = "account_confirmed",
+        metric = METRIC_PAYMENT_CHANNELS_OPENED,
+        "payment-channel open confirmed",
+    );
+    for retryable in [true, false] {
+        tracing::info!(
+            monotonic_counter.pay_payment_settlement_errors_total = 0_u64,
+            protocol = "mpp/session",
+            retryable,
+            metric = METRIC_SETTLEMENT_ERRORS,
+            "payment settlement failed",
+        );
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct PaymentAmount {
@@ -34,8 +63,6 @@ pub struct PaymentAmount {
 /// other than `"periodic"`) always warn so they surface for the
 /// in-flight request that just lost telemetry.
 const PERIODIC_WARN_AFTER_CONSECUTIVE_FAILURES: u64 = 5;
-const MAX_METRIC_ERROR_LABEL_BYTES: usize = 512;
-
 /// Timeout for a single `getBalance` round-trip. Without this, a stalled
 /// RPC connection can hang the periodic probe forever and accumulate
 /// warning noise on the next interval tick.
@@ -79,7 +106,6 @@ impl FeePayerWallet {
                     gauge.pay_fee_payer_wallet_sol = sol,
                     reason,
                     subdomain = %subdomain,
-                    path = %path,
                     wallet = %self.address,
                     metric = METRIC_FEE_PAYER_WALLET_SOL,
                     "fee payer wallet balance observed",
@@ -91,7 +117,6 @@ impl FeePayerWallet {
                         monotonic_counter.pay_fee_paid_sol_total = fee_paid_sol,
                         reason,
                         subdomain = %subdomain,
-                        path = %path,
                         wallet = %self.address,
                         metric = METRIC_FEE_PAID_SOL,
                         "fee payer SOL spend observed",
@@ -111,9 +136,16 @@ impl FeePayerWallet {
                 let is_periodic = reason == "periodic";
                 let should_warn =
                     !is_periodic || failures >= PERIODIC_WARN_AFTER_CONSECUTIVE_FAILURES;
+                tracing::info!(
+                    monotonic_counter.pay_fee_payer_balance_errors_total = 1_u64,
+                    reason,
+                    subdomain = %subdomain,
+                    wallet = %self.address,
+                    metric = METRIC_FEE_PAYER_BALANCE_ERRORS,
+                    "fee payer wallet balance observation failed",
+                );
                 if should_warn {
                     tracing::warn!(
-                        monotonic_counter.pay_fee_payer_balance_errors_total = 1_u64,
                         reason,
                         subdomain = %subdomain,
                         path = %path,
@@ -125,7 +157,6 @@ impl FeePayerWallet {
                     );
                 } else {
                     tracing::debug!(
-                        monotonic_counter.pay_fee_payer_balance_errors_total = 1_u64,
                         reason,
                         subdomain = %subdomain,
                         path = %path,
@@ -193,7 +224,7 @@ pub fn record_402_challenge_sent(
     path: &str,
     method: &str,
     amount_usd: Option<f64>,
-    currencies: &str,
+    schemes: &str,
     challenge_count: usize,
 ) {
     if let Some(amount_usd) = amount_usd {
@@ -202,10 +233,8 @@ pub fn record_402_challenge_sent(
             histogram.pay_402_challenge_amount_usd = amount_usd,
             protocol,
             subdomain = %subdomain,
-            path = %path,
             http_method = %method,
-            currency = %currencies,
-            challenge_count = challenge_count as u64,
+            schemes = %schemes,
             metric = METRIC_402_RESPONSES,
             "402 payment challenge sent",
         );
@@ -214,14 +243,21 @@ pub fn record_402_challenge_sent(
             monotonic_counter.pay_402_responses_total = 1_u64,
             protocol,
             subdomain = %subdomain,
-            path = %path,
             http_method = %method,
-            currency = %currencies,
-            challenge_count = challenge_count as u64,
+            schemes = %schemes,
             metric = METRIC_402_RESPONSES,
             "402 payment challenge sent",
         );
     }
+    tracing::debug!(
+        protocol,
+        subdomain = %subdomain,
+        path = %path,
+        http_method = %method,
+        schemes = %schemes,
+        challenge_count,
+        "402 payment challenge details",
+    );
 }
 
 pub fn record_challenge_error(protocol: &'static str, currency: &str, error: &str) {
@@ -229,9 +265,14 @@ pub fn record_challenge_error(protocol: &'static str, currency: &str, error: &st
         monotonic_counter.pay_402_challenge_errors_total = 1_u64,
         protocol,
         currency = %currency,
-        error = %error,
         metric = METRIC_CHALLENGE_ERRORS,
         "payment challenge generation failed",
+    );
+    tracing::error!(
+        protocol,
+        currency = %currency,
+        error = %error,
+        "payment challenge generation error details",
     );
 }
 
@@ -243,16 +284,24 @@ pub fn record_payment_collected(
     reference: &str,
 ) {
     match payment {
-        Some(payment) => tracing::info!(
-            monotonic_counter.pay_payments_collected_usd_total = payment.ui_amount,
-            protocol,
-            subdomain = %subdomain,
-            path = %path,
-            currency = %payment.currency,
-            reference = %reference,
-            metric = METRIC_PAYMENTS_COLLECTED_USD,
-            "payment collected",
-        ),
+        Some(payment) => {
+            tracing::info!(
+                monotonic_counter.pay_payments_collected_usd_total = payment.ui_amount,
+                protocol,
+                subdomain = %subdomain,
+                metric = METRIC_PAYMENTS_COLLECTED_USD,
+                "payment collected",
+            );
+            tracing::info!(
+                protocol,
+                subdomain = %subdomain,
+                path = %path,
+                currency = %payment.currency,
+                amount_usd = payment.ui_amount,
+                reference = %reference,
+                "payment collection details",
+            );
+        }
         None => tracing::info!(
             protocol,
             subdomain = %subdomain,
@@ -276,10 +325,8 @@ pub fn record_paid_request_completed(
                 monotonic_counter.pay_402_requests_successful_total = 1_u64,
                 protocol,
                 subdomain = %subdomain,
-                path = %path,
                 status = status.as_u16() as u64,
                 currency = %payment.currency,
-                amount_usd = payment.ui_amount,
                 metric = METRIC_402_SUCCESS,
                 "paid request completed",
             ),
@@ -287,7 +334,6 @@ pub fn record_paid_request_completed(
                 monotonic_counter.pay_402_requests_successful_total = 1_u64,
                 protocol,
                 subdomain = %subdomain,
-                path = %path,
                 status = status.as_u16() as u64,
                 metric = METRIC_402_SUCCESS,
                 "paid request completed",
@@ -300,12 +346,19 @@ pub fn record_paid_request_completed(
             monotonic_counter.pay_paid_delivery_errors_total = 1_u64,
             protocol,
             subdomain = %subdomain,
-            path = %path,
             status = status.as_u16() as u64,
             metric = METRIC_PAID_DELIVERY_ERRORS,
             "paid upstream delivery failed",
         );
     }
+    tracing::debug!(
+        protocol,
+        subdomain = %subdomain,
+        path = %path,
+        status = status.as_u16() as u64,
+        amount_usd = payment.map(|amount| amount.ui_amount),
+        "paid request completion details",
+    );
 }
 
 pub fn record_settlement_error(
@@ -315,39 +368,110 @@ pub fn record_settlement_error(
     error: &str,
     retryable: bool,
 ) {
-    let error = bounded_metric_label(error, MAX_METRIC_ERROR_LABEL_BYTES);
     tracing::warn!(
         monotonic_counter.pay_payment_settlement_errors_total = 1_u64,
+        protocol,
+        retryable,
+        metric = METRIC_SETTLEMENT_ERRORS,
+        "payment settlement failed",
+    );
+    tracing::warn!(
         protocol,
         subdomain = %subdomain,
         path = %path,
         retryable,
         error = %error,
-        metric = METRIC_SETTLEMENT_ERRORS,
-        "payment settlement failed",
+        "payment settlement error details",
     );
-}
-
-fn bounded_metric_label(value: &str, max_bytes: usize) -> &str {
-    if value.len() <= max_bytes {
-        return value;
-    }
-    let mut end = max_bytes;
-    while !value.is_char_boundary(end) {
-        end -= 1;
-    }
-    &value[..end]
 }
 
 pub fn record_upstream_error(subdomain: &str, path: &str, upstream: &str, error: &str) {
     tracing::error!(
         monotonic_counter.pay_upstream_errors_total = 1_u64,
         subdomain = %subdomain,
+        metric = METRIC_UPSTREAM_ERRORS,
+        "upstream request failed",
+    );
+    tracing::error!(
+        subdomain = %subdomain,
         path = %path,
         upstream = %upstream,
         error = %error,
-        metric = METRIC_UPSTREAM_ERRORS,
-        "upstream request failed",
+        "upstream request error details",
+    );
+}
+
+pub fn record_payment_channel_closed(signature: &str, channel: &str) {
+    tracing::info!(
+        monotonic_counter.pay_payment_channels_closed_total = 1_u64,
+        protocol = "mpp/session",
+        metric = METRIC_PAYMENT_CHANNELS_CLOSED,
+        "payment-channel settlement confirmed",
+    );
+    tracing::info!(
+        signature = %signature,
+        channel = %channel,
+        "payment-channel settlement details",
+    );
+}
+
+pub fn record_payment_channel_opened(
+    signature: &str,
+    channel: &str,
+    client_id: &str,
+    currency: &str,
+    network: &str,
+    escrowed: u64,
+) {
+    tracing::info!(
+        monotonic_counter.pay_payment_channels_opened_total = 1_u64,
+        protocol = "mpp/session",
+        channel_kind = "payment_channel",
+        verification = "account_confirmed",
+        metric = METRIC_PAYMENT_CHANNELS_OPENED,
+        "payment-channel open confirmed",
+    );
+    tracing::info!(
+        gauge.pay_payment_channel_escrowed_base_units = escrowed,
+        channel_id = channel,
+        currency,
+        network,
+        protocol = "mpp/session",
+        metric = METRIC_PAYMENT_CHANNEL_ESCROWED,
+        "payment-channel escrow confirmed",
+    );
+    tracing::info!(
+        gauge.pay_payment_channel_client = 1_u64,
+        client_id,
+        protocol = "mpp/session",
+        metric = METRIC_PAYMENT_CHANNEL_CLIENT,
+        "payment-channel client confirmed",
+    );
+    tracing::info!(
+        signature = %signature,
+        channel = %channel,
+        "payment-channel open details",
+    );
+}
+
+/// Record the latest cumulative voucher only after it has been accepted and
+/// persisted. The channel id is intentionally a metric attribute: the
+/// settlement dashboard pairs this proxy-side watermark with the worker's
+/// confirmed on-chain watermark to derive the value still at risk.
+pub fn record_payment_channel_voucher_cumulative(
+    channel_id: &str,
+    currency: &str,
+    network: &str,
+    cumulative: u64,
+) {
+    tracing::info!(
+        gauge.pay_payment_channel_voucher_cumulative_base_units = cumulative,
+        channel_id,
+        currency,
+        network,
+        protocol = "mpp/session",
+        metric = METRIC_PAYMENT_CHANNEL_VOUCHER_CUMULATIVE,
+        "payment-channel voucher persisted",
     );
 }
 
@@ -390,15 +514,5 @@ mod tests {
     fn paid_delivery_error_is_5xx() {
         assert!(is_paid_delivery_error(StatusCode::BAD_GATEWAY));
         assert!(!is_paid_delivery_error(StatusCode::BAD_REQUEST));
-    }
-
-    #[test]
-    fn metric_error_labels_are_bounded_on_utf8_boundaries() {
-        let error = format!("{}failure", "é".repeat(300));
-        let bounded = bounded_metric_label(&error, MAX_METRIC_ERROR_LABEL_BYTES);
-
-        assert!(bounded.len() <= MAX_METRIC_ERROR_LABEL_BYTES);
-        assert!(bounded.is_char_boundary(bounded.len()));
-        assert_eq!(bounded.len(), 512);
     }
 }

@@ -32,7 +32,12 @@ pub struct DemoCommand {
 }
 
 impl DemoCommand {
-    pub fn run(self, active_account_name: Option<&str>, _sandbox: bool) -> pay_core::Result<()> {
+    pub fn run(
+        self,
+        legacy_signer_source: Option<&str>,
+        account_override: Option<&str>,
+        _sandbox: bool,
+    ) -> pay_core::Result<()> {
         // Extract embedded spec to ./pay-demo.yaml in the current directory
         let spec_path = std::path::PathBuf::from("pay-demo.yaml");
         std::fs::write(&spec_path, DEMO_SPEC)
@@ -59,6 +64,6 @@ impl DemoCommand {
             no_register: false,
             scaffolded_spec: Some("./pay-demo.yaml".to_string()),
         };
-        cmd.run(active_account_name, true)
+        cmd.run(legacy_signer_source, account_override, true)
     }
 }

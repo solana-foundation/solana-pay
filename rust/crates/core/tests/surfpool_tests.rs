@@ -470,12 +470,16 @@ async fn push_session_full_flow() {
     use pay_core::PaymentState;
     use pay_core::server::session::SessionMpp;
     use pay_kit::mpp::client::session::ActiveSession;
+    use pay_kit::mpp::program::payment_channels::generated::generated::{
+        accounts::Channel, types::SettlementWatermarks,
+    };
     use pay_kit::mpp::server::session::SessionConfig;
     use pay_kit::mpp::solana_keychain::memory::MemorySigner;
     use pay_kit::mpp::{
         PaymentCredential, SessionMode, format_authorization, parse_www_authenticate,
     };
     use pay_types::metering::ApiSpec;
+    use std::str::FromStr;
     use std::sync::Arc;
 
     // ── App state ──────────────────────────────────────────────────────────
@@ -595,13 +599,84 @@ async fn push_session_full_flow() {
     )
     .await;
 
-    // Channel ID is any valid Solana pubkey (would be the real Fiber channel
-    // in production; here it's just a key for the in-memory store).
-    let channel_id = Keypair::new().pubkey();
+    // Surfpool does not load the payment-channels program for this middleware
+    // integration test, so install the account state that a confirmed open
+    // would have created. The server now requires both the confirmed open
+    // signature and the channel account before it creates session state.
+    let deposit = 1_000_000u64; // 1 USDC
+    let mint = solana_pubkey::Pubkey::from_str(pay_kit::mpp::mints::USDC_MAINNET).unwrap();
+    let token_program =
+        solana_pubkey::Pubkey::from_str(pay_kit::mpp::programs::TOKEN_PROGRAM).unwrap();
+    let salt = 42;
+    let open_slot = pay_kit::mpp::solana_rpc_client::rpc_client::RpcClient::new(rpc_url.clone())
+        .get_slot()
+        .unwrap();
+    let grace_period = 900;
+    let program_id = pay_kit::mpp::program::payment_channels::default_program_id();
+    let open_params = pay_kit::mpp::program::payment_channels::OpenChannelParams {
+        payer: client_kp.pubkey(),
+        rent_payer: operator.pubkey(),
+        payee: recipient.pubkey(),
+        mint,
+        authorized_signer: session_kp.pubkey(),
+        salt,
+        open_slot,
+        deposit,
+        grace_period,
+        recipients: vec![],
+        token_program,
+        program_id,
+    };
+    let channel_id =
+        pay_kit::mpp::program::payment_channels::derive_channel_addresses(&open_params).channel;
+    let (_, bump) = pay_kit::mpp::program::payment_channels::find_channel_pda(
+        &open_params.payer,
+        &open_params.payee,
+        &open_params.mint,
+        &open_params.authorized_signer,
+        open_params.salt,
+        open_params.open_slot,
+        &open_params.program_id,
+    );
+    let channel = Channel {
+        discriminator: 1,
+        version: 1,
+        bump,
+        status: 0,
+        salt,
+        deposit,
+        settlement: SettlementWatermarks {
+            settled: 0,
+            payout_watermark: 0,
+        },
+        closure_started_at: 0,
+        payer_withdrawn_at: 0,
+        grace_period,
+        distribution_hash: [0; 32],
+        payer: client_kp.pubkey(),
+        payee: recipient.pubkey(),
+        authorized_signer: session_kp.pubkey(),
+        mint,
+        rent_payer: operator.pubkey(),
+        open_slot,
+    };
+    let channel_data = borsh::to_vec(&channel).unwrap();
+    surfnet
+        .cheatcodes()
+        .set_account(&channel_id, 1_000_000, &channel_data, &program_id)
+        .unwrap();
     let mut active = ActiveSession::new(channel_id, session_signer);
 
-    let deposit = 1_000_000u64; // 1 USDC
-    let open_action = active.open_action(deposit, &open_tx_sig);
+    let open_action = active.open_payment_channel_action(
+        deposit,
+        &client_kp.pubkey().to_string(),
+        &recipient.pubkey().to_string(),
+        &mint.to_string(),
+        salt,
+        grace_period,
+        open_slot,
+        &open_tx_sig,
+    );
     let auth =
         format_authorization(&PaymentCredential::new(challenge.to_echo(), open_action)).unwrap();
 
@@ -613,12 +688,16 @@ async fn push_session_full_flow() {
         .send()
         .await
         .unwrap();
+    let status = resp.status();
+    let body = resp.text().await.unwrap();
     assert_eq!(
-        resp.status(),
-        402,
+        status, 402,
         "open should acknowledge with 402, got {}: {}",
-        resp.status(),
-        resp.text().await.unwrap()
+        status, body
+    );
+    assert!(
+        body.contains("session_voucher_required"),
+        "open should request the first voucher, got: {body}"
     );
 
     // ── Step 3: Voucher (subsequent API call) ──────────────────────────────

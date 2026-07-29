@@ -1,0 +1,136 @@
+# Xtream IPTV gate — stablecoin-gate an existing Xtream-Codes panel.
+# =============================================================================
+# Puts a pay 402 gate in front of an Xtream panel so clients pay in USDC to
+# browse and resolve streams. The panel password is injected server-side from
+# $XT_PASS and never appears in this file.
+#
+# Sandbox test (no real funds):
+#   XT_PASS=... cargo run -p pay -- --sandbox server start xtream-gate.yaml
+#   cargo run -p pay -- --sandbox curl \
+#     "http://127.0.0.1:1402/player_api.php?username=<PANEL_USER>&action=get_live_categories"
+#
+# Verified against pay 0.22.0. Notes on the design choices below.
+#
+# ── How Xtream carries credentials (and how we inject them) ──────────────────
+# Xtream puts username+password in EVERY request, two different ways:
+#   • player_api.php?username=U&password=P&action=…   (query params)
+#   • /live|movie|series/U/P/ID.ext                    (path segments)
+# The client sends the username (not the secret — it is echoed everywhere) and
+# a throwaway password; the gate supplies the real password from $XT_PASS.
+#
+#   - Query: `auth: query_param` appends `password=$XT_PASS`. Standard XUI/PHP
+#     panels take the LAST value when a param repeats, so the injected one wins
+#     over the client's throwaway. (If your panel doesn't, have the client omit
+#     the password entirely — televisor "gateway account" mode.)
+#   - Path: a single path_rewrite forces all its {placeholders} to one env
+#     value, so we anchor on the KNOWN, STATIC username as a literal and rewrite
+#     only the password segment.
+#
+# ── Security reality (read before relying on this) ───────────────────────────
+# This is a FORWARD proxy: it does not rewrite response bodies or upstream
+# redirects. So a determined *paying* client can still recover the panel
+# password, because Xtream leaks it back:
+#   1. player_api.php with NO action returns `user_info` echoing the password.
+#      → Don't rely on the gate to hide it; either accept that payers can read
+#        it, or run per-customer sub-accounts (see below).
+#   2. Catch-up (`/timeshift/U/P/…`) 302-redirects to a URL whose PATH contains
+#      the raw credentials. Live/VOD/series redirect to an OPAQUE media token
+#      (safe). This spec therefore does NOT expose /timeshift.
+# If you need payers to be UNABLE to extract the credential, don't proxy one
+# shared account — mint a short-lived per-customer panel account on payment
+# (Mother-of-all fix; needs your panel's reseller API). This spec is the
+# pragmatic "monetize access to my deal" option, not a DRM boundary.
+
+name: xtream-gate
+subdomain: "acme-tv" # → acme-tv.pay.sh
+title: "ACME TV"
+description: "Stablecoin-gated access to an Xtream IPTV panel."
+category: media
+version: v1
+
+profile:
+  type: xtream-codes
+  version: v1
+
+routing:
+  type: proxy
+  url: "http://panel.example.com:8080/" # your panel origin
+  path_rewrites:
+    # Anchor on your real (static) panel username; inject only the password.
+    - prefix: "live/71e138bb92f1/{pass}"
+      env: XT_PASS
+    - prefix: "movie/71e138bb92f1/{pass}"
+      env: XT_PASS
+    - prefix: "series/71e138bb92f1/{pass}"
+      env: XT_PASS
+  auth:
+    method: query_param
+    key: "password"
+    value_from_env: XT_PASS
+
+operator:
+  currencies:
+    usd: ["USDC"]
+  network: mainnet # use localnet under --sandbox first
+  fee_payer: true
+  recipient: "<YOUR_REVENUE_WALLET_B58>"
+  # For a long-running server, pin the settlement signer instead of relying on
+  # ~/.config/pay/accounts.yml:
+  # signer: { backend: file, path: /etc/pay/keypair.json }
+
+endpoints:
+  # Metadata: cheap per call. get_* actions do NOT echo the password.
+  - method: GET
+    path: "player_api.php"
+    resource: "api"
+    description: "Xtream JSON API (categories, streams, VOD, series, EPG)."
+    metering:
+      dimensions:
+        - direction: usage
+          unit: requests
+          scale: 1
+          tiers:
+            - price_usd: 0.001
+
+  # Stream resolution: one payment resolves one playable (opaque) media URL,
+  # which the client then streams directly (video bypasses this gate).
+  - method: GET
+    path: "live/{username}/{password}/{stream}"
+    resource: "stream"
+    description: "Resolve a live channel."
+    metering:
+      dimensions:
+        - direction: usage
+          unit: requests
+          scale: 1
+          tiers:
+            - price_usd: 0.05
+  - method: GET
+    path: "movie/{username}/{password}/{stream}"
+    resource: "stream"
+    description: "Resolve a movie (VOD)."
+    metering:
+      dimensions:
+        - direction: usage
+          unit: requests
+          scale: 1
+          tiers:
+            - price_usd: 0.05
+  - method: GET
+    path: "series/{username}/{password}/{episode}"
+    resource: "stream"
+    description: "Resolve a series episode."
+    metering:
+      dimensions:
+        - direction: usage
+          unit: requests
+          scale: 1
+          tiers:
+            - price_usd: 0.05
+
+  # Flat monthly pass instead of per-request: replace an endpoint's `metering`
+  # block with this.
+  #   subscription:
+  #     period: "30d"
+  #     price_usd: 6.00
+  #     currency: USDC

@@ -1,5 +1,8 @@
 pub mod account;
+pub mod acp;
+mod acp_middleware;
 pub(crate) mod agent_args;
+mod buzz_setup;
 pub mod catalog;
 pub mod claude;
 pub mod codex;
@@ -46,6 +49,8 @@ pub enum Command {
     Http(http::HttpCommand),
     /// Fetch a URL using the built-in HTTP client (no external tool required).
     Fetch(fetch::FetchCommand),
+    /// Run an ACP agent harness with 402 payment support.
+    Acp(acp::AcpCommand),
     /// Run Claude Code with 402 payment support.
     Claude(claude::ClaudeCommand),
     /// Run Codex with 402 payment support.
@@ -115,6 +120,7 @@ pub enum ToolKind {
     Wget,
     Http,
     Fetch,
+    Acp,
     Claude,
     Codex,
     Goose,
@@ -145,6 +151,7 @@ impl Command {
             | Command::Wget(_)
             | Command::Http(_)
             | Command::Fetch(_)
+            | Command::Acp(_)
             | Command::Claude(_)
             | Command::Codex(_)
             | Command::Goose(_)
@@ -172,6 +179,7 @@ impl Command {
             Command::Wget(_) => ToolKind::Wget,
             Command::Http(_) => ToolKind::Http,
             Command::Fetch(_) => ToolKind::Fetch,
+            Command::Acp(_) => ToolKind::Acp,
             Command::Claude(_) => ToolKind::Claude,
             Command::Codex(_) => ToolKind::Codex,
             Command::Goose(_) => ToolKind::Goose,
@@ -243,7 +251,9 @@ impl Command {
             }
             Command::Setup(cmd) => return cmd.run(),
             Command::Topup(cmd) => return cmd.run(),
-            Command::Server { command } => return command.run(keypair_override, sandbox),
+            Command::Server { command } => {
+                return command.run(keypair_override, account_override, sandbox);
+            }
             Command::Mcp => {
                 let rt = tokio::runtime::Builder::new_multi_thread()
                     .enable_all()
@@ -279,6 +289,7 @@ impl Command {
                 network_override,
                 alternate_provider,
             )?),
+            Command::Acp(cmd) => std::process::exit(cmd.run(account_override, network_override)?),
             Command::Docs { command } => return command.run(),
             _ => {}
         }
@@ -572,6 +583,7 @@ fn handle_outcome(
                 return pay_session_and_retry(
                     &challenge,
                     req.as_ref(),
+                    &resource_url,
                     tool,
                     output_fmt,
                     fetch_headers,
@@ -1672,6 +1684,7 @@ fn pay_x402_siwx_and_retry(
 fn pay_session_and_retry(
     challenge: &mpp::Challenge,
     req: Option<&SessionRequest>,
+    resource_url: &str,
     tool: &Tool,
     output_fmt: Option<OutputFormat>,
     fetch_headers: Option<Vec<(String, String)>>,
@@ -1742,6 +1755,7 @@ fn pay_session_and_retry(
                         account_override,
                         deposit,
                         SessionMode::Pull,
+                        resource_url,
                         sandbox,
                     )?;
                 header
@@ -1769,6 +1783,7 @@ fn pay_session_and_retry(
                 network_override,
                 account_override,
                 deposit,
+                resource_url,
                 sandbox,
             )?;
             header

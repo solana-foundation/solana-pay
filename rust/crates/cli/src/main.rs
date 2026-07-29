@@ -227,10 +227,10 @@ fn main() {
         unsafe { std::env::set_var("PAY_PROTOCOL_ENFORCED", "mpp") };
     }
 
-    // ── Legacy keypair source for non-payment commands ─────────────────────
+    // ── Legacy signer fallback for non-payment commands ────────────────────
     //
-    // `pay topup` and server commands still use the original
-    // keystore-source-string flow.
+    // Server commands resolve accounts after reading the spec's network; this
+    // value is only their raw pay.toml/platform-keystore fallback.
     // Launcher commands (`pay claude`/`pay codex`) pass only an explicit
     // `--account` through to the MCP server and must not resolve an account
     // before the first-run setup hook below.
@@ -259,10 +259,13 @@ fn main() {
                 | Command::Wget(_)
                 | Command::Http(_)
                 | Command::Fetch(_)
+                | Command::Acp(_)
                 | Command::Mcp
         ) {
         None
-    } else if matches!(command, Command::Server { .. } | Command::Topup(_)) {
+    } else if matches!(command, Command::Server { .. }) {
+        config.legacy_keypair_source()
+    } else if matches!(command, Command::Topup(_)) {
         config.default_active_account_name()
     } else {
         resolve_keypair(&config)
@@ -290,6 +293,14 @@ fn main() {
     // cryptic "no account configured" error mid-flight. Sandbox flows
     // generate ephemeral wallets on first use, so they're exempt.
     if command.requires_account() && !sandbox_mode && !has_any_account() {
+        if matches!(command, Command::Acp(_)) {
+            eprintln!(
+                "{}",
+                "No pay account configured. Run `pay setup` in a terminal before starting an ACP client."
+                    .dimmed()
+            );
+            std::process::exit(1);
+        }
         eprintln!(
             "{}",
             "No pay account configured — running `pay setup` first…".dimmed()
@@ -653,6 +664,32 @@ mod tests {
                 assert_eq!(cmd.args, ["--model", "qwen3.7-plus"]);
             }
             _ => panic!("expected goose command"),
+        }
+    }
+
+    #[test]
+    fn acp_parses_headless_provider_and_model_without_adapter_leakage() {
+        let opts = Opts::try_parse_from([
+            "pay",
+            "acp",
+            "goose",
+            "--provider",
+            "modelstudio",
+            "--model",
+            "qwen3.7-plus",
+            "--",
+            "--debug",
+        ])
+        .unwrap();
+
+        match opts.command {
+            Some(Command::Acp(cmd)) => {
+                assert_eq!(cmd.harness, commands::acp::AcpHarness::Goose);
+                assert_eq!(cmd.provider.as_deref(), Some("modelstudio"));
+                assert_eq!(cmd.model.as_deref(), Some("qwen3.7-plus"));
+                assert_eq!(cmd.args, ["--debug"]);
+            }
+            _ => panic!("expected acp command"),
         }
     }
 

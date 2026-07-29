@@ -28,13 +28,15 @@ use futures_util::StreamExt;
 use http::{HeaderMap, HeaderName, HeaderValue, StatusCode, Uri};
 use pay_core::PaymentState;
 use pay_core::server::gate::{
-    GateDecision, GateRequest, GateResponse, PaymentGate, ReceiptAnnotation, SessionForward,
+    GateDecision, GateRequest, GateResponse, PaidRequestTelemetry, PaymentGate, ReceiptAnnotation,
+    SessionForward, UptoPaymentTelemetry,
     settle_delegated_session as settle_delegated_session_forward, settle_upto, settle_upto_metered,
 };
 use pay_core::server::metering::{self, UptoSettlementPlan};
 use pay_core::server::proxy::{
     STRIP_HEADERS, UpstreamPlan, prepare_upstream, routing_signs_request_body,
 };
+use pay_core::server::telemetry;
 use pay_kit::x402::server::VerifiedUptoOpen;
 use pay_types::metering::ApiSpec;
 use pingora::http::{RequestHeader, ResponseHeader};
@@ -53,6 +55,8 @@ enum Target {
         sni: String,
         host_header: String,
         path_and_query: String,
+        subdomain: String,
+        upstream: String,
         /// Forwarded client headers (minus stripped) + injected auth headers.
         headers: Vec<(String, String)>,
     },
@@ -72,6 +76,9 @@ pub struct Ctx {
     /// rated with the same usage pipeline as x402 `upto`, then the gateway
     /// signs and persists the cumulative voucher before returning the body.
     session: Option<SessionForward>,
+    /// Present only for payment-backed forwards. Consumed by `logging`, where
+    /// Pingora exposes the final downstream status for every forwarding path.
+    paid_request: Option<PaidRequestTelemetry>,
     /// Captured at `request_filter` for the Payment Debugger exchange emitted
     /// in `logging` (the data plane is Pingora, so the old axum logging
     /// middleware never sees proxied traffic).
@@ -95,6 +102,7 @@ struct PendingUpto {
     open: VerifiedUptoOpen,
     settle_amount: u64,
     settlement: Option<UptoSettlementPlan>,
+    telemetry: UptoPaymentTelemetry,
 }
 
 /// Request-side facts captured up front for the PDB exchange.
@@ -195,7 +203,7 @@ impl<S: PaymentState> Http402Gate<S> {
         // No body-signing auth → an empty placeholder body is safe for prep.
         match prepare_upstream(api, method, uri, headers, &[]).await {
             Ok(UpstreamPlan::Forward(prepared)) => {
-                ctx.target = Some(target_from_prepared(prepared));
+                ctx.target = Some(target_from_prepared(prepared, api.subdomain.clone()));
                 Ok(false)
             }
             Ok(UpstreamPlan::Respond(resp)) => {
@@ -298,10 +306,20 @@ impl<S: PaymentState> Http402Gate<S> {
                     served_ok,
                     response_headers,
                     response_body,
+                    pending.telemetry,
                 )
                 .await
             }
-            None => settle_upto(&self.state, pending.open, pending.settle_amount, served_ok).await,
+            None => {
+                settle_upto(
+                    &self.state,
+                    pending.open,
+                    pending.settle_amount,
+                    served_ok,
+                    pending.telemetry,
+                )
+                .await
+            }
         }
     }
 
@@ -389,6 +407,12 @@ impl<S: PaymentState> Http402Gate<S> {
         let upstream = match upstream_req.send().await {
             Ok(resp) => resp,
             Err(e) => {
+                telemetry::record_upstream_error(
+                    &api.subdomain,
+                    uri.path(),
+                    prepared.url.as_str(),
+                    &e.to_string(),
+                );
                 tracing::error!(error = %e, upstream = %prepared.url, "buffered upstream request failed");
                 let extra = self.drain_payment_headers(ctx, false).await;
                 write_buffered_response(
@@ -405,10 +429,24 @@ impl<S: PaymentState> Http402Gate<S> {
 
         let status = StatusCode::from_u16(upstream.status().as_u16())
             .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+        if status.is_server_error() {
+            telemetry::record_upstream_error(
+                &api.subdomain,
+                uri.path(),
+                prepared.url.as_str(),
+                &format!("upstream returned {status}"),
+            );
+        }
         let response_headers = filtered_response_headers(upstream.headers());
         let body = match collect_reqwest_body(upstream, response_limit).await {
             Ok(body) => body,
             Err(e) => {
+                telemetry::record_upstream_error(
+                    &api.subdomain,
+                    uri.path(),
+                    prepared.url.as_str(),
+                    &e.to_string(),
+                );
                 tracing::warn!(error = %e, "failed to buffer response-metered body");
                 let extra = self.drain_payment_headers(ctx, false).await;
                 write_buffered_response(
@@ -554,6 +592,7 @@ impl<S: PaymentState> ProxyHttp for Http402Gate<S> {
             receipt: None,
             upto: None,
             session: None,
+            paid_request: None,
             log: None,
             observer: None,
             buffered_usage: None,
@@ -634,8 +673,10 @@ impl<S: PaymentState> ProxyHttp for Http402Gate<S> {
                 session: session_forward,
                 receipt,
                 upto,
+                paid_request,
             } => {
                 ctx.receipt = receipt;
+                ctx.paid_request = paid_request;
                 // x402 `upto`: the channel is open; hold it for post-response
                 // settlement (response_filter on success, logging on failure).
                 ctx.upto = upto.map(|u| {
@@ -644,9 +685,10 @@ impl<S: PaymentState> ProxyHttp for Http402Gate<S> {
                         open: *u.open,
                         settle_amount: u.settle_amount,
                         settlement: u.settlement,
+                        telemetry: u.telemetry,
                     }
                 });
-                ctx.session = session_forward;
+                ctx.session = session_forward.map(|pending| *pending);
                 // Delegated sessions always settle before releasing a
                 // successful response, including fixed-price endpoints. x402
                 // `upto` only needs this path when pricing consumes response
@@ -765,6 +807,21 @@ impl<S: PaymentState> ProxyHttp for Http402Gate<S> {
         upstream_response: &mut ResponseHeader,
         ctx: &mut Ctx,
     ) -> pingora::Result<()> {
+        if upstream_response.status.is_server_error()
+            && let Some(Target::Api {
+                subdomain,
+                upstream,
+                ..
+            }) = &ctx.target
+        {
+            let path = ctx.log.as_ref().map_or("", |log| log.path.as_str());
+            telemetry::record_upstream_error(
+                subdomain,
+                path,
+                upstream,
+                &format!("upstream returned {}", upstream_response.status),
+            );
+        }
         if let Some(receipt) = &ctx.receipt {
             for (name, value) in &receipt.headers {
                 // Pass the HeaderValue through unchanged (a receipt can carry
@@ -844,7 +901,7 @@ impl<S: PaymentState> ProxyHttp for Http402Gate<S> {
     /// plane, so the old axum `logging_middleware` never sees proxied traffic —
     /// this is what keeps PDB populated. Fires for every request (short-circuit
     /// 402s included); control-plane paths were filtered out at capture time.
-    async fn logging(&self, session: &mut Session, _e: Option<&pingora::Error>, ctx: &mut Ctx)
+    async fn logging(&self, session: &mut Session, error: Option<&pingora::Error>, ctx: &mut Ctx)
     where
         Self::CTX: Send + Sync,
     {
@@ -864,6 +921,26 @@ impl<S: PaymentState> ProxyHttp for Http402Gate<S> {
                 .await
         {
             deferred_payment_headers.push(header);
+        }
+        if let Some(paid_request) = ctx.paid_request.take() {
+            let status = session
+                .response_written()
+                .and_then(|response| StatusCode::from_u16(response.status.as_u16()).ok())
+                .unwrap_or_else(|| {
+                    if error.is_some() {
+                        StatusCode::BAD_GATEWAY
+                    } else {
+                        StatusCode::INTERNAL_SERVER_ERROR
+                    }
+                });
+            let path = ctx.log.as_ref().map_or("", |log| log.path.as_str());
+            telemetry::record_paid_request_completed(
+                paid_request.protocol,
+                &paid_request.subdomain,
+                path,
+                status,
+                paid_request.payment.as_ref(),
+            );
         }
         let Some(log) = ctx.log.take() else {
             return;
@@ -937,6 +1014,16 @@ impl<S: PaymentState> ProxyHttp for Http402Gate<S> {
                 pingora::ErrorSource::Internal | pingora::ErrorSource::Unset => 500,
             },
         };
+        if code >= 500
+            && let Some(Target::Api {
+                subdomain,
+                upstream,
+                ..
+            }) = &ctx.target
+        {
+            let path = ctx.log.as_ref().map_or("", |log| log.path.as_str());
+            telemetry::record_upstream_error(subdomain, path, upstream, &e.to_string());
+        }
 
         if code > 0 {
             if extra.is_empty() {
@@ -1011,8 +1098,12 @@ fn is_control_plane(path: &str) -> bool {
 }
 
 /// Split a prepared upstream request into a connectable [`Target::Api`].
-fn target_from_prepared(prepared: pay_core::server::proxy::PreparedUpstreamRequest) -> Target {
+fn target_from_prepared(
+    prepared: pay_core::server::proxy::PreparedUpstreamRequest,
+    subdomain: String,
+) -> Target {
     let url = prepared.url;
+    let upstream = url.to_string();
     let tls = url.scheme() == "https";
     let host = url.host_str().unwrap_or("").to_string();
     let port = url
@@ -1034,6 +1125,8 @@ fn target_from_prepared(prepared: pay_core::server::proxy::PreparedUpstreamReque
         sni: host,
         host_header,
         path_and_query,
+        subdomain,
+        upstream,
         headers: prepared.headers,
     }
 }
