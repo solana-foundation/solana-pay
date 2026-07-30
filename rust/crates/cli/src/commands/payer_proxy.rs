@@ -75,7 +75,8 @@ pub struct PayerProxy {
 /// Payment contract the local payer must enforce for its upstream.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PaymentProtocol {
-    /// Preserve the generic payer behavior: MPP charge first, then x402 upto.
+    /// Preserve the generic payer behavior: MPP charge first, then x402
+    /// `upto`, then x402 `exact`.
     Auto,
     /// Require a delegated MPP session and never fall back to x402.
     MppSession,
@@ -330,9 +331,14 @@ async fn proxy(State(state): State<Arc<PayerState>>, req: Request) -> Response {
         }
     };
 
+    // Normalize OpenAI Chat Completions before the send/402 loop so paid
+    // retries replay the exact same compatible body. Goose uses the newer
+    // `developer` role for GPT-5, while some compatible providers only
+    // accept the older `system` role.
+    let body = normalize_openai_chat_request(&state, &method, &path, &body);
+
     // Anthropic → OpenAI request translation for OpenAI-compatible
-    // upstreams. Happens BEFORE the send/402 loop so the pay-retry
-    // replays the translated body. Everything else passes through.
+    // upstreams. This also happens before the send/402 loop.
     let (url, body, translated) = match translate_request(&state, &method, &path, &body) {
         Some(openai_body) => (
             format!("{}/{}", state.upstream, state.chat_path),
@@ -502,7 +508,8 @@ async fn proxy(State(state): State<Arc<PayerState>>, req: Request) -> Response {
         })
         .await
     } else if !charge_challenges.is_empty() {
-        // Scheme precedence in auto mode: MPP charge first, then x402 upto.
+        // Scheme precedence in auto mode: MPP charge first, then x402 upto,
+        // then x402 exact.
         // `select_challenge_by_balance` / `build_credential` spin their own
         // runtimes and may block on RPC + signing — keep them off the async
         // workers.
@@ -522,8 +529,18 @@ async fn proxy(State(state): State<Arc<PayerState>>, req: Request) -> Response {
             build_upto_authorization(&state, &upto, &resource_url).map(|payment| (payment, None))
         })
         .await
+    } else if let Some(exact) = parse_exact_challenge(&resp_headers, &resp_body) {
+        // x402 `exact`: sign this one request. Session and usage-metered
+        // channels remain preferred, but an exact-only provider must still
+        // work in auto mode.
+        let state = state.clone();
+        let resource_url = url.clone();
+        tokio::task::spawn_blocking(move || {
+            build_exact_authorization(&state, &exact, &resource_url).map(|payment| (payment, None))
+        })
+        .await
     } else {
-        tracing::warn!(%url, "payer proxy: 402 without an MPP or x402-upto challenge — passing through");
+        tracing::warn!(%url, "payer proxy: 402 without a supported MPP or x402 challenge — passing through");
         return buffered_response(status, &resp_headers, resp_body);
     };
 
@@ -609,6 +626,68 @@ fn parse_upto_challenge(
         .collect();
     let body = std::str::from_utf8(resp_body).ok();
     pay_core::client::x402::parse_upto(&headers, body)
+}
+
+/// Parse an x402 `exact` challenge after the preferred `upto` parser has had
+/// first refusal. Some upto envelopes are intentionally accepted by the
+/// lenient exact parser, so call order is significant.
+fn parse_exact_challenge(
+    resp_headers: &HeaderMap,
+    resp_body: &Bytes,
+) -> Option<pay_core::client::x402::Challenge> {
+    let headers: Vec<(String, String)> = resp_headers
+        .iter()
+        .filter_map(|(name, value)| {
+            value
+                .to_str()
+                .ok()
+                .map(|value| (name.as_str().to_string(), value.to_string()))
+        })
+        .collect();
+    let body = std::str::from_utf8(resp_body).ok();
+    pay_core::client::x402::parse(&headers, body)
+}
+
+/// Normalize newer OpenAI Chat Completions fields for broadly compatible
+/// providers. Invalid or unrelated bodies pass through untouched so the
+/// upstream remains responsible for reporting request errors.
+fn normalize_openai_chat_request(
+    state: &PayerState,
+    method: &Method,
+    path: &str,
+    body: &Bytes,
+) -> Bytes {
+    if state.dialect != Dialect::OpenAiCompat
+        || method != Method::POST
+        || path != "/v1/chat/completions"
+    {
+        return body.clone();
+    }
+
+    let Ok(mut request) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return body.clone();
+    };
+    let Some(messages) = request
+        .get_mut("messages")
+        .and_then(serde_json::Value::as_array_mut)
+    else {
+        return body.clone();
+    };
+
+    let mut changed = false;
+    for message in messages {
+        if message.get("role").and_then(|role| role.as_str()) == Some("developer") {
+            message["role"] = serde_json::Value::String("system".to_string());
+            changed = true;
+        }
+    }
+    if !changed {
+        return body.clone();
+    }
+
+    serde_json::to_vec(&request)
+        .map(Bytes::from)
+        .unwrap_or_else(|_| body.clone())
 }
 
 /// When the upstream is OpenAI-compatible and the inbound request is
@@ -763,9 +842,9 @@ fn translate_stream_response(
     })
 }
 
-/// The header(s) a paid retry must carry. MPP charge sets a single
-/// `Authorization: Payment <credential>`; x402 `upto` sets `PAYMENT-SIGNATURE`
-/// (and never touches `Authorization`, so the caller's upstream key survives).
+/// The header(s) a paid retry must carry. MPP sets
+/// `Authorization: Payment <credential>`; x402 `upto` and `exact` set their
+/// version-appropriate payment header without clobbering an upstream key.
 struct PaidHeaders {
     headers: Vec<(String, String)>,
 }
@@ -775,6 +854,15 @@ impl PaidHeaders {
     fn mpp(credential: String) -> Self {
         Self {
             headers: vec![(header::AUTHORIZATION.as_str().to_string(), credential)],
+        }
+    }
+
+    fn x402(headers: Vec<(&'static str, String)>) -> Self {
+        Self {
+            headers: headers
+                .into_iter()
+                .map(|(name, value)| (name.to_string(), value))
+                .collect(),
         }
     }
 }
@@ -940,19 +1028,53 @@ fn build_upto_authorization(
         );
     }
 
-    Ok(PaidHeaders {
-        headers: built
-            .headers
-            .into_iter()
-            .map(|(name, value)| (name.to_string(), value))
-            .collect(),
-    })
+    Ok(PaidHeaders::x402(built.headers))
+}
+
+/// Sign a one-shot x402 `exact` payment and return its retry headers. This is
+/// the final auto-mode fallback after MPP charge and x402 `upto`.
+fn build_exact_authorization(
+    state: &PayerState,
+    challenge: &pay_core::client::x402::Challenge,
+    resource_url: &str,
+) -> pay_core::Result<PaidHeaders> {
+    if let Some(cap) = state.per_request_cap_base_units {
+        let amount: u128 = challenge.requirements.amount.parse().map_err(|_| {
+            pay_core::Error::Mpp(format!(
+                "x402-exact challenge advertised a non-numeric amount: {}",
+                challenge.requirements.amount
+            ))
+        })?;
+        if amount > cap {
+            return Err(pay_core::Error::Mpp(format!(
+                "x402-exact amount {amount} (base units of {}) exceeds the payer's per-request budget {cap}",
+                challenge.requirements.currency
+            )));
+        }
+    }
+
+    let built = pay_core::client::x402::build_payment(
+        challenge,
+        state.store.as_ref(),
+        state.network_override.as_deref(),
+        state.account_override.as_deref(),
+        Some(resource_url),
+    )?;
+
+    if let Some(resolved) = built.ephemeral_notice {
+        tracing::info!(
+            network = %resolved.network,
+            pubkey = resolved.account.pubkey.as_deref().unwrap_or("(unknown)"),
+            "payer proxy: generated ephemeral wallet"
+        );
+    }
+
+    Ok(PaidHeaders::x402(built.headers))
 }
 
 /// Forward a request upstream, replaying `body`. When `payment` is `Some`,
-/// its headers are applied to the paid retry: MPP replaces `Authorization`
-/// with the `Payment` credential; x402-upto adds `PAYMENT-SIGNATURE` (leaving
-/// the caller's own `Authorization` intact).
+/// its headers are applied to the paid retry: MPP replaces `Authorization`;
+/// x402 adds its payment proof without replacing the caller's upstream key.
 async fn send_upstream(
     state: &PayerState,
     method: &Method,
@@ -1183,6 +1305,36 @@ mod tests {
         base64::engine::general_purpose::STANDARD.encode(envelope.to_string().as_bytes())
     }
 
+    /// A canned x402 `exact` challenge that can be signed offline for the same
+    /// reason as [`upto_challenge_header`]: it carries a devnet network, fee
+    /// payer, and recent blockhash.
+    fn exact_challenge_header(amount: &str) -> String {
+        let payee = "CXhrFZJLKqjzmP3sjYLcF4dTeXWKCy9e2SXXZ2Yo6MPY";
+        let envelope = serde_json::json!({
+            "x402Version": 2,
+            "resource": {
+                "url": "http://127.0.0.1/v1/messages",
+                "description": "test exact payment",
+                "mimeType": "application/json"
+            },
+            "accepts": [{
+                "scheme": "exact",
+                "network": pay_kit::x402::exact::SOLANA_DEVNET,
+                "amount": amount,
+                "asset": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+                "payTo": payee,
+                "maxTimeoutSeconds": 300,
+                "extra": {
+                    "feePayer": payee,
+                    "recentBlockhash": "9zrUHnA1nCByPksy3aL8tQ47vqdaG2vnFs4HrxgcZj4F",
+                    "decimals": 6
+                }
+            }]
+        });
+        use base64::Engine;
+        base64::engine::general_purpose::STANDARD.encode(envelope.to_string().as_bytes())
+    }
+
     async fn spawn_server(app: Router) -> String {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1260,6 +1412,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn blockrun_chat_uses_api_v1_provider_path() {
+        let seen = Arc::new(Mutex::new(None::<serde_json::Value>));
+        let record = seen.clone();
+        let upstream = spawn_server(Router::new().route(
+            "/api/v1/chat/completions",
+            axum::routing::post(move |body: axum::Json<serde_json::Value>| {
+                let record = record.clone();
+                async move {
+                    *record.lock().unwrap() = Some(body.0);
+                    (StatusCode::OK, "blockrun path reached")
+                }
+            }),
+        ))
+        .await;
+        let payer = spawn_payer_with(
+            PayerUpstream {
+                base_url: upstream,
+                host_header: None,
+                dialect: Dialect::OpenAiCompat,
+                chat_path: "api/v1/chat/completions".to_string(),
+                responses_path: "v1/responses".to_string(),
+                require_payment: false,
+                payment_protocol: PaymentProtocol::Auto,
+            },
+            None,
+        )
+        .await;
+
+        let response = reqwest::Client::new()
+            .post(format!("{payer}/v1/chat/completions"))
+            .json(&serde_json::json!({
+                "model": "openai/gpt-5.6-sol",
+                "messages": [
+                    { "role": "developer", "content": "You are Goose." },
+                    { "role": "user", "content": "test" }
+                ]
+            }))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.text().await.unwrap(), "blockrun path reached");
+        let body = seen.lock().unwrap().clone().unwrap();
+        assert_eq!(body["messages"][0]["role"], "system");
+        assert_eq!(body["messages"][1]["role"], "user");
+    }
+
+    #[tokio::test]
     async fn direct_openai_responses_uses_declared_provider_path() {
         let upstream = spawn_server(Router::new().route(
             "/v1/responses",
@@ -1280,6 +1481,24 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(response.text().await.unwrap(), "responses path reached");
+    }
+
+    #[test]
+    fn parses_x402_exact_challenge_from_payment_required_header() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "payment-required",
+            HeaderValue::from_str(&exact_challenge_header("28130")).unwrap(),
+        );
+
+        let challenge = parse_exact_challenge(&headers, &Bytes::new()).unwrap();
+
+        assert_eq!(challenge.x402_version, 2);
+        assert_eq!(challenge.requirements.amount, "28130");
+        assert_eq!(
+            challenge.requirements.resource,
+            "http://127.0.0.1/v1/messages"
+        );
     }
 
     #[tokio::test]
@@ -1507,6 +1726,77 @@ mod tests {
             seen.retry_body.as_deref(),
             Some(body.as_bytes()),
             "upto retry must replay the identical request body"
+        );
+    }
+
+    /// Stub that offers only x402 `exact`, matching BlockRun's payment
+    /// protocol, then accepts the signed retry.
+    fn exact_stub(seen: Arc<Mutex<StubSeen>>, amount: &'static str) -> Router {
+        Router::new().fallback(any(move |req: Request| {
+            let seen = seen.clone();
+            async move {
+                let uri = req.uri().to_string();
+                let sig = req
+                    .headers()
+                    .get("payment-signature")
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_string);
+                let body = axum::body::to_bytes(req.into_body(), MAX_BODY_BYTES)
+                    .await
+                    .unwrap();
+                let mut seen = seen.lock().unwrap();
+                seen.calls += 1;
+                if seen.calls == 1 {
+                    seen.first_uri = Some(uri);
+                    seen.retry_body = Some(body.to_vec());
+                    return Response::builder()
+                        .status(StatusCode::PAYMENT_REQUIRED)
+                        .header("payment-required", exact_challenge_header(amount))
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(r#"{"error":"payment required"}"#))
+                        .unwrap();
+                }
+                assert_eq!(
+                    seen.retry_body.as_deref(),
+                    Some(&body[..]),
+                    "exact retry must replay the identical body"
+                );
+                seen.retry_auth = sig;
+                (StatusCode::OK, "exact paid ok").into_response()
+            }
+        }))
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pays_x402_exact_402_and_retries_with_payment_header() {
+        let seen = Arc::new(Mutex::new(StubSeen::default()));
+        let upstream = spawn_server(exact_stub(seen.clone(), "28130")).await;
+        let payer = spawn_payer(upstream, None).await;
+
+        let body = r#"{"model":"openai/gpt-5.6-sol","messages":[{"role":"user","content":"hi"}]}"#;
+        let resp = reqwest::Client::new()
+            .post(format!("{payer}/v1/messages"))
+            .header("authorization", "Bearer upstream-key")
+            .header("content-type", "application/json")
+            .body(body)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.text().await.unwrap(), "exact paid ok");
+
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.calls, 2, "exactly one retry after the exact 402");
+        let sig = seen
+            .retry_auth
+            .as_deref()
+            .expect("exact retry must carry a PAYMENT-SIGNATURE header");
+        assert!(!sig.is_empty(), "PAYMENT-SIGNATURE must be non-empty");
+        assert_eq!(
+            seen.retry_body.as_deref(),
+            Some(body.as_bytes()),
+            "exact retry must replay the identical request body"
         );
     }
 

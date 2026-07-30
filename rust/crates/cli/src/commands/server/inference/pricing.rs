@@ -1,11 +1,8 @@
 //! Per-model input/output token pricing for `pay gate inference`.
 //!
-//! This is a **display-only** overlay: it expresses per-model token rates
-//! (USD per 1M tokens), validates them against the models a provider actually
-//! serves, and surfaces them in the provider picker. It does **not** change
-//! charging or settlement — the synthesized charge spec and the flat
-//! `--price-usd` path are untouched. Per-token metering is a deferred
-//! follow-up that needs response-side usage extraction.
+//! These rates drive both the provider UI and sandbox charging. Priced
+//! inference synthesizes x402-upto metering, observes response-side usage, and
+//! settles the actual input/output token cost after serving.
 //!
 //! Two input forms feed the same [`PricingConfig`]:
 //!
@@ -38,6 +35,7 @@ pub struct TokenRate {
 
 /// Per-model token pricing, with an optional catch-all `default`.
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PricingConfig {
     /// Fallback rate for any model without an explicit entry.
     #[serde(default)]
@@ -54,9 +52,16 @@ impl PricingConfig {
     pub fn from_yaml_file(path: &str) -> pay_core::Result<Self> {
         let expanded = shellexpand::tilde(path).to_string();
         let contents = std::fs::read_to_string(&expanded)
-            .map_err(|e| pay_core::Error::Config(format!("read paywall file {path}: {e}")))?;
-        serde_yml::from_str(&contents)
-            .map_err(|e| pay_core::Error::Config(format!("parse paywall file {path}: {e}")))
+            .map_err(|e| pay_core::Error::Config(format!("read rates file {path}: {e}")))?;
+        let config: Self = serde_yml::from_str(&contents)
+            .map_err(|e| pay_core::Error::Config(format!("parse rates file {path}: {e}")))?;
+        if config.default.is_none() && config.per_model.is_empty() {
+            return Err(pay_core::Error::Config(format!(
+                "rates file {path} must define `default` and/or `models`; \
+                 use an ApiSpec paywall with `pay gate api`"
+            )));
+        }
+        Ok(config)
     }
 
     /// Parse the inline shorthand: comma-separated `model=in/out` items.
@@ -90,6 +95,11 @@ impl PricingConfig {
                     config.per_model.insert(model.to_string(), rate);
                 }
             }
+        }
+        if config.default.is_none() && config.per_model.is_empty() {
+            return Err(pay_core::Error::Config(
+                "--price must define a default and/or at least one model rate".to_string(),
+            ));
         }
         Ok(config)
     }
@@ -195,7 +205,7 @@ mod tests {
     #[test]
     fn parses_the_yaml_file_shape() {
         let dir = std::env::temp_dir();
-        let path = dir.join(format!("pay-inference-paywall-{}.yml", std::process::id()));
+        let path = dir.join(format!("pay-inference-rates-{}.yml", std::process::id()));
         std::fs::write(
             &path,
             "default: { in: 0.10, out: 0.30 }\n\
@@ -211,6 +221,35 @@ mod tests {
         assert_eq!(config.default, Some(rate(0.10, 0.30)));
         assert_eq!(config.per_model.get("gemma4"), Some(&rate(0.15, 0.60)));
         assert_eq!(config.per_model.get("qwen3:8b"), Some(&rate(0.50, 1.50)));
+    }
+
+    #[test]
+    fn rates_file_rejects_empty_config() {
+        let path = std::env::temp_dir().join(format!(
+            "pay-inference-empty-rates-{}.yml",
+            std::process::id()
+        ));
+        std::fs::write(&path, "{}\n").unwrap();
+
+        let err = PricingConfig::from_yaml_file(path.to_str().unwrap()).unwrap_err();
+        std::fs::remove_file(&path).ok();
+
+        assert!(err.to_string().contains("must define `default`"), "{err}");
+    }
+
+    #[test]
+    fn rates_file_rejects_api_paywall_shape() {
+        let path = std::env::temp_dir().join(format!(
+            "pay-inference-api-paywall-{}.yml",
+            std::process::id()
+        ));
+        std::fs::write(&path, "name: example\nsubdomain: example\nendpoints: []\n").unwrap();
+
+        let err = PricingConfig::from_yaml_file(path.to_str().unwrap()).unwrap_err();
+        std::fs::remove_file(&path).ok();
+
+        assert!(err.to_string().contains("parse rates file"), "{err}");
+        assert!(err.to_string().contains("unknown field"), "{err}");
     }
 
     #[test]
@@ -248,6 +287,9 @@ mod tests {
         // Non-numeric rate.
         let err = PricingConfig::from_inline("gemma4=lo/hi").unwrap_err();
         assert!(err.to_string().contains("gemma4=lo/hi"), "{err}");
+
+        let err = PricingConfig::from_inline("").unwrap_err();
+        assert!(err.to_string().contains("at least one model rate"), "{err}");
 
         // Empty model name.
         assert!(PricingConfig::from_inline("=0.1/0.2").is_err());

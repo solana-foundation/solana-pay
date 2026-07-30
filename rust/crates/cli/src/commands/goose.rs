@@ -14,6 +14,7 @@ const OPENAI_HOST_ENV: &str = "OPENAI_HOST";
 const OPENAI_API_KEY_ENV: &str = "OPENAI_API_KEY";
 const OPENAI_BASE_PATH_ENV: &str = "OPENAI_BASE_PATH";
 const GOOSE_DISABLE_SESSION_NAMING_ENV: &str = "GOOSE_DISABLE_SESSION_NAMING";
+const GOOSE_CHAT_COMPLETIONS_PATH: &str = "/v1/chat/completions";
 
 /// Run Goose with 402 payment support.
 #[derive(Args)]
@@ -99,7 +100,10 @@ pub(crate) fn goose_provider_env(
         (OPENAI_API_KEY_ENV.to_string(), "pay".to_string()),
         (
             OPENAI_BASE_PATH_ENV.to_string(),
-            "v1/chat/completions".to_string(),
+            // Goose treats the relative default as model-routable and sends
+            // GPT-5 models to `/v1/responses`. The absolute path explicitly
+            // opts into Chat Completions for OpenAI-compatible providers.
+            GOOSE_CHAT_COMPLETIONS_PATH.to_string(),
         ),
         // Goose otherwise makes a second, hidden model request after each of
         // the first few turns to generate a session title. With a paid
@@ -148,12 +152,33 @@ mod tests {
         )));
         assert!(env.contains(&(
             OPENAI_BASE_PATH_ENV.to_string(),
-            "v1/chat/completions".to_string()
+            GOOSE_CHAT_COMPLETIONS_PATH.to_string()
         )));
         assert!(env.contains(&(
             GOOSE_DISABLE_SESSION_NAMING_ENV.to_string(),
             "true".to_string()
         )));
+    }
+
+    #[test]
+    fn gpt5_models_are_pinned_to_explicit_chat_completions_path() {
+        let provider = AlternateProvider {
+            base_url: "http://127.0.0.1:54321".to_string(),
+            model: Some("openai/gpt-5.6-sol".to_string()),
+        };
+        let env = goose_provider_env(&provider, "openai/gpt-5.6-sol");
+        let base_path = env
+            .iter()
+            .find_map(|(key, value)| (key == OPENAI_BASE_PATH_ENV).then_some(value));
+
+        assert_eq!(
+            base_path.map(String::as_str),
+            Some(GOOSE_CHAT_COMPLETIONS_PATH)
+        );
+        assert!(
+            GOOSE_CHAT_COMPLETIONS_PATH.starts_with('/'),
+            "Goose 1.43 treats the relative v1/chat/completions default as model-routable"
+        );
     }
 
     #[test]

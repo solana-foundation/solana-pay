@@ -88,6 +88,16 @@ async fn session_channel_store()
     }
 }
 
+/// The gateway owns session close/settlement until a separately deployed
+/// durable-store reconciler exists. Redis still persists lifecycle deadlines;
+/// embedded reconciliation ensures those deadlines are actually processed by
+/// the active gateway instead of leaving channels open indefinitely.
+fn session_lifecycle_reconciliation(
+    _durable_session_store: bool,
+) -> SessionLifecycleReconciliation {
+    SessionLifecycleReconciliation::Embedded
+}
+
 /// Start the payment gateway proxy.
 ///
 /// Loads a paywall from a YAML file and starts an HTTP proxy that:
@@ -1132,11 +1142,7 @@ impl StartCommand {
                         Duration::from_millis(sess.close_delay_ms),
                         Duration::from_millis(sess.close_batch_interval_ms),
                         Duration::from_millis(sess.settlement_interval_ms),
-                        if durable_session_store {
-                            SessionLifecycleReconciliation::External
-                        } else {
-                            SessionLifecycleReconciliation::Embedded
-                        },
+                        session_lifecycle_reconciliation(durable_session_store),
                     );
                     session_mpps.push(smpp);
                 }
@@ -3057,13 +3063,26 @@ mod tests {
     };
     use super::{
         build_pdb_config, default_bind, delegated_session_channel_payout, payout_recipient_pubkeys,
-        payout_recipient_targets, resolve_operator_currencies, validate_browser_rpc_request,
-        x402_currency_configs, x402_upto_beneficiary_pubkey, x402_upto_payout_for_recipient,
+        payout_recipient_targets, resolve_operator_currencies, session_lifecycle_reconciliation,
+        validate_browser_rpc_request, x402_currency_configs, x402_upto_beneficiary_pubkey,
+        x402_upto_payout_for_recipient,
     };
     use crate::network::SolanaNetwork;
     use serial_test::serial;
     use solana_pubkey::Pubkey;
     use std::str::FromStr;
+
+    #[test]
+    fn gateway_owns_session_lifecycle_for_memory_and_redis_stores() {
+        assert_eq!(
+            session_lifecycle_reconciliation(false),
+            super::SessionLifecycleReconciliation::Embedded
+        );
+        assert_eq!(
+            session_lifecycle_reconciliation(true),
+            super::SessionLifecycleReconciliation::Embedded
+        );
+    }
 
     #[test]
     fn profile_yaml_expands_before_startup_validation() {

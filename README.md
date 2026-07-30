@@ -55,6 +55,27 @@ pay claude
 pay codex
 ```
 
+ACP clients such as Buzz can launch the same paid inference route without
+sharing their protocol stream with Pay:
+
+```sh
+# Interactive provider/model selection when run from a terminal
+pay acp goose
+
+# Deterministic configuration for a headless ACP client
+pay acp goose --provider alibaba --model qwen3.7-plus
+```
+
+`pay acp` supports `goose`, `claude`, and `codex`. It starts the payer proxy,
+configures the selected ACP adapter to use it, and passes ACP JSON-RPC through
+stdin/stdout unchanged. Headless clients may set `PAY_ACP_PROVIDER` and
+`PAY_ACP_MODEL` instead of passing flags.
+
+When Buzz Desktop is installed, `pay setup` and `pay setup --update` offer to
+register a **Pay + Goose/Claude Code/Codex** custom harness. Setup discovers
+compatible providers and models, then writes an idempotent `pay-acp` definition
+to Buzz's custom harness settings.
+
 ### 🛠️ Payment debugging and simulations
 
 `pay` ships with an embedded Payment Debugger — a local web UI that visualizes every 402 challenge-response cycle as a sequence diagram. See exactly which headers were sent, which protocol was used (MPP or x402), and where things went wrong.
@@ -65,8 +86,8 @@ Everything runs locally — no data leaves your machine.
 # Start a gateway with the debugger on any paywall
 pay gate api paywall.yml --debugger
 
-# Discover and gate local inference with an optional per-model paywall
-pay --sandbox gate inference paywall.yml
+# Discover and gate local inference with optional per-model rates
+pay --sandbox gate inference rates.yml
 
 # Or run the bundled demo (sandbox + debugger + sample endpoints)
 pay server demo

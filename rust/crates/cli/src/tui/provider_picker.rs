@@ -3,11 +3,11 @@
 //!
 //! Built to scale past local discovery — providers will eventually come from
 //! the p2p registry with many entries — so the layout is a full-width plain
-//! table (no sidebar, no borders): a 🔍 type-to-search field and a sectioned
-//! (LOCAL / SOLANA AGENT GATEWAY / P2P), rail-styled provider list in the
-//! notice-component style (`components/notice.rs`: colored `│` rail + bold
-//! title + dimmed body). `←`/`→` cycle the selected provider's models; the
-//! picked model renders as an accent-colored chip with its price.
+//! table (no sidebar, no borders): a 🔍 type-to-search field and a rail-styled
+//! provider list in the notice-component style (`components/notice.rs`:
+//! colored `│` rail + bold title + dimmed body). `←`/`→` cycle the selected
+//! provider's models; the picked model renders as an accent-colored chip with
+//! its price.
 
 use std::io;
 
@@ -26,45 +26,6 @@ use super::widgets::controls_bar;
 
 /// Rows per provider entry: title, model list, price/description.
 const ENTRY_HEIGHT: u16 = 3;
-
-/// Picker sections, in display order. Every provider renders under exactly
-/// one of these; empty sections show a dim `none` placeholder so the layout
-/// stays self-explanatory.
-const SECTIONS: [Section; 3] = [Section::Local, Section::Gateway, Section::P2p];
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Section {
-    /// Pay-managed local providers. Nothing lands here yet — port-probed
-    /// servers are self-hosted peers and list under [`Section::P2p`].
-    Local,
-    /// Hosted pay-catalog providers behind the Solana Agent Gateway.
-    Gateway,
-    /// Self-hosted peers: port-probed inference servers (Ollama, LM
-    /// Studio, …) today, the iroh p2p registry next.
-    P2p,
-}
-
-impl Section {
-    fn title(self) -> &'static str {
-        match self {
-            Section::Local => "LOCAL",
-            Section::Gateway => "SOLANA AGENT GATEWAY",
-            Section::P2p => "P2P",
-        }
-    }
-
-    fn of(provider: &DiscoveredProvider) -> Self {
-        if provider.hosted() {
-            Section::Gateway
-        } else {
-            Section::P2p
-        }
-    }
-
-    fn rank(self) -> usize {
-        SECTIONS.iter().position(|s| *s == self).unwrap_or(0)
-    }
-}
 
 /// The provider (and model) the user picked.
 pub struct ProviderChoice {
@@ -163,9 +124,9 @@ impl ProviderPickerApp {
         mut providers: Vec<DiscoveredProvider>,
         requested_model: Option<String>,
     ) -> Self {
-        // Group by section (stable, so discovery order survives within a
-        // section) — the list renders under section headers.
-        providers.sort_by_key(|p| Section::of(p).rank());
+        // Keep hosted providers first while preserving discovery order within
+        // the hosted and self-hosted groups.
+        providers.sort_by_key(|provider| !provider.hosted());
         Self {
             harness,
             providers,
@@ -334,13 +295,10 @@ fn render_search(frame: &mut ratatui::Frame, area: Rect, app: &ProviderPickerApp
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
-/// One display row of the sectioned provider list.
+/// One display row of the provider list.
 enum ListRow<'a> {
-    /// Blank line between sections.
+    /// Blank line between providers.
     Gap,
-    Header(&'static str),
-    /// Dim placeholder under an empty section.
-    None,
     /// `usize` is the index into [`ProviderPickerApp::filtered`].
     Entry(usize, &'a DiscoveredProvider),
 }
@@ -357,25 +315,14 @@ impl ListRow<'_> {
 fn render_provider_list(frame: &mut ratatui::Frame, area: Rect, app: &ProviderPickerApp) {
     let providers = app.filtered();
 
-    // Section-grouped rows. `filtered()` is already section-ordered (the
-    // provider list is sorted at construction), so entry indices stay in
-    // sync with the selection cursor.
+    // Keep one empty row between provider options. Entry indices stay in sync
+    // with the selection cursor because gaps do not participate in selection.
     let mut rows: Vec<ListRow> = Vec::new();
-    for (i, section) in SECTIONS.iter().enumerate() {
-        if i > 0 {
+    for (idx, provider) in providers.iter().enumerate() {
+        if idx > 0 {
             rows.push(ListRow::Gap);
         }
-        rows.push(ListRow::Header(section.title()));
-        let mut any = false;
-        for (idx, provider) in providers.iter().enumerate() {
-            if Section::of(provider) == *section {
-                rows.push(ListRow::Entry(idx, provider));
-                any = true;
-            }
-        }
-        if !any {
-            rows.push(ListRow::None);
-        }
+        rows.push(ListRow::Entry(idx, provider));
     }
 
     // Scroll (in lines) so the selected entry is fully visible.
@@ -412,20 +359,6 @@ fn render_provider_list(frame: &mut ratatui::Frame, area: Rect, app: &ProviderPi
         };
         match row {
             ListRow::Gap => {}
-            ListRow::Header(title) => frame.render_widget(
-                Paragraph::new(Line::from(Span::styled(
-                    *title,
-                    Style::default().fg(Color::DarkGray).bold(),
-                ))),
-                row_area,
-            ),
-            ListRow::None => frame.render_widget(
-                Paragraph::new(Line::from(Span::styled(
-                    "  none",
-                    Style::default().fg(Color::DarkGray),
-                ))),
-                row_area,
-            ),
             ListRow::Entry(idx, provider) => {
                 let selected = *idx == app.selected;
                 let chosen = selected.then(|| app.chosen_model(provider)).flatten();
@@ -444,10 +377,11 @@ fn render_provider_list(frame: &mut ratatui::Frame, area: Rect, app: &ProviderPi
 
 /// One three-line entry in the notice style: a `│` rail spanning the row
 /// (brand-colored when selected, gray otherwise), bold title + dim origin
-/// on line 1, the model list on line 2, and price/description on line 3.
+/// on line 1, the model choice on line 2, and price on line 3.
 /// Selection thickens the rail (`┃`), brightens the title, and highlights
 /// the `←`/`→`-picked model as a white-on-accent chip (the list windows so
-/// it stays visible).
+/// it stays visible). Inactive rows collapse to one priced model plus a count
+/// so providers remain directly comparable.
 fn render_provider_entry(
     frame: &mut ratatui::Frame,
     area: Rect,
@@ -483,27 +417,28 @@ fn render_provider_entry(
         top.push(Span::styled(format!(" · v{version}"), dim));
     }
 
+    let summary_model = chosen_model.or_else(|| first_priced_model(provider, models));
     let mut models_line = vec![rail.clone()];
     let avail = (area.width as usize).saturating_sub(2);
     if models.is_empty() {
         models_line.push(Span::styled("no models reported", dim));
     } else if let Some(chosen) = chosen_model {
         models_line.extend(model_chip_spans(models, chosen, accent, dim, avail));
-    } else {
+    } else if let Some(model) = summary_model {
+        let remaining = models.len().saturating_sub(1);
+        let suffix = if remaining == 0 {
+            String::new()
+        } else {
+            format!(" · {remaining} more")
+        };
         models_line.push(Span::styled(
-            truncate_str(
-                &models
-                    .iter()
-                    .map(|m| m.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", "),
-                avail,
-            ),
+            truncate_str(&format!("{model}{suffix}"), avail),
             dim,
         ));
     }
 
-    let detail = pricing_detail_line(provider.pricing_hint_for_model(chosen_model), rail, area);
+    let pricing_hint = provider.pricing_hint_for_model(summary_model);
+    let detail = pricing_detail_line(pricing_hint, rail);
 
     frame.render_widget(
         Paragraph::new(vec![Line::from(top), Line::from(models_line), detail]),
@@ -511,10 +446,22 @@ fn render_provider_entry(
     );
 }
 
+fn first_priced_model<'a>(provider: &DiscoveredProvider, models: &[&'a String]) -> Option<&'a str> {
+    models
+        .iter()
+        .copied()
+        .find(|model| {
+            provider
+                .pricing_hint_for_model(Some(model))
+                .is_some_and(|hint| hint.variant.is_some() || hint.io.is_some())
+        })
+        .or_else(|| models.first().copied())
+        .map(String::as_str)
+}
+
 fn pricing_detail_line(
     hint: Option<crate::commands::server::inference::providers::PricingHint>,
     rail: Span<'static>,
-    area: Rect,
 ) -> Line<'static> {
     let dim = Style::default().fg(Color::DarkGray);
     let mut detail = vec![rail];
@@ -524,19 +471,7 @@ fn pricing_detail_line(
     };
 
     let price = hint.to_string();
-    let mut used = 2 + price.chars().count();
     detail.push(Span::styled(price, Style::default().fg(Color::Yellow)));
-    let description = hint
-        .description
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty());
-    if let Some(description) = description {
-        detail.push(Span::styled(" · ", dim));
-        used += 3;
-        let remaining = (area.width as usize).saturating_sub(used);
-        detail.push(Span::styled(truncate_str(description, remaining), dim));
-    }
     Line::from(detail)
 }
 
@@ -701,7 +636,7 @@ mod tests {
             model_pricing: vec![pay_pdb::types::ModelPricingSummary {
                 model: "gemma4:latest".into(),
                 variant: Some("gemma4".into()),
-                price: Some("in $1.00 · out $3.00 /1M tok".into()),
+                price: Some("input $1.00 · output $3.00 / 1M tokens".into()),
                 description: None,
             }],
         }
@@ -970,12 +905,12 @@ mod tests {
 
     #[test]
     fn hosted_row_shows_pricing_hint_and_gateway_host() {
-        // Passed peer-first on purpose: the app groups by section, so the
-        // hosted entry must still sort first (gateway section precedes P2P).
+        // Passed peer-first on purpose: hosted entries still sort first in the
+        // flat list.
         let mut app = app(vec![ollama(&["llama3.2:3b"]), hosted_gemini()]);
         assert_eq!(
             filtered_slugs(&app),
-            vec!["generativelanguage", "ollama"],
+            vec!["google", "ollama"],
             "gateway providers must sort before p2p ones"
         );
         // Select ollama so the gemini row renders unselected (the selected
@@ -1008,17 +943,32 @@ mod tests {
     }
 
     #[test]
+    fn inactive_row_uses_first_model_price_when_no_aggregate_exists() {
+        let mut app = app(vec![
+            proxied_ollama_with_gateway_pricing(),
+            lm_studio(&["qwen2.5-7b"]),
+        ]);
+        app.move_selection(1);
+
+        let text = buffer_text(&draw(&app, 120, 30));
+        assert!(
+            text.contains("input $1.00 · output $3.00 / 1M tokens"),
+            "inactive row must fall back to its first model's live price:\n{text}"
+        );
+    }
+
+    #[test]
     fn selected_row_price_tracks_the_picked_model_for_variant_pricing() {
         // Gemini-only so it's the selected row; flash is picked first.
         let mut app = app(vec![hosted_gemini_variant_priced()]);
         let flash = buffer_text(&draw(&app, 120, 30));
         assert!(
-            flash.contains("in $0.34 · out $2.88 /1M tok"),
+            flash.contains("input $0.34 · output $2.88 / 1M tokens"),
             "flash price must reflect its per-model variant:\n{flash}"
         );
         assert!(
-            flash.contains("Balanced Gemini 2.5 model"),
-            "flash description must reflect its per-model variant:\n{flash}"
+            !flash.contains("Balanced Gemini 2.5 model"),
+            "model prose should not compete with the price:\n{flash}"
         );
         assert!(
             !flash.contains("tok  gemini-2.5-flash"),
@@ -1030,12 +980,12 @@ mod tests {
         assert_eq!(app.choice().unwrap().model, "gemini-2.5-pro");
         let pro = buffer_text(&draw(&app, 120, 30));
         assert!(
-            pro.contains("in $1.44 · out $11.50 /1M tok"),
+            pro.contains("input $1.44 · output $11.50 / 1M tokens"),
             "pro price must track the ←/→ selection:\n{pro}"
         );
         assert!(
-            pro.contains("Gemini 2.5 Pro for complex reasoning"),
-            "pro description must track the ←/→ selection:\n{pro}"
+            !pro.contains("Gemini 2.5 Pro for complex reasoning"),
+            "model prose should not compete with the price:\n{pro}"
         );
         assert!(
             !pro.contains("tok  gemini-2.5-pro"),
@@ -1045,9 +995,24 @@ mod tests {
             !pro.contains("$0.34"),
             "flash price must not linger after switching model:\n{pro}"
         );
+    }
+
+    #[test]
+    fn inactive_row_collapses_models_to_one_choice_and_count() {
+        let mut app = app(vec![
+            hosted_gemini_variant_priced(),
+            ollama(&["llama3.2:3b"]),
+        ]);
+        app.move_selection(1);
+
+        let text = buffer_text(&draw(&app, 120, 30));
         assert!(
-            !pro.contains("Balanced Gemini 2.5 model"),
-            "flash description must not linger after switching model:\n{pro}"
+            text.contains("gemini-2.5-flash · 1 more"),
+            "inactive model list should collapse to one comparable choice:\n{text}"
+        );
+        assert!(
+            !text.contains("gemini-2.5-flash, gemini-2.5-pro"),
+            "inactive row should not dump every model:\n{text}"
         );
     }
 
@@ -1065,7 +1030,7 @@ mod tests {
             "model line should still show the full served model:\n{text}"
         );
         assert!(
-            text.contains("in $1.00 · out $3.00 /1M tok"),
+            text.contains("input $1.00 · output $3.00 / 1M tokens"),
             "gateway-supplied price should render:\n{text}"
         );
         assert!(
@@ -1075,39 +1040,59 @@ mod tests {
     }
 
     #[test]
-    fn sections_render_in_order_with_placeholders_for_empty_ones() {
+    fn provider_list_is_flat_without_section_headers_or_placeholders() {
         let app = app(vec![ollama(&["llama3.2:3b"]), hosted_gemini()]);
 
         let text = buffer_text(&draw(&app, 120, 30));
-        let local = text.find("LOCAL").expect("LOCAL header");
-        let gateway = text
-            .find("SOLANA AGENT GATEWAY")
-            .expect("SOLANA AGENT GATEWAY header");
-        let p2p = text.find("P2P").expect("P2P header");
-        assert!(local < gateway && gateway < p2p, "section order:\n{text}");
-
-        // Hosted entries land under the gateway header; port-probed
-        // servers are self-hosted peers and land under P2P.
         let ollama_at = text.find("Ollama").expect("ollama entry");
         let gemini_at = text.find("Google Gemini").expect("gemini entry");
         assert!(
-            gateway < gemini_at && gemini_at < p2p,
-            "gemini under gateway:\n{text}"
+            gemini_at < ollama_at,
+            "hosted entries should remain first:\n{text}"
         );
-        assert!(p2p < ollama_at, "ollama under P2P:\n{text}");
+        assert!(!text.contains("LOCAL"), "unexpected LOCAL header:\n{text}");
+        assert!(
+            !text.contains("SOLANA AGENT GATEWAY"),
+            "unexpected gateway header:\n{text}"
+        );
+        assert!(!text.contains("P2P"), "unexpected P2P header:\n{text}");
+        assert!(
+            !text.contains("  none"),
+            "unexpected empty-section placeholder:\n{text}"
+        );
+    }
 
-        // LOCAL has no providers yet — dim placeholder.
-        assert!(text.contains("none"), "empty section placeholder:\n{text}");
+    #[test]
+    fn provider_options_have_one_blank_line_between_them() {
+        let app = app(vec![ollama(&["llama3.2:3b"]), lm_studio(&["qwen2.5-7b"])]);
+
+        let text = buffer_text(&draw(&app, 120, 30));
+        let lines: Vec<_> = text.lines().collect();
+        let ollama_line = lines
+            .iter()
+            .position(|line| line.contains("Ollama"))
+            .expect("Ollama row");
+        let lm_studio_line = lines
+            .iter()
+            .position(|line| line.contains("LM Studio"))
+            .expect("LM Studio row");
+
+        assert_eq!(
+            lm_studio_line - ollama_line,
+            usize::from(ENTRY_HEIGHT) + 1,
+            "provider rows should be separated by exactly one line:\n{text}"
+        );
+        assert!(
+            lines[lm_studio_line - 1].trim().is_empty(),
+            "provider separator should be blank:\n{text}"
+        );
     }
 
     #[test]
     fn selected_row_carries_brand_color_rail_and_model_chip() {
-        // Gemini selected (gateway section sorts first), ollama inactive.
+        // Gemini selected (hosted entries sort first), ollama inactive.
         let app = app(vec![ollama(&["llama3.2:3b"]), hosted_gemini()]);
-        assert_eq!(
-            app.selected_provider().unwrap().slug(),
-            "generativelanguage"
-        );
+        assert_eq!(app.selected_provider().unwrap().slug(), "google");
 
         let buffer = draw(&app, 120, 30);
         let text = buffer_text(&buffer);
@@ -1192,15 +1177,19 @@ mod tests {
             "model-filter chips should be gone:\n{text}"
         );
 
-        // Section headers.
-        assert!(text.contains("LOCAL"), "missing LOCAL header:\n{text}");
+        // Flat provider list — no grouping headers or empty placeholders.
+        assert!(!text.contains("LOCAL"), "unexpected LOCAL header:\n{text}");
         assert!(
-            text.contains("SOLANA AGENT GATEWAY"),
-            "missing gateway header:\n{text}"
+            !text.contains("SOLANA AGENT GATEWAY"),
+            "unexpected gateway header:\n{text}"
         );
-        assert!(text.contains("P2P"), "missing P2P header:\n{text}");
+        assert!(!text.contains("P2P"), "unexpected P2P header:\n{text}");
+        assert!(
+            !text.contains("  none"),
+            "unexpected empty-section placeholder:\n{text}"
+        );
 
-        // Two-line rail entries: selected rail + plain rail, titles, the
+        // Three-line rail entries: selected rail + plain rail, titles, the
         // selected row's model chip, and per-entry detail lines.
         assert!(text.contains('┃'), "missing selected rail:\n{text}");
         assert!(text.contains('│'), "missing entry rail:\n{text}");

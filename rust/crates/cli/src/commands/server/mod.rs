@@ -16,6 +16,9 @@ pub enum ServerCommand {
     /// Start a proxy that enables stablecoin payments for your API.
     #[command(hide = true)]
     Start(start::StartCommand),
+    /// Legacy alias for `pay gate inference`.
+    #[command(hide = true)]
+    Inference(inference::InferenceCommand),
     /// Create a paywall YAML file that defines endpoints and payment requirements.
     Scaffold(scaffold::ScaffoldCommand),
     /// Derive (and optionally write back) the on-chain `Plan` PDAs for
@@ -47,6 +50,7 @@ impl ServerCommand {
         match self {
             Self::Demo(cmd) => cmd.otlp_sidecar.as_deref(),
             Self::Start(cmd) => cmd.otlp_sidecar.as_deref(),
+            Self::Inference(_) => None,
             Self::Scaffold(_) => None,
             Self::Plans { .. } => None,
         }
@@ -61,6 +65,10 @@ impl ServerCommand {
         match self {
             Self::Demo(cmd) => cmd.run(legacy_signer_source, account_override, sandbox),
             Self::Start(cmd) => cmd.run(legacy_signer_source, account_override, sandbox),
+            Self::Inference(cmd) => {
+                eprintln!("warning: `pay serve inference` moved to `pay gate inference`");
+                cmd.run(legacy_signer_source, account_override, sandbox)
+            }
             Self::Scaffold(cmd) => cmd.run(),
             Self::Plans { command } => match command {
                 PlansCommand::Publish(cmd) => cmd.run(),

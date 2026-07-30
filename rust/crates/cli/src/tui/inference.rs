@@ -1024,7 +1024,7 @@ mod tests {
                 .map(|model| ModelPricingSummary {
                     model: (*model).to_string(),
                     variant: Some((*model).to_string()),
-                    price: Some("in $0.10 · out $0.20 /1M tok".to_string()),
+                    price: Some("input $0.10 · output $0.20 / 1M tokens".to_string()),
                     description: None,
                 })
                 .collect(),
@@ -1586,7 +1586,7 @@ mod tests {
         assert!(text.contains("Ollama"), "missing provider title:\n{text}");
         assert!(text.contains("llama3.2:3b"), "missing model name:\n{text}");
         assert!(
-            text.contains("in $0.10 · out $0.20 /1M tok"),
+            text.contains("input $0.10 · output $0.20 / 1M"),
             "missing model pricing in sidebar:\n{text}"
         );
         assert!(text.contains("web ui"), "missing web control:\n{text}");

@@ -1,6 +1,6 @@
 //! Shared payment-stack machinery for the gateway commands.
 //!
-//! `pay gate api` and `pay gate inference [PAYWALL]`/`--price` build the
+//! `pay gate api` and `pay gate inference [RATES]`/`--price` build the
 //! same sandbox charge stack: an auto/ephemeral fee-payer signer, localnet RPC
 //! resolution, Surfpool wallet funding + payout-recipient ATA preparation,
 //! the shared recent-blockhash cache, the charge HMAC secret (mirrored into

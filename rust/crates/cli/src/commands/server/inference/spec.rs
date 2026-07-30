@@ -4,7 +4,7 @@
 //! `GateDecision::Passthrough`: forwarded upstream unmetered but still
 //! captured by the proxy's `record_exchange` hook into PDB.
 //!
-//! With per-model token pricing (positional paywall or `--price`, sandbox), the
+//! With per-model token pricing (positional rates file or `--price`, sandbox), the
 //! registry's `paid` endpoints are emitted as **x402-upto** metered
 //! endpoints: the client opens a channel with a per-request USD ceiling
 //! ([`MAX_REQUEST_USD`]), the gateway serves the response, and the operator

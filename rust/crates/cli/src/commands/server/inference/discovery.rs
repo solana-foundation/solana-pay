@@ -30,7 +30,7 @@ pub struct DiscoveredProvider {
     pub models: Vec<String>,
     /// Server-reported version when the identify response carries one.
     pub version: Option<String>,
-    /// Display-only per-model token pricing overlay (paywall or `--price`).
+    /// Per-model token pricing from a rates file or `--price`.
     /// When set and it resolves the picked model, the picker shows real
     /// in/out token rates for that model instead of the provider's own
     /// (trait) hint. `None` keeps the pre-existing hosted behavior.
@@ -67,7 +67,7 @@ impl DiscoveredProvider {
     /// Price for `model`, unifying the two pricing sources at one call site:
     ///
     /// 1. When a display-only [`PricingConfig`] overlay
-    ///    (paywall or `--price`) resolves the model, build a per-model
+    ///    (rates file or `--price`) resolves the model, build a per-model
     ///    in/out [`PricingHint`] from its token rates.
     /// 2. Otherwise fall back to the provider's own (trait) hint — the
     ///    pre-existing hosted-catalog behavior, unchanged when no overlay is
@@ -479,7 +479,7 @@ mod tests {
         assert_eq!(gemma.io, Some((0.15, 0.60)));
         assert_eq!(gemma.unit, "tokens");
         assert_eq!(gemma.variant.as_deref(), Some("gemma4"));
-        assert_eq!(gemma.to_string(), "in $0.15 · out $0.60 /1M tok");
+        assert_eq!(gemma.to_string(), "input $0.15 · output $0.60 / 1M tokens");
 
         // A model with no explicit entry resolves via the `*` default.
         let other = discovered
@@ -498,7 +498,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             gemma_summary.price.as_deref(),
-            Some("in $0.15 · out $0.60 /1M tok")
+            Some("input $0.15 · output $0.60 / 1M tokens")
         );
         assert_eq!(gemma_summary.variant.as_deref(), Some("gemma4"));
 

@@ -36,7 +36,7 @@ pay skills list                   # browse the API registry
 pay skills show <provider>        # show a provider's endpoints
 pay account list                  # list accounts
 pay topup                         # fund account
-pay gate api                      # run a payment gateway for your API
+pay gate api <paywall.yml>        # run a payment gateway for your API
 ```
 
 ## Notes

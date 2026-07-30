@@ -47,6 +47,10 @@ docker-run *ARGS:
 gate-api PAYWALL *ARGS:
     cargo run -- gate api {{PAYWALL}} {{ARGS}}
 
+# Backward-compatible alias for local scripts.
+serve PAYWALL *ARGS:
+    cargo run -- gate api {{PAYWALL}} {{ARGS}}
+
 # Start the payment verifier service (for Apigee / external gateways)
 apigee-serve *ARGS:
     cargo run -p pay -- server verify {{ARGS}}

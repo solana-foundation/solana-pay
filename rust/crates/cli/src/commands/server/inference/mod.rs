@@ -5,7 +5,7 @@
 //! By default this is free passthrough: synthesized specs have no metered
 //! endpoints, so the payment gate forwards everything while
 //! `record_exchange` still feeds the PDB correlation engine (`AllExchanges`
-//! mode). With `--sandbox [PAYWALL]` or `--price` (per-model token rates), the
+//! mode). With `--sandbox [RATES]` or `--price` (per-model token rates), the
 //! registry's `paid` endpoints are synthesized as x402-upto per-token
 //! metered endpoints and the command builds a sandbox charge stack reusing
 //! the `gate api` machinery (localnet + Surfpool, ephemeral fee-payer
@@ -112,7 +112,7 @@ pub struct InferenceCommand {
     #[arg(short = 's', long)]
     pub sandbox: bool,
 
-    /// Optional paywall YAML with per-model token rates. With `--sandbox`,
+    /// Optional rates YAML with per-model token rates. With `--sandbox`,
     /// this charges per token via x402-upto (input×in-rate + output×out-rate,
     /// settled after serve); model-listing/health stay free. Mutually
     /// exclusive with the inline `--price` shorthand. Shape:
@@ -124,17 +124,17 @@ pub struct InferenceCommand {
     ///   "qwen3:8b": { in: 0.50, out: 1.50 }
     /// ```
     #[arg(
-        value_name = "PAYWALL",
+        value_name = "RATES",
         conflicts_with_all = ["pricing", "price"]
     )]
-    pub paywall: Option<String>,
+    pub rates: Option<String>,
 
-    /// Legacy alias for the positional paywall YAML.
+    /// Legacy alias for the positional rates YAML.
     #[arg(
         long,
-        value_name = "PAYWALL",
+        value_name = "RATES",
         hide = true,
-        conflicts_with_all = ["paywall", "price"]
+        conflicts_with_all = ["rates", "price"]
     )]
     pub pricing: Option<String>,
 
@@ -271,7 +271,7 @@ fn enforce_sandbox(spec: &ApiSpec, path: &str) -> pay_core::Result<()> {
 /// Per-model pricing charge gate: per-token charging is sandbox-only for now
 /// (localnet stablecoins via the Surfpool sandbox). Per-model pricing WITHOUT
 /// `--sandbox` is refused loudly rather than silently pointed at a real
-/// cluster — mainnet per-token charging is not wired yet. No paywall or
+/// cluster — mainnet per-token charging is not wired yet. No rates file or
 /// pricing flag ⇒
 /// free passthrough (unchanged).
 fn enforce_pricing_sandbox(
@@ -280,24 +280,24 @@ fn enforce_pricing_sandbox(
 ) -> pay_core::Result<()> {
     if pricing_config.is_some() && !sandbox {
         return Err(pay_core::Error::Config(
-            "inference paywall/--price: mainnet per-token charging is not wired yet — run with --sandbox"
+            "inference rates/--price: mainnet per-token charging is not wired yet — run with --sandbox"
                 .into(),
         ));
     }
     Ok(())
 }
 
-/// Resolve per-model token pricing from positional `PAYWALL`, legacy
-/// `--pricing <PAYWALL>`, or inline `--price <SPEC>`. At most one may be set
+/// Resolve per-model token pricing from positional `RATES`, legacy
+/// `--pricing <RATES>`, or inline `--price <SPEC>`. At most one may be set
 /// (enforced by clap and re-checked here for programmatic callers). `None`
 /// means free passthrough.
 fn resolve_pricing_config(
-    paywall_file: Option<&str>,
+    rates_file: Option<&str>,
     legacy_pricing_file: Option<&str>,
     price_inline: Option<&str>,
 ) -> pay_core::Result<Option<pricing::PricingConfig>> {
     let configured = [
-        paywall_file.is_some(),
+        rates_file.is_some(),
         legacy_pricing_file.is_some(),
         price_inline.is_some(),
     ]
@@ -306,11 +306,11 @@ fn resolve_pricing_config(
     .count();
     if configured > 1 {
         return Err(pay_core::Error::Config(
-            "set one inference paywall source: positional PAYWALL or --price".into(),
+            "set one inference pricing source: positional RATES or --price".into(),
         ));
     }
 
-    if let Some(path) = paywall_file.or(legacy_pricing_file) {
+    if let Some(path) = rates_file.or(legacy_pricing_file) {
         Ok(Some(pricing::PricingConfig::from_yaml_file(path)?))
     } else if let Some(spec) = price_inline {
         Ok(Some(pricing::PricingConfig::from_inline(spec)?))
@@ -399,7 +399,7 @@ impl InferenceCommand {
     ) -> pay_core::Result<()> {
         let sandbox = self.sandbox || global_sandbox;
         let pricing_config = resolve_pricing_config(
-            self.paywall.as_deref(),
+            self.rates.as_deref(),
             self.pricing.as_deref(),
             self.price.as_deref(),
         )?;
@@ -732,7 +732,7 @@ impl InferenceCommand {
             );
         }
         if payment.is_some() {
-            eprintln!("⏺ charging per token (localnet) — in/out rates from your paywall");
+            eprintln!("⏺ charging per token (localnet) — in/out rates from your rates config");
         }
 
         let (x402_upto, fee_payer_signer, fee_payer_wallet) = match payment {

@@ -604,13 +604,13 @@ mod tests {
     #[test]
     fn gate_inference_is_the_canonical_inference_gateway_command() {
         let opts =
-            Opts::try_parse_from(["pay", "gate", "inference", "paywall.yml", "--no-tui"]).unwrap();
+            Opts::try_parse_from(["pay", "gate", "inference", "rates.yml", "--no-tui"]).unwrap();
 
         match opts.command {
             Some(Command::Gate {
                 command: commands::server::GateCommand::Inference(cmd),
             }) => {
-                assert_eq!(cmd.paywall.as_deref(), Some("paywall.yml"));
+                assert_eq!(cmd.rates.as_deref(), Some("rates.yml"));
                 assert!(cmd.no_tui);
             }
             _ => panic!("expected gate inference command"),
@@ -618,8 +618,27 @@ mod tests {
     }
 
     #[test]
-    fn serve_inference_is_rejected_after_rename() {
-        assert!(Opts::try_parse_from(["pay", "serve", "inference"]).is_err());
+    fn gate_inference_help_calls_the_positional_input_rates() {
+        let err = match Opts::try_parse_from(["pay", "gate", "inference", "--help"]) {
+            Err(err) => err,
+            Ok(_) => panic!("--help should stop argument parsing"),
+        };
+        let help = err.to_string();
+
+        assert!(help.contains("[RATES]"), "{help}");
+        assert!(!help.contains("[PAYWALL]"), "{help}");
+    }
+
+    #[test]
+    fn serve_inference_remains_as_a_hidden_migration_alias() {
+        let opts = Opts::try_parse_from(["pay", "serve", "inference", "rates.yml"]).unwrap();
+
+        match opts.command {
+            Some(Command::Server {
+                command: commands::server::ServerCommand::Inference(cmd),
+            }) => assert_eq!(cmd.rates.as_deref(), Some("rates.yml")),
+            _ => panic!("expected legacy serve inference command"),
+        }
     }
 
     #[test]

@@ -541,7 +541,9 @@ fn gateway_payer_upstream(provider: &DiscoveredProvider) -> payer_proxy::PayerUp
 /// catalog entry still advertises the legacy x402 fallback.
 fn provider_payment_protocol(provider: &DiscoveredProvider) -> payer_proxy::PaymentProtocol {
     match provider.slug() {
-        "modelstudio" | "generativelanguage" => payer_proxy::PaymentProtocol::MppSession,
+        "alibaba" | "google" | "modelstudio" | "generativelanguage" => {
+            payer_proxy::PaymentProtocol::MppSession
+        }
         _ => payer_proxy::PaymentProtocol::Auto,
     }
 }
@@ -586,7 +588,7 @@ fn select_provider_choice(
         let provider = providers
             .into_iter()
             .find(|provider| {
-                provider.slug().eq_ignore_ascii_case(requested_provider)
+                provider_slug_matches(provider.slug(), requested_provider)
                     || provider.title().eq_ignore_ascii_case(requested_provider)
             })
             .ok_or_else(|| {
@@ -614,6 +616,18 @@ fn select_provider_choice(
             "{agent} provider selection cancelled"
         ))),
     }
+}
+
+/// Match current provider brands while accepting CLI values persisted before
+/// the catalog picker switched from API-resource names to brand names.
+fn provider_slug_matches(slug: &str, requested: &str) -> bool {
+    slug.eq_ignore_ascii_case(requested)
+        || match slug {
+            "google" => requested.eq_ignore_ascii_case("generativelanguage"),
+            "blockrun" => requested.eq_ignore_ascii_case("openai"),
+            "alibaba" => requested.eq_ignore_ascii_case("modelstudio"),
+            _ => false,
+        }
 }
 
 fn discover_local_providers() -> pay_core::Result<Vec<DiscoveredProvider>> {
@@ -707,11 +721,10 @@ fn discover_catalog_providers() -> Vec<DiscoveredProvider> {
     };
     rt.block_on(async {
         let mut resolved = match load_catalog_quietly().await {
-            Ok(mut catalog) => catalog_providers::resolve_catalog_providers(
-                &mut catalog,
-                catalog_providers::DEFAULT_CATALOG_FQNS,
-            )
-            .await,
+            Ok(mut catalog) => {
+                let fqns = catalog_providers::picker_catalog_fqns(&catalog);
+                catalog_providers::resolve_catalog_providers(&mut catalog, &fqns).await
+            }
             Err(e) => {
                 tracing::debug!(error = %e, "skills catalog unavailable — using built-in gateway providers");
                 Vec::new()
@@ -728,7 +741,6 @@ fn discover_catalog_providers() -> Vec<DiscoveredProvider> {
         let mut discovered = Vec::new();
         for provider in resolved {
             let base_url = provider.service_url().to_string();
-            let provider: Arc<dyn InferenceProvider> = Arc::new(provider);
             let Some(version) = provider.identify(&client, &base_url).await else {
                 tracing::debug!(
                     slug = provider.slug(),
@@ -737,14 +749,17 @@ fn discover_catalog_providers() -> Vec<DiscoveredProvider> {
                 );
                 continue;
             };
-            let models = provider.list_models(&client, &base_url).await;
+            let (models, model_pricing) = provider
+                .list_models_with_pricing(&client, &base_url)
+                .await;
+            let provider: Arc<dyn InferenceProvider> = Arc::new(provider);
             discovered.push(DiscoveredProvider {
                 provider,
                 base_url,
                 models,
                 version,
                 pricing: None,
-                model_pricing: Vec::new(),
+                model_pricing,
             });
         }
         discovered
@@ -765,7 +780,8 @@ async fn load_catalog_quietly() -> pay_core::Result<pay_core::skills::Catalog> {
     let cache_is_fresh = pay_core::skills::config::SkillsConfig::load()
         .map(|cfg| cfg.valid_cache_path().is_some())
         .unwrap_or(false);
-    if cache_is_fresh && let Ok(catalog) = pay_core::skills::load_cached_skills() {
+    if cache_is_fresh && let Ok(mut catalog) = pay_core::skills::load_cached_skills() {
+        pay_core::skills::overlay::merge_pins_into(&mut catalog);
         return Ok(catalog);
     }
     pay_core::skills::load_skills().await
@@ -1001,6 +1017,15 @@ mod tests {
     }
 
     #[test]
+    fn provider_brand_slugs_accept_legacy_resource_aliases() {
+        assert!(provider_slug_matches("google", "google"));
+        assert!(provider_slug_matches("google", "generativelanguage"));
+        assert!(provider_slug_matches("blockrun", "openai"));
+        assert!(provider_slug_matches("alibaba", "modelstudio"));
+        assert!(!provider_slug_matches("blockrun", "google"));
+    }
+
+    #[test]
     fn launch_banner_abbreviates_payer_pubkeys() {
         assert_eq!(
             abbreviate_pubkey("CHPEgF7X1hYJf64oRx53ABUL43DXpEjTJBzAYmZWNuKR"),
@@ -1016,7 +1041,7 @@ mod tests {
             chat_completions_path(&provider),
             "compatible-mode/v1/chat/completions"
         );
-        assert_eq!(responses_path(&provider), "v1/responses");
+        assert_eq!(responses_path(&provider), "compatible-mode/v1/responses");
     }
 
     #[test]
@@ -1069,7 +1094,7 @@ mod tests {
             model_pricing: vec![pay_pdb::types::ModelPricingSummary {
                 model: "gemma4:latest".into(),
                 variant: Some("gemma4".into()),
-                price: Some("in $1.00 · out $3.00 /1M tok".into()),
+                price: Some("input $1.00 · output $3.00 / 1M tokens".into()),
                 description: None,
             }],
         }];
@@ -1082,7 +1107,7 @@ mod tests {
         let hint = providers[0]
             .pricing_hint_for_model(Some("gemma4:latest"))
             .unwrap();
-        assert_eq!(hint.to_string(), "in $1.00 · out $3.00 /1M tok");
+        assert_eq!(hint.to_string(), "input $1.00 · output $3.00 / 1M tokens");
         assert_eq!(hint.variant.as_deref(), Some("gemma4"));
     }
 
