@@ -20,7 +20,7 @@ use ratatui::widgets::{Block, Paragraph};
 
 use crate::commands::server::inference::discovery::DiscoveredProvider;
 
-use super::term::{SPINNER, TuiBackend, with_terminal};
+use super::term::{SPINNER, TuiBackend, with_terminal_paste};
 use super::theme::TOPUP_MAIN_BG;
 use super::widgets::controls_bar;
 
@@ -46,14 +46,23 @@ pub fn select_provider(
     harness: &str,
     providers: Vec<DiscoveredProvider>,
     requested_model: Option<&str>,
+    mut discover_custom: impl FnMut(&str) -> Result<Vec<DiscoveredProvider>, String>,
 ) -> io::Result<ProviderSelection> {
-    if !std::io::IsTerminal::is_terminal(&std::io::stderr()) || providers.is_empty() {
+    if !std::io::IsTerminal::is_terminal(&std::io::stderr()) {
         return Ok(ProviderSelection::Cancelled);
     }
 
     let harness = harness.to_string();
     let requested_model = requested_model.map(str::to_string);
-    with_terminal(|terminal| run(terminal, harness, providers, requested_model))
+    with_terminal_paste(|terminal| {
+        run(
+            terminal,
+            harness,
+            providers,
+            requested_model,
+            &mut discover_custom,
+        )
+    })
 }
 
 fn run(
@@ -61,6 +70,7 @@ fn run(
     harness: String,
     providers: Vec<DiscoveredProvider>,
     requested_model: Option<String>,
+    discover_custom: &mut impl FnMut(&str) -> Result<Vec<DiscoveredProvider>, String>,
 ) -> io::Result<ProviderSelection> {
     let mut app = ProviderPickerApp::new(harness, providers, requested_model);
 
@@ -68,33 +78,49 @@ fn run(
         app.tick = app.tick.wrapping_add(1);
         terminal.draw(|frame| render(frame, &app))?;
 
-        if event::poll(std::time::Duration::from_millis(50))?
-            && let Event::Key(key) = event::read()?
-        {
-            if key.kind != KeyEventKind::Press {
-                continue;
-            }
-            match key.code {
-                KeyCode::Esc => return Ok(ProviderSelection::Cancelled),
-                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    return Ok(ProviderSelection::Cancelled);
-                }
-                KeyCode::Up => app.move_selection(-1),
-                KeyCode::Down => app.move_selection(1),
-                KeyCode::Tab | KeyCode::Right => app.cycle_model(1),
-                KeyCode::BackTab | KeyCode::Left => app.cycle_model(-1),
-                KeyCode::Enter => {
-                    if let Some(choice) = app.choice() {
-                        return Ok(ProviderSelection::Selected(choice));
+        if event::poll(std::time::Duration::from_millis(50))? {
+            match event::read()? {
+                Event::Paste(value) => app.paste(&value),
+                Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
+                    KeyCode::Esc => return Ok(ProviderSelection::Cancelled),
+                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        return Ok(ProviderSelection::Cancelled);
                     }
-                }
-                KeyCode::Backspace => app.pop_search(),
-                KeyCode::Char(ch)
-                    if !key.modifiers.contains(KeyModifiers::CONTROL)
-                        && !key.modifiers.contains(KeyModifiers::ALT) =>
-                {
-                    app.push_search(ch);
-                }
+                    KeyCode::Up => app.move_selection(-1),
+                    KeyCode::Down => app.move_selection(1),
+                    KeyCode::Tab | KeyCode::Right => app.cycle_model(1),
+                    KeyCode::BackTab | KeyCode::Left => app.cycle_model(-1),
+                    KeyCode::Enter if app.custom_selected() => {
+                        let Some(url) = app.custom_submission() else {
+                            continue;
+                        };
+                        app.discovering = true;
+                        app.custom_error = None;
+                        terminal.draw(|frame| render(frame, &app))?;
+                        match discover_custom(&url) {
+                            Ok(providers) if providers.is_empty() => {
+                                app.custom_error =
+                                    Some("No compatible inference provider found".to_string());
+                            }
+                            Ok(providers) => app.add_custom_providers(providers),
+                            Err(error) => app.custom_error = Some(error),
+                        }
+                        app.discovering = false;
+                    }
+                    KeyCode::Enter => {
+                        if let Some(choice) = app.choice() {
+                            return Ok(ProviderSelection::Selected(choice));
+                        }
+                    }
+                    KeyCode::Backspace => app.pop_input(),
+                    KeyCode::Char(ch)
+                        if !key.modifiers.contains(KeyModifiers::CONTROL)
+                            && !key.modifiers.contains(KeyModifiers::ALT) =>
+                    {
+                        app.push_input(ch);
+                    }
+                    _ => {}
+                },
                 _ => {}
             }
         }
@@ -111,10 +137,19 @@ struct ProviderPickerApp {
     search: String,
     /// Index into [`Self::filtered`].
     selected: usize,
+    /// The permanent Custom action is selected independently from the
+    /// provider index so a zero-result search does not turn typed text into a
+    /// URL halfway through the query.
+    custom_active: bool,
     /// `←`/`→` cursor into the selected provider's model list.
     model_idx: usize,
     /// `--model` lock: overrides the per-provider model choice.
     requested_model: Option<String>,
+    /// URL being edited by the final, permanent Custom row.
+    custom_url: String,
+    /// Last validation/discovery failure, rendered under the URL field.
+    custom_error: Option<String>,
+    discovering: bool,
     tick: usize,
 }
 
@@ -127,13 +162,18 @@ impl ProviderPickerApp {
         // Keep hosted providers first while preserving discovery order within
         // the hosted and self-hosted groups.
         providers.sort_by_key(|provider| !provider.hosted());
+        let custom_active = providers.is_empty();
         Self {
             harness,
             providers,
             search: String::new(),
             selected: 0,
+            custom_active,
             model_idx: 0,
             requested_model,
+            custom_url: String::new(),
+            custom_error: None,
+            discovering: false,
             tick: 0,
         }
     }
@@ -180,10 +220,16 @@ impl ProviderPickerApp {
     }
 
     fn selected_provider(&self) -> Option<&DiscoveredProvider> {
-        self.filtered().get(self.selected).copied()
+        (!self.custom_active)
+            .then(|| self.filtered().get(self.selected).copied())
+            .flatten()
     }
 
-    fn clamp_selection(&mut self) {
+    fn custom_selected(&self) -> bool {
+        self.custom_active
+    }
+
+    fn clamp_provider_selection(&mut self) {
         let clamped = self.selected.min(self.filtered().len().saturating_sub(1));
         if clamped != self.selected {
             self.selected = clamped;
@@ -193,7 +239,23 @@ impl ProviderPickerApp {
 
     fn move_selection(&mut self, delta: isize) {
         let len = self.filtered().len();
+        if self.custom_active {
+            if delta < 0 && len > 0 {
+                self.custom_active = false;
+                self.selected = len - 1;
+                self.model_idx = 0;
+            }
+            return;
+        }
         if len == 0 {
+            if delta > 0 {
+                self.custom_active = true;
+            }
+            return;
+        }
+        if delta > 0 && self.selected + 1 >= len {
+            self.custom_active = true;
+            self.model_idx = 0;
             return;
         }
         let next = (self.selected as isize + delta).clamp(0, len as isize - 1) as usize;
@@ -207,7 +269,7 @@ impl ProviderPickerApp {
     /// narrowed) models — clamped at both ends, no wrap. No-op while the
     /// model is locked by `--model` or the provider reports no models.
     fn cycle_model(&mut self, delta: isize) {
-        if self.model_locked() {
+        if self.model_locked() || self.custom_selected() {
             return;
         }
         let len = match self.selected_provider() {
@@ -220,16 +282,66 @@ impl ProviderPickerApp {
         self.model_idx = (self.model_idx as isize + delta).clamp(0, len as isize - 1) as usize;
     }
 
-    fn push_search(&mut self, ch: char) {
-        self.search.push(ch);
-        self.model_idx = 0;
-        self.clamp_selection();
+    fn push_input(&mut self, ch: char) {
+        if self.custom_selected() {
+            self.custom_url.push(ch);
+            self.custom_error = None;
+        } else {
+            self.search.push(ch);
+            self.model_idx = 0;
+            self.clamp_provider_selection();
+        }
     }
 
-    fn pop_search(&mut self) {
-        self.search.pop();
+    fn paste(&mut self, value: &str) {
+        for ch in value.chars().filter(|ch| !ch.is_control()) {
+            self.push_input(ch);
+        }
+    }
+
+    fn pop_input(&mut self) {
+        if self.custom_selected() {
+            self.custom_url.pop();
+            self.custom_error = None;
+        } else {
+            self.search.pop();
+            self.model_idx = 0;
+            self.clamp_provider_selection();
+        }
+    }
+
+    fn custom_submission(&mut self) -> Option<String> {
+        let url = self.custom_url.trim();
+        if url.is_empty() {
+            self.custom_error = Some("Paste an http:// or https:// server URL".to_string());
+            return None;
+        }
+        Some(url.to_string())
+    }
+
+    fn add_custom_providers(&mut self, providers: Vec<DiscoveredProvider>) {
+        let selected = providers
+            .first()
+            .map(|provider| (provider.slug().to_string(), provider.base_url.clone()));
+        for provider in providers {
+            self.providers.retain(|existing| {
+                existing.slug() != provider.slug() || existing.base_url != provider.base_url
+            });
+            self.providers.push(provider);
+        }
+        self.providers.sort_by_key(|provider| !provider.hosted());
+        self.search.clear();
+        self.custom_url.clear();
+        self.custom_error = None;
+        self.custom_active = false;
         self.model_idx = 0;
-        self.clamp_selection();
+        if let Some((slug, base_url)) = selected {
+            self.selected = self
+                .filtered()
+                .iter()
+                .position(|provider| provider.slug() == slug && provider.base_url == base_url)
+                .unwrap_or(0);
+        }
     }
 
     /// Model that Enter would launch for `provider`: `--model` lock > the
@@ -301,12 +413,15 @@ enum ListRow<'a> {
     Gap,
     /// `usize` is the index into [`ProviderPickerApp::filtered`].
     Entry(usize, &'a DiscoveredProvider),
+    /// Permanent final action for adding a catalog-backed inference server.
+    Custom,
 }
 
 impl ListRow<'_> {
     fn height(&self) -> u16 {
         match self {
             ListRow::Entry(..) => ENTRY_HEIGHT,
+            ListRow::Custom => ENTRY_HEIGHT,
             _ => 1,
         }
     }
@@ -324,16 +439,20 @@ fn render_provider_list(frame: &mut ratatui::Frame, area: Rect, app: &ProviderPi
         }
         rows.push(ListRow::Entry(idx, provider));
     }
+    if !providers.is_empty() {
+        rows.push(ListRow::Gap);
+    }
+    rows.push(ListRow::Custom);
 
     // Scroll (in lines) so the selected entry is fully visible.
     let mut sel_end: u16 = 0;
     let mut total: u16 = 0;
     for row in &rows {
         let h = row.height();
-        if let ListRow::Entry(idx, _) = row
-            && *idx == app.selected
-        {
-            sel_end = total + h;
+        match row {
+            ListRow::Entry(idx, _) if *idx == app.selected => sel_end = total + h,
+            ListRow::Custom if app.custom_selected() => sel_end = total + h,
+            _ => {}
         }
         total += h;
     }
@@ -371,8 +490,77 @@ fn render_provider_list(frame: &mut ratatui::Frame, area: Rect, app: &ProviderPi
                     chosen.as_deref(),
                 );
             }
+            ListRow::Custom => render_custom_entry(frame, row_area, app),
         }
     }
+}
+
+fn render_custom_entry(frame: &mut ratatui::Frame, area: Rect, app: &ProviderPickerApp) {
+    let selected = app.custom_selected();
+    let accent = if selected {
+        Color::Cyan
+    } else {
+        Color::DarkGray
+    };
+    let rail_glyph = if selected { "┃" } else { "│" };
+    let rail = Span::styled(format!("{rail_glyph} "), Style::default().fg(accent).bold());
+    let title_style = if selected {
+        Style::default().fg(Color::White).bold()
+    } else {
+        Style::default().fg(Color::Gray).bold()
+    };
+    let dim = Style::default().fg(Color::DarkGray);
+
+    let top = Line::from(vec![rail.clone(), Span::styled("Custom", title_style)]);
+    let input = if selected {
+        let value = if app.custom_url.is_empty() {
+            Span::styled("Paste inference server URL…", dim)
+        } else {
+            Span::styled(app.custom_url.clone(), Style::default().fg(Color::White))
+        };
+        Line::from(vec![
+            rail.clone(),
+            value,
+            Span::styled("▌", Style::default().fg(Color::Gray)),
+        ])
+    } else {
+        Line::from(vec![
+            rail.clone(),
+            Span::styled("Bring your own inference server", dim),
+        ])
+    };
+    let detail = if app.discovering {
+        Line::from(vec![
+            rail,
+            Span::styled(
+                format!(
+                    "{} Discovering OpenAPI, models, and pricing…",
+                    SPINNER[app.tick % SPINNER.len()]
+                ),
+                Style::default().fg(Color::Cyan),
+            ),
+        ])
+    } else if let Some(error) = app.custom_error.as_deref() {
+        Line::from(vec![
+            rail,
+            Span::styled(
+                truncate_str(error, area.width.saturating_sub(2) as usize),
+                Style::default().fg(Color::Red),
+            ),
+        ])
+    } else if selected {
+        Line::from(vec![
+            rail,
+            Span::styled(
+                "Discovers OpenAPI, models, and pricing · saves on success",
+                dim,
+            ),
+        ])
+    } else {
+        Line::from(rail)
+    };
+
+    frame.render_widget(Paragraph::new(vec![top, input, detail]), area);
 }
 
 /// One three-line entry in the notice style: a `│` rail spanning the row
@@ -531,33 +719,49 @@ fn model_chip_spans<'a>(
 }
 
 fn render_controls(frame: &mut ratatui::Frame, area: Rect, app: &ProviderPickerApp) {
-    let entries: Vec<(&str, &str)> = vec![
-        ("↑ ↓", "provider"),
-        ("← →", "model"),
-        ("a-z", "search"),
-        ("⏎", "launch"),
-        ("Esc", "cancel"),
-    ];
+    let entries: Vec<(&str, &str)> = if app.custom_selected() {
+        vec![
+            ("↑ ↓", "provider"),
+            ("paste", "URL"),
+            ("⏎", "add"),
+            ("Esc", "cancel"),
+        ]
+    } else {
+        vec![
+            ("↑ ↓", "provider"),
+            ("← →", "model"),
+            ("a-z", "search"),
+            ("⏎", "launch"),
+            ("Esc", "cancel"),
+        ]
+    };
 
     let spinner = SPINNER[app.tick % SPINNER.len()];
-    let status = match app.selected_provider() {
-        Some(provider) => match app.chosen_model(provider) {
-            Some(model) => Line::from(vec![
-                Span::styled(spinner, Style::default().fg(Color::Green).bold()),
-                Span::styled(
-                    format!(" {} → {}/{} ", app.harness, provider.slug(), model),
-                    Style::default().fg(Color::DarkGray),
-                ),
-            ]),
-            None => Line::from(Span::styled(
-                "pass --model to launch this provider ",
-                Style::default().fg(Color::Yellow),
-            )),
-        },
-        None => Line::from(Span::styled(
-            "no providers match ",
+    let status = if app.custom_selected() {
+        Line::from(Span::styled(
+            "custom catalog-backed server ",
             Style::default().fg(Color::DarkGray),
-        )),
+        ))
+    } else {
+        match app.selected_provider() {
+            Some(provider) => match app.chosen_model(provider) {
+                Some(model) => Line::from(vec![
+                    Span::styled(spinner, Style::default().fg(Color::Green).bold()),
+                    Span::styled(
+                        format!(" {} → {}/{} ", app.harness, provider.slug(), model),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                ]),
+                None => Line::from(Span::styled(
+                    "pass --model to launch this provider ",
+                    Style::default().fg(Color::Yellow),
+                )),
+            },
+            None => Line::from(Span::styled(
+                "no providers match ",
+                Style::default().fg(Color::DarkGray),
+            )),
+        }
     };
     controls_bar(frame, area, &entries, Some(status));
 }
@@ -673,6 +877,13 @@ mod tests {
         app.search = "nope".into();
         assert!(app.filtered().is_empty());
         assert!(app.selected_provider().is_none());
+        assert!(
+            !app.custom_selected(),
+            "a zero-result search must not activate URL entry"
+        );
+        app.push_input('!');
+        assert_eq!(app.search, "nope!");
+        assert!(app.custom_url.is_empty());
     }
 
     #[test]
@@ -709,7 +920,7 @@ mod tests {
 
         // Typing a model query narrows what ←/→ walks and what Enter picks.
         for ch in "nomic".chars() {
-            app.push_search(ch);
+            app.push_input(ch);
         }
         assert_eq!(filtered_slugs(&app), vec!["ollama"]);
         assert_eq!(app.choice().unwrap().model, "nomic-embed");
@@ -742,17 +953,72 @@ mod tests {
 
         // Typing narrows the list to one entry — selection clamps to it.
         for ch in "ollama".chars() {
-            app.push_search(ch);
+            app.push_input(ch);
         }
         assert_eq!(app.selected, 0);
         assert_eq!(app.selected_provider().unwrap().slug(), "ollama");
 
         // Deleting the query restores the full list; selection stays valid.
         while !app.search.is_empty() {
-            app.pop_search();
+            app.pop_input();
         }
         assert_eq!(filtered_slugs(&app).len(), 2);
         assert_eq!(app.selected, 0);
+    }
+
+    #[test]
+    fn custom_is_always_the_final_option_and_owns_text_input_when_selected() {
+        let mut app = app(vec![ollama(&["llama3.2:3b"]), lm_studio(&["qwen2.5-7b"])]);
+        app.move_selection(1);
+        app.move_selection(1);
+        assert!(app.custom_selected());
+        assert!(app.selected_provider().is_none());
+
+        app.paste("https://inference.example.com\n");
+        assert_eq!(app.custom_url, "https://inference.example.com");
+        assert!(app.search.is_empty(), "URL paste must not alter search");
+
+        let text = buffer_text(&draw(&app, 120, 30));
+        assert!(text.contains("Custom"), "missing Custom row:\n{text}");
+        assert!(
+            text.contains("https://inference.example.com"),
+            "selected Custom row must render its URL input:\n{text}"
+        );
+        assert!(
+            text.contains("saves on success"),
+            "selected Custom row must explain persistence:\n{text}"
+        );
+    }
+
+    #[test]
+    fn discovered_custom_provider_is_selected_and_shows_all_models() {
+        let mut app = app(vec![ollama(&["llama3.2:3b"])]);
+        app.move_selection(1);
+        assert!(app.custom_selected());
+
+        let custom = hosted_gemini_variant_priced();
+        app.add_custom_providers(vec![custom]);
+
+        assert!(!app.custom_selected());
+        assert_eq!(app.selected_provider().unwrap().slug(), "google");
+        assert_eq!(app.choice().unwrap().model, "gemini-2.5-flash");
+        let text = buffer_text(&draw(&app, 120, 30));
+        assert!(
+            text.contains("gemini-2.5-flash") && text.contains("gemini-2.5-pro"),
+            "newly selected provider must expose its model choices:\n{text}"
+        );
+    }
+
+    #[test]
+    fn custom_is_available_when_discovery_found_no_providers() {
+        let app = app(Vec::new());
+        assert!(app.custom_selected());
+        let text = buffer_text(&draw(&app, 100, 16));
+        assert!(text.contains("Custom"), "missing Custom row:\n{text}");
+        assert!(
+            text.contains("Paste inference server URL"),
+            "empty picker must start in URL-entry mode:\n{text}"
+        );
     }
 
     // ── Enter → choice ──

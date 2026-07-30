@@ -1242,7 +1242,7 @@ async fn fetch_one_async(client: &reqwest::Client, url: &str) -> Result<Catalog>
         .text()
         .await
         .map_err(|e| Error::Config(format!("read {url}: {e}")))?;
-    parse_catalog(&raw)
+    parse_catalog_source(&raw, url)
 }
 
 /// Shared async HTTP fetch used by detail/endpoint/openapi loaders.
@@ -1366,6 +1366,170 @@ pub mod blocking {
 
 fn parse_catalog(raw: &str) -> Result<Catalog> {
     serde_json::from_str(raw).map_err(|e| Error::Config(format!("parse catalog: {e}")))
+}
+
+/// Parse either a Pay catalog or an OpenAPI document into the common catalog
+/// shape. This lets durable custom sources point directly at
+/// `/openapi.json`; inline `x-pay-metering` pricing is preserved by the
+/// existing OpenAPI endpoint parser.
+pub fn parse_catalog_source(raw: &str, source_url: &str) -> Result<Catalog> {
+    if let Ok(catalog) = parse_catalog(raw) {
+        return Ok(catalog);
+    }
+
+    let doc: serde_json::Value = serde_json::from_str(raw)
+        .map_err(|error| Error::Config(format!("parse catalog or OpenAPI: {error}")))?;
+    validate_payment_discovery_openapi(&doc, source_url)?;
+    let resolved = openapi::parse_endpoints(raw).map_err(|error| {
+        Error::Config(format!(
+            "{source_url} is neither a Pay catalog nor valid OpenAPI: {error}"
+        ))
+    })?;
+    if resolved.is_empty() {
+        return Err(Error::Config(format!(
+            "OpenAPI source {source_url} contains no endpoints"
+        )));
+    }
+
+    let source = reqwest::Url::parse(source_url)
+        .map_err(|error| Error::Config(format!("invalid OpenAPI URL {source_url}: {error}")))?;
+    let service_url = doc
+        .pointer("/servers/0/url")
+        .and_then(serde_json::Value::as_str)
+        .filter(|url| !url.contains('{'))
+        .and_then(|url| source.join(url).ok())
+        .unwrap_or_else(|| {
+            let mut origin = source.clone();
+            origin.set_path("/");
+            origin.set_query(None);
+            origin.set_fragment(None);
+            origin
+        })
+        .to_string()
+        .trim_end_matches('/')
+        .to_string();
+    let host = reqwest::Url::parse(&service_url)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_string))
+        .unwrap_or_else(|| "inference".to_string());
+    let title = doc
+        .pointer("/info/title")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|title| !title.is_empty())
+        .unwrap_or(&host)
+        .to_string();
+    let slug = title
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                ch.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>()
+        .trim_matches('-')
+        .to_string();
+    let description = doc
+        .pointer("/info/description")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let endpoints: Vec<Endpoint> = resolved
+        .into_iter()
+        .map(|endpoint| Endpoint {
+            method: endpoint.spec.method,
+            full_path: build_endpoint_url(&service_url, &endpoint.spec.path),
+            path: endpoint.spec.path,
+            resource: endpoint.spec.resource,
+            description: endpoint.spec.description,
+            pricing: endpoint.spec.pricing,
+        })
+        .collect();
+    let prices: Vec<(f64, f64)> = endpoints
+        .iter()
+        .filter_map(|endpoint| price_range_usd(&endpoint.pricing))
+        .collect();
+    let min_price_usd = prices
+        .iter()
+        .map(|(min, _)| *min)
+        .reduce(f64::min)
+        .unwrap_or(0.0);
+    let max_price_usd = prices
+        .iter()
+        .map(|(_, max)| *max)
+        .reduce(f64::max)
+        .unwrap_or(0.0);
+    let service = Service {
+        fqn: format!("custom/{slug}"),
+        meta: pay_types::registry::ServiceMeta {
+            title,
+            description,
+            use_case: None,
+            category: "ai_ml".to_string(),
+            service_url: service_url.clone(),
+            sandbox_service_url: None,
+        },
+        endpoint_count: endpoints.len() as u32,
+        has_metering: endpoints.iter().any(|endpoint| endpoint.pricing.is_some()),
+        has_free_tier: endpoints.iter().any(|endpoint| endpoint.pricing.is_none()),
+        min_price_usd,
+        max_price_usd,
+        sha: String::new(),
+        endpoints,
+        content: None,
+    };
+    Ok(Catalog {
+        schema_version: "1".to_string(),
+        generated_at: String::new(),
+        base_url: service_url,
+        provider_count: 1,
+        providers: vec![service],
+    })
+}
+
+fn validate_payment_discovery_openapi(doc: &serde_json::Value, source_url: &str) -> Result<()> {
+    if !doc
+        .get("openapi")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|version| version.starts_with("3."))
+    {
+        return Err(Error::Config(format!(
+            "{source_url} must be an OpenAPI 3.x payment-discovery document"
+        )));
+    }
+    for pointer in ["/info/title", "/info/version"] {
+        if doc
+            .pointer(pointer)
+            .and_then(serde_json::Value::as_str)
+            .is_none_or(|value| value.trim().is_empty())
+        {
+            return Err(Error::Config(format!(
+                "{source_url} is missing required OpenAPI field `{}`",
+                pointer.trim_start_matches('/').replace('/', ".")
+            )));
+        }
+    }
+    let paths = doc
+        .get("paths")
+        .and_then(serde_json::Value::as_object)
+        .filter(|paths| !paths.is_empty())
+        .ok_or_else(|| Error::Config(format!("{source_url} has no OpenAPI paths")))?;
+    let has_payment_operation = paths.values().any(|path| {
+        path.as_object().is_some_and(|methods| {
+            methods.values().any(|operation| {
+                operation.get("x-payment-info").is_some()
+                    && operation.pointer("/responses/402").is_some()
+            })
+        })
+    });
+    if !has_payment_operation {
+        return Err(Error::Config(format!(
+            "{source_url} has no operation with `x-payment-info` and a 402 response"
+        )));
+    }
+    Ok(())
 }
 
 fn write_cache(cfg: &config::SkillsConfig, catalog: &Catalog) -> Result<std::path::PathBuf> {
@@ -1932,6 +2096,62 @@ fn collect_prices(pricing: &Option<serde_json::Value>, out: &mut Vec<f64>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn openapi_source_becomes_an_inline_catalog_with_pricing() {
+        let raw = serde_json::json!({
+            "openapi": "3.1.0",
+            "info": {
+                "title": "Acme Inference",
+                "description": "A custom OpenAI-compatible server",
+                "version": "1.0.0"
+            },
+            "servers": [{"url": "https://inference.example.com"}],
+            "paths": {
+                "/v1/models": {
+                    "get": {"summary": "List models"}
+                },
+                "/v1/chat/completions": {
+                    "post": {
+                        "summary": "Chat",
+                        "tags": ["openai"],
+                        "x-payment-info": {
+                            "offers": [{
+                                "intent": "charge",
+                                "method": "x402",
+                                "amount": null
+                            }]
+                        },
+                        "x-pay-metering": {
+                            "dimensions": [{
+                                "direction": "input",
+                                "unit": "tokens",
+                                "scale": 1000000,
+                                "tiers": [{"price_usd": 0.4}]
+                            }]
+                        },
+                        "responses": {
+                            "200": {"description": "OK"},
+                            "402": {"description": "Payment Required"}
+                        }
+                    }
+                }
+            }
+        })
+        .to_string();
+
+        let catalog =
+            parse_catalog_source(&raw, "https://inference.example.com/openapi.json").unwrap();
+        assert_eq!(catalog.providers.len(), 1);
+        let service = &catalog.providers[0];
+        assert_eq!(service.fqn, "custom/acme-inference");
+        assert_eq!(service.meta.title, "Acme Inference");
+        assert_eq!(service.meta.service_url, "https://inference.example.com");
+        assert_eq!(service.endpoints.len(), 2);
+        assert!(service.has_metering);
+        assert_eq!(service.min_price_usd, 0.4);
+        assert_eq!(service.max_price_usd, 0.4);
+    }
 
     #[tokio::test]
     async fn fetch_and_merge_rejects_empty_sources() {

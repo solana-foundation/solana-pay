@@ -1,5 +1,6 @@
 pub(crate) mod translate;
 
+use std::io::IsTerminal;
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
@@ -29,6 +30,7 @@ const OLLAMA_AUTH_TOKEN: &str = "ollama";
 /// Hosted catalog gateways are remote (TLS handshake included) — give their
 /// reachability/model probes more room than the localhost ones.
 const CATALOG_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+const CUSTOM_PROVIDER_TIMEOUT: Duration = Duration::from_secs(5);
 /// Run Claude Code with 402 payment support.
 ///
 /// Launches Claude Code with the pay MCP server injected automatically.
@@ -271,11 +273,11 @@ pub(crate) fn prepare_alternate_provider_for(
     let requested_model = model_arg(args);
     let (providers, gateway_up) = discover_compatible_providers(client)?;
 
-    let choice = if providers.is_empty() {
+    let choice = if providers.is_empty() && !std::io::stderr().is_terminal() {
         None
     } else {
         Some(select_provider_choice(
-            agent,
+            client,
             providers,
             requested_model.as_deref(),
             requested_provider,
@@ -516,9 +518,30 @@ fn payer_upstream(provider: &DiscoveredProvider, base_url: String) -> payer_prox
         dialect: provider.provider.dialect(),
         chat_path: chat_completions_path(provider.provider.as_ref()),
         responses_path: responses_path(provider.provider.as_ref()),
-        require_payment: provider.hosted(),
+        require_payment: provider_requires_payment(provider),
         payment_protocol: provider_payment_protocol(provider),
     }
+}
+
+/// Remote catalog gateways are expected to enforce their advertised payment
+/// gate. Loopback OpenAPI providers may intentionally mix priced and free
+/// models/routes; the payer still handles any 402 it receives, but a successful
+/// passthrough is not a security error.
+fn provider_requires_payment(provider: &DiscoveredProvider) -> bool {
+    if !provider.hosted() {
+        return false;
+    }
+    reqwest::Url::parse(&provider.base_url)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_string))
+        .is_none_or(|host| {
+            if host == "localhost" {
+                return false;
+            }
+            host.parse::<std::net::IpAddr>()
+                .map(|ip| !ip.is_loopback())
+                .unwrap_or(true)
+        })
 }
 
 /// The inference gateway routes providers by Host subdomain. The payer proxy
@@ -574,11 +597,12 @@ fn responses_path(provider: &dyn InferenceProvider) -> String {
 }
 
 fn select_provider_choice(
-    agent: &str,
+    client: AlternateClient,
     providers: Vec<DiscoveredProvider>,
     requested_model: Option<&str>,
     requested_provider: Option<&str>,
 ) -> pay_core::Result<crate::tui::ProviderChoice> {
+    let agent = client.name();
     if let Some(requested_provider) = requested_provider {
         let available = providers
             .iter()
@@ -608,14 +632,191 @@ fn select_provider_choice(
         return Ok(crate::tui::ProviderChoice { provider, model });
     }
 
-    match select_provider(agent, providers, requested_model)
-        .map_err(|e| pay_core::Error::Config(format!("Provider selection failed: {e}")))?
+    match select_provider(agent, providers, requested_model, |url| {
+        discover_and_save_custom_providers(client, url)
+    })
+    .map_err(|e| pay_core::Error::Config(format!("Provider selection failed: {e}")))?
     {
         ProviderSelection::Selected(choice) => Ok(choice),
         ProviderSelection::Cancelled => Err(pay_core::Error::Config(format!(
             "{agent} provider selection cancelled"
         ))),
     }
+}
+
+/// Turn a pasted inference origin into the draft-standard `/openapi.json`
+/// discovery URL. Explicit OpenAPI or catalog JSON URLs are respected.
+fn custom_source_url(input: &str) -> Result<String, String> {
+    let input = input.trim();
+    let candidate = if input.contains("://") {
+        input.to_string()
+    } else {
+        format!("https://{input}")
+    };
+    let mut url =
+        reqwest::Url::parse(&candidate).map_err(|error| format!("Invalid server URL: {error}"))?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err("Server URL must use http:// or https://".to_string());
+    }
+    if url.host_str().is_none() {
+        return Err("Server URL must include a host".to_string());
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err("Server URL must not contain credentials".to_string());
+    }
+    let loopback = url.host_str().is_some_and(|host| {
+        host == "localhost"
+            || host
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|ip| ip.is_loopback())
+    });
+    if url.scheme() == "http" && !loopback {
+        return Err(
+            "Payment discovery requires HTTPS (http:// is allowed only for loopback servers)"
+                .to_string(),
+        );
+    }
+    url.set_fragment(None);
+    let path = url.path().to_ascii_lowercase();
+    let direct_catalog = path.ends_with("/pay-skills.json")
+        || path.ends_with("/catalog.json")
+        || path.ends_with("/skills.json");
+    let direct_openapi = path.ends_with("/openapi.json");
+    if direct_catalog || direct_openapi {
+        return Ok(url.to_string());
+    }
+
+    url.set_path("/openapi.json");
+    url.set_query(None);
+    Ok(url.to_string())
+}
+
+fn discover_and_save_custom_providers(
+    client_kind: AlternateClient,
+    input: &str,
+) -> Result<Vec<DiscoveredProvider>, String> {
+    let source_url = custom_source_url(input)?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| format!("Could not start discovery: {error}"))?;
+    let providers = runtime.block_on(discover_custom_providers(client_kind, &source_url))?;
+
+    let mut config = pay_core::skills::config::SkillsConfig::load().map_err(|error| {
+        format!("Discovered provider but could not load skills config: {error}")
+    })?;
+    if config.add_source(&source_url) {
+        config.save().map_err(|error| {
+            format!("Discovered provider but could not save {source_url}: {error}")
+        })?;
+    }
+    Ok(providers)
+}
+
+/*
+ * Keep custom discovery beside provider selection: it is harness-aware and
+ * returns the same DiscoveredProvider abstraction used by local and catalog
+ * providers.
+ */
+async fn discover_custom_providers(
+    client_kind: AlternateClient,
+    source_url: &str,
+) -> Result<Vec<DiscoveredProvider>, String> {
+    let client = reqwest::Client::builder()
+        .timeout(CUSTOM_PROVIDER_TIMEOUT)
+        .build()
+        .map_err(|error| format!("Could not create discovery client: {error}"))?;
+    let response = client
+        .get(source_url)
+        .send()
+        .await
+        .map_err(|error| format!("Could not discover {source_url}: {error}"))?;
+    if !response.status().is_success() {
+        return Err(format!(
+            "No discovery document at {source_url} ({})",
+            response.status()
+        ));
+    }
+    let raw = response
+        .text()
+        .await
+        .map_err(|error| format!("Could not read {source_url}: {error}"))?;
+    let mut catalog = pay_core::skills::parse_catalog_source(&raw, source_url)
+        .map_err(|error| format!("Invalid discovery document at {source_url}: {error}"))?;
+    if catalog.providers.is_empty() {
+        return Err("The discovered catalog contains no providers".to_string());
+    }
+
+    let fqns: Vec<String> = catalog
+        .providers
+        .iter()
+        .map(|provider| provider.fqn.clone())
+        .collect();
+    let mut discovered = Vec::new();
+    let mut rejected = Vec::new();
+    for fqn in fqns {
+        if let Err(error) = pay_core::skills::ensure_endpoints(&mut catalog, &fqn).await {
+            rejected.push(format!("{fqn}: OpenAPI endpoints unavailable ({error})"));
+            continue;
+        }
+        let Some(service) = catalog
+            .providers
+            .iter()
+            .find(|provider| provider.fqn == fqn)
+        else {
+            continue;
+        };
+        if service.meta.service_url.trim().is_empty() {
+            rejected.push(format!("{fqn}: service_url is missing"));
+            continue;
+        }
+
+        let provider = catalog_providers::CatalogProvider::from_service(service);
+        let base_url = provider.service_url().to_string();
+        let Some(version) = provider.identify(&client, &base_url).await else {
+            rejected.push(format!("{fqn}: inference server is unreachable"));
+            continue;
+        };
+        let (models, model_pricing) = provider.list_models_with_pricing(&client, &base_url).await;
+        if models.is_empty() {
+            rejected.push(format!("{fqn}: no models were discovered"));
+            continue;
+        }
+        let has_pricing = provider.pricing_hint().is_some()
+            || model_pricing.iter().any(|model| model.price.is_some());
+        if !has_pricing {
+            rejected.push(format!("{fqn}: no pricing metadata was discovered"));
+            continue;
+        }
+
+        let found = DiscoveredProvider {
+            provider: Arc::new(provider),
+            base_url,
+            models,
+            version,
+            pricing: None,
+            model_pricing,
+        };
+        if !client_kind.provider_supported(&found) {
+            rejected.push(format!(
+                "{fqn}: not compatible with {}",
+                client_kind.display_name()
+            ));
+            continue;
+        }
+        discovered.push(found);
+    }
+
+    if discovered.is_empty() {
+        let detail = rejected
+            .first()
+            .map(|reason| format!(": {reason}"))
+            .unwrap_or_default();
+        return Err(format!(
+            "No compatible priced inference provider found{detail}"
+        ));
+    }
+    Ok(discovered)
 }
 
 /// Match current provider brands while accepting CLI values persisted before
@@ -1026,6 +1227,146 @@ mod tests {
     }
 
     #[test]
+    fn custom_provider_url_resolves_server_origins_and_accepts_direct_catalogs() {
+        assert_eq!(
+            custom_source_url("inference.example.com").unwrap(),
+            "https://inference.example.com/openapi.json"
+        );
+        assert_eq!(
+            custom_source_url("http://127.0.0.1:1402/v1").unwrap(),
+            "http://127.0.0.1:1402/openapi.json"
+        );
+        assert_eq!(
+            custom_source_url("https://example.com/custom/catalog.json?channel=dev").unwrap(),
+            "https://example.com/custom/catalog.json?channel=dev"
+        );
+        assert_eq!(
+            custom_source_url("https://example.com/openapi.json").unwrap(),
+            "https://example.com/openapi.json"
+        );
+        assert!(custom_source_url("file:///tmp/catalog.json").is_err());
+        assert!(custom_source_url("https://user:secret@example.com").is_err());
+        assert!(custom_source_url("http://inference.example.com").is_err());
+    }
+
+    #[test]
+    fn custom_openapi_discovers_models_pricing_and_openai_routes() {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                use axum::Router;
+                use axum::routing::get;
+
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let base_url = format!("http://{}", listener.local_addr().unwrap());
+                let openapi = serde_json::json!({
+                    "openapi": "3.1.0",
+                    "info": {"title": "Acme Inference", "version": "1.0.0"},
+                    "servers": [{"url": base_url.clone()}],
+                    "x-service-info": {"categories": ["compute"]},
+                    "paths": {
+                        "/v1/models": {
+                            "get": {
+                                "summary": "Models",
+                                "responses": {"200": {"description": "Models"}}
+                            }
+                        },
+                        "/v1/chat/completions": {
+                            "post": {
+                                "summary": "Chat",
+                                "tags": ["openai"],
+                                "x-payment-info": {
+                                    "offers": [{
+                                        "intent": "charge",
+                                        "method": "x402",
+                                        "amount": null,
+                                        "currency": "USDC"
+                                    }]
+                                },
+                                "x-pay-metering": {
+                                    "variants": [{
+                                        "param": "model",
+                                        "value": "acme-large",
+                                        "dimensions": [
+                                            {
+                                                "direction": "input",
+                                                "unit": "tokens",
+                                                "scale": 1000000,
+                                                "tiers": [{"price_usd": 0.4}]
+                                            },
+                                            {
+                                                "direction": "output",
+                                                "unit": "tokens",
+                                                "scale": 1000000,
+                                                "tiers": [{"price_usd": 1.6}]
+                                            }
+                                        ]
+                                    }]
+                                },
+                                "responses": {
+                                    "200": {"description": "OK"},
+                                    "402": {"description": "Payment Required"}
+                                }
+                            }
+                        }
+                    }
+                })
+                .to_string();
+                let models = serde_json::json!({
+                    "data": [
+                        {"id": "acme-large"},
+                        {"id": "acme-small"}
+                    ]
+                })
+                .to_string();
+                let app = Router::new()
+                    .route(
+                        "/openapi.json",
+                        get({
+                            let openapi = openapi.clone();
+                            move || {
+                                let openapi = openapi.clone();
+                                async move { openapi }
+                            }
+                        }),
+                    )
+                    .route(
+                        "/v1/models",
+                        get({
+                            let models = models.clone();
+                            move || {
+                                let models = models.clone();
+                                async move { models }
+                            }
+                        }),
+                    );
+                tokio::spawn(async move {
+                    axum::serve(listener, app).await.unwrap();
+                });
+
+                let providers = discover_custom_providers(
+                    AlternateClient::Goose,
+                    &format!("{base_url}/openapi.json"),
+                )
+                .await
+                .unwrap();
+
+                assert_eq!(providers.len(), 1);
+                assert_eq!(providers[0].slug(), "acme-inference");
+                assert_eq!(providers[0].models, ["acme-large", "acme-small"]);
+                assert_eq!(
+                    providers[0]
+                        .pricing_hint_for_model(Some("acme-large"))
+                        .unwrap()
+                        .to_string(),
+                    "input $0.40 · output $1.60 / 1M tokens"
+                );
+            });
+    }
+
+    #[test]
     fn launch_banner_abbreviates_payer_pubkeys() {
         assert_eq!(
             abbreviate_pubkey("CHPEgF7X1hYJf64oRx53ABUL43DXpEjTJBzAYmZWNuKR"),
@@ -1146,5 +1487,36 @@ mod tests {
             upstream.host_header.as_deref(),
             Some("ollama.localhost:1402")
         );
+    }
+
+    #[test]
+    fn loopback_catalog_provider_does_not_require_every_route_to_charge() {
+        let service: pay_core::skills::Service = serde_json::from_value(serde_json::json!({
+            "fqn": "custom/ollama",
+            "title": "Ollama",
+            "category": "ai_ml",
+            "service_url": "http://127.0.0.1:1402",
+            "endpoints": [{
+                "method": "POST",
+                "path": "v1/chat/completions",
+                "resource": "openai",
+                "pricing": {"dimensions": [{"unit": "requests", "tiers": [{"price_usd": 0.01}]}]}
+            }]
+        }))
+        .unwrap();
+        let catalog = catalog_providers::CatalogProvider::from_service(&service);
+        let provider = DiscoveredProvider {
+            provider: Arc::new(catalog),
+            base_url: "http://127.0.0.1:1402".to_string(),
+            models: vec!["gemma4:latest".to_string()],
+            version: None,
+            pricing: None,
+            model_pricing: Vec::new(),
+        };
+        assert!(!provider_requires_payment(&provider));
+
+        let mut remote = provider;
+        remote.base_url = "https://inference.example.com".to_string();
+        assert!(provider_requires_payment(&remote));
     }
 }

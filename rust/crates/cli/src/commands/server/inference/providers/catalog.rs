@@ -24,6 +24,17 @@ const GOOGLE_GEMINI_FQN: &str = "solana-foundation/google/generativelanguage";
 const GOOGLE_GEMINI_GATEWAY_URL: &str = "https://generativelanguage.google.gateway-402.com";
 const GOOGLE_OPENAI_CHAT_PATH: &str = "v1beta/openai/chat/completions";
 
+fn is_openai_compatible_endpoint(endpoint: &pay_core::skills::Endpoint) -> bool {
+    endpoint
+        .resource
+        .as_deref()
+        .is_some_and(|resource| resource.eq_ignore_ascii_case(OPENAI_RESOURCE))
+        || {
+            let path = endpoint.path.to_ascii_lowercase();
+            path.contains("chat/completions") || path.trim_matches('/').ends_with("/responses")
+        }
+}
+
 /// A hosted inference provider backed by a resolved catalog entry.
 pub struct CatalogProvider {
     fqn: String,
@@ -411,12 +422,7 @@ impl InferenceProvider for CatalogProvider {
                 Dialect::GeminiNative
             }
         } else if self.fqn.contains("alibaba/modelstudio")
-            || self.endpoints.iter().any(|endpoint| {
-                endpoint
-                    .resource
-                    .as_deref()
-                    .is_some_and(|resource| resource.eq_ignore_ascii_case(OPENAI_RESOURCE))
-            })
+            || self.endpoints.iter().any(is_openai_compatible_endpoint)
         {
             Dialect::OpenAiCompat
         } else {
@@ -793,12 +799,7 @@ pub fn picker_catalog_fqns(catalog: &pay_core::skills::Catalog) -> Vec<String> {
         .map(|fqn| (*fqn).to_string())
         .collect();
     for provider in &catalog.providers {
-        let openai_compatible = provider.endpoints.iter().any(|endpoint| {
-            endpoint
-                .resource
-                .as_deref()
-                .is_some_and(|resource| resource.eq_ignore_ascii_case(OPENAI_RESOURCE))
-        });
+        let openai_compatible = provider.endpoints.iter().any(is_openai_compatible_endpoint);
         if openai_compatible && !fqns.iter().any(|fqn| fqn == &provider.fqn) {
             fqns.push(provider.fqn.clone());
         }

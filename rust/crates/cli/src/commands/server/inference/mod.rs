@@ -24,7 +24,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::Router;
-use axum::response::Redirect;
+use axum::http::{HeaderMap, StatusCode, header};
+use axum::response::{IntoResponse, Redirect};
 use axum::routing::get;
 use clap::Args;
 use pay_core::PaymentState;
@@ -659,6 +660,14 @@ impl InferenceCommand {
         }
 
         let summaries = provider_summaries(&registry, restrict, &discovered);
+        let discovery_identity = payment
+            .as_ref()
+            .map(|payment| payment.pricing.recipient.as_str());
+        let discovery_docs = Arc::new(inference_openapi_documents(
+            &specs,
+            if sandbox { "localnet" } else { "local" },
+            discovery_identity,
+        ));
         let pdb = PdbState::with_mode(
             serde_json::json!({
                 "mode": "inference",
@@ -689,6 +698,33 @@ impl InferenceCommand {
         // `nest_service` (not `nest`) so the nested root `/…/` resolves —
         // same as `gate api`.
         let mut router = Router::new();
+        router = router.route(
+            "/openapi.json",
+            get({
+                let discovery_docs = discovery_docs.clone();
+                move |headers: HeaderMap| {
+                    let discovery_docs = discovery_docs.clone();
+                    async move {
+                        let subdomain = headers
+                            .get(header::HOST)
+                            .and_then(|host| host.to_str().ok())
+                            .and_then(|host| host.split('.').next());
+                        match discovery_docs
+                            .iter()
+                            .find(|(slug, _)| Some(slug.as_str()) == subdomain)
+                            .or_else(|| (discovery_docs.len() == 1).then(|| &discovery_docs[0]))
+                        {
+                            Some((_, document)) => (
+                                [(header::CACHE_CONTROL, "max-age=300")],
+                                axum::Json(document.clone()),
+                            )
+                                .into_response(),
+                            None => StatusCode::NOT_FOUND.into_response(),
+                        }
+                    }
+                }
+            }),
+        );
         if !self.no_web {
             router = router
                 .nest_service(UI_PATH, pay_pdb::debugger_router(pdb.clone()))
@@ -973,6 +1009,50 @@ fn provider_index(pdb: &PdbState) -> axum::Json<serde_json::Value> {
     }))
 }
 
+/// Draft-standard OpenAPI discovery documents for a running inference
+/// gateway. The payment offers are advisory; the runtime 402 challenge remains
+/// authoritative. `x-pay-metering` retains per-model token rates that the
+/// draft's offer envelope intentionally represents as dynamic pricing.
+fn inference_openapi_documents(
+    specs: &[ApiSpec],
+    network_slug: &str,
+    payment_identity: Option<&str>,
+) -> Vec<(String, serde_json::Value)> {
+    let context = pay_core::server::openapi::DiscoveryContext {
+        network_slug,
+        pay_to: payment_identity,
+        fee_payer: payment_identity,
+    };
+    let mut documents = Vec::new();
+    for spec in specs {
+        let mut document = pay_core::server::openapi::synthesize_from_spec(spec, &context);
+        if let Some(paths) = document
+            .get_mut("paths")
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            paths.insert(
+                "/v1/models".to_string(),
+                serde_json::json!({
+                    "get": {
+                        "summary": "List available inference models.",
+                        "responses": {
+                            "200": {"description": "Available models"}
+                        }
+                    }
+                }),
+            );
+        }
+        if let Some(object) = document.as_object_mut() {
+            object.insert(
+                "x-service-info".to_string(),
+                serde_json::json!({"categories": ["compute"]}),
+            );
+        }
+        documents.push((spec.subdomain.clone(), document));
+    }
+    documents
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1005,6 +1085,38 @@ mod tests {
             fee_payer_signer: None,
             fee_payer_wallet: None,
         }
+    }
+
+    #[test]
+    fn inference_gateway_openapi_is_payment_discovery_aligned() {
+        let discovered = discovered_provider(
+            Arc::new(providers::ollama::Ollama),
+            &["smollm2:135m-instruct-q2_K", "gemma4:latest"],
+        );
+        let pricing: pricing::PricingConfig = serde_yml::from_str(
+            r#"
+models:
+  gemma4:
+    in: 1.0
+    out: 3.0
+"#,
+        )
+        .unwrap();
+        let spec_pricing = spec::SpecPricing {
+            config: pricing,
+            recipient: "recipient".to_string(),
+        };
+        let specs = vec![spec::provider_spec(&discovered, Some(&spec_pricing))];
+
+        let documents = inference_openapi_documents(&specs, "localnet", Some("recipient"));
+        let document = &documents[0].1;
+        assert_eq!(document["openapi"], "3.1.0");
+        assert_eq!(document["x-service-info"]["categories"][0], "compute");
+        assert!(document["paths"]["/v1/models"]["get"].is_object());
+        let chat = &document["paths"]["/v1/chat/completions"]["post"];
+        assert!(chat["x-payment-info"]["offers"].is_array());
+        assert!(chat["x-pay-metering"]["variants"].is_array());
+        assert!(chat["responses"]["402"].is_object());
     }
 
     #[test]

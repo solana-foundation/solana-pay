@@ -304,6 +304,9 @@ fn build_offer(spec: &OfferSpec) -> Value {
             human
         };
         offer.insert("description".to_string(), json!(description));
+    } else {
+        // Payment Discovery requires `amount` even when pricing is dynamic.
+        offer.insert("amount".to_string(), Value::Null);
     }
     if let Some(pt) = spec.pay_to {
         offer.insert("payTo".to_string(), json!(pt));
