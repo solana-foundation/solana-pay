@@ -5,8 +5,8 @@ use std::process::{Command, Stdio};
 
 use clap::Args;
 
+use super::agent::{AlternateClient, AlternateProvider, prepare_alternate_provider};
 use super::agent_args::args_without_model;
-use super::claude::{AlternateClient, AlternateProvider, prepare_alternate_provider};
 
 const GOOSE_PROVIDER_ENV: &str = "GOOSE_PROVIDER";
 const GOOSE_MODEL_ENV: &str = "GOOSE_MODEL";

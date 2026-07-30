@@ -27,7 +27,7 @@
 //! Anthropic-shaped `POST /v1/messages` requests. When its upstream speaks
 //! OpenAI chat completions ([`Dialect::OpenAiCompat`] — vLLM, LM Studio,
 //! llama.cpp, Alibaba Model Studio's compatible mode), those requests are
-//! translated to OpenAI shape (see [`crate::commands::claude::translate`]),
+//! translated to OpenAI shape (see [`crate::commands::agent::translate`]),
 //! sent to the upstream's chat-completions path, and translated back to an
 //! Anthropic envelope. The payment retry composes with translation: the
 //! challenge fires on the translated request, so the retry replays the
@@ -51,7 +51,7 @@ use pay_core::accounts::{
 #[cfg(test)]
 use pay_kit::x402::PAYMENT_RESPONSE_HEADER;
 
-use super::claude::translate;
+use super::agent::translate;
 use crate::commands::server::inference::providers::Dialect;
 
 /// Request bodies are buffered so the paid retry can replay them; cap the

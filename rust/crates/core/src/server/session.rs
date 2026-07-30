@@ -587,6 +587,9 @@ impl SessionLifecycleRunloop {
                 self.next_settlement =
                     settlement_interval.map(|interval| Instant::now() + interval);
                 self.reconciliation = reconciliation;
+                if reconciliation == SessionLifecycleReconciliation::Embedded {
+                    self.adopt_persisted_channels().await;
+                }
                 true
             }
             Some(SessionLifecycleCommand::Touch {
@@ -640,6 +643,51 @@ impl SessionLifecycleRunloop {
                 ))
             })?;
         Ok(Some(state))
+    }
+
+    /// Transfer lifecycle records left by a previous embedded runloop while
+    /// preserving their existing deadlines. A concurrent newer touch wins
+    /// because the store refuses to replace a later `close_after`.
+    async fn adopt_persisted_channels(&self) {
+        let states = match self.runtime.channel_store.list_channels().await {
+            Ok(states) => states,
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    "failed to enumerate payment channels for lifecycle adoption"
+                );
+                return;
+            }
+        };
+        for state in states {
+            if state.sealed || state.close_requested_at.is_some() {
+                continue;
+            }
+            let Some(lifecycle) = state.lifecycle else {
+                continue;
+            };
+            if lifecycle.owner == self.owner {
+                continue;
+            }
+            if let Err(error) = self
+                .runtime
+                .channel_store
+                .touch_channel_lifecycle(
+                    &state.channel_id,
+                    ChannelLifecycle {
+                        owner: self.owner.clone(),
+                        close_after: lifecycle.close_after,
+                    },
+                )
+                .await
+            {
+                tracing::warn!(
+                    channel_id = state.channel_id,
+                    %error,
+                    "failed to adopt persisted payment-channel lifecycle"
+                );
+            }
+        }
     }
 
     fn next_wakeup_delay(&self) -> Option<Duration> {
@@ -2329,6 +2377,67 @@ mod tests {
             .await
             .expect_err("a worker-claimed close cannot be woken");
         assert!(error.to_string().contains("close is pending"));
+    }
+
+    #[tokio::test]
+    async fn embedded_lifecycle_adopts_persisted_deadlines_after_restart() {
+        let store: Arc<dyn ChannelStore> = Arc::new(MemoryChannelStore::new());
+        let config = test_session_config();
+        let first =
+            SessionMpp::new_with_channel_store(config.clone(), "test-secret", Arc::clone(&store));
+        first.start_lifecycle_runloop_with_settlement_and_batching(
+            Duration::from_secs(3600),
+            Duration::from_secs(60),
+            Duration::ZERO,
+            SessionLifecycleReconciliation::External,
+        );
+        let challenge = first.challenge(CAP).unwrap();
+        let handle = SessionHandle::new(
+            solana_pubkey::Pubkey::new_unique(),
+            test_session_signer(),
+            challenge,
+        );
+        let open_header = handle.open_header(CAP, "open_sig").await.unwrap();
+        let SessionOutcome::Active { state: opened, .. } =
+            first.process(&open_header).await.unwrap()
+        else {
+            panic!("expected open to return active session");
+        };
+
+        let persisted = store
+            .get_channel(&opened.channel_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let original = persisted.lifecycle.expect("deadline should be persisted");
+        drop(first);
+
+        let restarted =
+            SessionMpp::new_with_channel_store(config, "test-secret", Arc::clone(&store));
+        restarted.start_lifecycle_runloop_with_settlement_and_batching(
+            Duration::from_secs(3600),
+            Duration::from_secs(60),
+            Duration::ZERO,
+            SessionLifecycleReconciliation::Embedded,
+        );
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let persisted = store
+                    .get_channel(&opened.channel_id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let lifecycle = persisted.lifecycle.unwrap();
+                if lifecycle.owner != original.owner {
+                    assert_eq!(lifecycle.close_after, original.close_after);
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("restarted embedded worker should adopt the persisted deadline");
     }
 
     #[tokio::test]

@@ -12,8 +12,8 @@ use std::process::{Command, Stdio};
 
 use clap::Args;
 
+use super::agent::{AlternateClient, AlternateProvider, prepare_alternate_provider};
 use super::agent_args::args_without_model;
-use super::claude::{AlternateClient, AlternateProvider, prepare_alternate_provider};
 
 /// Allow-list of pay MCP tools surfaced to qodercli. Must stay in sync
 /// with the tool set exposed by other pay launchers.

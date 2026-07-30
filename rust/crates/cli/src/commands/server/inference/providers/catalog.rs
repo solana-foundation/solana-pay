@@ -350,9 +350,9 @@ impl InferenceProvider for CatalogProvider {
         &[]
     }
     fn color(&self) -> Option<&str> {
-        if self.fqn.contains("/google/") {
+        if self.fqn == GOOGLE_GEMINI_FQN {
             Some("#4285f4")
-        } else if self.fqn.contains("/alibaba/") {
+        } else if self.fqn == ALIBABA_MODELSTUDIO_FQN {
             Some("#ff6a00")
         } else {
             Some("#94a3b8")
@@ -411,7 +411,7 @@ impl InferenceProvider for CatalogProvider {
             .collect()
     }
     fn dialect(&self) -> Dialect {
-        if self.fqn.contains("google/generativelanguage") {
+        if self.fqn == GOOGLE_GEMINI_FQN {
             if self
                 .endpoints
                 .iter()
@@ -421,7 +421,7 @@ impl InferenceProvider for CatalogProvider {
             } else {
                 Dialect::GeminiNative
             }
-        } else if self.fqn.contains("alibaba/modelstudio")
+        } else if self.fqn == ALIBABA_MODELSTUDIO_FQN
             || self.endpoints.iter().any(is_openai_compatible_endpoint)
         {
             Dialect::OpenAiCompat
@@ -723,10 +723,10 @@ fn models_from_pricing_variants(endpoints: &[pay_core::skills::Endpoint]) -> Vec
 /// verbose for a picker row); everything else uses the catalog title,
 /// falling back to the fqn.
 fn display_title(fqn: &str, catalog_title: &str) -> String {
-    if fqn.contains("google/generativelanguage") {
+    if fqn == GOOGLE_GEMINI_FQN {
         return "Google Gemini".to_string();
     }
-    if fqn.contains("alibaba/modelstudio") {
+    if fqn == ALIBABA_MODELSTUDIO_FQN {
         return "Alibaba Model Studio".to_string();
     }
     if catalog_title.trim().is_empty() {
@@ -741,9 +741,9 @@ fn display_title(fqn: &str, catalog_title: &str) -> String {
 /// Catalog FQNs describe API resources (`generativelanguage`, `openai`,
 /// `modelstudio`), while the CLI presents the provider brands users choose.
 fn display_slug(fqn: &str, catalog_name: &str) -> String {
-    if fqn.contains("google/generativelanguage") {
+    if fqn == GOOGLE_GEMINI_FQN {
         "google"
-    } else if fqn.contains("alibaba/modelstudio") {
+    } else if fqn == ALIBABA_MODELSTUDIO_FQN {
         "alibaba"
     } else {
         catalog_name
@@ -1185,6 +1185,22 @@ mod tests {
             CatalogProvider::from_service(&other).dialect(),
             Dialect::Unknown
         );
+    }
+
+    #[test]
+    fn provider_brand_overrides_require_exact_canonical_fqns() {
+        let service: pay_core::skills::Service = serde_json::from_value(serde_json::json!({
+            "fqn": "third-party/solana-foundation/alibaba/modelstudio",
+            "title": "Unrelated Model Studio",
+            "service_url": "https://example.com"
+        }))
+        .unwrap();
+        let provider = CatalogProvider::from_service(&service);
+
+        assert_eq!(provider.slug(), "modelstudio");
+        assert_eq!(provider.title(), "Unrelated Model Studio");
+        assert_eq!(provider.color(), Some("#94a3b8"));
+        assert_eq!(provider.dialect(), Dialect::Unknown);
     }
 
     #[test]
