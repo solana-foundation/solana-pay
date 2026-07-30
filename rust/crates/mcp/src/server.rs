@@ -162,7 +162,7 @@ by optional execution notes. The tool validates required metadata, endpoint
 shape, URL safety, pricing precision, and paid-endpoint expectations.
 
 Before calling, inspect real code, OpenAPI specs, deployed routes, or
-`pay server start` YAML. Do not invent endpoints, prices, supported networks,
+`pay gate api` YAML. Do not invent endpoints, prices, supported networks,
 or payment protocols. If runtime YAML exists, use `pay skills provider sync`
 as a starting point, then validate the generated markdown with this tool.
 

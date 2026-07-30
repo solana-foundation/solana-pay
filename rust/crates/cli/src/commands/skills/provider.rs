@@ -6,7 +6,7 @@ use owo_colors::OwoColorize;
 
 #[derive(Subcommand)]
 pub enum ProviderCommand {
-    /// Sync runtime provider YAMLs into registry .md files.
+    /// Sync runtime paywall YAMLs into registry .md files.
     Sync(SyncCommand),
 }
 
@@ -20,7 +20,7 @@ impl ProviderCommand {
 
 /// Sync runtime .yml specs into registry .md files.
 ///
-/// Reads .yml files (the `pay server start` format), extracts the
+/// Reads .yml files (the `pay gate api` format), extracts the
 /// registry-relevant fields, translates metering → pricing, drops
 /// runtime config, and writes .md files with YAML frontmatter.
 #[derive(clap::Args)]
@@ -190,7 +190,7 @@ fn expand_paths(patterns: &[String]) -> pay_core::Result<Vec<PathBuf>> {
     Ok(files)
 }
 
-/// Convert a runtime provider YAML (serde_json::Value) to a registry .md string.
+/// Convert a runtime paywall YAML (serde_json::Value) to a registry .md string.
 fn convert_to_registry_md(
     spec: &serde_json::Value,
     name: &str,

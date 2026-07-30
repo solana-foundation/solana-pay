@@ -13,7 +13,7 @@ pub enum Protocol {
     X402,
     Session,
     /// Plain HTTP exchange with no payment protocol involved — used by
-    /// `AllExchanges` mode (e.g. `pay serve inference` passthrough traffic).
+    /// `AllExchanges` mode (e.g. `pay gate inference` passthrough traffic).
     Http,
 }
 
@@ -128,7 +128,7 @@ pub struct SessionInfo {
 
 // ── Inference (local AI gateway) ──
 
-/// Live inference telemetry attached to a flow by `pay serve inference`.
+/// Live inference telemetry attached to a flow by `pay gate inference`.
 #[derive(Debug, Clone, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct InferenceInfo {

@@ -77,11 +77,16 @@ pub enum Command {
     Setup(setup::SetupCommand),
     /// Import funds from Venmo, PayPal, or a mobile wallet.
     Topup(topup::TopupCommand),
-    /// Gate your API with stablecoin payments.
+    /// Manage gateway demos, paywall specs, and subscription plans.
     #[command(alias = "serve")]
     Server {
         #[command(subcommand)]
         command: server::ServerCommand,
+    },
+    /// Gate APIs or local inference with stablecoin payments.
+    Gate {
+        #[command(subcommand)]
+        command: server::GateCommand,
     },
     /// Browse, search, and inspect API providers from the skills catalog.
     Skills {
@@ -132,6 +137,7 @@ impl Command {
     pub fn otlp_sidecar(&self) -> Option<&str> {
         match self {
             Command::Server { command } => command.otlp_sidecar(),
+            Command::Gate { command } => command.otlp_sidecar(),
             _ => None,
         }
     }
@@ -166,6 +172,7 @@ impl Command {
             | Command::Catalog { .. }
             | Command::Install(_)
             | Command::Server { .. }
+            | Command::Gate { .. }
             | Command::Docs { .. }
             | Command::Mcp => false,
         }
@@ -194,6 +201,7 @@ impl Command {
             | Command::Setup(_)
             | Command::Topup(_)
             | Command::Server { .. }
+            | Command::Gate { .. }
             | Command::Docs { .. } => ToolKind::Mcp,
             Command::Mcp => ToolKind::Mcp,
         }
@@ -252,6 +260,9 @@ impl Command {
             Command::Setup(cmd) => return cmd.run(),
             Command::Topup(cmd) => return cmd.run(),
             Command::Server { command } => {
+                return command.run(keypair_override, account_override, sandbox);
+            }
+            Command::Gate { command } => {
                 return command.run(keypair_override, account_override, sandbox);
             }
             Command::Mcp => {

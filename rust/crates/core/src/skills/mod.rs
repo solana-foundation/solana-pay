@@ -1017,7 +1017,7 @@ fn parse_detail(raw: &str) -> Result<ProviderDetailFile> {
 /// configured sources.
 ///
 /// When the config has any ephemeral sources (auto-registered
-/// `pay server start` instances on this host), the durable cached
+/// `pay gate api` instances on this host), the durable cached
 /// catalog is augmented with a fresh fetch of just those ephemeral
 /// sources on every call. Ephemeral specs change as the developer
 /// edits + restarts their server; the 30 min TTL would otherwise hide
@@ -1119,7 +1119,7 @@ pub async fn update_skills_for(cache_bust: bool, client_app: ClientApp) -> Resul
 /// Returns the merged catalog covering DURABLE (non-ephemeral) sources
 /// only. Ephemeral providers are folded in by [`merge_ephemeral_into`]
 /// on top of either the cached or the freshly-fetched durable catalog —
-/// they're never persisted to disk so a crashed `pay server` doesn't
+/// they're never persisted to disk so a crashed `pay gate api` doesn't
 /// leave stale entries in the cache.
 async fn fetch_and_merge(
     cfg: &config::SkillsConfig,
@@ -1191,7 +1191,7 @@ async fn fetch_and_merge(
 
 /// Append providers from every ephemeral source onto `catalog`,
 /// dedup'd by FQN against what's already there. Failures are logged
-/// at debug — a crashed `pay server` is the common case and we don't
+/// at debug — a crashed `pay gate api` is the common case and we don't
 /// want to clobber every `list_catalog` invocation with warnings.
 async fn merge_ephemeral_into(
     catalog: &mut Catalog,
@@ -1216,7 +1216,7 @@ async fn merge_ephemeral_into(
                 tracing::debug!(
                     url = %source.url,
                     error = %e,
-                    "Ephemeral skills source unreachable (likely a stopped pay server)"
+                    "Ephemeral skills source unreachable (likely a stopped pay gate api)"
                 );
             }
         }

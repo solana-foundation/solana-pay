@@ -62,8 +62,11 @@ pay codex
 Everything runs locally — no data leaves your machine.
 
 ```sh
-# Start a gateway with the debugger on any API spec
-pay server start --debugger spec.yml
+# Start a gateway with the debugger on any paywall
+pay gate api paywall.yml --debugger
+
+# Discover and gate local inference with an optional per-model paywall
+pay --sandbox gate inference paywall.yml
 
 # Or run the bundled demo (sandbox + debugger + sample endpoints)
 pay server demo

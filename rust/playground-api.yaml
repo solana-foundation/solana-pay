@@ -2,7 +2,7 @@
 # =============================================================================
 # A faithful port of pay-kit's TypeScript `playground-api`
 # (~/Coding/pay-kit/typescript/examples/playground-api/index.ts) to a pay-server
-# YAML spec. One file declares the priced routes; `pay server start` stands up
+# YAML spec. One file declares the priced routes; `pay gate api` stands up
 # the same 402-gated surface the Express demo exposes — one endpoint per gate /
 # scheme — so you can drive the pay client against every payment path and build
 # confidence the gateway (pingora front + axum control-plane) behaves.
@@ -10,7 +10,7 @@
 # Run it self-contained against the hosted Surfpool sandbox (no real funds, the
 # operator + recipient are auto-funded, MPP challenges are sandbox-compatible):
 #
-#   cargo run -p pay -- --sandbox server start playground-api.yaml
+#   cargo run -p pay -- --sandbox gate api playground-api.yaml
 #   # serves on 0.0.0.0:1402
 #
 # Then exercise it with the client, e.g.:

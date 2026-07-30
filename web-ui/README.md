@@ -13,7 +13,7 @@ Runs against the [Solana Payment Sandbox](https://402.surfnet.dev) — no real f
 
 - **Backend** — Express API (`api/index.ts`) with payment-gated demo endpoints, an embedded x402 facilitator, and a correlation engine that groups raw HTTP requests into payment flows streamed over SSE.
 - **Frontend** — React SPA (`src/`) with Vite. Compact flow list with protocol badge, resource path, status, and latency. Expanded view shows a step-by-step sequence diagram alongside a timestamped event log.
-- **Embedded mode** — The frontend and backend are also compiled into the `pay` Rust binary (`crates/pdb`). Run `pay --sandbox server start --debugger spec.yml` to get the debugger alongside any gateway proxy.
+- **Embedded mode** — The frontend and backend are also compiled into the `pay` Rust binary (`crates/pdb`). Run `pay --sandbox gate api paywall.yml --debugger` to get the debugger alongside any gateway proxy.
 
 For source packaging, build or unpack the frontend before compiling Rust:
 

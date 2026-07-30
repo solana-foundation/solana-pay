@@ -1,6 +1,6 @@
 //! Shared payment-stack machinery for the gateway commands.
 //!
-//! `pay server start` and `pay serve inference --price`/`--pricing` build the
+//! `pay gate api` and `pay gate inference [PAYWALL]`/`--price` build the
 //! same sandbox charge stack: an auto/ephemeral fee-payer signer, localnet RPC
 //! resolution, Surfpool wallet funding + payout-recipient ATA preparation,
 //! the shared recent-blockhash cache, the charge HMAC secret (mirrored into
@@ -186,7 +186,7 @@ pub(crate) struct FundingTargetBalance {
 ///     `network: localnet` path lands here).
 ///
 /// `fund_via_surfpool` deposits a fixed amount (100 SOL + 1000 USDC) so
-/// calling it on every server start is idempotent and survives Surfpool
+/// calling it on every `pay gate api` start is idempotent and survives Surfpool
 /// restarts (which would otherwise wipe the cheatcode-set balances).
 ///
 /// When the RPC is a real cluster (mainnet/devnet/local validator), funding
@@ -624,12 +624,12 @@ pub(crate) fn build_charge_mpps(
 
 /// Build the x402 `upto` backend for the sandbox charge stack.
 ///
-/// Mirrors `server start`'s upto wiring: an [`X402Upto`] built from the
+/// Mirrors `gate api`'s upto wiring: an [`X402Upto`] built from the
 /// operator (fee-payer) signer, the sandbox RPC, and the configured
 /// currencies, sharing the same blockhash cache as the charge MPPs. In
 /// sandbox inference the payout recipient IS the operator's own gateway
 /// wallet, so the operator keeps the whole channel payout. Used by
-/// `pay serve inference` per-token charging, where the settlement voucher is
+/// `pay gate inference` per-token charging, where the settlement voucher is
 /// signed post-response from the observed token usage.
 pub(crate) fn build_sandbox_upto_backend(
     currency_configs: &[(String, String, u8)],

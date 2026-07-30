@@ -39,7 +39,7 @@ fn render_banner_art(tagline: impl std::fmt::Display) -> String {
 }
 
 /// Render one banner row with the vertical white-to-gray gradient used by
-/// `pay server start`.
+/// `pay gate api`.
 pub fn gradient_line(line: &str, row: usize, row_count: usize) -> String {
     let mut rendered = String::new();
     let vertical_position = if row_count <= 1 {

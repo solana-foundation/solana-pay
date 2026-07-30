@@ -112,7 +112,7 @@ pub struct ProviderFrontmatter {
 /// openapi:
 ///   url: openapi.json
 ///
-/// # Local filesystem path — only valid for `pay server start --openapi`,
+/// # Local filesystem path — only valid for `pay gate api --openapi`,
 /// # rejected by the pay-skills registry validator
 /// openapi:
 ///   path: ./openapi.json
@@ -130,7 +130,7 @@ pub enum OpenapiSource {
     /// provider's `service_url`. The pay-server gateway uses the same
     /// semantics for its `--openapi` flag.
     Url { url: String },
-    /// Local filesystem path, used by `pay server start --openapi` to read
+    /// Local filesystem path, used by `pay gate api --openapi` to read
     /// a doc co-located with the YAML on disk. The pay-skills registry
     /// validator rejects this variant — registry providers must use `url:`
     /// so consumers can fetch the doc remotely.

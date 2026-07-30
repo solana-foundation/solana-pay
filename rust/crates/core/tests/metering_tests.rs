@@ -1,7 +1,7 @@
 //! Metering engine tests.
 //!
 //! Tests the price resolution logic against every metering pattern
-//! defined in the test provider YAML.
+//! defined in the test paywall YAML.
 //!
 //! Run: `cargo test -p pay-core --features server --test metering_tests`
 
@@ -11,7 +11,7 @@ use pay_types::metering::{AccountingMode, ApiSpec};
 use std::path::Path;
 
 fn load_test_api() -> ApiSpec {
-    let content = std::fs::read_to_string(Path::new("tests/fixtures/test-provider.yml")).unwrap();
+    let content = std::fs::read_to_string(Path::new("tests/fixtures/test-paywall.yml")).unwrap();
     serde_yml::from_str(&content).unwrap()
 }
 

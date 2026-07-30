@@ -99,7 +99,7 @@ pub trait PaymentState: Clone + Send + Sync + 'static {
     fn record_exchange(&self, _exchange: HttpExchange) {}
 
     /// Called at request time, before the upstream responds. A host that
-    /// tracks in-flight requests (`pay serve inference`) returns a log id;
+    /// tracks in-flight requests (`pay gate inference`) returns a log id;
     /// the gate echoes it in [`HttpExchange::log_id`] and in
     /// [`PaymentState::record_exchange_update`] calls. Returning `None`
     /// (the default) also disables the gate's response stream observer for

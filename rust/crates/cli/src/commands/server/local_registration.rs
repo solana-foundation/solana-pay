@@ -1,4 +1,4 @@
-//! Lifecycle hooks that register a running `pay server` with the local
+//! Lifecycle hooks that register a running `pay gate api` with the local
 //! skills config so an MCP agent on the same host can discover it.
 //!
 //! - `sweep_dead_ephemeral_sources` runs at boot. It TCP-probes every
@@ -10,7 +10,7 @@
 //! - `deregister` removes that entry on graceful shutdown.
 //!
 //! The skills.yaml file is rewritten in place under each call. Two
-//! pay-server starts racing on the file are not currently locked
+//! concurrent gateway starts racing on the file are not currently locked
 //! (relying on the underlying short critical section); a follow-up can
 //! add a `.lock` sibling if that ever becomes a real issue.
 
@@ -43,7 +43,7 @@ pub fn local_source_name(subdomain: &str, bind: &str) -> String {
 /// Best-effort: probe every ephemeral source in the config and drop
 /// the ones that don't answer a TCP connect within
 /// [`SWEEP_PROBE_TIMEOUT`]. Saves the file when it changed. Logs at
-/// debug for individual probes — this runs on every server start, no
+/// debug for individual probes — this runs on every `pay gate api` start, no
 /// reason to be noisy.
 pub fn sweep_dead_ephemeral_sources() -> Result<usize, pay_core::Error> {
     let mut cfg = SkillsConfig::load()?;

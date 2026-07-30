@@ -73,7 +73,7 @@ impl ApiSpec {
     /// explicitly are left untouched (explicit config is a restriction).
     ///
     /// Resolving here (once, at load) keeps every consumer — the payment gate,
-    /// the OpenAPI offer builder, and the x402-backend probe in `server start` —
+    /// the OpenAPI offer builder, and the x402-backend probe in `gate api` —
     /// reading the same scheme set.
     pub fn apply_scheme_defaults(&mut self) {
         let has_session = self.session.is_some();
@@ -1120,7 +1120,7 @@ pub struct SubscriptionEndpoint {
     pub recipient: Option<String>,
 
     /// Free-trial length in days. Reserved for a future iteration —
-    /// `pay server` ignores this in v0 and surfaces a warning.
+    /// `pay gate api` ignores this in v0 and surfaces a warning.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub free_trial_days: Option<u32>,
 }

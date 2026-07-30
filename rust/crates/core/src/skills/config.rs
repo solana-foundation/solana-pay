@@ -30,7 +30,7 @@ pub struct Source {
     /// Resolved URL to the catalog JSON.
     pub url: String,
     /// Marks a transient source — currently the auto-registration written
-    /// by a running `pay server start` so the local API is discoverable
+    /// by a running `pay gate api` so the local API is discoverable
     /// by an MCP agent on the same host. Ephemeral entries are TCP-probed
     /// at boot and reaped if their server is gone, and the catalog loader
     /// bypasses cache for them so live edits to the server's spec become
@@ -114,7 +114,7 @@ impl SkillsConfig {
 
     /// Add a source marked as ephemeral (auto-removed on graceful shutdown,
     /// reaped at boot if its server isn't reachable). Caller supplies the
-    /// display `name` so multiple concurrent `pay server start` instances
+    /// display `name` so multiple concurrent `pay gate api` instances
     /// don't collide on the URL-derived default. Returns true if new.
     pub fn add_ephemeral_source(&mut self, name: &str, url: &str) -> bool {
         if self.sources.iter().any(|s| s.url == url) {
@@ -153,7 +153,7 @@ impl SkillsConfig {
     /// True when at least one ephemeral source is registered. Catalog
     /// callers use this to skip the on-disk cache and re-fetch every
     /// load — ephemeral specs change as the developer edits + restarts
-    /// `pay server`, and a 30 min TTL would hide those edits from the
+    /// `pay gate api`, and a 30 min TTL would hide those edits from the
     /// MCP agent in the same shell.
     pub fn has_ephemeral_sources(&self) -> bool {
         self.sources.iter().any(|s| s.ephemeral)

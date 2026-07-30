@@ -2,7 +2,7 @@
 //!
 //! Some agent CLIs cannot handle HTTP 402 payment challenges, so they cannot
 //! talk to a priced inference gateway directly. This proxy sits between the
-//! agent process and the upstream (`pay serve inference`, a hosted paid
+//! agent process and the upstream (`pay gate inference`, a hosted paid
 //! provider, or a bare local provider in direct mode):
 //!
 //! 1. Every request is forwarded upstream, preserving method, path+query,

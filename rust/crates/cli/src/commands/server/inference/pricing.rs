@@ -1,4 +1,4 @@
-//! Per-model input/output token pricing for `pay serve inference`.
+//! Per-model input/output token pricing for `pay gate inference`.
 //!
 //! This is a **display-only** overlay: it expresses per-model token rates
 //! (USD per 1M tokens), validates them against the models a provider actually
@@ -54,9 +54,9 @@ impl PricingConfig {
     pub fn from_yaml_file(path: &str) -> pay_core::Result<Self> {
         let expanded = shellexpand::tilde(path).to_string();
         let contents = std::fs::read_to_string(&expanded)
-            .map_err(|e| pay_core::Error::Config(format!("read pricing file {path}: {e}")))?;
+            .map_err(|e| pay_core::Error::Config(format!("read paywall file {path}: {e}")))?;
         serde_yml::from_str(&contents)
-            .map_err(|e| pay_core::Error::Config(format!("parse pricing file {path}: {e}")))
+            .map_err(|e| pay_core::Error::Config(format!("parse paywall file {path}: {e}")))
     }
 
     /// Parse the inline shorthand: comma-separated `model=in/out` items.
@@ -195,7 +195,7 @@ mod tests {
     #[test]
     fn parses_the_yaml_file_shape() {
         let dir = std::env::temp_dir();
-        let path = dir.join(format!("pay-pricing-{}.yml", std::process::id()));
+        let path = dir.join(format!("pay-inference-paywall-{}.yml", std::process::id()));
         std::fs::write(
             &path,
             "default: { in: 0.10, out: 0.30 }\n\

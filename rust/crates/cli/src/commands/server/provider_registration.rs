@@ -1,4 +1,4 @@
-//! On-chain registration phase shared by `pay serve` commands.
+//! On-chain registration phase shared by `pay server` and `pay gate` commands.
 //!
 //! PDA seeds provide deterministic identity, while category and protocol are
 //! duplicated at stable account-data offsets for `getProgramAccounts` memcmp

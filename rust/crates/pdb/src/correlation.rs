@@ -27,7 +27,7 @@ pub enum CorrelationMode {
     /// Only 402 challenges / payment retries become flows (Payment Debugger).
     #[default]
     PaymentFlows,
-    /// Every exchange becomes a flow immediately (`pay serve inference`).
+    /// Every exchange becomes a flow immediately (`pay gate inference`).
     /// Payment challenge/retry *correlation* is not applied in this mode —
     /// each HTTP exchange is one flow; unifying the two models is deferred
     /// until the inference gateway grows payment gating.

@@ -205,7 +205,7 @@ async fn full_payment_flow_with_surfnet() {
         .unwrap();
 
     let api: ApiSpec =
-        serde_yml::from_str(&std::fs::read_to_string("tests/fixtures/test-provider.yml").unwrap())
+        serde_yml::from_str(&std::fs::read_to_string("tests/fixtures/test-paywall.yml").unwrap())
             .unwrap();
 
     let mpp = Mpp::new(pay_kit::mpp::server::Config {
@@ -335,7 +335,7 @@ async fn replayed_authorization_is_rejected() {
         .unwrap();
 
     let api: ApiSpec =
-        serde_yml::from_str(&std::fs::read_to_string("tests/fixtures/test-provider.yml").unwrap())
+        serde_yml::from_str(&std::fs::read_to_string("tests/fixtures/test-paywall.yml").unwrap())
             .unwrap();
 
     let mpp = Mpp::new(pay_kit::mpp::server::Config {
@@ -515,7 +515,7 @@ async fn push_session_full_flow() {
         .unwrap();
 
     let api: ApiSpec =
-        serde_yml::from_str(&std::fs::read_to_string("tests/fixtures/test-provider.yml").unwrap())
+        serde_yml::from_str(&std::fs::read_to_string("tests/fixtures/test-paywall.yml").unwrap())
             .unwrap();
 
     // 1 USDC cap (6 decimals). rpc_url enables on-chain signature verification.
@@ -799,7 +799,7 @@ async fn mpp_build_credential_with_surfnet() {
         .unwrap();
 
     let api: ApiSpec =
-        serde_yml::from_str(&std::fs::read_to_string("tests/fixtures/test-provider.yml").unwrap())
+        serde_yml::from_str(&std::fs::read_to_string("tests/fixtures/test-paywall.yml").unwrap())
             .unwrap();
 
     let mpp = Mpp::new(pay_kit::mpp::server::Config {

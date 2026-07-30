@@ -1,4 +1,4 @@
-//! `pay server start` — start a payment gateway proxy.
+//! `pay gate api` — start a payment gateway proxy.
 
 use std::str::FromStr;
 use std::sync::Arc;
@@ -90,14 +90,15 @@ async fn session_channel_store()
 
 /// Start the payment gateway proxy.
 ///
-/// Loads an API spec from a YAML file and starts an HTTP proxy that:
+/// Loads a paywall from a YAML file and starts an HTTP proxy that:
 /// - Returns 402 with MPP challenge for metered endpoints
 /// - Forwards to upstream on valid payment
 /// - Passes through free endpoints directly
 #[derive(clap::Args)]
 pub struct StartCommand {
-    /// Path to the provider YAML spec file.
-    pub spec: String,
+    /// Path to the paywall YAML spec file.
+    #[arg(value_name = "PAYWALL")]
+    pub paywall: String,
 
     /// Address to bind to. Defaults to 0.0.0.0:$PORT when PORT is set.
     #[arg(long, default_value_t = default_bind())]
@@ -116,7 +117,7 @@ pub struct StartCommand {
     pub rpc_url: Option<String>,
 
     /// Launch the Payment Debugger UI alongside the gateway.
-    /// Automatically enabled in sandbox mode (`pay --sandbox server start`).
+    /// Automatically enabled in sandbox mode (`pay --sandbox gate api`).
     #[arg(long)]
     pub debugger: bool,
 
@@ -144,7 +145,7 @@ pub struct StartCommand {
     pub no_register: bool,
 
     #[arg(skip)]
-    pub scaffolded_spec: Option<String>,
+    pub scaffolded_paywall: Option<String>,
 }
 
 #[derive(Clone)]
@@ -589,12 +590,13 @@ impl StartCommand {
         sandbox: bool,
     ) -> pay_core::Result<()> {
         let debugger = self.debugger || sandbox;
-        let expanded = shellexpand::tilde(&self.spec);
-        let contents = std::fs::read_to_string(expanded.as_ref())
-            .map_err(|e| pay_core::Error::Config(format!("Failed to read {}: {e}", self.spec)))?;
+        let expanded = shellexpand::tilde(&self.paywall);
+        let contents = std::fs::read_to_string(expanded.as_ref()).map_err(|e| {
+            pay_core::Error::Config(format!("Failed to read {}: {e}", self.paywall))
+        })?;
 
         let (mut api, api_profile) = pay_core::server::profiles::load_yaml_with_profile(&contents)
-            .map_err(|e| pay_core::Error::Config(format!("Invalid spec: {e}")))?;
+            .map_err(|e| pay_core::Error::Config(format!("Invalid paywall: {e}")))?;
 
         apply_spec_env_vars(&api)?;
         api.resolve_env_templates()
@@ -622,9 +624,9 @@ impl StartCommand {
                 .collect::<Vec<_>>()
                 .join("\n");
             return Err(pay_core::Error::Config(format!(
-                "{} configuration error(s) in spec `{}`:\n{detail}",
+                "{} configuration error(s) in paywall `{}`:\n{detail}",
                 spec_issues.len(),
-                self.spec,
+                self.paywall,
             )));
         }
 
@@ -685,8 +687,8 @@ impl StartCommand {
         let currencies = resolve_operator_currencies(op, &self.currency);
 
         // `--sandbox` is an authoritative local-dev switch: pin the
-        // network to localnet regardless of the spec's `operator.network`.
-        // Otherwise `pay --sandbox server start <spec with network:
+        // network to localnet regardless of the paywall's `operator.network`.
+        // Otherwise `pay --sandbox gate api <paywall with network:
         // devnet>` would derive `auto_network = "devnet"` below and
         // silently mint (and persist) an `accounts.devnet.gateway`
         // ephemeral while talking to real devnet — the opposite of what
@@ -762,7 +764,7 @@ impl StartCommand {
             //   3. **Throwaway network slug** (`localnet` / `devnet`)**
             //      with no explicit signer** — smart default: route
             //      through the network-aware loader so users running
-            //      `pay server start` against a localnet/devnet spec
+            //      `pay gate api` against a localnet/devnet paywall
             //      don't have to think about signers. Same code path as
             //      the sandbox flag.
             //
@@ -834,7 +836,7 @@ impl StartCommand {
             if fee_payer && fee_payer_signer.is_none() {
                 return Err(pay_core::Error::Config(
                     "operator.fee_payer is `true` but no fee payer signer is configured.\n\n\
-                     In sandbox mode, start the server with `pay --sandbox server start ...` \
+                     In sandbox mode, start the server with `pay --sandbox gate api ...` \
                      (or use `pay -s server demo`).\n\
                      In production, set `operator.signer` in the YAML (`backend: env`, \
                      `backend: account`, `backend: file`, or a gcp-kms signer in a \
@@ -865,7 +867,7 @@ impl StartCommand {
             // the prompt — we can't serve a half-configured gateway.
             let api = ensure_subscription_plans(
                 api,
-                &self.spec,
+                &self.paywall,
                 &recipient,
                 fee_payer_signer.clone(),
                 &rpc_url,
@@ -1167,7 +1169,7 @@ impl StartCommand {
 
             let banner = render_pay_banner(PAY_SH_TAGLINE.dimmed());
             let has_startup_status =
-                generated_gateway_account.is_some() || self.scaffolded_spec.is_some();
+                generated_gateway_account.is_some() || self.scaffolded_paywall.is_some();
             if !banner.is_empty() {
                 eprintln!("{banner}");
                 if has_startup_status {
@@ -1185,8 +1187,8 @@ impl StartCommand {
                     network.slug().dimmed(),
                 );
             }
-            if let Some(scaffolded_spec) = &self.scaffolded_spec {
-                eprintln!("{} {}", "Scaffolding".green(), scaffolded_spec);
+            if let Some(scaffolded_paywall) = &self.scaffolded_paywall {
+                eprintln!("{} {}", "Scaffolding".green(), scaffolded_paywall);
             }
             eprintln!();
 
@@ -1740,7 +1742,7 @@ impl StartCommand {
 
             // ── Local skills registration ──────────────────────────────────
             //
-            // Reap dead ephemeral entries from prior crashed `pay server`
+            // Reap dead ephemeral entries from prior crashed `pay gate api`
             // runs before adding ours, then register this server so any
             // MCP agent on the same host can discover its endpoints via
             // the standard `list_catalog` path. The matching deregister
@@ -2149,7 +2151,7 @@ async fn ensure_subscription_plans(
             return Err(pay_core::Error::Config(format!(
                 "endpoint `{}` has plan_id `{yaml_plan_id}` but \
                  plan_id_numeric={plan_id_numeric} derives to `{plan_pda}`. \
-                 Clear plan_id from the YAML and let `pay server start` regenerate it.",
+                 Clear plan_id from the YAML and let `pay gate api` regenerate it.",
                 endpoint.path
             )));
         }
@@ -3724,7 +3726,7 @@ endpoints:
     // ── resolve_signer (operator.signer in YAML) ───────────────────────────
     //
     // Tests for the SignerConfig variants exposed via `operator.signer` in
-    // a provider YAML. Each variant is exercised through
+    // a paywall YAML. Each variant is exercised through
     // `resolve_signer_with_store` so we can inject a `MemoryAccountsStore`
     // and never touch `~/.config/pay/accounts.yml`.
 

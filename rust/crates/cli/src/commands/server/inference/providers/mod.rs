@@ -1,4 +1,4 @@
-//! Inference provider implementations for `pay serve inference`.
+//! Inference provider implementations for `pay gate inference`.
 //!
 //! Each built-in local inference server (Ollama, LM Studio, llama.cpp, vLLM,
 //! exo) implements [`InferenceProvider`] in its own file with its constants

@@ -472,7 +472,7 @@ fn prepare_claude_launch(
 /// 1. **Hosted compatible provider selected** (Model Studio, … from
 ///    the pay catalog) → payer proxy targets its `service_url` directly
 ///    and settles the gateway's MPP 402 challenges per request.
-/// 2. **Gateway on 127.0.0.1:1402** (the user ran `pay serve inference`,
+/// 2. **Gateway on 127.0.0.1:1402** (the user ran `pay gate inference`,
 ///    possibly priced, in another terminal) → payer proxy targets the
 ///    gateway and settles its MPP 402 challenges.
 /// 3. **No gateway** → run local provider discovery and target the
@@ -641,7 +641,7 @@ fn gateway_provider_summaries() -> Vec<ProviderSummary> {
         return Vec::new();
     };
     fetch_gateway_provider_summaries(&client, "/__402/pdb/api/config")
-        // `pay serve inference --no-web` exposes the same provider snapshot at
+        // `pay gate inference --no-web` exposes the same provider snapshot at
         // `/` instead of mounting the PDB config route.
         .or_else(|| fetch_gateway_provider_summaries(&client, "/"))
         .unwrap_or_default()
@@ -755,7 +755,7 @@ fn discover_catalog_providers() -> Vec<DiscoveredProvider> {
 ///
 /// `pay_core::skills::load_skills()` re-fetches every *ephemeral* source on
 /// each call — including the `/.well-known/pay-skills.json` a running
-/// `pay serve inference` auto-registers — and that fetch goes through the
+/// `pay gate inference` auto-registers — and that fetch goes through the
 /// payment gate, polluting the gateway's CONNECTIONS panel with an
 /// anonymous 127.0.0.1 row on every `pay claude` launch. The hosted
 /// defaults are durable CDN entries, so a fresh on-disk cache (pure disk

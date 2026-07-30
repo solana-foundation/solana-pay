@@ -30,7 +30,7 @@ pub struct DiscoveredProvider {
     pub models: Vec<String>,
     /// Server-reported version when the identify response carries one.
     pub version: Option<String>,
-    /// Display-only per-model token pricing overlay (`--price`/`--pricing`).
+    /// Display-only per-model token pricing overlay (paywall or `--price`).
     /// When set and it resolves the picked model, the picker shows real
     /// in/out token rates for that model instead of the provider's own
     /// (trait) hint. `None` keeps the pre-existing hosted behavior.
@@ -67,7 +67,7 @@ impl DiscoveredProvider {
     /// Price for `model`, unifying the two pricing sources at one call site:
     ///
     /// 1. When a display-only [`PricingConfig`] overlay
-    ///    (`--price`/`--pricing`) resolves the model, build a per-model
+    ///    (paywall or `--price`) resolves the model, build a per-model
     ///    in/out [`PricingHint`] from its token rates.
     /// 2. Otherwise fall back to the provider's own (trait) hint — the
     ///    pre-existing hosted-catalog behavior, unchanged when no overlay is

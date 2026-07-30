@@ -1,4 +1,4 @@
-//! Live TUI for `pay serve inference`: provider sidebar and per-connection
+//! Live TUI for `pay gate inference`: provider sidebar and per-connection
 //! activity table, fed by the PDB event stream (bridged from
 //! `broadcast::Sender<SseMessage>` to a `std::sync::mpsc` channel by the
 //! caller).
@@ -29,7 +29,7 @@ const FLOW_CAP: usize = 200;
 
 // ── Public API ────────────────────────────────────────────────────────────
 
-/// Everything `run_inference_tui` needs; wired by the `serve inference`
+/// Everything `run_inference_tui` needs; wired by the `gate inference`
 /// command.
 pub struct InferenceTuiArgs {
     /// Public gateway URL, e.g. `http://127.0.0.1:1402`.

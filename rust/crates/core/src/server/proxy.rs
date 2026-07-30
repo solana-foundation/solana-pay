@@ -503,7 +503,7 @@ fn apply_prepared_request_auth(
                 format!(
                     "Proxy auth misconfigured: env var `{value_from_env}` is not set, \
                      can't inject the `{key}` header into the upstream request. \
-                     Export it in the shell that runs `pay server start`."
+                     Export it in the shell that runs `pay gate api`."
                 )
             })?;
             if secret.trim().is_empty() {
@@ -532,7 +532,7 @@ fn apply_prepared_request_auth(
                 format!(
                     "Proxy auth misconfigured: env var `{value_from_env}` is not set, \
                      can't inject `?{key}=...` into the upstream request. \
-                     Export it in the shell that runs `pay server start`."
+                     Export it in the shell that runs `pay gate api`."
                 )
             })?;
             if secret.trim().is_empty() {

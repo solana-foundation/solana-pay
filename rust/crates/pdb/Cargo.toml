@@ -1,6 +1,6 @@
 [package]
 name = "pay-pdb"
-description = "Embedded Payment Debugger UI + backend for pay server"
+description = "Embedded Payment Debugger UI + backend for pay gate"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

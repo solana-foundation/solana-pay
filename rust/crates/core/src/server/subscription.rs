@@ -154,7 +154,7 @@ pub fn build_handler(
         // `challenge_binding_secret` and `realm` are required on the SDK side — fall
         // back loudly when the operator config is incomplete instead
         // of inheriting a silent SDK default. Boot-time validation in
-        // `pay server start` is supposed to catch a missing secret
+        // `pay gate api` is supposed to catch a missing secret
         // before any request lands; this guard is the runtime backstop.
         challenge_binding_secret: defaults
             .challenge_binding_secret
@@ -326,7 +326,7 @@ pub async fn check_plan_exists(
 /// Broadcast a `create_plan` instruction and wait for confirmation, then
 /// read the new Plan account to capture its `created_at` timestamp.
 ///
-/// This function does **not** prompt — callers (e.g. `pay server start`)
+/// This function does **not** prompt — callers (e.g. `pay gate api`)
 /// are expected to interactively confirm via dialoguer before invoking
 /// it, since publishing costs real SOL on mainnet.
 pub async fn publish_plan(
@@ -411,7 +411,7 @@ pub async fn publish_plan(
 
 /// Read just the `created_at` (i64 LE) out of a freshly-published Plan
 /// account at the canonical offset. Avoids vendoring the full Plan
-/// account decoder for the one field `pay server start` actually needs.
+/// account decoder for the one field `pay gate api` actually needs.
 async fn fetch_plan_created_at(rpc_url: &str, plan_pda: &solana_pubkey::Pubkey) -> Result<i64> {
     let url = rpc_url.to_string();
     let pda = *plan_pda;

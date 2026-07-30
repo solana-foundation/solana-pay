@@ -2,7 +2,7 @@
 //!
 //! The server loads an OpenAPI 3 or Google Discovery JSON document declared
 //! by the operator (via `--openapi` on the CLI or an `openapi:` field in the
-//! provider YAML — both reuse [`pay_types::registry::OpenapiSource`]).
+//! paywall YAML — both reuse [`pay_types::registry::OpenapiSource`]).
 //!
 //! Two transforms are applied before the document is exposed to clients:
 //!
@@ -77,7 +77,7 @@ pub struct DiscoveryContext<'a> {
     pub fee_payer: Option<&'a str>,
 }
 
-/// Synthesize an OpenAPI 3.1 document from the provider spec itself, for when
+/// Synthesize an OpenAPI 3.1 document from the paywall spec itself, for when
 /// the operator did not supply an upstream doc (`--openapi` / `openapi:`).
 ///
 /// Mirrors pay-kit's TS `openapiFromExpress`: each declared endpoint becomes an
