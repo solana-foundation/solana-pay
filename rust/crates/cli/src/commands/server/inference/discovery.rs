@@ -93,9 +93,8 @@ impl DiscoveredProvider {
                 .model_pricing
                 .iter()
                 .find(|summary| summary.model == model)
-            && let Some(price) = &summary.price
         {
-            return Some(PricingHint {
+            return summary.price.as_ref().map(|price| PricingHint {
                 display: Some(price.clone()),
                 min_usd: 0.0,
                 max_usd: 0.0,

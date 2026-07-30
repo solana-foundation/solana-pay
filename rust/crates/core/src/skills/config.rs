@@ -37,6 +37,10 @@ pub struct Source {
     /// visible on the next agent call without waiting on the 30 min TTL.
     #[serde(default, skip_serializing_if = "is_false")]
     pub ephemeral: bool,
+    /// User-pinned inference discovery source added from the provider picker.
+    /// These are removed when their server is no longer reachable.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub inference: bool,
 }
 
 fn is_false(b: &bool) -> bool {
@@ -64,6 +68,7 @@ impl Default for SkillsConfig {
                 name: "pay-skills".to_string(),
                 url: DEFAULT_SOURCE.to_string(),
                 ephemeral: false,
+                inference: false,
             }],
         }
     }
@@ -108,6 +113,28 @@ impl SkillsConfig {
             name: derive_name(source),
             url,
             ephemeral: false,
+            inference: false,
+        });
+        true
+    }
+
+    /// Add or mark a durable source as a provider-picker inference pin.
+    /// Returns true when the persisted config changed.
+    pub fn add_inference_source(&mut self, source: &str) -> bool {
+        let url = resolve_source_url(source);
+        if let Some(existing) = self.sources.iter_mut().find(|existing| existing.url == url) {
+            if existing.inference {
+                return false;
+            }
+            existing.inference = true;
+            existing.ephemeral = false;
+            return true;
+        }
+        self.sources.push(Source {
+            name: derive_name(source),
+            url,
+            ephemeral: false,
+            inference: true,
         });
         true
     }
@@ -124,6 +151,7 @@ impl SkillsConfig {
             name: name.to_string(),
             url: url.to_string(),
             ephemeral: true,
+            inference: false,
         });
         true
     }
@@ -312,6 +340,31 @@ mod tests {
         let last = cfg.sources.last().unwrap();
         assert_eq!(last.name, "company/apis");
         assert!(last.url.contains("raw.githubusercontent.com"));
+    }
+
+    #[test]
+    fn inference_source_is_marked_and_deduplicated() {
+        let mut config = SkillsConfig::default();
+        let source = "http://127.0.0.1:1402/openapi.json";
+
+        assert!(config.add_source(source));
+        assert!(config.add_inference_source(source));
+        assert!(!config.add_inference_source(source));
+        assert_eq!(
+            config
+                .sources
+                .iter()
+                .filter(|entry| entry.url == source)
+                .count(),
+            1
+        );
+        let saved = config
+            .sources
+            .iter()
+            .find(|entry| entry.url == source)
+            .unwrap();
+        assert!(saved.inference);
+        assert!(!saved.ephemeral);
     }
 
     #[test]

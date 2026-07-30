@@ -10,6 +10,7 @@
 //! its price.
 
 use std::io;
+use std::sync::mpsc::{Receiver, TryRecvError};
 
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::Terminal;
@@ -46,6 +47,7 @@ pub fn select_provider(
     harness: &str,
     providers: Vec<DiscoveredProvider>,
     requested_model: Option<&str>,
+    provider_updates: Option<Receiver<Vec<DiscoveredProvider>>>,
     mut discover_custom: impl FnMut(&str) -> Result<Vec<DiscoveredProvider>, String>,
 ) -> io::Result<ProviderSelection> {
     if !std::io::IsTerminal::is_terminal(&std::io::stderr()) {
@@ -60,6 +62,7 @@ pub fn select_provider(
             harness,
             providers,
             requested_model,
+            provider_updates,
             &mut discover_custom,
         )
     })
@@ -70,11 +73,31 @@ fn run(
     harness: String,
     providers: Vec<DiscoveredProvider>,
     requested_model: Option<String>,
+    mut provider_updates: Option<Receiver<Vec<DiscoveredProvider>>>,
     discover_custom: &mut impl FnMut(&str) -> Result<Vec<DiscoveredProvider>, String>,
 ) -> io::Result<ProviderSelection> {
     let mut app = ProviderPickerApp::new(harness, providers, requested_model);
+    app.providers_loading = provider_updates.is_some();
+    if app.providers_loading && app.providers.is_empty() {
+        app.custom_active = false;
+    }
 
     loop {
+        if let Some(updates) = provider_updates.as_ref() {
+            match updates.try_recv() {
+                Ok(providers) => {
+                    app.add_background_providers(providers);
+                }
+                Err(TryRecvError::Disconnected) => {
+                    app.providers_loading = false;
+                    if app.providers.is_empty() {
+                        app.custom_active = true;
+                    }
+                    provider_updates = None;
+                }
+                Err(TryRecvError::Empty) => {}
+            }
+        }
         app.tick = app.tick.wrapping_add(1);
         terminal.draw(|frame| render(frame, &app))?;
 
@@ -150,6 +173,9 @@ struct ProviderPickerApp {
     /// Last validation/discovery failure, rendered under the URL field.
     custom_error: Option<String>,
     discovering: bool,
+    /// Hosted provider discovery runs after the TUI opens so network probes
+    /// never leave the user staring at an unchanged terminal.
+    providers_loading: bool,
     tick: usize,
 }
 
@@ -174,6 +200,7 @@ impl ProviderPickerApp {
             custom_url: String::new(),
             custom_error: None,
             discovering: false,
+            providers_loading: false,
             tick: 0,
         }
     }
@@ -344,6 +371,30 @@ impl ProviderPickerApp {
         }
     }
 
+    fn add_background_providers(&mut self, providers: Vec<DiscoveredProvider>) {
+        let selected = self
+            .selected_provider()
+            .map(|provider| (provider.slug().to_string(), provider.base_url.clone()));
+        for provider in providers {
+            self.providers.retain(|existing| {
+                existing.slug() != provider.slug() || existing.base_url != provider.base_url
+            });
+            self.providers.push(provider);
+        }
+        self.providers.sort_by_key(|provider| !provider.hosted());
+        if self.custom_selected() {
+            return;
+        }
+        self.selected = selected
+            .and_then(|(slug, base_url)| {
+                self.filtered()
+                    .iter()
+                    .position(|provider| provider.slug() == slug && provider.base_url == base_url)
+            })
+            .unwrap_or(0);
+        self.model_idx = 0;
+    }
+
     /// Model that Enter would launch for `provider`: `--model` lock > the
     /// `←`/`→` model cursor over the search-narrowed models (selected
     /// provider only) > the provider's first model. `None` when the
@@ -391,6 +442,20 @@ fn render(frame: &mut ratatui::Frame, app: &ProviderPickerApp) {
 /// 🔍 type-to-search field: the live query (with a trailing cursor), or a
 /// dim placeholder while empty.
 fn render_search(frame: &mut ratatui::Frame, area: Rect, app: &ProviderPickerApp) {
+    if app.custom_selected() {
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled("＋ ", Style::default().fg(Color::Cyan).bold()),
+                Span::styled(
+                    "Add an inference server",
+                    Style::default().fg(Color::White).bold(),
+                ),
+                Span::styled(" · enter its URL below", Style::default().fg(Color::Gray)),
+            ])),
+            area,
+        );
+        return;
+    }
     let mut spans = vec![Span::raw("🔍 ")];
     if app.search.is_empty() {
         spans.push(Span::styled(
@@ -479,7 +544,7 @@ fn render_provider_list(frame: &mut ratatui::Frame, area: Rect, app: &ProviderPi
         match row {
             ListRow::Gap => {}
             ListRow::Entry(idx, provider) => {
-                let selected = *idx == app.selected;
+                let selected = !app.custom_selected() && *idx == app.selected;
                 let chosen = selected.then(|| app.chosen_model(provider)).flatten();
                 render_provider_entry(
                     frame,
@@ -511,15 +576,29 @@ fn render_custom_entry(frame: &mut ratatui::Frame, area: Rect, app: &ProviderPic
     };
     let dim = Style::default().fg(Color::DarkGray);
 
-    let top = Line::from(vec![rail.clone(), Span::styled("Custom", title_style)]);
+    let top = Line::from(vec![
+        rail.clone(),
+        Span::styled(
+            if selected {
+                "Custom inference server"
+            } else {
+                "Custom"
+            },
+            title_style,
+        ),
+    ]);
     let input = if selected {
         let value = if app.custom_url.is_empty() {
-            Span::styled("Paste inference server URL…", dim)
+            Span::styled(
+                "Paste or type http://localhost:…",
+                Style::default().fg(Color::White),
+            )
         } else {
             Span::styled(app.custom_url.clone(), Style::default().fg(Color::White))
         };
         Line::from(vec![
             rail.clone(),
+            Span::styled("URL › ", Style::default().fg(Color::Cyan).bold()),
             value,
             Span::styled("▌", Style::default().fg(Color::Gray)),
         ])
@@ -552,8 +631,8 @@ fn render_custom_entry(frame: &mut ratatui::Frame, area: Rect, app: &ProviderPic
         Line::from(vec![
             rail,
             Span::styled(
-                "Discovers OpenAPI, models, and pricing · saves on success",
-                dim,
+                "Press Enter to discover models and pricing, save, and select",
+                Style::default().fg(Color::Gray),
             ),
         ])
     } else {
@@ -722,8 +801,8 @@ fn render_controls(frame: &mut ratatui::Frame, area: Rect, app: &ProviderPickerA
     let entries: Vec<(&str, &str)> = if app.custom_selected() {
         vec![
             ("↑ ↓", "provider"),
-            ("paste", "URL"),
-            ("⏎", "add"),
+            ("type / paste", "URL"),
+            ("⏎", "discover"),
             ("Esc", "cancel"),
         ]
     } else {
@@ -737,7 +816,18 @@ fn render_controls(frame: &mut ratatui::Frame, area: Rect, app: &ProviderPickerA
     };
 
     let spinner = SPINNER[app.tick % SPINNER.len()];
-    let status = if app.custom_selected() {
+    let status = if app.providers_loading {
+        Line::from(vec![
+            Span::styled(
+                SPINNER[app.tick % SPINNER.len()],
+                Style::default().fg(Color::Cyan).bold(),
+            ),
+            Span::styled(
+                " Loading hosted providers ",
+                Style::default().fg(Color::DarkGray),
+            ),
+        ])
+    } else if app.custom_selected() {
         Line::from(Span::styled(
             "custom catalog-backed server ",
             Style::default().fg(Color::DarkGray),
@@ -985,8 +1075,17 @@ mod tests {
             "selected Custom row must render its URL input:\n{text}"
         );
         assert!(
-            text.contains("saves on success"),
-            "selected Custom row must explain persistence:\n{text}"
+            text.contains("Press Enter to discover models and pricing, save, and select"),
+            "selected Custom row must explain its action:\n{text}"
+        );
+        assert!(
+            text.contains("Add an inference server · enter its URL below"),
+            "search header must become a visible URL-entry prompt:\n{text}"
+        );
+        assert_eq!(
+            text.matches('┃').count(),
+            ENTRY_HEIGHT as usize,
+            "only Custom may retain the active rail while editing its URL:\n{text}"
         );
     }
 
@@ -1016,8 +1115,26 @@ mod tests {
         let text = buffer_text(&draw(&app, 100, 16));
         assert!(text.contains("Custom"), "missing Custom row:\n{text}");
         assert!(
-            text.contains("Paste inference server URL"),
+            text.contains("Paste or type http://localhost:"),
             "empty picker must start in URL-entry mode:\n{text}"
+        );
+    }
+
+    #[test]
+    fn background_providers_do_not_move_focus_from_the_current_row() {
+        let mut app = app(vec![ollama(&["llama3.2:3b"])]);
+        app.providers_loading = true;
+        app.add_background_providers(vec![hosted_gemini()]);
+
+        assert_eq!(app.selected_provider().unwrap().slug(), "ollama");
+        assert_eq!(filtered_slugs(&app), vec!["google", "ollama"]);
+
+        app.move_selection(1);
+        assert!(app.custom_selected());
+        app.add_background_providers(vec![hosted_gemini_variant_priced()]);
+        assert!(
+            app.custom_selected(),
+            "a background refresh must not steal focus from URL entry"
         );
     }
 
@@ -1220,6 +1337,34 @@ mod tests {
         assert!(
             text.contains("input $1.00 · output $3.00 / 1M tokens"),
             "inactive row must fall back to its first model's live price:\n{text}"
+        );
+    }
+
+    #[test]
+    fn explicitly_unpriced_model_does_not_inherit_provider_aggregate() {
+        let mut provider = hosted_gemini();
+        provider.models = vec!["smollm2:135m-instruct-q2_K".into(), "gemma4:latest".into()];
+        provider.model_pricing = vec![
+            pay_pdb::types::ModelPricingSummary {
+                model: "smollm2:135m-instruct-q2_K".into(),
+                variant: None,
+                price: None,
+                description: None,
+            },
+            pay_pdb::types::ModelPricingSummary {
+                model: "gemma4:latest".into(),
+                variant: Some("gemma4".into()),
+                price: Some("input $1.00 · output $3.00 / 1M tokens".into()),
+                description: None,
+            },
+        ];
+        let app = app(vec![provider]);
+
+        let text = buffer_text(&draw(&app, 120, 20));
+        assert!(text.contains("unpriced"), "missing unpriced state:\n{text}");
+        assert!(
+            !text.contains("$0.0000–0.0100/req"),
+            "selected SmolLM must not inherit the provider aggregate:\n{text}"
         );
     }
 

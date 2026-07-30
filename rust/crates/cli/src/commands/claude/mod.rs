@@ -271,7 +271,18 @@ pub(crate) fn prepare_alternate_provider_for(
 ) -> pay_core::Result<AlternateProvider> {
     let agent = client.name();
     let requested_model = model_arg(args);
-    let (providers, gateway_up) = discover_compatible_providers(client)?;
+    let interactive_picker = std::io::stderr().is_terminal() && requested_provider.is_none();
+    let (providers, gateway_up, provider_updates) = if interactive_picker {
+        let gateway_up = gateway_listening();
+        (
+            Vec::new(),
+            gateway_up,
+            Some(discover_providers_in_background(client, gateway_up)),
+        )
+    } else {
+        let (providers, gateway_up) = discover_compatible_providers(client)?;
+        (providers, gateway_up, None)
+    };
 
     let choice = if providers.is_empty() && !std::io::stderr().is_terminal() {
         None
@@ -281,6 +292,7 @@ pub(crate) fn prepare_alternate_provider_for(
             providers,
             requested_model.as_deref(),
             requested_provider,
+            provider_updates,
         )?)
     };
 
@@ -382,7 +394,26 @@ pub(crate) fn discover_acp_provider_options(
 fn discover_compatible_providers(
     client: AlternateClient,
 ) -> pay_core::Result<(Vec<DiscoveredProvider>, bool)> {
+    let (mut providers, gateway_up) = discover_runtime_providers(client)?;
+    providers.extend(discover_catalog_providers());
+    providers.retain(|provider| client.provider_supported(provider));
+    Ok((providers, gateway_up))
+}
+
+/// Loopback-only discovery shared by headless selection and the interactive
+/// picker's background worker.
+fn discover_runtime_providers(
+    client: AlternateClient,
+) -> pay_core::Result<(Vec<DiscoveredProvider>, bool)> {
     let gateway_up = gateway_listening();
+    let providers = discover_runtime_providers_for_gateway(client, gateway_up)?;
+    Ok((providers, gateway_up))
+}
+
+fn discover_runtime_providers_for_gateway(
+    client: AlternateClient,
+    gateway_up: bool,
+) -> pay_core::Result<Vec<DiscoveredProvider>> {
     let mut providers = discover_local_providers()?;
     if gateway_up {
         let gateway_providers = gateway_provider_summaries();
@@ -392,9 +423,103 @@ fn discover_compatible_providers(
             apply_gateway_proxy_fallback(&mut providers);
         }
     }
-    providers.extend(discover_catalog_providers());
     providers.retain(|provider| client.provider_supported(provider));
-    Ok((providers, gateway_up))
+    Ok(providers)
+}
+
+fn discover_providers_in_background(
+    client: AlternateClient,
+    gateway_up: bool,
+) -> std::sync::mpsc::Receiver<Vec<DiscoveredProvider>> {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let local_sender = sender.clone();
+    let _ = std::thread::Builder::new()
+        .name("pay-local-provider-discovery".to_string())
+        .spawn(move || {
+            let providers =
+                discover_runtime_providers_for_gateway(client, gateway_up).unwrap_or_default();
+            let _ = local_sender.send(providers);
+        });
+    let catalog_sender = sender.clone();
+    let _ = std::thread::Builder::new()
+        .name("pay-catalog-provider-discovery".to_string())
+        .spawn(move || {
+            let mut providers = discover_catalog_providers();
+            providers.retain(|provider| client.provider_supported(provider));
+            let _ = catalog_sender.send(providers);
+            let pinned = discover_pinned_inference_providers(client);
+            let _ = catalog_sender.send(pinned);
+        });
+    drop(sender);
+    receiver
+}
+
+fn discover_pinned_inference_providers(client_kind: AlternateClient) -> Vec<DiscoveredProvider> {
+    let Ok(config) = pay_core::skills::config::SkillsConfig::load() else {
+        return Vec::new();
+    };
+    let sources: Vec<String> = config
+        .sources
+        .iter()
+        .filter(|source| pinned_inference_source(source))
+        .map(|source| source.url.clone())
+        .collect();
+    if sources.is_empty() {
+        return Vec::new();
+    }
+
+    let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    else {
+        return Vec::new();
+    };
+    let mut discovered = Vec::new();
+    let mut reachable = Vec::new();
+    let mut stale = Vec::new();
+    runtime.block_on(async {
+        let Ok(client) = reqwest::Client::builder()
+            .timeout(CUSTOM_PROVIDER_TIMEOUT)
+            .build()
+        else {
+            return;
+        };
+        for source in &sources {
+            if client.get(source).send().await.is_err() {
+                stale.push(source.clone());
+                continue;
+            }
+            reachable.push(source.clone());
+            if let Ok(mut providers) = discover_custom_providers(client_kind, source).await {
+                discovered.append(&mut providers);
+            }
+        }
+    });
+
+    if !stale.is_empty() || !reachable.is_empty() {
+        let Ok(mut config) = pay_core::skills::config::SkillsConfig::load() else {
+            return discovered;
+        };
+        let mut changed = false;
+        for source in stale {
+            changed |= config.remove_source_by_url(&source);
+        }
+        for source in reachable {
+            changed |= config.add_inference_source(&source);
+        }
+        if changed {
+            let _ = config.save();
+        }
+    }
+    discovered
+}
+
+fn pinned_inference_source(source: &pay_core::skills::config::Source) -> bool {
+    !source.ephemeral
+        && (source.inference
+            || reqwest::Url::parse(&source.url)
+                .ok()
+                .is_some_and(|url| url.path().to_ascii_lowercase().ends_with("/openapi.json")))
 }
 
 fn print_alternate_route(
@@ -601,6 +726,7 @@ fn select_provider_choice(
     providers: Vec<DiscoveredProvider>,
     requested_model: Option<&str>,
     requested_provider: Option<&str>,
+    provider_updates: Option<std::sync::mpsc::Receiver<Vec<DiscoveredProvider>>>,
 ) -> pay_core::Result<crate::tui::ProviderChoice> {
     let agent = client.name();
     if let Some(requested_provider) = requested_provider {
@@ -632,7 +758,7 @@ fn select_provider_choice(
         return Ok(crate::tui::ProviderChoice { provider, model });
     }
 
-    match select_provider(agent, providers, requested_model, |url| {
+    match select_provider(agent, providers, requested_model, provider_updates, |url| {
         discover_and_save_custom_providers(client, url)
     })
     .map_err(|e| pay_core::Error::Config(format!("Provider selection failed: {e}")))?
@@ -705,7 +831,7 @@ fn discover_and_save_custom_providers(
     let mut config = pay_core::skills::config::SkillsConfig::load().map_err(|error| {
         format!("Discovered provider but could not load skills config: {error}")
     })?;
-    if config.add_source(&source_url) {
+    if config.add_inference_source(&source_url) {
         config.save().map_err(|error| {
             format!("Discovered provider but could not save {source_url}: {error}")
         })?;
@@ -921,7 +1047,7 @@ fn discover_catalog_providers() -> Vec<DiscoveredProvider> {
         return Vec::new();
     };
     rt.block_on(async {
-        let mut resolved = match load_catalog_quietly().await {
+        let mut resolved = match load_catalog_quietly() {
             Ok(mut catalog) => {
                 let fqns = catalog_providers::picker_catalog_fqns(&catalog);
                 catalog_providers::resolve_catalog_providers(&mut catalog, &fqns).await
@@ -939,53 +1065,80 @@ fn discover_catalog_providers() -> Vec<DiscoveredProvider> {
             return Vec::new();
         };
 
-        let mut discovered = Vec::new();
-        for provider in resolved {
-            let base_url = provider.service_url().to_string();
-            let Some(version) = provider.identify(&client, &base_url).await else {
-                tracing::debug!(
-                    slug = provider.slug(),
-                    %base_url,
-                    "hosted catalog provider unreachable — skipping"
-                );
-                continue;
-            };
-            let (models, model_pricing) = provider
-                .list_models_with_pricing(&client, &base_url)
-                .await;
-            let provider: Arc<dyn InferenceProvider> = Arc::new(provider);
-            discovered.push(DiscoveredProvider {
-                provider,
-                base_url,
-                models,
-                version,
-                pricing: None,
-                model_pricing,
+        let mut probes = tokio::task::JoinSet::new();
+        for (index, provider) in resolved.drain(..).enumerate() {
+            let client = client.clone();
+            probes.spawn(async move {
+                let base_url = provider.service_url().to_string();
+                let Some(version) = provider.identify(&client, &base_url).await else {
+                    tracing::debug!(
+                        slug = provider.slug(),
+                        %base_url,
+                        "hosted catalog provider unreachable — skipping"
+                    );
+                    return None;
+                };
+                let (models, model_pricing) = provider
+                    .list_models_with_pricing(&client, &base_url)
+                    .await;
+                let provider: Arc<dyn InferenceProvider> = Arc::new(provider);
+                Some((
+                    index,
+                    DiscoveredProvider {
+                        provider,
+                        base_url,
+                        models,
+                        version,
+                        pricing: None,
+                        model_pricing,
+                    },
+                ))
             });
         }
+        let mut discovered = Vec::new();
+        while let Some(result) = probes.join_next().await {
+            if let Ok(Some(provider)) = result {
+                discovered.push(provider);
+            }
+        }
+        discovered.sort_by_key(|(index, _)| *index);
         discovered
+            .into_iter()
+            .map(|(_, provider)| provider)
+            .collect()
     })
 }
 
-/// Load the skills catalog without waking the local gateway when possible.
+/// Load the skills catalog without waking the local gateway or blocking the
+/// picker on a catalog refresh.
 ///
 /// `pay_core::skills::load_skills()` re-fetches every *ephemeral* source on
 /// each call — including the `/.well-known/pay-skills.json` a running
 /// `pay gate inference` auto-registers — and that fetch goes through the
 /// payment gate, polluting the gateway's CONNECTIONS panel with an
-/// anonymous 127.0.0.1 row on every `pay claude` launch. The hosted
-/// defaults are durable CDN entries, so a fresh on-disk cache (pure disk
-/// read) is all we need; the full network load only runs when the cache is
-/// stale or missing — the same cadence as any other `pay skills` command.
-async fn load_catalog_quietly() -> pay_core::Result<pay_core::skills::Catalog> {
-    let cache_is_fresh = pay_core::skills::config::SkillsConfig::load()
-        .map(|cfg| cfg.valid_cache_path().is_some())
-        .unwrap_or(false);
-    if cache_is_fresh && let Ok(mut catalog) = pay_core::skills::load_cached_skills() {
+/// anonymous 127.0.0.1 row on every `pay claude` launch. Provider selection is
+/// not a catalog-update command, so any non-empty on-disk snapshot is suitable;
+/// pinned OpenAPI sources are refreshed separately in the background.
+fn load_catalog_quietly() -> pay_core::Result<pay_core::skills::Catalog> {
+    if let Ok(mut catalog) = pay_core::skills::load_cached_skills() {
         pay_core::skills::overlay::merge_pins_into(&mut catalog);
         return Ok(catalog);
     }
-    pay_core::skills::load_skills().await
+    let mut catalog = pay_core::skills::Catalog {
+        schema_version: "1".to_string(),
+        generated_at: String::new(),
+        base_url: String::new(),
+        provider_count: 0,
+        providers: Vec::new(),
+    };
+    pay_core::skills::overlay::merge_pins_into(&mut catalog);
+    if catalog.providers.is_empty() {
+        return Err(pay_core::Error::Config(
+            "no cached or pinned inference providers".to_string(),
+        ));
+    }
+    catalog.provider_count = catalog.providers.len() as u32;
+    Ok(catalog)
 }
 
 /// Whether an inference gateway is already serving HTTP on its default
@@ -1247,6 +1400,34 @@ mod tests {
         assert!(custom_source_url("file:///tmp/catalog.json").is_err());
         assert!(custom_source_url("https://user:secret@example.com").is_err());
         assert!(custom_source_url("http://inference.example.com").is_err());
+    }
+
+    #[test]
+    fn only_provider_picker_sources_are_treated_as_inference_pins() {
+        let canonical: pay_core::skills::config::Source =
+            serde_json::from_value(serde_json::json!({
+                "name": "pay-skills",
+                "url": pay_core::skills::config::DEFAULT_SOURCE
+            }))
+            .unwrap();
+        assert!(!pinned_inference_source(&canonical));
+
+        let legacy_openapi: pay_core::skills::config::Source =
+            serde_json::from_value(serde_json::json!({
+                "name": "openapi.json",
+                "url": "http://127.0.0.1:1402/openapi.json"
+            }))
+            .unwrap();
+        assert!(pinned_inference_source(&legacy_openapi));
+
+        let marked_catalog: pay_core::skills::config::Source =
+            serde_json::from_value(serde_json::json!({
+                "name": "custom",
+                "url": "https://inference.example.com/catalog.json",
+                "inference": true
+            }))
+            .unwrap();
+        assert!(pinned_inference_source(&marked_catalog));
     }
 
     #[test]

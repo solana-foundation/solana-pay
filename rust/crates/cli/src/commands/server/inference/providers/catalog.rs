@@ -481,6 +481,7 @@ impl InferenceProvider for CatalogProvider {
         let mut variant_name: Option<String> = None;
         let mut description: Option<String> = None;
         let mut matched = false;
+        let mut variants_declared = false;
         for ep in self.endpoints.iter().filter(|ep| ep.pricing.is_some()) {
             let Some(variants) = ep
                 .pricing
@@ -490,6 +491,7 @@ impl InferenceProvider for CatalogProvider {
             else {
                 continue;
             };
+            variants_declared = true;
             let Some(variant) = match_variant(variants, model) else {
                 continue;
             };
@@ -520,8 +522,15 @@ impl InferenceProvider for CatalogProvider {
                     .map(str::to_string);
             }
         }
-        if !matched || !min.is_finite() {
-            return self.pricing_hint();
+        if !matched {
+            return if variants_declared {
+                None
+            } else {
+                self.pricing_hint()
+            };
+        }
+        if !min.is_finite() {
+            return None;
         }
         Some(PricingHint {
             display: None,
@@ -1109,6 +1118,28 @@ mod tests {
             .pricing_hint_for_model(Some("gemini-2.5-flash"))
             .unwrap();
         assert_eq!(hint, provider.pricing_hint().unwrap());
+    }
+
+    #[test]
+    fn unmatched_model_is_unpriced_when_variants_are_model_specific() {
+        let mut provider = gemini_variant_priced();
+        for endpoint in &mut provider.endpoints {
+            if let Some(variants) = endpoint
+                .pricing
+                .as_mut()
+                .and_then(|pricing| pricing.get_mut("variants"))
+                .and_then(serde_json::Value::as_array_mut)
+            {
+                variants.retain(|variant| variant["value"] != "default");
+            }
+        }
+
+        assert!(
+            provider
+                .pricing_hint_for_model(Some("smollm2:135m-instruct-q2_K"))
+                .is_none(),
+            "another model's aggregate range must not price an unmatched model"
+        );
     }
 
     #[test]
