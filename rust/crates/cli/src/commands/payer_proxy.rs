@@ -389,7 +389,10 @@ async fn proxy(State(state): State<Arc<PayerState>>, req: Request) -> Response {
     };
 
     if first.status() != StatusCode::PAYMENT_REQUIRED {
-        if state.require_payment && first.status().is_success() && !used_cached_session {
+        if requires_payment_challenge(&state, &method, &path)
+            && first.status().is_success()
+            && !used_cached_session
+        {
             tracing::error!(%url, status = %first.status(), "payer proxy: hosted provider bypassed its payment gate");
             let message = if path.trim_matches('/') == "v1/responses" {
                 "payer proxy: the hosted Responses endpoint is not payment-enabled; deploy its Agent Gateway provider spec before using Codex"
@@ -452,7 +455,8 @@ async fn proxy(State(state): State<Arc<PayerState>>, req: Request) -> Response {
             }
         };
         if refreshed.status() != StatusCode::PAYMENT_REQUIRED {
-            if state.require_payment && refreshed.status().is_success() {
+            if requires_payment_challenge(&state, &method, &path) && refreshed.status().is_success()
+            {
                 tracing::error!(%url, status = %refreshed.status(), "payer proxy: hosted provider bypassed its payment gate while refreshing a session");
                 return (
                     StatusCode::BAD_GATEWAY,
@@ -581,6 +585,13 @@ async fn proxy(State(state): State<Arc<PayerState>>, req: Request) -> Response {
             buffered_response(status, &resp_headers, resp_body)
         }
     }
+}
+
+/// Hosted providers must challenge successful inference requests, but model
+/// discovery is intentionally public so harnesses can initialize before the
+/// first paid completion.
+fn requires_payment_challenge(state: &PayerState, method: &Method, path: &str) -> bool {
+    state.require_payment && !(*method == Method::GET && path.trim_end_matches('/') == "/v1/models")
 }
 
 /// Map standard agent API paths to the selected provider's declared paths.
@@ -1536,6 +1547,37 @@ mod tests {
                 .unwrap()
                 .contains("refusing an ungated response")
         );
+    }
+
+    #[tokio::test]
+    async fn hosted_provider_allows_public_model_discovery() {
+        let upstream = spawn_server(Router::new().route(
+            "/v1/models",
+            axum::routing::get(|| async { (StatusCode::OK, r#"{"data":[]}"#) }),
+        ))
+        .await;
+        let payer = spawn_payer_with(
+            PayerUpstream {
+                base_url: upstream,
+                host_header: None,
+                dialect: Dialect::OpenAiCompat,
+                chat_path: "v1/chat/completions".to_string(),
+                responses_path: "v1/responses".to_string(),
+                require_payment: true,
+                payment_protocol: PaymentProtocol::Auto,
+            },
+            None,
+        )
+        .await;
+
+        let response = reqwest::Client::new()
+            .get(format!("{payer}/v1/models"))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.text().await.unwrap(), r#"{"data":[]}"#);
     }
 
     const OPENAI_COMPLETION_JSON: &str = r#"{

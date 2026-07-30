@@ -31,11 +31,28 @@ pub struct Params {
     pub body_file: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(untagged)]
 pub enum BodyParam {
     Text(String),
     Json(Value),
+}
+
+impl JsonSchema for BodyParam {
+    fn inline_schema() -> bool {
+        true
+    }
+
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "BodyParam".into()
+    }
+
+    fn json_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        // Schemars represents arbitrary JSON as the boolean schema `true`.
+        // Some inference engines reject boolean tool schemas; `{}` has the
+        // same accept-anything semantics and is broadly compatible.
+        schemars::json_schema!({})
+    }
 }
 
 impl BodyParam {
@@ -1264,6 +1281,21 @@ mod tests {
         let schema = serde_json::to_value(rmcp::schemars::schema_for!(Params)).unwrap();
         assert!(schema.pointer("/properties/body_file").is_some());
         assert!(schema.pointer("/properties/body").is_some());
+    }
+
+    #[test]
+    fn arbitrary_json_body_schema_uses_compatible_object_form() {
+        let mut generator = schemars::SchemaGenerator::default();
+        let body_schema = serde_json::to_value(BodyParam::json_schema(&mut generator)).unwrap();
+        assert_eq!(body_schema, serde_json::json!({}));
+
+        let schema = serde_json::to_value(rmcp::schemars::schema_for!(Params)).unwrap();
+        assert!(
+            schema
+                .pointer("/properties/body")
+                .is_some_and(Value::is_object)
+        );
+        assert!(schema.pointer("/$defs/BodyParam").is_none());
     }
 
     #[test]
