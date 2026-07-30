@@ -8,7 +8,7 @@ use dialoguer::{Confirm, Input, Select, theme::ColorfulTheme};
 use owo_colors::OwoColorize;
 use serde::{Deserialize, Serialize};
 
-use super::claude::{AlternateClient, AlternateProviderOption, discover_acp_provider_options};
+use super::agent::{AlternateClient, AlternateProviderOption, discover_acp_provider_options};
 
 const BUZZ_APP_ID: &str = "xyz.block.buzz.app";
 const HARNESS_ID: &str = "pay-acp";

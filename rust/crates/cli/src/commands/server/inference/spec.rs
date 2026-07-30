@@ -4,7 +4,7 @@
 //! `GateDecision::Passthrough`: forwarded upstream unmetered but still
 //! captured by the proxy's `record_exchange` hook into PDB.
 //!
-//! With per-model token pricing (`--price`/`--pricing`, sandbox), the
+//! With per-model token pricing (positional rates file or `--price`, sandbox), the
 //! registry's `paid` endpoints are emitted as **x402-upto** metered
 //! endpoints: the client opens a channel with a per-request USD ceiling
 //! ([`MAX_REQUEST_USD`]), the gateway serves the response, and the operator
@@ -66,7 +66,7 @@ pub fn provider_spec(provider: &DiscoveredProvider, pricing: Option<&SpecPricing
         subdomain: provider.slug().to_string(),
         title: provider.title().to_string(),
         description: format!(
-            "Local {} inference proxied by pay serve inference",
+            "Local {} inference proxied by pay gate inference",
             provider.title()
         ),
         category: ApiCategory::AiMl,
@@ -87,7 +87,7 @@ pub fn provider_spec(provider: &DiscoveredProvider, pricing: Option<&SpecPricing
         session: None,
     };
     // Resolve per-endpoint scheme defaults so the gate, challenge builder, and
-    // verifier all read the same scheme set — same as `server start` does right
+    // verifier all read the same scheme set — same as `gate api` does right
     // after loading a YAML spec. Priced endpoints already carry an explicit
     // `[x402-upto]` scheme, so this only fills unset (free) ones.
     api.apply_scheme_defaults();
@@ -414,7 +414,7 @@ mod tests {
         );
         assert!(operator.fee_payer);
 
-        // The full spec passes the same validation `server start` runs — no
+        // The full spec passes the same validation `gate api` runs — no
         // precision errors (the token-bucket precision fix is in crates/types).
         assert_eq!(
             pay_types::metering::validate_api_spec(&spec),

@@ -6,7 +6,7 @@ HTTP 402 flows locally, or publish the API to
 
 Pay has two developer-facing parts:
 
-- `pay server start <spec.yml>` runs a payment gateway. It returns HTTP 402 for
+- `pay gate api <paywall.yml>` runs a payment gateway. It returns HTTP 402 for
   metered endpoints, verifies payment, then either proxies to an upstream API or
   responds directly.
 - A `pay-skills` provider markdown file lists the API in the public registry so
@@ -18,7 +18,7 @@ Pay has two developer-facing parts:
 Start with a scaffold:
 
 ```sh
-pay server scaffold provider.yml
+pay server scaffold paywall.yml
 ```
 
 A minimal proxy spec:
@@ -94,7 +94,7 @@ Pay at it and the gateway will serve a filtered + URL-rewritten copy at
 `GET /openapi.json`:
 
 ```sh
-pay server start provider.yml --openapi openapi.json
+pay gate api paywall.yml --openapi openapi.json
 ```
 
 What the gateway does with that document:
@@ -173,7 +173,7 @@ mainnet funds are required.
 Terminal A, start your paid gateway on a non-debugger port:
 
 ```sh
-EXAMPLE_API_KEY=... pay --sandbox server start provider.yml --bind 127.0.0.1:1403
+EXAMPLE_API_KEY=... pay --sandbox gate api paywall.yml --bind 127.0.0.1:1403
 ```
 
 Terminal B, call it through Pay and capture the flow in the debugger:
@@ -191,7 +191,7 @@ to another port such as `1403` when testing with `pay --debugger curl`.
 Alternative: run the debugger inside the server instead:
 
 ```sh
-pay --sandbox server start provider.yml --debugger
+pay --sandbox gate api paywall.yml --debugger
 pay --sandbox curl http://127.0.0.1:1402/v1/search -d '{"query":"test"}'
 ```
 
@@ -216,7 +216,7 @@ Recommended baseline:
 - Run the official container image `ghcr.io/solana-foundation/pay:<version>` or
   a pinned image mirrored into your cloud registry. Avoid mutable `latest` tags
   for production rollouts.
-- Deploy one `pay server start <spec.yml>` instance per API/provider surface.
+- Deploy one `pay gate api <paywall.yml>` instance per API/provider surface.
   On Cloud Run, this maps cleanly to one service per provider or per upstream
   API, each with its own YAML spec and environment.
 - Bind to the platform port, for example `--bind 0.0.0.0:8080` on Cloud Run.
@@ -258,7 +258,7 @@ operator:
 Example Cloud Run command:
 
 ```sh
-pay server start /app/providers/google/bigquery.yml \
+pay gate api /app/providers/google/bigquery.yml \
   --bind 0.0.0.0:8080 \
   --openapi /app/providers/google/bigquery.json \
   --otlp-sidecar 127.0.0.1:4318
@@ -361,7 +361,7 @@ The registry validator requires the `url:` value to be a fully-qualified
 `https://` URL — relative URLs are not accepted because the registry is
 consumed remotely and resolving against `service_url` would be ambiguous.
 `openapi: { path: ... }` is **not** valid in the registry either —
-`path:` is filesystem-only and reserved for `pay server start --openapi
+`path:` is filesystem-only and reserved for `pay gate api --openapi
 <file>`, where the doc is co-located with the YAML on disk.
 
 Specs must declare exactly one of `endpoints:` or `openapi:`. Inline

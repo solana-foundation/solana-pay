@@ -80,11 +80,11 @@ provider choice.
   every single payments require autenticate local user approval with Touch ID, 
   providers are curated, and external responses are treated as untrusted data.
 - Read `references/monetize-api.md` when a developer wants to monetize an API
-  with Pay, write a `pay server start` YAML file, create a pay-skills provider
+  with Pay, write a `pay gate api` paywall YAML file, create a pay-skills provider
   listing, deploy it as a production cloud gateway, validate/probe it, test
   locally with sandbox/debugger, or submit a PR to `https://github.com/solana-foundation/pay-skills`.
 - Read `references/setup-cli.md` when the user asks how to install, configure,
-  launch, use the CLI, run `pay server`, or create/review a pay-skills provider
+  launch, use the CLI, run `pay gate`, or create/review a pay-skills provider
   file.
 
 # Default Examples

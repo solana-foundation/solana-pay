@@ -1,18 +1,18 @@
-//! `pay serve inference` — discover local AI inference servers (Ollama,
+//! `pay gate inference` — discover local AI inference servers (Ollama,
 //! LM Studio, llama.cpp, vLLM, exo) and front them with the Pingora gateway,
 //! tracking every request live in the TUI and the embedded web UI.
 //!
 //! By default this is free passthrough: synthesized specs have no metered
 //! endpoints, so the payment gate forwards everything while
 //! `record_exchange` still feeds the PDB correlation engine (`AllExchanges`
-//! mode). With `--sandbox --price`/`--pricing` (per-model token rates), the
+//! mode). With `--sandbox [RATES]` or `--price` (per-model token rates), the
 //! registry's `paid` endpoints are synthesized as x402-upto per-token
 //! metered endpoints and the command builds a sandbox charge stack reusing
-//! the `server start` machinery (localnet + Surfpool, ephemeral fee-payer
+//! the `gate api` machinery (localnet + Surfpool, ephemeral fee-payer
 //! signer, USDC). Each priced request opens a channel with a per-request USD
 //! ceiling and settles the ACTUAL token cost after serving (input×in-rate +
 //! output×out-rate, from the response stream observer) — entirely in-gate,
-//! no extra control-plane routes. See docs/serve-inference.md.
+//! no extra control-plane routes.
 
 pub mod discovery;
 pub mod pricing;
@@ -24,7 +24,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::Router;
-use axum::response::Redirect;
+use axum::http::{HeaderMap, StatusCode, header};
+use axum::response::{IntoResponse, Redirect};
 use axum::routing::get;
 use clap::Args;
 use pay_core::PaymentState;
@@ -45,7 +46,7 @@ use providers::InferenceProvider;
 /// control plane. The SPA also stays mounted at `pay_pdb::PDB_PATH` because
 /// its API/SSE calls are absolute paths there.
 const UI_PATH: &str = "/__402/ui";
-/// Local address where `pay serve inference` listens by default.
+/// Local address where `pay gate inference` listens by default.
 pub const DEFAULT_BIND: &str = "127.0.0.1:1402";
 /// Loopback URL for the default local inference gateway.
 pub const LOCAL_GATEWAY_BASE_URL: &str = "http://127.0.0.1:1402";
@@ -112,10 +113,10 @@ pub struct InferenceCommand {
     #[arg(short = 's', long)]
     pub sandbox: bool,
 
-    /// Per-model token pricing file (YAML). With `--sandbox` this CHARGES per
-    /// token via x402-upto (input×in-rate + output×out-rate, settled after
-    /// serve); model-listing/health stay free. Mutually exclusive with
-    /// `--price`. Shape:
+    /// Optional rates YAML with per-model token rates. With `--sandbox`,
+    /// this charges per token via x402-upto (input×in-rate + output×out-rate,
+    /// settled after serve); model-listing/health stay free. Mutually
+    /// exclusive with the inline `--price` shorthand. Shape:
     ///
     /// ```yaml
     /// default: { in: 0.10, out: 0.30 }
@@ -123,14 +124,26 @@ pub struct InferenceCommand {
     ///   "gemma4": { in: 0.15, out: 0.60 }
     ///   "qwen3:8b": { in: 0.50, out: 1.50 }
     /// ```
-    #[arg(long, value_name = "FILE", conflicts_with = "price")]
+    #[arg(
+        value_name = "RATES",
+        conflicts_with_all = ["pricing", "price"]
+    )]
+    pub rates: Option<String>,
+
+    /// Legacy alias for the positional rates YAML.
+    #[arg(
+        long,
+        value_name = "RATES",
+        hide = true,
+        conflicts_with_all = ["rates", "price"]
+    )]
     pub pricing: Option<String>,
 
     /// Inline per-model token pricing shorthand (comma-separated
     /// `model=in/out`; `*=in/out` or a bare `in/out` sets the default), USD
     /// per 1M tokens. With `--sandbox` this CHARGES per token via x402-upto.
     /// e.g. `gemma4=0.15/0.60,qwen3:8b=0.5/1.5,*=0.1/0.3`.
-    #[arg(long, value_name = "SPEC")]
+    #[arg(long, value_name = "RATES")]
     pub price: Option<String>,
 }
 
@@ -259,7 +272,8 @@ fn enforce_sandbox(spec: &ApiSpec, path: &str) -> pay_core::Result<()> {
 /// Per-model pricing charge gate: per-token charging is sandbox-only for now
 /// (localnet stablecoins via the Surfpool sandbox). Per-model pricing WITHOUT
 /// `--sandbox` is refused loudly rather than silently pointed at a real
-/// cluster — mainnet per-token charging is not wired yet. No pricing flag ⇒
+/// cluster — mainnet per-token charging is not wired yet. No rates file or
+/// pricing flag ⇒
 /// free passthrough (unchanged).
 fn enforce_pricing_sandbox(
     pricing_config: Option<&pricing::PricingConfig>,
@@ -267,28 +281,42 @@ fn enforce_pricing_sandbox(
 ) -> pay_core::Result<()> {
     if pricing_config.is_some() && !sandbox {
         return Err(pay_core::Error::Config(
-            "--price/--pricing: mainnet per-token charging is not wired yet — run with --sandbox"
+            "inference rates/--price: mainnet per-token charging is not wired yet — run with --sandbox"
                 .into(),
         ));
     }
     Ok(())
 }
 
-/// Resolve the per-model token pricing from `--pricing <FILE>` or `--price
-/// <SPEC>`. At most one may be set (enforced by clap `conflicts_with`,
-/// re-checked here so a programmatic caller can't slip both past). `None`
-/// means no per-model pricing: free passthrough.
+/// Resolve per-model token pricing from positional `RATES`, legacy
+/// `--pricing <RATES>`, or inline `--price <SPEC>`. At most one may be set
+/// (enforced by clap and re-checked here for programmatic callers). `None`
+/// means free passthrough.
 fn resolve_pricing_config(
-    pricing_file: Option<&str>,
+    rates_file: Option<&str>,
+    legacy_pricing_file: Option<&str>,
     price_inline: Option<&str>,
 ) -> pay_core::Result<Option<pricing::PricingConfig>> {
-    match (pricing_file, price_inline) {
-        (Some(_), Some(_)) => Err(pay_core::Error::Config(
-            "--price and --pricing both set per-model token pricing — use one".into(),
-        )),
-        (Some(path), None) => Ok(Some(pricing::PricingConfig::from_yaml_file(path)?)),
-        (None, Some(spec)) => Ok(Some(pricing::PricingConfig::from_inline(spec)?)),
-        (None, None) => Ok(None),
+    let configured = [
+        rates_file.is_some(),
+        legacy_pricing_file.is_some(),
+        price_inline.is_some(),
+    ]
+    .into_iter()
+    .filter(|is_set| *is_set)
+    .count();
+    if configured > 1 {
+        return Err(pay_core::Error::Config(
+            "set one inference pricing source: positional RATES or --price".into(),
+        ));
+    }
+
+    if let Some(path) = rates_file.or(legacy_pricing_file) {
+        Ok(Some(pricing::PricingConfig::from_yaml_file(path)?))
+    } else if let Some(spec) = price_inline {
+        Ok(Some(pricing::PricingConfig::from_inline(spec)?))
+    } else {
+        Ok(None)
     }
 }
 
@@ -371,19 +399,22 @@ impl InferenceCommand {
         global_sandbox: bool,
     ) -> pay_core::Result<()> {
         let sandbox = self.sandbox || global_sandbox;
-        let pricing_config =
-            resolve_pricing_config(self.pricing.as_deref(), self.price.as_deref())?;
+        let pricing_config = resolve_pricing_config(
+            self.rates.as_deref(),
+            self.pricing.as_deref(),
+            self.price.as_deref(),
+        )?;
         enforce_pricing_sandbox(pricing_config.as_ref(), sandbox)?;
 
         // Probe the public bind up front: Pingora only discovers a taken port
         // deep inside its service thread, where the bind failure is a panic.
         // Fail here with an actionable message instead (a second gateway is
-        // usually another `pay serve inference` or a `pay claude` session).
+        // usually another `pay gate inference` or a `pay claude` session).
         match std::net::TcpListener::bind(&self.bind) {
             Ok(probe) => drop(probe),
             Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
                 return Err(pay_core::Error::Config(format!(
-                    "{} is already in use — another gateway is running (pay serve \
+                    "{} is already in use — another gateway is running (pay gate \
                      inference or a pay claude session). Stop it or pass --bind \
                      with a free port.",
                     self.bind
@@ -629,6 +660,14 @@ impl InferenceCommand {
         }
 
         let summaries = provider_summaries(&registry, restrict, &discovered);
+        let discovery_identity = payment
+            .as_ref()
+            .map(|payment| payment.pricing.recipient.as_str());
+        let discovery_docs = Arc::new(inference_openapi_documents(
+            &specs,
+            if sandbox { "localnet" } else { "local" },
+            discovery_identity,
+        ));
         let pdb = PdbState::with_mode(
             serde_json::json!({
                 "mode": "inference",
@@ -657,8 +696,35 @@ impl InferenceCommand {
         // it in the address bar); the SPA's API calls are absolute
         // `/__402/pdb/*` paths, so the router stays mounted there too.
         // `nest_service` (not `nest`) so the nested root `/…/` resolves —
-        // same as `server start`.
+        // same as `gate api`.
         let mut router = Router::new();
+        router = router.route(
+            "/openapi.json",
+            get({
+                let discovery_docs = discovery_docs.clone();
+                move |headers: HeaderMap| {
+                    let discovery_docs = discovery_docs.clone();
+                    async move {
+                        let subdomain = headers
+                            .get(header::HOST)
+                            .and_then(|host| host.to_str().ok())
+                            .and_then(|host| host.split('.').next());
+                        match discovery_docs
+                            .iter()
+                            .find(|(slug, _)| Some(slug.as_str()) == subdomain)
+                            .or_else(|| (discovery_docs.len() == 1).then(|| &discovery_docs[0]))
+                        {
+                            Some((_, document)) => (
+                                [(header::CACHE_CONTROL, "max-age=300")],
+                                axum::Json(document.clone()),
+                            )
+                                .into_response(),
+                            None => StatusCode::NOT_FOUND.into_response(),
+                        }
+                    }
+                }
+            }),
+        );
         if !self.no_web {
             router = router
                 .nest_service(UI_PATH, pay_pdb::debugger_router(pdb.clone()))
@@ -702,7 +768,7 @@ impl InferenceCommand {
             );
         }
         if payment.is_some() {
-            eprintln!("⏺ charging per token (localnet) — in/out rates from your pricing");
+            eprintln!("⏺ charging per token (localnet) — in/out rates from your rates config");
         }
 
         let (x402_upto, fee_payer_signer, fee_payer_wallet) = match payment {
@@ -734,7 +800,7 @@ struct SandboxPayments {
     fee_payer_wallet: FeePayerWallet,
 }
 
-/// Build the minimal sandbox charge stack, reusing the `server start`
+/// Build the minimal sandbox charge stack, reusing the `gate api`
 /// machinery (`super::payments`): localnet + sandbox RPC, the ephemeral
 /// auto fee-payer signer (payout recipient = the signer's own wallet), USDC
 /// only, Surfpool funding + recipient ATA preparation, the blockhash cache,
@@ -927,7 +993,7 @@ fn spawn_watch_task(
                     routed.push(provider.slug().to_string());
                     tracing::info!(
                         provider = %provider.slug(),
-                        "new provider detected — restart `pay serve inference` to route it"
+                        "new provider detected — restart `pay gate inference` to route it"
                     );
                 }
             }
@@ -938,9 +1004,53 @@ fn spawn_watch_task(
 
 fn provider_index(pdb: &PdbState) -> axum::Json<serde_json::Value> {
     axum::Json(serde_json::json!({
-        "service": "pay serve inference",
+        "service": "pay gate inference",
         "providers": pdb.providers(),
     }))
+}
+
+/// Draft-standard OpenAPI discovery documents for a running inference
+/// gateway. The payment offers are advisory; the runtime 402 challenge remains
+/// authoritative. `x-pay-metering` retains per-model token rates that the
+/// draft's offer envelope intentionally represents as dynamic pricing.
+fn inference_openapi_documents(
+    specs: &[ApiSpec],
+    network_slug: &str,
+    payment_identity: Option<&str>,
+) -> Vec<(String, serde_json::Value)> {
+    let context = pay_core::server::openapi::DiscoveryContext {
+        network_slug,
+        pay_to: payment_identity,
+        fee_payer: payment_identity,
+    };
+    let mut documents = Vec::new();
+    for spec in specs {
+        let mut document = pay_core::server::openapi::synthesize_from_spec(spec, &context);
+        if let Some(paths) = document
+            .get_mut("paths")
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            paths.insert(
+                "/v1/models".to_string(),
+                serde_json::json!({
+                    "get": {
+                        "summary": "List available inference models.",
+                        "responses": {
+                            "200": {"description": "Available models"}
+                        }
+                    }
+                }),
+            );
+        }
+        if let Some(object) = document.as_object_mut() {
+            object.insert(
+                "x-service-info".to_string(),
+                serde_json::json!({"categories": ["compute"]}),
+            );
+        }
+        documents.push((spec.subdomain.clone(), document));
+    }
+    documents
 }
 
 #[cfg(test)]
@@ -975,6 +1085,38 @@ mod tests {
             fee_payer_signer: None,
             fee_payer_wallet: None,
         }
+    }
+
+    #[test]
+    fn inference_gateway_openapi_is_payment_discovery_aligned() {
+        let discovered = discovered_provider(
+            Arc::new(providers::ollama::Ollama),
+            &["smollm2:135m-instruct-q2_K", "gemma4:latest"],
+        );
+        let pricing: pricing::PricingConfig = serde_yml::from_str(
+            r#"
+models:
+  gemma4:
+    in: 1.0
+    out: 3.0
+"#,
+        )
+        .unwrap();
+        let spec_pricing = spec::SpecPricing {
+            config: pricing,
+            recipient: "recipient".to_string(),
+        };
+        let specs = vec![spec::provider_spec(&discovered, Some(&spec_pricing))];
+
+        let documents = inference_openapi_documents(&specs, "localnet", Some("recipient"));
+        let document = &documents[0].1;
+        assert_eq!(document["openapi"], "3.1.0");
+        assert_eq!(document["x-service-info"]["categories"][0], "compute");
+        assert!(document["paths"]["/v1/models"]["get"].is_object());
+        let chat = &document["paths"]["/v1/chat/completions"]["post"];
+        assert!(chat["x-payment-info"]["offers"].is_array());
+        assert!(chat["x-pay-metering"]["variants"].is_array());
+        assert!(chat["responses"]["402"].is_object());
     }
 
     #[test]

@@ -32,7 +32,7 @@ pub fn link_with_arrow(text: &str, url: &str) -> String {
 
 /// Build the `?cluster=...` query suffix for Solana Explorer URLs.
 ///
-/// Retained for the few places (e.g. server start's tokens-page link)
+/// Retained for the few places (e.g. `gate api`'s tokens-page link)
 /// that still point at Solana Explorer for non-receipt views; receipts
 /// route through pay.sh via [`solana_transaction_link`].
 pub fn solana_explorer_cluster_query(cluster: &SolanaExplorerCluster) -> String {

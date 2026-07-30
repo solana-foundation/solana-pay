@@ -1,12 +1,12 @@
-//! `pay server demo` — start the gateway with a bundled demo spec.
+//! `pay server demo` — start the gateway with a bundled demo paywall.
 //!
 //! Extracts the embedded payment-debugger.yml to `./pay-demo.yaml` in the
-//! current working directory, then invokes `pay server start` with sandbox and
+//! current working directory, then invokes `pay gate api` with sandbox and
 //! debugger implied.
 
 use crate::commands::server::start::StartCommand;
 
-const DEMO_SPEC: &str = include_str!("payment-debugger.yml");
+const DEMO_PAYWALL: &str = include_str!("payment-debugger.yml");
 
 #[derive(clap::Args)]
 pub struct DemoCommand {
@@ -38,9 +38,9 @@ impl DemoCommand {
         account_override: Option<&str>,
         _sandbox: bool,
     ) -> pay_core::Result<()> {
-        // Extract embedded spec to ./pay-demo.yaml in the current directory
-        let spec_path = std::path::PathBuf::from("pay-demo.yaml");
-        std::fs::write(&spec_path, DEMO_SPEC)
+        // Extract the embedded paywall to ./pay-demo.yaml.
+        let paywall_path = std::path::PathBuf::from("pay-demo.yaml");
+        std::fs::write(&paywall_path, DEMO_PAYWALL)
             .map_err(|e| pay_core::Error::Config(format!("Failed to write pay-demo.yaml: {e}")))?;
 
         // Demo mode always runs on sandbox. Default to hosted Surfpool;
@@ -52,7 +52,7 @@ impl DemoCommand {
         };
 
         let cmd = StartCommand {
-            spec: spec_path.to_string_lossy().into_owned(),
+            paywall: paywall_path.to_string_lossy().into_owned(),
             bind: self.bind,
             recipient: self.recipient,
             currency: self.currency,
@@ -62,7 +62,7 @@ impl DemoCommand {
             openapi: None,
             public_url: None,
             no_register: false,
-            scaffolded_spec: Some("./pay-demo.yaml".to_string()),
+            scaffolded_paywall: Some("./pay-demo.yaml".to_string()),
         };
         cmd.run(legacy_signer_source, account_override, true)
     }

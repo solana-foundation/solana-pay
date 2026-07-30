@@ -1,4 +1,4 @@
-//! Inference provider implementations for `pay serve inference`.
+//! Inference provider implementations for `pay gate inference`.
 //!
 //! Each built-in local inference server (Ollama, LM Studio, llama.cpp, vLLM,
 //! exo) implements [`InferenceProvider`] in its own file with its constants
@@ -72,24 +72,37 @@ pub struct PricingHint {
     pub description: Option<String>,
     /// Explicit per-1M-token input/output rates `(input, output)`, when the
     /// price is quoted per token direction. When `Some`, the display renders
-    /// `in $X · out $Y /1M tok`; the min/max fields stay populated (the two
-    /// rates) so range-based consumers keep working.
+    /// `input $X · output $Y / 1M tokens`; the min/max fields stay populated
+    /// (the two rates) so range-based consumers keep working.
     pub io: Option<(f64, f64)>,
 }
 
 impl std::fmt::Display for PricingHint {
-    /// With `io`: `in $0.15 · out $0.60 /1M tok`. Otherwise `$0.0100/req`,
-    /// or `$0.0000–0.0100/req` when prices vary.
+    /// With `io`: `input $0.15 · output $0.60 / 1M tokens`. Otherwise
+    /// `$0.0100/req`, or `$0.0000–0.0100/req` when request prices vary.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         if let Some(display) = &self.display {
             return f.write_str(display);
         }
         if let Some((input, output)) = self.io {
-            return write!(f, "in ${input:.2} · out ${output:.2} /1M tok");
+            return write!(
+                f,
+                "input {} · output {} / 1M tokens",
+                format_token_rate(input),
+                format_token_rate(output)
+            );
+        }
+        if self.unit == "tokens" {
+            let min = format_token_rate(self.min_usd);
+            let max = format_token_rate(self.max_usd);
+            return if (self.min_usd - self.max_usd).abs() < f64::EPSILON {
+                write!(f, "{min} / 1M tokens")
+            } else {
+                write!(f, "{min}–{max} / 1M tokens")
+            };
         }
         let unit = match self.unit.as_str() {
             "requests" => "req",
-            "tokens" => "tok",
             other => other,
         };
         if (self.min_usd - self.max_usd).abs() < f64::EPSILON {
@@ -98,6 +111,17 @@ impl std::fmt::Display for PricingHint {
             write!(f, "${:.4}–{:.4}/{unit}", self.min_usd, self.max_usd)
         }
     }
+}
+
+fn format_token_rate(usd: f64) -> String {
+    let precision = if usd != 0.0 && usd.abs() < 0.0001 {
+        6
+    } else if usd != 0.0 && usd.abs() < 0.01 {
+        4
+    } else {
+        2
+    };
+    format!("${usd:.precision$}")
 }
 
 /// A local inference server the gateway can discover, front, and meter.
@@ -390,7 +414,18 @@ mod tests {
             description: None,
             io: None,
         };
-        assert_eq!(tokens.to_string(), "$0.0007/tok");
+        assert_eq!(tokens.to_string(), "$0.0007 / 1M tokens");
+
+        let token_range = PricingHint {
+            display: None,
+            min_usd: 0.05,
+            max_usd: 138.0,
+            unit: "tokens".to_string(),
+            variant: None,
+            description: None,
+            io: None,
+        };
+        assert_eq!(token_range.to_string(), "$0.05–$138.00 / 1M tokens");
     }
 
     #[test]
@@ -404,7 +439,7 @@ mod tests {
             description: None,
             io: Some((0.15, 0.60)),
         };
-        assert_eq!(io.to_string(), "in $0.15 · out $0.60 /1M tok");
+        assert_eq!(io.to_string(), "input $0.15 · output $0.60 / 1M tokens");
     }
 
     #[test]

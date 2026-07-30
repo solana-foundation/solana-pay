@@ -102,7 +102,7 @@ impl PaymentState for SessionTestState {
 }
 
 fn load_test_api() -> ApiSpec {
-    let content = std::fs::read_to_string("tests/fixtures/test-provider.yml").unwrap();
+    let content = std::fs::read_to_string("tests/fixtures/test-paywall.yml").unwrap();
     serde_yml::from_str(&content).unwrap()
 }
 
@@ -816,7 +816,7 @@ fn accounting_many_scopes() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn root_redirects_to_pdb_with_html_accept() {
-    // Simulates `pay server start`: root with Accept:text/html → redirect to pdb.
+    // Simulates `pay gate api`: root with Accept:text/html → redirect to pdb.
     // Unlisted paths (e.g. /favicon.ico) must return 404, not forward to upstream
     // (which would trigger spurious OAuth2 fetches).
     let api = load_respond_api();

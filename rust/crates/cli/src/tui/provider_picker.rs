@@ -3,13 +3,14 @@
 //!
 //! Built to scale past local discovery — providers will eventually come from
 //! the p2p registry with many entries — so the layout is a full-width plain
-//! table (no sidebar, no borders): a 🔍 type-to-search field and a sectioned
-//! (LOCAL / SOLANA AGENT GATEWAY / P2P), rail-styled provider list in the
-//! notice-component style (`components/notice.rs`: colored `│` rail + bold
-//! title + dimmed body). `←`/`→` cycle the selected provider's models; the
-//! picked model renders as an accent-colored chip with its price.
+//! table (no sidebar, no borders): a 🔍 type-to-search field and a rail-styled
+//! provider list in the notice-component style (`components/notice.rs`:
+//! colored `│` rail + bold title + dimmed body). `←`/`→` cycle the selected
+//! provider's models; the picked model renders as an accent-colored chip with
+//! its price.
 
 use std::io;
+use std::sync::mpsc::{Receiver, TryRecvError};
 
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::Terminal;
@@ -20,51 +21,12 @@ use ratatui::widgets::{Block, Paragraph};
 
 use crate::commands::server::inference::discovery::DiscoveredProvider;
 
-use super::term::{SPINNER, TuiBackend, with_terminal};
+use super::term::{SPINNER, TuiBackend, with_terminal_paste};
 use super::theme::TOPUP_MAIN_BG;
 use super::widgets::controls_bar;
 
 /// Rows per provider entry: title, model list, price/description.
 const ENTRY_HEIGHT: u16 = 3;
-
-/// Picker sections, in display order. Every provider renders under exactly
-/// one of these; empty sections show a dim `none` placeholder so the layout
-/// stays self-explanatory.
-const SECTIONS: [Section; 3] = [Section::Local, Section::Gateway, Section::P2p];
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Section {
-    /// Pay-managed local providers. Nothing lands here yet — port-probed
-    /// servers are self-hosted peers and list under [`Section::P2p`].
-    Local,
-    /// Hosted pay-catalog providers behind the Solana Agent Gateway.
-    Gateway,
-    /// Self-hosted peers: port-probed inference servers (Ollama, LM
-    /// Studio, …) today, the iroh p2p registry next.
-    P2p,
-}
-
-impl Section {
-    fn title(self) -> &'static str {
-        match self {
-            Section::Local => "LOCAL",
-            Section::Gateway => "SOLANA AGENT GATEWAY",
-            Section::P2p => "P2P",
-        }
-    }
-
-    fn of(provider: &DiscoveredProvider) -> Self {
-        if provider.hosted() {
-            Section::Gateway
-        } else {
-            Section::P2p
-        }
-    }
-
-    fn rank(self) -> usize {
-        SECTIONS.iter().position(|s| *s == self).unwrap_or(0)
-    }
-}
 
 /// The provider (and model) the user picked.
 pub struct ProviderChoice {
@@ -85,14 +47,25 @@ pub fn select_provider(
     harness: &str,
     providers: Vec<DiscoveredProvider>,
     requested_model: Option<&str>,
+    provider_updates: Option<Receiver<Vec<DiscoveredProvider>>>,
+    mut discover_custom: impl FnMut(&str) -> Result<Vec<DiscoveredProvider>, String>,
 ) -> io::Result<ProviderSelection> {
-    if !std::io::IsTerminal::is_terminal(&std::io::stderr()) || providers.is_empty() {
+    if !std::io::IsTerminal::is_terminal(&std::io::stderr()) {
         return Ok(ProviderSelection::Cancelled);
     }
 
     let harness = harness.to_string();
     let requested_model = requested_model.map(str::to_string);
-    with_terminal(|terminal| run(terminal, harness, providers, requested_model))
+    with_terminal_paste(|terminal| {
+        run(
+            terminal,
+            harness,
+            providers,
+            requested_model,
+            provider_updates,
+            &mut discover_custom,
+        )
+    })
 }
 
 fn run(
@@ -100,40 +73,77 @@ fn run(
     harness: String,
     providers: Vec<DiscoveredProvider>,
     requested_model: Option<String>,
+    mut provider_updates: Option<Receiver<Vec<DiscoveredProvider>>>,
+    discover_custom: &mut impl FnMut(&str) -> Result<Vec<DiscoveredProvider>, String>,
 ) -> io::Result<ProviderSelection> {
     let mut app = ProviderPickerApp::new(harness, providers, requested_model);
+    app.providers_loading = provider_updates.is_some();
+    if app.providers_loading && app.providers.is_empty() {
+        app.custom_active = false;
+    }
 
     loop {
+        if let Some(updates) = provider_updates.as_ref() {
+            match updates.try_recv() {
+                Ok(providers) => {
+                    app.add_background_providers(providers);
+                }
+                Err(TryRecvError::Disconnected) => {
+                    app.providers_loading = false;
+                    if app.providers.is_empty() {
+                        app.custom_active = true;
+                    }
+                    provider_updates = None;
+                }
+                Err(TryRecvError::Empty) => {}
+            }
+        }
         app.tick = app.tick.wrapping_add(1);
         terminal.draw(|frame| render(frame, &app))?;
 
-        if event::poll(std::time::Duration::from_millis(50))?
-            && let Event::Key(key) = event::read()?
-        {
-            if key.kind != KeyEventKind::Press {
-                continue;
-            }
-            match key.code {
-                KeyCode::Esc => return Ok(ProviderSelection::Cancelled),
-                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    return Ok(ProviderSelection::Cancelled);
-                }
-                KeyCode::Up => app.move_selection(-1),
-                KeyCode::Down => app.move_selection(1),
-                KeyCode::Tab | KeyCode::Right => app.cycle_model(1),
-                KeyCode::BackTab | KeyCode::Left => app.cycle_model(-1),
-                KeyCode::Enter => {
-                    if let Some(choice) = app.choice() {
-                        return Ok(ProviderSelection::Selected(choice));
+        if event::poll(std::time::Duration::from_millis(50))? {
+            match event::read()? {
+                Event::Paste(value) => app.paste(&value),
+                Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
+                    KeyCode::Esc => return Ok(ProviderSelection::Cancelled),
+                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        return Ok(ProviderSelection::Cancelled);
                     }
-                }
-                KeyCode::Backspace => app.pop_search(),
-                KeyCode::Char(ch)
-                    if !key.modifiers.contains(KeyModifiers::CONTROL)
-                        && !key.modifiers.contains(KeyModifiers::ALT) =>
-                {
-                    app.push_search(ch);
-                }
+                    KeyCode::Up => app.move_selection(-1),
+                    KeyCode::Down => app.move_selection(1),
+                    KeyCode::Tab | KeyCode::Right => app.cycle_model(1),
+                    KeyCode::BackTab | KeyCode::Left => app.cycle_model(-1),
+                    KeyCode::Enter if app.custom_selected() => {
+                        let Some(url) = app.custom_submission() else {
+                            continue;
+                        };
+                        app.discovering = true;
+                        app.custom_error = None;
+                        terminal.draw(|frame| render(frame, &app))?;
+                        match discover_custom(&url) {
+                            Ok(providers) if providers.is_empty() => {
+                                app.custom_error =
+                                    Some("No compatible inference provider found".to_string());
+                            }
+                            Ok(providers) => app.add_custom_providers(providers),
+                            Err(error) => app.custom_error = Some(error),
+                        }
+                        app.discovering = false;
+                    }
+                    KeyCode::Enter => {
+                        if let Some(choice) = app.choice() {
+                            return Ok(ProviderSelection::Selected(choice));
+                        }
+                    }
+                    KeyCode::Backspace => app.pop_input(),
+                    KeyCode::Char(ch)
+                        if !key.modifiers.contains(KeyModifiers::CONTROL)
+                            && !key.modifiers.contains(KeyModifiers::ALT) =>
+                    {
+                        app.push_input(ch);
+                    }
+                    _ => {}
+                },
                 _ => {}
             }
         }
@@ -150,10 +160,22 @@ struct ProviderPickerApp {
     search: String,
     /// Index into [`Self::filtered`].
     selected: usize,
+    /// The permanent Custom action is selected independently from the
+    /// provider index so a zero-result search does not turn typed text into a
+    /// URL halfway through the query.
+    custom_active: bool,
     /// `←`/`→` cursor into the selected provider's model list.
     model_idx: usize,
     /// `--model` lock: overrides the per-provider model choice.
     requested_model: Option<String>,
+    /// URL being edited by the final, permanent Custom row.
+    custom_url: String,
+    /// Last validation/discovery failure, rendered under the URL field.
+    custom_error: Option<String>,
+    discovering: bool,
+    /// Hosted provider discovery runs after the TUI opens so network probes
+    /// never leave the user staring at an unchanged terminal.
+    providers_loading: bool,
     tick: usize,
 }
 
@@ -163,16 +185,22 @@ impl ProviderPickerApp {
         mut providers: Vec<DiscoveredProvider>,
         requested_model: Option<String>,
     ) -> Self {
-        // Group by section (stable, so discovery order survives within a
-        // section) — the list renders under section headers.
-        providers.sort_by_key(|p| Section::of(p).rank());
+        // Keep hosted providers first while preserving discovery order within
+        // the hosted and self-hosted groups.
+        providers.sort_by_key(|provider| !provider.hosted());
+        let custom_active = providers.is_empty();
         Self {
             harness,
             providers,
             search: String::new(),
             selected: 0,
+            custom_active,
             model_idx: 0,
             requested_model,
+            custom_url: String::new(),
+            custom_error: None,
+            discovering: false,
+            providers_loading: false,
             tick: 0,
         }
     }
@@ -219,10 +247,16 @@ impl ProviderPickerApp {
     }
 
     fn selected_provider(&self) -> Option<&DiscoveredProvider> {
-        self.filtered().get(self.selected).copied()
+        (!self.custom_active)
+            .then(|| self.filtered().get(self.selected).copied())
+            .flatten()
     }
 
-    fn clamp_selection(&mut self) {
+    fn custom_selected(&self) -> bool {
+        self.custom_active
+    }
+
+    fn clamp_provider_selection(&mut self) {
         let clamped = self.selected.min(self.filtered().len().saturating_sub(1));
         if clamped != self.selected {
             self.selected = clamped;
@@ -232,7 +266,23 @@ impl ProviderPickerApp {
 
     fn move_selection(&mut self, delta: isize) {
         let len = self.filtered().len();
+        if self.custom_active {
+            if delta < 0 && len > 0 {
+                self.custom_active = false;
+                self.selected = len - 1;
+                self.model_idx = 0;
+            }
+            return;
+        }
         if len == 0 {
+            if delta > 0 {
+                self.custom_active = true;
+            }
+            return;
+        }
+        if delta > 0 && self.selected + 1 >= len {
+            self.custom_active = true;
+            self.model_idx = 0;
             return;
         }
         let next = (self.selected as isize + delta).clamp(0, len as isize - 1) as usize;
@@ -246,7 +296,7 @@ impl ProviderPickerApp {
     /// narrowed) models — clamped at both ends, no wrap. No-op while the
     /// model is locked by `--model` or the provider reports no models.
     fn cycle_model(&mut self, delta: isize) {
-        if self.model_locked() {
+        if self.model_locked() || self.custom_selected() {
             return;
         }
         let len = match self.selected_provider() {
@@ -259,16 +309,90 @@ impl ProviderPickerApp {
         self.model_idx = (self.model_idx as isize + delta).clamp(0, len as isize - 1) as usize;
     }
 
-    fn push_search(&mut self, ch: char) {
-        self.search.push(ch);
-        self.model_idx = 0;
-        self.clamp_selection();
+    fn push_input(&mut self, ch: char) {
+        if self.custom_selected() {
+            self.custom_url.push(ch);
+            self.custom_error = None;
+        } else {
+            self.search.push(ch);
+            self.model_idx = 0;
+            self.clamp_provider_selection();
+        }
     }
 
-    fn pop_search(&mut self) {
-        self.search.pop();
+    fn paste(&mut self, value: &str) {
+        for ch in value.chars().filter(|ch| !ch.is_control()) {
+            self.push_input(ch);
+        }
+    }
+
+    fn pop_input(&mut self) {
+        if self.custom_selected() {
+            self.custom_url.pop();
+            self.custom_error = None;
+        } else {
+            self.search.pop();
+            self.model_idx = 0;
+            self.clamp_provider_selection();
+        }
+    }
+
+    fn custom_submission(&mut self) -> Option<String> {
+        let url = self.custom_url.trim();
+        if url.is_empty() {
+            self.custom_error = Some("Paste an http:// or https:// server URL".to_string());
+            return None;
+        }
+        Some(url.to_string())
+    }
+
+    fn add_custom_providers(&mut self, providers: Vec<DiscoveredProvider>) {
+        let selected = providers
+            .first()
+            .map(|provider| (provider.slug().to_string(), provider.base_url.clone()));
+        for provider in providers {
+            self.providers.retain(|existing| {
+                existing.slug() != provider.slug() || existing.base_url != provider.base_url
+            });
+            self.providers.push(provider);
+        }
+        self.providers.sort_by_key(|provider| !provider.hosted());
+        self.search.clear();
+        self.custom_url.clear();
+        self.custom_error = None;
+        self.custom_active = false;
         self.model_idx = 0;
-        self.clamp_selection();
+        if let Some((slug, base_url)) = selected {
+            self.selected = self
+                .filtered()
+                .iter()
+                .position(|provider| provider.slug() == slug && provider.base_url == base_url)
+                .unwrap_or(0);
+        }
+    }
+
+    fn add_background_providers(&mut self, providers: Vec<DiscoveredProvider>) {
+        let selected = self
+            .selected_provider()
+            .map(|provider| (provider.slug().to_string(), provider.base_url.clone()));
+        for provider in providers {
+            self.providers.retain(|existing| {
+                existing.slug() != provider.slug() || existing.base_url != provider.base_url
+            });
+            self.providers.push(provider);
+        }
+        self.providers.sort_by_key(|provider| !provider.hosted());
+        if self.custom_selected() {
+            return;
+        }
+        self.selected = selected
+            .and_then(|(slug, base_url)| {
+                self.filtered()
+                    .iter()
+                    .position(|provider| provider.slug() == slug && provider.base_url == base_url)
+            })
+            .unwrap_or(0);
+        self.model_idx = 0;
     }
 
     /// Model that Enter would launch for `provider`: `--model` lock > the
@@ -318,6 +442,20 @@ fn render(frame: &mut ratatui::Frame, app: &ProviderPickerApp) {
 /// 🔍 type-to-search field: the live query (with a trailing cursor), or a
 /// dim placeholder while empty.
 fn render_search(frame: &mut ratatui::Frame, area: Rect, app: &ProviderPickerApp) {
+    if app.custom_selected() {
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled("＋ ", Style::default().fg(Color::Cyan).bold()),
+                Span::styled(
+                    "Add an inference server",
+                    Style::default().fg(Color::White).bold(),
+                ),
+                Span::styled(" · enter its URL below", Style::default().fg(Color::Gray)),
+            ])),
+            area,
+        );
+        return;
+    }
     let mut spans = vec![Span::raw("🔍 ")];
     if app.search.is_empty() {
         spans.push(Span::styled(
@@ -334,21 +472,21 @@ fn render_search(frame: &mut ratatui::Frame, area: Rect, app: &ProviderPickerApp
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
-/// One display row of the sectioned provider list.
+/// One display row of the provider list.
 enum ListRow<'a> {
-    /// Blank line between sections.
+    /// Blank line between providers.
     Gap,
-    Header(&'static str),
-    /// Dim placeholder under an empty section.
-    None,
     /// `usize` is the index into [`ProviderPickerApp::filtered`].
     Entry(usize, &'a DiscoveredProvider),
+    /// Permanent final action for adding a catalog-backed inference server.
+    Custom,
 }
 
 impl ListRow<'_> {
     fn height(&self) -> u16 {
         match self {
             ListRow::Entry(..) => ENTRY_HEIGHT,
+            ListRow::Custom => ENTRY_HEIGHT,
             _ => 1,
         }
     }
@@ -357,36 +495,29 @@ impl ListRow<'_> {
 fn render_provider_list(frame: &mut ratatui::Frame, area: Rect, app: &ProviderPickerApp) {
     let providers = app.filtered();
 
-    // Section-grouped rows. `filtered()` is already section-ordered (the
-    // provider list is sorted at construction), so entry indices stay in
-    // sync with the selection cursor.
+    // Keep one empty row between provider options. Entry indices stay in sync
+    // with the selection cursor because gaps do not participate in selection.
     let mut rows: Vec<ListRow> = Vec::new();
-    for (i, section) in SECTIONS.iter().enumerate() {
-        if i > 0 {
+    for (idx, provider) in providers.iter().enumerate() {
+        if idx > 0 {
             rows.push(ListRow::Gap);
         }
-        rows.push(ListRow::Header(section.title()));
-        let mut any = false;
-        for (idx, provider) in providers.iter().enumerate() {
-            if Section::of(provider) == *section {
-                rows.push(ListRow::Entry(idx, provider));
-                any = true;
-            }
-        }
-        if !any {
-            rows.push(ListRow::None);
-        }
+        rows.push(ListRow::Entry(idx, provider));
     }
+    if !providers.is_empty() {
+        rows.push(ListRow::Gap);
+    }
+    rows.push(ListRow::Custom);
 
     // Scroll (in lines) so the selected entry is fully visible.
     let mut sel_end: u16 = 0;
     let mut total: u16 = 0;
     for row in &rows {
         let h = row.height();
-        if let ListRow::Entry(idx, _) = row
-            && *idx == app.selected
-        {
-            sel_end = total + h;
+        match row {
+            ListRow::Entry(idx, _) if *idx == app.selected => sel_end = total + h,
+            ListRow::Custom if app.custom_selected() => sel_end = total + h,
+            _ => {}
         }
         total += h;
     }
@@ -412,22 +543,8 @@ fn render_provider_list(frame: &mut ratatui::Frame, area: Rect, app: &ProviderPi
         };
         match row {
             ListRow::Gap => {}
-            ListRow::Header(title) => frame.render_widget(
-                Paragraph::new(Line::from(Span::styled(
-                    *title,
-                    Style::default().fg(Color::DarkGray).bold(),
-                ))),
-                row_area,
-            ),
-            ListRow::None => frame.render_widget(
-                Paragraph::new(Line::from(Span::styled(
-                    "  none",
-                    Style::default().fg(Color::DarkGray),
-                ))),
-                row_area,
-            ),
             ListRow::Entry(idx, provider) => {
-                let selected = *idx == app.selected;
+                let selected = !app.custom_selected() && *idx == app.selected;
                 let chosen = selected.then(|| app.chosen_model(provider)).flatten();
                 render_provider_entry(
                     frame,
@@ -438,16 +555,100 @@ fn render_provider_list(frame: &mut ratatui::Frame, area: Rect, app: &ProviderPi
                     chosen.as_deref(),
                 );
             }
+            ListRow::Custom => render_custom_entry(frame, row_area, app),
         }
     }
 }
 
+fn render_custom_entry(frame: &mut ratatui::Frame, area: Rect, app: &ProviderPickerApp) {
+    let selected = app.custom_selected();
+    let accent = if selected {
+        Color::Cyan
+    } else {
+        Color::DarkGray
+    };
+    let rail_glyph = if selected { "┃" } else { "│" };
+    let rail = Span::styled(format!("{rail_glyph} "), Style::default().fg(accent).bold());
+    let title_style = if selected {
+        Style::default().fg(Color::White).bold()
+    } else {
+        Style::default().fg(Color::Gray).bold()
+    };
+    let dim = Style::default().fg(Color::DarkGray);
+
+    let top = Line::from(vec![
+        rail.clone(),
+        Span::styled(
+            if selected {
+                "Custom inference server"
+            } else {
+                "Custom"
+            },
+            title_style,
+        ),
+    ]);
+    let input = if selected {
+        let value = if app.custom_url.is_empty() {
+            Span::styled(
+                "Paste or type http://localhost:…",
+                Style::default().fg(Color::White),
+            )
+        } else {
+            Span::styled(app.custom_url.clone(), Style::default().fg(Color::White))
+        };
+        Line::from(vec![
+            rail.clone(),
+            Span::styled("URL › ", Style::default().fg(Color::Cyan).bold()),
+            value,
+            Span::styled("▌", Style::default().fg(Color::Gray)),
+        ])
+    } else {
+        Line::from(vec![
+            rail.clone(),
+            Span::styled("Bring your own inference server", dim),
+        ])
+    };
+    let detail = if app.discovering {
+        Line::from(vec![
+            rail,
+            Span::styled(
+                format!(
+                    "{} Discovering OpenAPI, models, and pricing…",
+                    SPINNER[app.tick % SPINNER.len()]
+                ),
+                Style::default().fg(Color::Cyan),
+            ),
+        ])
+    } else if let Some(error) = app.custom_error.as_deref() {
+        Line::from(vec![
+            rail,
+            Span::styled(
+                truncate_str(error, area.width.saturating_sub(2) as usize),
+                Style::default().fg(Color::Red),
+            ),
+        ])
+    } else if selected {
+        Line::from(vec![
+            rail,
+            Span::styled(
+                "Press Enter to discover models and pricing, save, and select",
+                Style::default().fg(Color::Gray),
+            ),
+        ])
+    } else {
+        Line::from(rail)
+    };
+
+    frame.render_widget(Paragraph::new(vec![top, input, detail]), area);
+}
+
 /// One three-line entry in the notice style: a `│` rail spanning the row
 /// (brand-colored when selected, gray otherwise), bold title + dim origin
-/// on line 1, the model list on line 2, and price/description on line 3.
+/// on line 1, the model choice on line 2, and price on line 3.
 /// Selection thickens the rail (`┃`), brightens the title, and highlights
 /// the `←`/`→`-picked model as a white-on-accent chip (the list windows so
-/// it stays visible).
+/// it stays visible). Inactive rows collapse to one priced model plus a count
+/// so providers remain directly comparable.
 fn render_provider_entry(
     frame: &mut ratatui::Frame,
     area: Rect,
@@ -483,27 +684,28 @@ fn render_provider_entry(
         top.push(Span::styled(format!(" · v{version}"), dim));
     }
 
+    let summary_model = chosen_model.or_else(|| first_priced_model(provider, models));
     let mut models_line = vec![rail.clone()];
     let avail = (area.width as usize).saturating_sub(2);
     if models.is_empty() {
         models_line.push(Span::styled("no models reported", dim));
     } else if let Some(chosen) = chosen_model {
         models_line.extend(model_chip_spans(models, chosen, accent, dim, avail));
-    } else {
+    } else if let Some(model) = summary_model {
+        let remaining = models.len().saturating_sub(1);
+        let suffix = if remaining == 0 {
+            String::new()
+        } else {
+            format!(" · {remaining} more")
+        };
         models_line.push(Span::styled(
-            truncate_str(
-                &models
-                    .iter()
-                    .map(|m| m.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", "),
-                avail,
-            ),
+            truncate_str(&format!("{model}{suffix}"), avail),
             dim,
         ));
     }
 
-    let detail = pricing_detail_line(provider.pricing_hint_for_model(chosen_model), rail, area);
+    let pricing_hint = provider.pricing_hint_for_model(summary_model);
+    let detail = pricing_detail_line(pricing_hint, rail);
 
     frame.render_widget(
         Paragraph::new(vec![Line::from(top), Line::from(models_line), detail]),
@@ -511,10 +713,22 @@ fn render_provider_entry(
     );
 }
 
+fn first_priced_model<'a>(provider: &DiscoveredProvider, models: &[&'a String]) -> Option<&'a str> {
+    models
+        .iter()
+        .copied()
+        .find(|model| {
+            provider
+                .pricing_hint_for_model(Some(model))
+                .is_some_and(|hint| hint.variant.is_some() || hint.io.is_some())
+        })
+        .or_else(|| models.first().copied())
+        .map(String::as_str)
+}
+
 fn pricing_detail_line(
     hint: Option<crate::commands::server::inference::providers::PricingHint>,
     rail: Span<'static>,
-    area: Rect,
 ) -> Line<'static> {
     let dim = Style::default().fg(Color::DarkGray);
     let mut detail = vec![rail];
@@ -524,19 +738,7 @@ fn pricing_detail_line(
     };
 
     let price = hint.to_string();
-    let mut used = 2 + price.chars().count();
     detail.push(Span::styled(price, Style::default().fg(Color::Yellow)));
-    let description = hint
-        .description
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty());
-    if let Some(description) = description {
-        detail.push(Span::styled(" · ", dim));
-        used += 3;
-        let remaining = (area.width as usize).saturating_sub(used);
-        detail.push(Span::styled(truncate_str(description, remaining), dim));
-    }
     Line::from(detail)
 }
 
@@ -596,33 +798,60 @@ fn model_chip_spans<'a>(
 }
 
 fn render_controls(frame: &mut ratatui::Frame, area: Rect, app: &ProviderPickerApp) {
-    let entries: Vec<(&str, &str)> = vec![
-        ("↑ ↓", "provider"),
-        ("← →", "model"),
-        ("a-z", "search"),
-        ("⏎", "launch"),
-        ("Esc", "cancel"),
-    ];
+    let entries: Vec<(&str, &str)> = if app.custom_selected() {
+        vec![
+            ("↑ ↓", "provider"),
+            ("type / paste", "URL"),
+            ("⏎", "discover"),
+            ("Esc", "cancel"),
+        ]
+    } else {
+        vec![
+            ("↑ ↓", "provider"),
+            ("← →", "model"),
+            ("a-z", "search"),
+            ("⏎", "launch"),
+            ("Esc", "cancel"),
+        ]
+    };
 
     let spinner = SPINNER[app.tick % SPINNER.len()];
-    let status = match app.selected_provider() {
-        Some(provider) => match app.chosen_model(provider) {
-            Some(model) => Line::from(vec![
-                Span::styled(spinner, Style::default().fg(Color::Green).bold()),
-                Span::styled(
-                    format!(" {} → {}/{} ", app.harness, provider.slug(), model),
-                    Style::default().fg(Color::DarkGray),
-                ),
-            ]),
-            None => Line::from(Span::styled(
-                "pass --model to launch this provider ",
-                Style::default().fg(Color::Yellow),
-            )),
-        },
-        None => Line::from(Span::styled(
-            "no providers match ",
+    let status = if app.providers_loading {
+        Line::from(vec![
+            Span::styled(
+                SPINNER[app.tick % SPINNER.len()],
+                Style::default().fg(Color::Cyan).bold(),
+            ),
+            Span::styled(
+                " Loading hosted providers ",
+                Style::default().fg(Color::DarkGray),
+            ),
+        ])
+    } else if app.custom_selected() {
+        Line::from(Span::styled(
+            "custom catalog-backed server ",
             Style::default().fg(Color::DarkGray),
-        )),
+        ))
+    } else {
+        match app.selected_provider() {
+            Some(provider) => match app.chosen_model(provider) {
+                Some(model) => Line::from(vec![
+                    Span::styled(spinner, Style::default().fg(Color::Green).bold()),
+                    Span::styled(
+                        format!(" {} → {}/{} ", app.harness, provider.slug(), model),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                ]),
+                None => Line::from(Span::styled(
+                    "pass --model to launch this provider ",
+                    Style::default().fg(Color::Yellow),
+                )),
+            },
+            None => Line::from(Span::styled(
+                "no providers match ",
+                Style::default().fg(Color::DarkGray),
+            )),
+        }
     };
     controls_bar(frame, area, &entries, Some(status));
 }
@@ -701,7 +930,7 @@ mod tests {
             model_pricing: vec![pay_pdb::types::ModelPricingSummary {
                 model: "gemma4:latest".into(),
                 variant: Some("gemma4".into()),
-                price: Some("in $1.00 · out $3.00 /1M tok".into()),
+                price: Some("input $1.00 · output $3.00 / 1M tokens".into()),
                 description: None,
             }],
         }
@@ -738,6 +967,13 @@ mod tests {
         app.search = "nope".into();
         assert!(app.filtered().is_empty());
         assert!(app.selected_provider().is_none());
+        assert!(
+            !app.custom_selected(),
+            "a zero-result search must not activate URL entry"
+        );
+        app.push_input('!');
+        assert_eq!(app.search, "nope!");
+        assert!(app.custom_url.is_empty());
     }
 
     #[test]
@@ -774,7 +1010,7 @@ mod tests {
 
         // Typing a model query narrows what ←/→ walks and what Enter picks.
         for ch in "nomic".chars() {
-            app.push_search(ch);
+            app.push_input(ch);
         }
         assert_eq!(filtered_slugs(&app), vec!["ollama"]);
         assert_eq!(app.choice().unwrap().model, "nomic-embed");
@@ -807,17 +1043,99 @@ mod tests {
 
         // Typing narrows the list to one entry — selection clamps to it.
         for ch in "ollama".chars() {
-            app.push_search(ch);
+            app.push_input(ch);
         }
         assert_eq!(app.selected, 0);
         assert_eq!(app.selected_provider().unwrap().slug(), "ollama");
 
         // Deleting the query restores the full list; selection stays valid.
         while !app.search.is_empty() {
-            app.pop_search();
+            app.pop_input();
         }
         assert_eq!(filtered_slugs(&app).len(), 2);
         assert_eq!(app.selected, 0);
+    }
+
+    #[test]
+    fn custom_is_always_the_final_option_and_owns_text_input_when_selected() {
+        let mut app = app(vec![ollama(&["llama3.2:3b"]), lm_studio(&["qwen2.5-7b"])]);
+        app.move_selection(1);
+        app.move_selection(1);
+        assert!(app.custom_selected());
+        assert!(app.selected_provider().is_none());
+
+        app.paste("https://inference.example.com\n");
+        assert_eq!(app.custom_url, "https://inference.example.com");
+        assert!(app.search.is_empty(), "URL paste must not alter search");
+
+        let text = buffer_text(&draw(&app, 120, 30));
+        assert!(text.contains("Custom"), "missing Custom row:\n{text}");
+        assert!(
+            text.contains("https://inference.example.com"),
+            "selected Custom row must render its URL input:\n{text}"
+        );
+        assert!(
+            text.contains("Press Enter to discover models and pricing, save, and select"),
+            "selected Custom row must explain its action:\n{text}"
+        );
+        assert!(
+            text.contains("Add an inference server · enter its URL below"),
+            "search header must become a visible URL-entry prompt:\n{text}"
+        );
+        assert_eq!(
+            text.matches('┃').count(),
+            ENTRY_HEIGHT as usize,
+            "only Custom may retain the active rail while editing its URL:\n{text}"
+        );
+    }
+
+    #[test]
+    fn discovered_custom_provider_is_selected_and_shows_all_models() {
+        let mut app = app(vec![ollama(&["llama3.2:3b"])]);
+        app.move_selection(1);
+        assert!(app.custom_selected());
+
+        let custom = hosted_gemini_variant_priced();
+        app.add_custom_providers(vec![custom]);
+
+        assert!(!app.custom_selected());
+        assert_eq!(app.selected_provider().unwrap().slug(), "google");
+        assert_eq!(app.choice().unwrap().model, "gemini-2.5-flash");
+        let text = buffer_text(&draw(&app, 120, 30));
+        assert!(
+            text.contains("gemini-2.5-flash") && text.contains("gemini-2.5-pro"),
+            "newly selected provider must expose its model choices:\n{text}"
+        );
+    }
+
+    #[test]
+    fn custom_is_available_when_discovery_found_no_providers() {
+        let app = app(Vec::new());
+        assert!(app.custom_selected());
+        let text = buffer_text(&draw(&app, 100, 16));
+        assert!(text.contains("Custom"), "missing Custom row:\n{text}");
+        assert!(
+            text.contains("Paste or type http://localhost:"),
+            "empty picker must start in URL-entry mode:\n{text}"
+        );
+    }
+
+    #[test]
+    fn background_providers_do_not_move_focus_from_the_current_row() {
+        let mut app = app(vec![ollama(&["llama3.2:3b"])]);
+        app.providers_loading = true;
+        app.add_background_providers(vec![hosted_gemini()]);
+
+        assert_eq!(app.selected_provider().unwrap().slug(), "ollama");
+        assert_eq!(filtered_slugs(&app), vec!["google", "ollama"]);
+
+        app.move_selection(1);
+        assert!(app.custom_selected());
+        app.add_background_providers(vec![hosted_gemini_variant_priced()]);
+        assert!(
+            app.custom_selected(),
+            "a background refresh must not steal focus from URL entry"
+        );
     }
 
     // ── Enter → choice ──
@@ -970,12 +1288,12 @@ mod tests {
 
     #[test]
     fn hosted_row_shows_pricing_hint_and_gateway_host() {
-        // Passed peer-first on purpose: the app groups by section, so the
-        // hosted entry must still sort first (gateway section precedes P2P).
+        // Passed peer-first on purpose: hosted entries still sort first in the
+        // flat list.
         let mut app = app(vec![ollama(&["llama3.2:3b"]), hosted_gemini()]);
         assert_eq!(
             filtered_slugs(&app),
-            vec!["generativelanguage", "ollama"],
+            vec!["google", "ollama"],
             "gateway providers must sort before p2p ones"
         );
         // Select ollama so the gemini row renders unselected (the selected
@@ -1008,17 +1326,60 @@ mod tests {
     }
 
     #[test]
+    fn inactive_row_uses_first_model_price_when_no_aggregate_exists() {
+        let mut app = app(vec![
+            proxied_ollama_with_gateway_pricing(),
+            lm_studio(&["qwen2.5-7b"]),
+        ]);
+        app.move_selection(1);
+
+        let text = buffer_text(&draw(&app, 120, 30));
+        assert!(
+            text.contains("input $1.00 · output $3.00 / 1M tokens"),
+            "inactive row must fall back to its first model's live price:\n{text}"
+        );
+    }
+
+    #[test]
+    fn explicitly_unpriced_model_does_not_inherit_provider_aggregate() {
+        let mut provider = hosted_gemini();
+        provider.models = vec!["smollm2:135m-instruct-q2_K".into(), "gemma4:latest".into()];
+        provider.model_pricing = vec![
+            pay_pdb::types::ModelPricingSummary {
+                model: "smollm2:135m-instruct-q2_K".into(),
+                variant: None,
+                price: None,
+                description: None,
+            },
+            pay_pdb::types::ModelPricingSummary {
+                model: "gemma4:latest".into(),
+                variant: Some("gemma4".into()),
+                price: Some("input $1.00 · output $3.00 / 1M tokens".into()),
+                description: None,
+            },
+        ];
+        let app = app(vec![provider]);
+
+        let text = buffer_text(&draw(&app, 120, 20));
+        assert!(text.contains("unpriced"), "missing unpriced state:\n{text}");
+        assert!(
+            !text.contains("$0.0000–0.0100/req"),
+            "selected SmolLM must not inherit the provider aggregate:\n{text}"
+        );
+    }
+
+    #[test]
     fn selected_row_price_tracks_the_picked_model_for_variant_pricing() {
         // Gemini-only so it's the selected row; flash is picked first.
         let mut app = app(vec![hosted_gemini_variant_priced()]);
         let flash = buffer_text(&draw(&app, 120, 30));
         assert!(
-            flash.contains("in $0.34 · out $2.88 /1M tok"),
+            flash.contains("input $0.34 · output $2.88 / 1M tokens"),
             "flash price must reflect its per-model variant:\n{flash}"
         );
         assert!(
-            flash.contains("Balanced Gemini 2.5 model"),
-            "flash description must reflect its per-model variant:\n{flash}"
+            !flash.contains("Balanced Gemini 2.5 model"),
+            "model prose should not compete with the price:\n{flash}"
         );
         assert!(
             !flash.contains("tok  gemini-2.5-flash"),
@@ -1030,12 +1391,12 @@ mod tests {
         assert_eq!(app.choice().unwrap().model, "gemini-2.5-pro");
         let pro = buffer_text(&draw(&app, 120, 30));
         assert!(
-            pro.contains("in $1.44 · out $11.50 /1M tok"),
+            pro.contains("input $1.44 · output $11.50 / 1M tokens"),
             "pro price must track the ←/→ selection:\n{pro}"
         );
         assert!(
-            pro.contains("Gemini 2.5 Pro for complex reasoning"),
-            "pro description must track the ←/→ selection:\n{pro}"
+            !pro.contains("Gemini 2.5 Pro for complex reasoning"),
+            "model prose should not compete with the price:\n{pro}"
         );
         assert!(
             !pro.contains("tok  gemini-2.5-pro"),
@@ -1045,9 +1406,24 @@ mod tests {
             !pro.contains("$0.34"),
             "flash price must not linger after switching model:\n{pro}"
         );
+    }
+
+    #[test]
+    fn inactive_row_collapses_models_to_one_choice_and_count() {
+        let mut app = app(vec![
+            hosted_gemini_variant_priced(),
+            ollama(&["llama3.2:3b"]),
+        ]);
+        app.move_selection(1);
+
+        let text = buffer_text(&draw(&app, 120, 30));
         assert!(
-            !pro.contains("Balanced Gemini 2.5 model"),
-            "flash description must not linger after switching model:\n{pro}"
+            text.contains("gemini-2.5-flash · 1 more"),
+            "inactive model list should collapse to one comparable choice:\n{text}"
+        );
+        assert!(
+            !text.contains("gemini-2.5-flash, gemini-2.5-pro"),
+            "inactive row should not dump every model:\n{text}"
         );
     }
 
@@ -1065,7 +1441,7 @@ mod tests {
             "model line should still show the full served model:\n{text}"
         );
         assert!(
-            text.contains("in $1.00 · out $3.00 /1M tok"),
+            text.contains("input $1.00 · output $3.00 / 1M tokens"),
             "gateway-supplied price should render:\n{text}"
         );
         assert!(
@@ -1075,39 +1451,59 @@ mod tests {
     }
 
     #[test]
-    fn sections_render_in_order_with_placeholders_for_empty_ones() {
+    fn provider_list_is_flat_without_section_headers_or_placeholders() {
         let app = app(vec![ollama(&["llama3.2:3b"]), hosted_gemini()]);
 
         let text = buffer_text(&draw(&app, 120, 30));
-        let local = text.find("LOCAL").expect("LOCAL header");
-        let gateway = text
-            .find("SOLANA AGENT GATEWAY")
-            .expect("SOLANA AGENT GATEWAY header");
-        let p2p = text.find("P2P").expect("P2P header");
-        assert!(local < gateway && gateway < p2p, "section order:\n{text}");
-
-        // Hosted entries land under the gateway header; port-probed
-        // servers are self-hosted peers and land under P2P.
         let ollama_at = text.find("Ollama").expect("ollama entry");
         let gemini_at = text.find("Google Gemini").expect("gemini entry");
         assert!(
-            gateway < gemini_at && gemini_at < p2p,
-            "gemini under gateway:\n{text}"
+            gemini_at < ollama_at,
+            "hosted entries should remain first:\n{text}"
         );
-        assert!(p2p < ollama_at, "ollama under P2P:\n{text}");
+        assert!(!text.contains("LOCAL"), "unexpected LOCAL header:\n{text}");
+        assert!(
+            !text.contains("SOLANA AGENT GATEWAY"),
+            "unexpected gateway header:\n{text}"
+        );
+        assert!(!text.contains("P2P"), "unexpected P2P header:\n{text}");
+        assert!(
+            !text.contains("  none"),
+            "unexpected empty-section placeholder:\n{text}"
+        );
+    }
 
-        // LOCAL has no providers yet — dim placeholder.
-        assert!(text.contains("none"), "empty section placeholder:\n{text}");
+    #[test]
+    fn provider_options_have_one_blank_line_between_them() {
+        let app = app(vec![ollama(&["llama3.2:3b"]), lm_studio(&["qwen2.5-7b"])]);
+
+        let text = buffer_text(&draw(&app, 120, 30));
+        let lines: Vec<_> = text.lines().collect();
+        let ollama_line = lines
+            .iter()
+            .position(|line| line.contains("Ollama"))
+            .expect("Ollama row");
+        let lm_studio_line = lines
+            .iter()
+            .position(|line| line.contains("LM Studio"))
+            .expect("LM Studio row");
+
+        assert_eq!(
+            lm_studio_line - ollama_line,
+            usize::from(ENTRY_HEIGHT) + 1,
+            "provider rows should be separated by exactly one line:\n{text}"
+        );
+        assert!(
+            lines[lm_studio_line - 1].trim().is_empty(),
+            "provider separator should be blank:\n{text}"
+        );
     }
 
     #[test]
     fn selected_row_carries_brand_color_rail_and_model_chip() {
-        // Gemini selected (gateway section sorts first), ollama inactive.
+        // Gemini selected (hosted entries sort first), ollama inactive.
         let app = app(vec![ollama(&["llama3.2:3b"]), hosted_gemini()]);
-        assert_eq!(
-            app.selected_provider().unwrap().slug(),
-            "generativelanguage"
-        );
+        assert_eq!(app.selected_provider().unwrap().slug(), "google");
 
         let buffer = draw(&app, 120, 30);
         let text = buffer_text(&buffer);
@@ -1192,15 +1588,19 @@ mod tests {
             "model-filter chips should be gone:\n{text}"
         );
 
-        // Section headers.
-        assert!(text.contains("LOCAL"), "missing LOCAL header:\n{text}");
+        // Flat provider list — no grouping headers or empty placeholders.
+        assert!(!text.contains("LOCAL"), "unexpected LOCAL header:\n{text}");
         assert!(
-            text.contains("SOLANA AGENT GATEWAY"),
-            "missing gateway header:\n{text}"
+            !text.contains("SOLANA AGENT GATEWAY"),
+            "unexpected gateway header:\n{text}"
         );
-        assert!(text.contains("P2P"), "missing P2P header:\n{text}");
+        assert!(!text.contains("P2P"), "unexpected P2P header:\n{text}");
+        assert!(
+            !text.contains("  none"),
+            "unexpected empty-section placeholder:\n{text}"
+        );
 
-        // Two-line rail entries: selected rail + plain rail, titles, the
+        // Three-line rail entries: selected rail + plain rail, titles, the
         // selected row's model chip, and per-entry detail lines.
         assert!(text.contains('┃'), "missing selected rail:\n{text}");
         assert!(text.contains('│'), "missing entry rail:\n{text}");

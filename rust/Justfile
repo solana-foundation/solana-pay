@@ -43,9 +43,13 @@ docker-build:
 docker-run *ARGS:
     docker run --rm pay {{ARGS}}
 
-# Start a payment gateway server
-serve SPEC *ARGS:
-    cargo run -- server start {{SPEC}} {{ARGS}}
+# Gate an API with a paywall
+gate-api PAYWALL *ARGS:
+    cargo run -- gate api {{PAYWALL}} {{ARGS}}
+
+# Backward-compatible alias for local scripts.
+serve PAYWALL *ARGS:
+    cargo run -- gate api {{PAYWALL}} {{ARGS}}
 
 # Start the payment verifier service (for Apigee / external gateways)
 apigee-serve *ARGS:

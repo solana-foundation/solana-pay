@@ -1,10 +1,10 @@
-//! `pay server scaffold` — generate a starter provider YAML spec.
+//! `pay server scaffold` — generate a starter paywall YAML spec.
 
-/// Generate a starter provider YAML spec file.
+/// Generate a starter paywall YAML spec file.
 #[derive(clap::Args)]
 pub struct ScaffoldCommand {
-    /// Output file path. Defaults to "provider.yml".
-    #[arg(default_value = "provider.yml")]
+    /// Output file path. Defaults to "paywall.yml".
+    #[arg(default_value = "paywall.yml")]
     pub output: String,
 }
 
@@ -52,7 +52,7 @@ impl ScaffoldCommand {
         eprintln!("Created {}", self.output);
         eprintln!();
         eprintln!("  Edit the file, then start the gateway:");
-        eprintln!("  pay server start {}", self.output);
+        eprintln!("  pay gate api {}", self.output);
         eprintln!();
 
         Ok(())

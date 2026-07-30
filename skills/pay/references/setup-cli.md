@@ -36,7 +36,7 @@ pay skills list                   # browse the API registry
 pay skills show <provider>        # show a provider's endpoints
 pay account list                  # list accounts
 pay topup                         # fund account
-pay server start                  # run a payment gateway for your API
+pay gate api <paywall.yml>        # run a payment gateway for your API
 ```
 
 ## Notes
@@ -46,7 +46,7 @@ pay server start                  # run a payment gateway for your API
   signing approval, then retries with the payment proof.
 - Free endpoints pass through without payment.
 - Use `create_skill` only when creating or reviewing a pay-skills provider file.
-- For developer/operator workflows that monetize an API, write `pay server`
+- For developer/operator workflows that monetize an API, write `pay gate api`
   YAML, publish a provider listing, or submit to
   `https://github.com/solana-foundation/pay-skills`, read
   `references/monetize-api.md`.

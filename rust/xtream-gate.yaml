@@ -5,7 +5,7 @@
 # $XT_PASS and never appears in this file.
 #
 # Sandbox test (no real funds):
-#   XT_PASS=... cargo run -p pay -- --sandbox server start xtream-gate.yaml
+#   XT_PASS=... cargo run -p pay -- --sandbox gate api xtream-gate.yaml
 #   cargo run -p pay -- --sandbox curl \
 #     "http://127.0.0.1:1402/player_api.php?username=<PANEL_USER>&action=get_live_categories"
 #

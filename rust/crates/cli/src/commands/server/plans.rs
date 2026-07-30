@@ -74,7 +74,7 @@ impl PublishCommand {
             let Some(sub) = endpoint.subscription.as_ref() else {
                 continue;
             };
-            // Stable plan-id derivation: must match `pay server start`
+            // Stable plan-id derivation: must match `pay gate api`
             // (see `pay_core::server::subscription::compute_plan_id_numeric`
             // + `pay_kit::mpp::program::subscriptions::plan_id_seed`) so the
             // PDA this command writes back to the YAML is the same one

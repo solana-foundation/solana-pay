@@ -11,9 +11,8 @@ use std::process::{Command, Stdio};
 
 use clap::{Args, ValueEnum};
 
-use super::claude::{
-    AlternateClient, AlternateProvider, claude_env, prepare_alternate_provider_for,
-};
+use super::agent::{AlternateClient, AlternateProvider, prepare_alternate_provider_for};
+use super::claude::claude_env;
 use super::codex::write_model_catalog_file;
 use super::goose::goose_provider_env;
 

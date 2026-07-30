@@ -65,7 +65,7 @@ async fn echo_handler(_req: Request<Body>) -> impl IntoResponse {
 /// instead of giving a misleading green).
 async fn start_server_with_network(network: &str) -> (String, tokio::task::JoinHandle<()>) {
     let api: ApiSpec =
-        serde_yml::from_str(&std::fs::read_to_string("tests/fixtures/test-provider.yml").unwrap())
+        serde_yml::from_str(&std::fs::read_to_string("tests/fixtures/test-paywall.yml").unwrap())
             .unwrap();
 
     let mpp = Mpp::new(pay_kit::mpp::server::Config {

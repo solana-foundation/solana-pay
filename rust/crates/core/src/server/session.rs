@@ -20,7 +20,9 @@ use pay_kit::mpp::blockhash::{BlockhashCache, CachedBlockhash};
 use pay_kit::mpp::server::session::{SealParams, SessionConfig, SessionServer};
 use pay_kit::mpp::settlement::worker::{RpcBroadcaster, SettlementConfig, SettlementHandle, spawn};
 use pay_kit::mpp::solana_keychain::SolanaSigner;
-use pay_kit::mpp::store::{ChannelLifecycle, ChannelState, ChannelStore, MemoryChannelStore};
+use pay_kit::mpp::store::{
+    ChannelLifecycle, ChannelState, ChannelStore, MemoryChannelStore, StoreError,
+};
 use pay_kit::mpp::{
     Base64UrlJson, CommitReceipt, OpenPayload, PaymentChallenge, SessionAction, SessionMode,
     SessionPullVoucherStrategy, SessionSettlementAuthority, SignedVoucher, VoucherData,
@@ -520,6 +522,15 @@ pub enum SessionLifecycleReconciliation {
     External,
 }
 
+const LIFECYCLE_OWNER_LEASE_PREFIX: &str = "embedded-v1:";
+const MIN_LIFECYCLE_OWNER_LEASE: Duration = Duration::from_secs(30);
+
+fn parse_lifecycle_owner_lease(owner: &str) -> Option<(&str, u64)> {
+    let owner = owner.strip_prefix(LIFECYCLE_OWNER_LEASE_PREFIX)?;
+    let (owner_id, expires_at_ms) = owner.rsplit_once(':')?;
+    Some((owner_id, expires_at_ms.parse().ok()?))
+}
+
 struct SessionLifecycleRunloop {
     runtime: SessionOperatorRuntime,
     owner: String,
@@ -559,6 +570,7 @@ impl SessionLifecycleRunloop {
                     }
                     _ = tokio::time::sleep(delay) => {
                         if self.reconciliation == SessionLifecycleReconciliation::Embedded {
+                            self.reconcile_persisted_ownership().await;
                             self.close_due_channels().await;
                         }
                         self.push_due_watermarks().await;
@@ -587,6 +599,9 @@ impl SessionLifecycleRunloop {
                 self.next_settlement =
                     settlement_interval.map(|interval| Instant::now() + interval);
                 self.reconciliation = reconciliation;
+                if reconciliation == SessionLifecycleReconciliation::Embedded {
+                    self.reconcile_persisted_ownership().await;
+                }
                 true
             }
             Some(SessionLifecycleCommand::Touch {
@@ -623,16 +638,15 @@ impl SessionLifecycleRunloop {
         let idle_deadline = touched_at_ms.saturating_add(duration_millis(close_delay));
         let close_after =
             round_up_timestamp(idle_deadline, duration_millis(self.close_batch_interval));
+        let owner = if self.reconciliation == SessionLifecycleReconciliation::Embedded {
+            self.leased_owner(unix_millis())
+        } else {
+            self.owner.clone()
+        };
         let state = self
             .runtime
             .channel_store
-            .touch_channel_lifecycle(
-                channel_id,
-                ChannelLifecycle {
-                    owner: self.owner.clone(),
-                    close_after,
-                },
-            )
+            .touch_channel_lifecycle(channel_id, ChannelLifecycle { owner, close_after })
             .await
             .map_err(|error| {
                 Error::Mpp(format!(
@@ -640,6 +654,91 @@ impl SessionLifecycleRunloop {
                 ))
             })?;
         Ok(Some(state))
+    }
+
+    fn lifecycle_owner_lease_duration(&self) -> Duration {
+        self.close_batch_interval
+            .saturating_mul(3)
+            .max(MIN_LIFECYCLE_OWNER_LEASE)
+    }
+
+    fn leased_owner(&self, now_ms: u64) -> String {
+        let expires_at_ms =
+            now_ms.saturating_add(duration_millis(self.lifecycle_owner_lease_duration()));
+        format!(
+            "{LIFECYCLE_OWNER_LEASE_PREFIX}{}:{expires_at_ms}",
+            self.owner
+        )
+    }
+
+    fn owns_lifecycle(&self, lifecycle: &ChannelLifecycle) -> bool {
+        parse_lifecycle_owner_lease(&lifecycle.owner)
+            .map(|(owner, _)| owner == self.owner)
+            .unwrap_or_else(|| lifecycle.owner == self.owner)
+    }
+
+    /// Renew this runloop's leases and atomically claim legacy or expired
+    /// records. Active leases owned by another gateway are left untouched.
+    async fn reconcile_persisted_ownership(&self) {
+        let states = match self.runtime.channel_store.list_channels().await {
+            Ok(states) => states,
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    "failed to enumerate payment channels for lifecycle ownership reconciliation"
+                );
+                return;
+            }
+        };
+        let now_ms = unix_millis();
+        let leased_owner = self.leased_owner(now_ms);
+        for state in states {
+            if state.sealed || state.close_requested_at.is_some() {
+                continue;
+            }
+            if state.lifecycle.is_none() {
+                continue;
+            }
+            let owner_id = self.owner.clone();
+            let replacement_owner = leased_owner.clone();
+            if let Err(error) = self
+                .runtime
+                .channel_store
+                .update_channel(
+                    &state.channel_id,
+                    Box::new(move |current| {
+                        let mut current = current
+                            .ok_or_else(|| StoreError::Internal("Channel not found".to_string()))?;
+                        if current.sealed || current.close_requested_at.is_some() {
+                            return Ok(current);
+                        }
+                        let Some(lifecycle) = current.lifecycle.as_mut() else {
+                            return Ok(current);
+                        };
+                        let claimable = parse_lifecycle_owner_lease(&lifecycle.owner).is_none_or(
+                            |(current_owner, expires_at_ms)| {
+                                current_owner == owner_id || expires_at_ms <= now_ms
+                            },
+                        );
+                        if claimable {
+                            lifecycle.owner = replacement_owner;
+                        }
+                        Ok(current)
+                    }),
+                )
+                .await
+            {
+                // Redis reports a compare-and-set miss when another gateway
+                // changed the record after this scan. The next scan reconciles
+                // the new state, so this is expected contention rather than a
+                // lifecycle failure.
+                tracing::debug!(
+                    channel_id = state.channel_id,
+                    %error,
+                    "payment-channel lifecycle ownership changed during reconciliation"
+                );
+            }
+        }
     }
 
     fn next_wakeup_delay(&self) -> Option<Duration> {
@@ -681,7 +780,7 @@ impl SessionLifecycleRunloop {
                     .lifecycle
                     .as_ref()
                     .filter(|lifecycle| {
-                        lifecycle.owner == self.owner && lifecycle.close_after <= now_ms
+                        self.owns_lifecycle(lifecycle) && lifecycle.close_after <= now_ms
                     })
                     .map(|_| state.channel_id)
             })
@@ -758,7 +857,7 @@ impl SessionLifecycleRunloop {
                 state
                     .lifecycle
                     .as_ref()
-                    .is_some_and(|lifecycle| lifecycle.owner == self.owner)
+                    .is_some_and(|lifecycle| self.owns_lifecycle(lifecycle))
             })
             .map(|state| state.channel_id)
             .collect::<Vec<_>>();
@@ -2329,6 +2428,166 @@ mod tests {
             .await
             .expect_err("a worker-claimed close cannot be woken");
         assert!(error.to_string().contains("close is pending"));
+    }
+
+    #[tokio::test]
+    async fn embedded_lifecycle_adopts_persisted_deadlines_after_restart() {
+        let store: Arc<dyn ChannelStore> = Arc::new(MemoryChannelStore::new());
+        let config = test_session_config();
+        let first =
+            SessionMpp::new_with_channel_store(config.clone(), "test-secret", Arc::clone(&store));
+        first.start_lifecycle_runloop_with_settlement_and_batching(
+            Duration::from_secs(3600),
+            Duration::from_secs(60),
+            Duration::ZERO,
+            SessionLifecycleReconciliation::External,
+        );
+        let challenge = first.challenge(CAP).unwrap();
+        let handle = SessionHandle::new(
+            solana_pubkey::Pubkey::new_unique(),
+            test_session_signer(),
+            challenge,
+        );
+        let open_header = handle.open_header(CAP, "open_sig").await.unwrap();
+        let SessionOutcome::Active { state: opened, .. } =
+            first.process(&open_header).await.unwrap()
+        else {
+            panic!("expected open to return active session");
+        };
+
+        let persisted = store
+            .get_channel(&opened.channel_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let original = persisted.lifecycle.expect("deadline should be persisted");
+        drop(first);
+
+        let restarted =
+            SessionMpp::new_with_channel_store(config, "test-secret", Arc::clone(&store));
+        restarted.start_lifecycle_runloop_with_settlement_and_batching(
+            Duration::from_secs(3600),
+            Duration::from_secs(60),
+            Duration::ZERO,
+            SessionLifecycleReconciliation::Embedded,
+        );
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let persisted = store
+                    .get_channel(&opened.channel_id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let lifecycle = persisted.lifecycle.unwrap();
+                if lifecycle.owner != original.owner {
+                    assert_eq!(lifecycle.close_after, original.close_after);
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("restarted embedded worker should adopt the persisted deadline");
+    }
+
+    #[tokio::test]
+    async fn embedded_lifecycle_preserves_live_owner_then_reclaims_expired_lease() {
+        let store: Arc<dyn ChannelStore> = Arc::new(MemoryChannelStore::new());
+        let session = SessionMpp::new_with_channel_store(
+            test_session_config(),
+            "test-secret",
+            Arc::clone(&store),
+        );
+        session.start_lifecycle_runloop_with_settlement_and_batching(
+            Duration::from_secs(3600),
+            Duration::from_secs(60),
+            Duration::ZERO,
+            SessionLifecycleReconciliation::External,
+        );
+        let challenge = session.challenge(CAP).unwrap();
+        let handle = SessionHandle::new(
+            solana_pubkey::Pubkey::new_unique(),
+            test_session_signer(),
+            challenge,
+        );
+        let open_header = handle.open_header(CAP, "open_sig").await.unwrap();
+        let SessionOutcome::Active { state: opened, .. } =
+            session.process(&open_header).await.unwrap()
+        else {
+            panic!("expected open to return active session");
+        };
+
+        let live_owner = "other-live-gateway";
+        let live_lease = format!(
+            "{LIFECYCLE_OWNER_LEASE_PREFIX}{live_owner}:{}",
+            unix_millis().saturating_add(60_000)
+        );
+        let original_deadline = store
+            .update_channel(
+                &opened.channel_id,
+                Box::new({
+                    let live_lease = live_lease.clone();
+                    move |state| {
+                        let mut state = state.unwrap();
+                        let lifecycle = state.lifecycle.as_mut().unwrap();
+                        lifecycle.owner = live_lease;
+                        Ok(state)
+                    }
+                }),
+            )
+            .await
+            .unwrap()
+            .lifecycle
+            .unwrap()
+            .close_after;
+
+        let (_tx, rx) = mpsc::unbounded_channel();
+        let contender = SessionLifecycleRunloop::new(session.operator_runtime.clone(), rx);
+        contender.reconcile_persisted_ownership().await;
+
+        let persisted = store
+            .get_channel(&opened.channel_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .lifecycle
+            .unwrap();
+        assert_eq!(
+            persisted.owner, live_lease,
+            "a live gateway must retain lifecycle ownership"
+        );
+        assert_eq!(persisted.close_after, original_deadline);
+
+        store
+            .update_channel(
+                &opened.channel_id,
+                Box::new(move |state| {
+                    let mut state = state.unwrap();
+                    state.lifecycle.as_mut().unwrap().owner =
+                        format!("{LIFECYCLE_OWNER_LEASE_PREFIX}{live_owner}:0");
+                    Ok(state)
+                }),
+            )
+            .await
+            .unwrap();
+        contender.reconcile_persisted_ownership().await;
+
+        let reclaimed = store
+            .get_channel(&opened.channel_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .lifecycle
+            .unwrap();
+        let (reclaimed_owner, expires_at_ms) =
+            parse_lifecycle_owner_lease(&reclaimed.owner).expect("owner should contain a lease");
+        assert_eq!(reclaimed_owner, contender.owner);
+        assert!(expires_at_ms > unix_millis());
+        assert_eq!(
+            reclaimed.close_after, original_deadline,
+            "ownership transfer must preserve the existing close deadline"
+        );
     }
 
     #[tokio::test]

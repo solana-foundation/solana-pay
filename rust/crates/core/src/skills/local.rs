@@ -1,4 +1,4 @@
-//! Synthesise a catalog JSON for a running `pay server` instance so a
+//! Synthesise a catalog JSON for a running `pay gate api` instance so a
 //! local MCP agent can discover its endpoints via the same code path
 //! that consumes CDN-hosted catalogs.
 //!
@@ -27,7 +27,7 @@ pub const WELL_KNOWN_PATH: &str = "/.well-known/pay-skills.json";
 const SCHEMA_VERSION: &str = "1";
 
 /// Build a catalog JSON document advertising a single running
-/// `pay server` instance.
+/// `pay gate api` instance.
 ///
 /// `base_url` is the URL the agent will use to hit the API itself
 /// (typically `http://127.0.0.1:<port>`); endpoints are emitted with

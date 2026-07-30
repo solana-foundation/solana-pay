@@ -238,7 +238,7 @@ fn main() {
     // resolve the wallet via `network_override` + `accounts.yml` instead.
     //
     // In sandbox mode, NO command should probe the keychain — that would
-    // defeat the whole point of `--sandbox`. The server start path
+    // defeat the whole point of `--sandbox`. The gate api path
     // resolves its own ephemeral via the network-aware loader instead.
     let keypair_override: Option<String> = if sandbox_mode
         || matches!(
@@ -263,7 +263,7 @@ fn main() {
                 | Command::Mcp
         ) {
         None
-    } else if matches!(command, Command::Server { .. }) {
+    } else if matches!(command, Command::Server { .. } | Command::Gate { .. }) {
         config.legacy_keypair_source()
     } else if matches!(command, Command::Topup(_)) {
         config.default_active_account_name()
@@ -599,6 +599,82 @@ mod tests {
         let mut command = Opts::command();
 
         assert!(!command.render_long_help().to_string().contains("--alt"));
+    }
+
+    #[test]
+    fn gate_inference_is_the_canonical_inference_gateway_command() {
+        let opts =
+            Opts::try_parse_from(["pay", "gate", "inference", "rates.yml", "--no-tui"]).unwrap();
+
+        match opts.command {
+            Some(Command::Gate {
+                command: commands::server::GateCommand::Inference(cmd),
+            }) => {
+                assert_eq!(cmd.rates.as_deref(), Some("rates.yml"));
+                assert!(cmd.no_tui);
+            }
+            _ => panic!("expected gate inference command"),
+        }
+    }
+
+    #[test]
+    fn gate_inference_help_calls_the_positional_input_rates() {
+        let err = match Opts::try_parse_from(["pay", "gate", "inference", "--help"]) {
+            Err(err) => err,
+            Ok(_) => panic!("--help should stop argument parsing"),
+        };
+        let help = err.to_string();
+
+        assert!(help.contains("[RATES]"), "{help}");
+        assert!(!help.contains("[PAYWALL]"), "{help}");
+    }
+
+    #[test]
+    fn serve_inference_remains_as_a_hidden_migration_alias() {
+        let opts = Opts::try_parse_from(["pay", "serve", "inference", "rates.yml"]).unwrap();
+
+        match opts.command {
+            Some(Command::Server {
+                command: commands::server::ServerCommand::Inference(cmd),
+            }) => assert_eq!(cmd.rates.as_deref(), Some("rates.yml")),
+            _ => panic!("expected legacy serve inference command"),
+        }
+    }
+
+    #[test]
+    fn gate_api_routes_to_the_spec_backed_gateway() {
+        let opts = Opts::try_parse_from(["pay", "gate", "api", "paywall.yml"]).unwrap();
+
+        match opts.command {
+            Some(Command::Gate {
+                command: commands::server::GateCommand::Api(cmd),
+            }) => assert_eq!(cmd.paywall, "paywall.yml"),
+            _ => panic!("expected gate api command"),
+        }
+    }
+
+    #[test]
+    fn server_start_remains_backward_compatible() {
+        let opts = Opts::try_parse_from(["pay", "server", "start", "paywall.yml"]).unwrap();
+
+        match opts.command {
+            Some(Command::Server {
+                command: commands::server::ServerCommand::Start(cmd),
+            }) => assert_eq!(cmd.paywall, "paywall.yml"),
+            _ => panic!("expected legacy server start command"),
+        }
+    }
+
+    #[test]
+    fn scaffold_defaults_to_paywall_yml() {
+        let opts = Opts::try_parse_from(["pay", "server", "scaffold"]).unwrap();
+
+        match opts.command {
+            Some(Command::Server {
+                command: commands::server::ServerCommand::Scaffold(cmd),
+            }) => assert_eq!(cmd.output, "paywall.yml"),
+            _ => panic!("expected server scaffold command"),
+        }
     }
 
     #[test]

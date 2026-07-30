@@ -3,7 +3,9 @@
 
 use std::io;
 
-use crossterm::event::{DisableFocusChange, EnableFocusChange};
+use crossterm::event::{
+    DisableBracketedPaste, DisableFocusChange, EnableBracketedPaste, EnableFocusChange,
+};
 use crossterm::execute;
 use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
 use ratatui::Terminal;
@@ -179,6 +181,21 @@ impl<W: io::Write> Backend for DowngradeBackend<W> {
 pub(crate) fn with_terminal<T>(
     f: impl FnOnce(&mut Terminal<TuiBackend>) -> io::Result<T>,
 ) -> io::Result<T> {
+    with_terminal_mode(false, f)
+}
+
+/// Picker variant that asks the terminal emulator to deliver a pasted URL as
+/// one [`crossterm::event::Event::Paste`] instead of simulated key presses.
+pub(crate) fn with_terminal_paste<T>(
+    f: impl FnOnce(&mut Terminal<TuiBackend>) -> io::Result<T>,
+) -> io::Result<T> {
+    with_terminal_mode(true, f)
+}
+
+fn with_terminal_mode<T>(
+    bracketed_paste: bool,
+    f: impl FnOnce(&mut Terminal<TuiBackend>) -> io::Result<T>,
+) -> io::Result<T> {
     terminal::enable_raw_mode()?;
     let mut stderr = io::stderr();
     // Focus events let the event loops force a full repaint when the user
@@ -186,12 +203,18 @@ pub(crate) fn with_terminal<T>(
     // alternate screen while it was hidden, and ratatui only diffs against
     // its own back-buffer.
     execute!(stderr, EnterAlternateScreen, EnableFocusChange)?;
+    if bracketed_paste {
+        execute!(stderr, EnableBracketedPaste)?;
+    }
     let backend = DowngradeBackend::new(CrosstermBackend::new(stderr), !supports_truecolor());
     let mut terminal = Terminal::new(backend)?;
 
     let result = f(&mut terminal);
 
     let _ = terminal::disable_raw_mode();
+    if bracketed_paste {
+        let _ = execute!(terminal.backend_mut(), DisableBracketedPaste);
+    }
     let _ = execute!(
         terminal.backend_mut(),
         DisableFocusChange,
