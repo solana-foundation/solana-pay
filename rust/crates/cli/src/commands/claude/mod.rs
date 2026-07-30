@@ -790,15 +790,20 @@ fn custom_source_url(input: &str) -> Result<String, String> {
     if !url.username().is_empty() || url.password().is_some() {
         return Err("Server URL must not contain credentials".to_string());
     }
-    let loopback = url.host_str().is_some_and(|host| {
+    // An explicitly entered IP is commonly a LAN or bare-metal inference
+    // server without a TLS hostname. Keep HTTP disabled for DNS names so a
+    // typo cannot silently downgrade a hosted provider.
+    let http_allowed = url.host_str().is_some_and(|host| {
         host == "localhost"
             || host
+                .trim_start_matches('[')
+                .trim_end_matches(']')
                 .parse::<std::net::IpAddr>()
-                .is_ok_and(|ip| ip.is_loopback())
+                .is_ok()
     });
-    if url.scheme() == "http" && !loopback {
+    if url.scheme() == "http" && !http_allowed {
         return Err(
-            "Payment discovery requires HTTPS (http:// is allowed only for loopback servers)"
+            "Payment discovery requires HTTPS for hostnames (http:// is allowed for localhost and literal IP addresses)"
                 .to_string(),
         );
     }
@@ -858,6 +863,13 @@ async fn discover_custom_providers(
         .await
         .map_err(|error| format!("Could not discover {source_url}: {error}"))?;
     if !response.status().is_success() {
+        if response.status() == reqwest::StatusCode::NOT_FOUND
+            && reqwest::Url::parse(source_url)
+                .ok()
+                .is_some_and(|url| url.path().eq_ignore_ascii_case("/openapi.json"))
+        {
+            return discover_inference_gateway(client_kind, &client, source_url).await;
+        }
         return Err(format!(
             "No discovery document at {source_url} ({})",
             response.status()
@@ -945,6 +957,99 @@ async fn discover_custom_providers(
     Ok(discovered)
 }
 
+/// Older `pay gate inference` versions expose their provider snapshot at `/`
+/// but do not publish `/openapi.json`. Accept that first-party index as a
+/// discovery fallback so a remote gateway can be added by IP address.
+async fn discover_inference_gateway(
+    client_kind: AlternateClient,
+    client: &reqwest::Client,
+    source_url: &str,
+) -> Result<Vec<DiscoveredProvider>, String> {
+    let mut origin =
+        reqwest::Url::parse(source_url).map_err(|error| format!("Invalid server URL: {error}"))?;
+    origin.set_path("/");
+    origin.set_query(None);
+    origin.set_fragment(None);
+    let response = client
+        .get(origin.clone())
+        .send()
+        .await
+        .map_err(|error| format!("Could not discover {origin}: {error}"))?;
+    if !response.status().is_success() {
+        return Err(format!(
+            "No discovery document at {source_url}, and the server index returned {}",
+            response.status()
+        ));
+    }
+    let index = response
+        .json::<GatewayConfig>()
+        .await
+        .map_err(|error| format!("Invalid inference server index at {origin}: {error}"))?;
+    if index.service.as_deref() != Some("pay gate inference") {
+        return Err(format!(
+            "No discovery document at {source_url}, and {origin} is not a pay inference gateway"
+        ));
+    }
+
+    let base_url = origin.as_str().trim_end_matches('/').to_string();
+    let mut discovered = Vec::new();
+    let mut rejected = Vec::new();
+    for summary in index.providers.into_iter().filter(|provider| provider.up) {
+        if summary.models.is_empty() {
+            rejected.push(format!("{}: no models were discovered", summary.slug));
+            continue;
+        }
+        if !summary
+            .model_pricing
+            .iter()
+            .any(|model| model.price.is_some())
+        {
+            rejected.push(format!(
+                "{}: no pricing metadata was discovered",
+                summary.slug
+            ));
+            continue;
+        }
+        let provider = providers::CustomProvider {
+            slug: summary.slug,
+            title: summary.title,
+            ports: Vec::new(),
+            color: summary.color,
+            identify: Vec::new(),
+            models: None,
+            paid: providers::openai_paid_endpoints(),
+        };
+        let found = DiscoveredProvider {
+            provider: Arc::new(provider),
+            base_url: base_url.clone(),
+            models: summary.models,
+            version: summary.version,
+            pricing: None,
+            model_pricing: summary.model_pricing,
+        };
+        if client_kind.provider_supported(&found) {
+            discovered.push(found);
+        } else {
+            rejected.push(format!(
+                "{}: not compatible with {}",
+                found.slug(),
+                client_kind.display_name()
+            ));
+        }
+    }
+
+    if discovered.is_empty() {
+        let detail = rejected
+            .first()
+            .map(|reason| format!(": {reason}"))
+            .unwrap_or_default();
+        return Err(format!(
+            "No compatible priced inference provider found{detail}"
+        ));
+    }
+    Ok(discovered)
+}
+
 /// Match current provider brands while accepting CLI values persisted before
 /// the catalog picker switched from API-resource names to brand names.
 fn provider_slug_matches(slug: &str, requested: &str) -> bool {
@@ -969,6 +1074,8 @@ fn discover_local_providers() -> pay_core::Result<Vec<DiscoveredProvider>> {
 
 #[derive(serde::Deserialize)]
 struct GatewayConfig {
+    #[serde(default)]
+    service: Option<String>,
     #[serde(default)]
     providers: Vec<ProviderSummary>,
 }
@@ -1397,6 +1504,18 @@ mod tests {
             custom_source_url("https://example.com/openapi.json").unwrap(),
             "https://example.com/openapi.json"
         );
+        assert_eq!(
+            custom_source_url("http://213.239.141.29:80").unwrap(),
+            "http://213.239.141.29/openapi.json"
+        );
+        assert_eq!(
+            custom_source_url("http://192.168.1.20:1402/v1").unwrap(),
+            "http://192.168.1.20:1402/openapi.json"
+        );
+        assert_eq!(
+            custom_source_url("http://[2001:db8::20]:1402").unwrap(),
+            "http://[2001:db8::20]:1402/openapi.json"
+        );
         assert!(custom_source_url("file:///tmp/catalog.json").is_err());
         assert!(custom_source_url("https://user:secret@example.com").is_err());
         assert!(custom_source_url("http://inference.example.com").is_err());
@@ -1543,6 +1662,67 @@ mod tests {
                         .unwrap()
                         .to_string(),
                     "input $0.40 · output $1.60 / 1M tokens"
+                );
+            });
+    }
+
+    #[test]
+    fn custom_provider_falls_back_to_pay_inference_gateway_index() {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                use axum::Router;
+                use axum::routing::get;
+
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let base_url = format!("http://{}", listener.local_addr().unwrap());
+                let index = serde_json::json!({
+                    "service": "pay gate inference",
+                    "providers": [{
+                        "slug": "llama-cpp",
+                        "title": "llama.cpp",
+                        "baseUrl": "http://127.0.0.1:8081",
+                        "up": true,
+                        "models": ["local-model"],
+                        "color": "#f59e0b",
+                        "modelPricing": [{
+                            "model": "local-model",
+                            "variant": "local-model",
+                            "price": "input $0.10 · output $0.30 / 1M tokens"
+                        }]
+                    }]
+                })
+                .to_string();
+                let app = Router::new().route(
+                    "/",
+                    get(move || {
+                        let index = index.clone();
+                        async move { index }
+                    }),
+                );
+                tokio::spawn(async move {
+                    axum::serve(listener, app).await.unwrap();
+                });
+
+                let providers = discover_custom_providers(
+                    AlternateClient::Goose,
+                    &format!("{base_url}/openapi.json"),
+                )
+                .await
+                .unwrap();
+
+                assert_eq!(providers.len(), 1);
+                assert_eq!(providers[0].slug(), "llama-cpp");
+                assert_eq!(providers[0].base_url, base_url);
+                assert_eq!(providers[0].models, ["local-model"]);
+                assert_eq!(
+                    providers[0]
+                        .pricing_hint_for_model(Some("local-model"))
+                        .unwrap()
+                        .to_string(),
+                    "input $0.10 · output $0.30 / 1M tokens"
                 );
             });
     }
