@@ -863,7 +863,8 @@ pub struct SessionSpec {
     pub batch_open_interval_ms: u64,
     /// Idle delay before the operator closes and settles the payment channel.
     ///
-    /// Defaults to `15000` when omitted. Set to `0` to disable automatic close.
+    /// Defaults to `600000` (ten minutes) when omitted. Set to `0` to disable
+    /// automatic close.
     #[serde(default = "default_session_close_delay_ms")]
     pub close_delay_ms: u64,
     /// Boundary used to group idle channel closes into settlement batches.
@@ -901,7 +902,7 @@ fn default_session_batch_open_interval_ms() -> u64 {
 }
 
 fn default_session_close_delay_ms() -> u64 {
-    15_000
+    600_000
 }
 
 fn default_session_close_batch_interval_ms() -> u64 {
@@ -2553,7 +2554,7 @@ mod tests {
         let session: SessionSpec = serde_json::from_str(r#"{"cap_usdc":10.0}"#).unwrap();
 
         assert_eq!(session.batch_open_interval_ms, 400);
-        assert_eq!(session.close_delay_ms, 15_000);
+        assert_eq!(session.close_delay_ms, 600_000);
         assert_eq!(session.close_batch_interval_ms, 60_000);
         assert_eq!(session.settlement_interval_ms, 5_000);
         assert_eq!(
