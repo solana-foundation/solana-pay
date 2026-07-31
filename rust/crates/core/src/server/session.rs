@@ -454,10 +454,12 @@ fn close_voucher_required(onchain_settled: u64, latest_accepted: u64) -> bool {
 pub struct DelegatedCapacityLease {
     runtime: SessionOperatorRuntime,
     channel_id: String,
+    heartbeat: tokio::task::JoinHandle<()>,
 }
 
 impl Drop for DelegatedCapacityLease {
     fn drop(&mut self) {
+        self.heartbeat.abort();
         self.runtime.release_capacity(&self.channel_id);
     }
 }
@@ -524,6 +526,10 @@ pub enum SessionLifecycleReconciliation {
 
 const LIFECYCLE_OWNER_LEASE_PREFIX: &str = "embedded-v1:";
 const MIN_LIFECYCLE_OWNER_LEASE: Duration = Duration::from_secs(30);
+#[cfg(not(test))]
+const DELEGATED_ACTIVITY_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
+#[cfg(test)]
+const DELEGATED_ACTIVITY_HEARTBEAT_INTERVAL: Duration = Duration::from_millis(10);
 
 fn parse_lifecycle_owner_lease(owner: &str) -> Option<(&str, u64)> {
     let owner = owner.strip_prefix(LIFECYCLE_OWNER_LEASE_PREFIX)?;
@@ -561,7 +567,7 @@ impl SessionLifecycleRunloop {
 
     async fn run(mut self) {
         loop {
-            if let Some(delay) = self.next_wakeup_delay() {
+            if let Some((delay, close_due)) = self.next_wakeup() {
                 tokio::select! {
                     command = self.rx.recv() => {
                         if !self.handle_command(command).await {
@@ -569,7 +575,9 @@ impl SessionLifecycleRunloop {
                         }
                     }
                     _ = tokio::time::sleep(delay) => {
-                        if self.reconciliation == SessionLifecycleReconciliation::Embedded {
+                        if close_due
+                            && self.reconciliation == SessionLifecycleReconciliation::Embedded
+                        {
                             self.reconcile_persisted_ownership().await;
                             self.close_due_channels().await;
                         }
@@ -741,7 +749,7 @@ impl SessionLifecycleRunloop {
         }
     }
 
-    fn next_wakeup_delay(&self) -> Option<Duration> {
+    fn next_wakeup(&self) -> Option<(Duration, bool)> {
         let close = if self.reconciliation == SessionLifecycleReconciliation::Embedded
             && self.close_delay.is_some()
         {
@@ -752,12 +760,7 @@ impl SessionLifecycleRunloop {
         let settlement = self
             .next_settlement
             .map(|deadline| deadline.saturating_duration_since(Instant::now()));
-        match (close, settlement) {
-            (Some(close), Some(settlement)) => Some(close.min(settlement)),
-            (Some(close), None) => Some(close),
-            (None, Some(settlement)) => Some(settlement),
-            (None, None) => None,
-        }
+        next_lifecycle_wakeup(close, settlement)
     }
 
     async fn close_due_channels(&mut self) {
@@ -914,6 +917,19 @@ fn duration_until_next_boundary(interval: Duration) -> Duration {
     let now = unix_millis();
     let next = round_up_timestamp(now.saturating_add(1), duration_millis(interval));
     Duration::from_millis(next.saturating_sub(now))
+}
+
+fn next_lifecycle_wakeup(
+    close: Option<Duration>,
+    settlement: Option<Duration>,
+) -> Option<(Duration, bool)> {
+    match (close, settlement) {
+        (Some(close), Some(settlement)) if close <= settlement => Some((close, true)),
+        (Some(_), Some(settlement)) => Some((settlement, false)),
+        (Some(close), None) => Some((close, true)),
+        (None, Some(settlement)) => Some((settlement, false)),
+        (None, None) => None,
+    }
 }
 
 enum SessionCloseResult {
@@ -1232,13 +1248,36 @@ impl SessionMpp {
         amount: u64,
     ) -> Result<Option<DelegatedCapacityLease>> {
         self.touch_channel(channel_id.to_string()).await?;
-        Ok(self
-            .operator_runtime
-            .reserve_capacity(channel_id, amount)
-            .then(|| DelegatedCapacityLease {
-                runtime: self.operator_runtime.clone(),
-                channel_id: channel_id.to_string(),
-            }))
+        if !self.operator_runtime.reserve_capacity(channel_id, amount) {
+            return Ok(None);
+        }
+
+        let lifecycle = self.lifecycle.clone();
+        let heartbeat_channel_id = channel_id.to_string();
+        let heartbeat = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(DELEGATED_ACTIVITY_HEARTBEAT_INTERVAL);
+            interval.tick().await;
+            loop {
+                interval.tick().await;
+                if let Err(error) = lifecycle
+                    .touch(heartbeat_channel_id.clone(), unix_millis())
+                    .await
+                {
+                    tracing::warn!(
+                        channel_id = heartbeat_channel_id,
+                        %error,
+                        "failed to heartbeat active delegated session"
+                    );
+                    break;
+                }
+            }
+        });
+
+        Ok(Some(DelegatedCapacityLease {
+            runtime: self.operator_runtime.clone(),
+            channel_id: channel_id.to_string(),
+            heartbeat,
+        }))
     }
 
     /// Record channel activity so the lifecycle runloop can defer auto-close.
@@ -2354,6 +2393,22 @@ mod tests {
         assert_eq!(round_up_timestamp(123, 0), 123);
     }
 
+    #[test]
+    fn settlement_wakeup_does_not_run_close_reconciliation_early() {
+        assert_eq!(
+            next_lifecycle_wakeup(Some(Duration::from_secs(60)), Some(Duration::from_secs(5))),
+            Some((Duration::from_secs(5), false))
+        );
+        assert_eq!(
+            next_lifecycle_wakeup(Some(Duration::from_secs(5)), Some(Duration::from_secs(60))),
+            Some((Duration::from_secs(5), true))
+        );
+        assert_eq!(
+            next_lifecycle_wakeup(Some(Duration::from_secs(5)), Some(Duration::from_secs(5))),
+            Some((Duration::from_secs(5), true))
+        );
+    }
+
     #[tokio::test]
     async fn external_lifecycle_persists_deadline_without_closing_locally() {
         let session = Arc::new(test_session_mpp());
@@ -2674,6 +2729,79 @@ mod tests {
             persisted.lifecycle.unwrap().close_after
                 >= touched_after.saturating_add(duration_millis(close_delay)),
             "capacity reservation must persist the request-start deadline before forwarding"
+        );
+    }
+
+    #[tokio::test]
+    async fn delegated_capacity_lease_heartbeats_external_idle_deadline() {
+        let session = Arc::new(test_session_mpp());
+        session.start_lifecycle_runloop_with_settlement_and_batching(
+            Duration::from_millis(30),
+            Duration::from_millis(1),
+            Duration::ZERO,
+            SessionLifecycleReconciliation::External,
+        );
+        let challenge = session.challenge(CAP).unwrap();
+        let handle = SessionHandle::new(
+            solana_pubkey::Pubkey::new_unique(),
+            test_session_signer(),
+            challenge,
+        );
+
+        let open_header = handle.open_header(CAP, "open_sig").await.unwrap();
+        let SessionOutcome::Active { state: opened, .. } =
+            session.process(&open_header).await.unwrap()
+        else {
+            panic!("expected open to return active session");
+        };
+        let lease = session
+            .reserve_delegated_capacity(&opened.channel_id, CAP)
+            .await
+            .unwrap()
+            .expect("request should reserve channel capacity");
+        let initial_deadline = session
+            .operator_runtime
+            .channel_store
+            .get_channel(&opened.channel_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .lifecycle
+            .unwrap()
+            .close_after;
+
+        tokio::time::sleep(Duration::from_millis(35)).await;
+
+        let heartbeat_deadline = session
+            .operator_runtime
+            .channel_store
+            .get_channel(&opened.channel_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .lifecycle
+            .unwrap()
+            .close_after;
+        assert!(
+            heartbeat_deadline > initial_deadline,
+            "an in-flight request must renew the external worker's idle deadline"
+        );
+
+        drop(lease);
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        let released_deadline = session
+            .operator_runtime
+            .channel_store
+            .get_channel(&opened.channel_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .lifecycle
+            .unwrap()
+            .close_after;
+        assert_eq!(
+            released_deadline, heartbeat_deadline,
+            "dropping the request lease must stop lifecycle heartbeats"
         );
     }
 
