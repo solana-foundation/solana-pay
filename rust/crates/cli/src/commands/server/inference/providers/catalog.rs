@@ -144,11 +144,15 @@ impl CatalogProvider {
         let Some(json) = get_json(client, base_url.trim_end_matches('/'), &path).await else {
             return (fallback(), Vec::new());
         };
-        let models = parse_model_names(&json);
-        let models = if models.is_empty() {
+        let advertised_models = parse_model_names(&json);
+        let models = if advertised_models.is_empty() {
             fallback()
         } else {
-            models
+            models_matching_configured_families(
+                advertised_models,
+                &self.endpoints,
+                &self.fallback_models,
+            )
         };
         (models, parse_openai_model_pricing(&json))
     }
@@ -718,6 +722,38 @@ fn models_from_pricing_variants(endpoints: &[pay_core::skills::Endpoint]) -> Vec
     models
 }
 
+/// Restrict a provider's broad model catalog to the model families priced by
+/// its inference endpoints, or its built-in fallback families while a catalog
+/// entry is not yet published. Alibaba's OpenAI-compatible model list includes
+/// audio, image, embedding, and realtime models that chat harnesses cannot
+/// call. These configured families are the agent route's supported allowlist.
+///
+/// Matching intentionally mirrors runtime pricing: a variant value is a
+/// substring of the advertised model id, so dated aliases remain available.
+/// The `default` pricing sentinel is excluded by
+/// [`models_from_pricing_variants`] and therefore cannot admit every model.
+fn models_matching_configured_families(
+    advertised_models: Vec<String>,
+    endpoints: &[pay_core::skills::Endpoint],
+    fallback_models: &[String],
+) -> Vec<String> {
+    let mut configured_models = models_from_pricing_variants(endpoints);
+    if configured_models.is_empty() {
+        configured_models.extend_from_slice(fallback_models);
+    }
+    if configured_models.is_empty() {
+        return advertised_models;
+    }
+    advertised_models
+        .into_iter()
+        .filter(|model| {
+            configured_models
+                .iter()
+                .any(|configured| model.contains(configured))
+        })
+        .collect()
+}
+
 /// Picker title for a catalog entry. Known default fqns get a short brand
 /// name (catalog titles like "Generative Language API (Gemini)" are too
 /// verbose for a picker row); everything else uses the catalog title,
@@ -1265,6 +1301,63 @@ mod tests {
         assert_eq!(
             models_from_pricing_variants(&provider.endpoints),
             vec!["gemini-2.5-flash-lite", "gemini-2.5-flash"]
+        );
+    }
+
+    #[test]
+    fn live_models_are_intersected_with_priced_model_families() {
+        let provider = gemini_variant_priced();
+        assert_eq!(
+            models_matching_configured_families(
+                vec![
+                    "qwen-audio-3.0-asr-flash".to_string(),
+                    "gemini-2.5-flash".to_string(),
+                    "gemini-2.5-flash-2026-07-15".to_string(),
+                    "gemini-2.5-pro".to_string(),
+                ],
+                &provider.endpoints,
+                &provider.fallback_models,
+            ),
+            ["gemini-2.5-flash", "gemini-2.5-flash-2026-07-15",],
+            "unpriced model families must not leak into an agent picker"
+        );
+    }
+
+    #[test]
+    fn live_models_remain_authoritative_without_pricing_variants() {
+        let provider = CatalogProvider::from_service(&blockrun_service());
+        let advertised = vec![
+            "openai/gpt-5.6-sol".to_string(),
+            "anthropic/claude-sonnet-5".to_string(),
+        ];
+        assert_eq!(
+            models_matching_configured_families(
+                advertised.clone(),
+                &provider.endpoints,
+                &provider.fallback_models,
+            ),
+            advertised,
+            "providers with live per-model pricing must retain their catalog"
+        );
+    }
+
+    #[test]
+    fn fallback_model_families_filter_broad_live_catalogs() {
+        let provider = alibaba_modelstudio_fallback();
+        assert_eq!(
+            models_matching_configured_families(
+                vec![
+                    "qwen-audio-3.0-asr-flash".to_string(),
+                    "qwen3.7-max".to_string(),
+                    "qwen3.7-max-2026-06-08".to_string(),
+                    "qwen3-coder-next".to_string(),
+                    "qwen-image-2.0".to_string(),
+                ],
+                &provider.endpoints,
+                &provider.fallback_models,
+            ),
+            ["qwen3.7-max", "qwen3.7-max-2026-06-08", "qwen3-coder-next",],
+            "fallback families must exclude non-agent Alibaba models"
         );
     }
 

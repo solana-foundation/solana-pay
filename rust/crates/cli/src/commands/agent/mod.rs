@@ -1287,7 +1287,11 @@ mod tests {
 
                 assert_eq!(providers.len(), 1);
                 assert_eq!(providers[0].slug(), "acme-inference");
-                assert_eq!(providers[0].models, ["acme-large", "acme-small"]);
+                assert_eq!(
+                    providers[0].models,
+                    ["acme-large"],
+                    "live models without a configured pricing variant must not be offered"
+                );
                 assert_eq!(
                     providers[0]
                         .pricing_hint_for_model(Some("acme-large"))
