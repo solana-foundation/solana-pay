@@ -897,18 +897,27 @@ pub enum SessionPullVoucherStrategy {
     OperatedVoucher,
 }
 
+/// Compatibility default for legacy pull-mode channel-open batching. The
+/// current server retains the setting in parsed specs but does not schedule
+/// channel opens from it.
 fn default_session_batch_open_interval_ms() -> u64 {
     400
 }
 
+/// Idle grace period restarted by each channel touch. The resulting deadline
+/// is rounded separately by `close_batch_interval_ms`.
 fn default_session_close_delay_ms() -> u64 {
     600_000
 }
 
+/// Deadline bucket width for grouping idle closes. This is neither the idle
+/// grace period nor the reconciliation worker's polling interval.
 fn default_session_close_batch_interval_ms() -> u64 {
     60_000
 }
 
+/// Cadence for pushing active-channel watermarks in embedded reconciliation
+/// mode. External reconciliation workers use their own configured cadence.
 fn default_session_settlement_interval_ms() -> u64 {
     5_000
 }
