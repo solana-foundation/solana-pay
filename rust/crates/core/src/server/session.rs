@@ -1521,9 +1521,7 @@ impl SessionMpp {
             }
 
             SessionAction::Use(p) => {
-                let state = self
-                    .verify_use_authentication(p, &credential.challenge.id)
-                    .await?;
+                let state = self.verify_use_authentication(p).await?;
                 self.record_committed_watermark(state.channel_id.clone(), state.cumulative);
                 self.touch_channel(state.channel_id.clone()).await?;
                 Ok(SessionOutcome::Active {
@@ -1673,11 +1671,7 @@ impl SessionMpp {
     /// Authenticates the request only — metering happens response-side via
     /// [`Self::authorize_delegated_usage`], which prices the delivered
     /// service and persists the operator-signed cumulative voucher.
-    async fn verify_use_authentication(
-        &self,
-        payload: &UsePayload,
-        echoed_challenge_id: &str,
-    ) -> Result<ChannelState> {
+    async fn verify_use_authentication(&self, payload: &UsePayload) -> Result<ChannelState> {
         if self.voucher_signer() != SessionVoucherSigner::Operator {
             return Err(Error::Mpp(
                 "use is only valid for operator-signed sessions".to_string(),
@@ -1702,13 +1696,26 @@ impl SessionMpp {
                 "payment channel close is pending".to_string(),
             ));
         }
+        // A record with no binding at all is not a mismatch: it either
+        // predates proof binding or was rewritten by a pre-binding writer.
+        // Name it so the client knows re-opening — not retrying the proof —
+        // is the fix. Mirrors PayKit's process_use.
+        if state.opening_challenge_id.is_empty() && state.authentication.is_none() {
+            return Err(Error::PaymentRejected(
+                "session channel predates proof binding; open a new session".to_string(),
+            ));
+        }
         let bound = serde_json::to_string(&payload.authentication)
             .map_err(|error| Error::Mpp(format!("serialize authentication: {error}")))?;
         let proof = &payload.authentication;
+        // No comparison against the request's outer challenge id: per
+        // draft-solana-session-00 the same bearer proof is presented for the
+        // channel's whole lifetime while the outer challenge rotates, and
+        // PayKit's canonical check binds the proof to the opening challenge
+        // only.
         if state.voucher_signer != "operator"
             || state.authentication.as_deref() != Some(bound.as_str())
             || proof.challenge_id != state.opening_challenge_id
-            || echoed_challenge_id != state.opening_challenge_id
             || proof.payer != state.payer
             || !proof
                 .verify(&state.channel_id)
@@ -1770,6 +1777,8 @@ pub fn test_channel_state(
         pending_deliveries: vec![],
         committed_deliveries: vec![],
         lifecycle: None,
+        schema_version: pay_kit::mpp::CHANNEL_STATE_SCHEMA_VERSION,
+        extra: Default::default(),
     }
 }
 
@@ -2184,6 +2193,41 @@ mod tests {
         assert!(
             err.to_string()
                 .contains("does not match the proof bound at open"),
+            "got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn use_names_a_record_that_predates_proof_binding() {
+        // A record whose binding fields were stripped by a pre-binding
+        // writer (or that predates proof binding) fails with its own error,
+        // not the generic proof mismatch.
+        let (session, challenge, _bound_channel, _proof, payer) =
+            operator_session_with_bound_channel().await;
+        let wiped = solana_pubkey::Pubkey::new_unique();
+        let payer_address = bs58::encode(payer.verifying_key().as_bytes()).into_string();
+        seed_channel(
+            &session,
+            &wiped.to_string(),
+            CAP,
+            &session.session_config.operator.clone(),
+            "",
+            "",
+            &payer_address,
+            None,
+        )
+        .await;
+        let proof =
+            SessionAuthentication::sign(challenge.id.clone(), &wiped.to_string(), &payer).unwrap();
+        let handle =
+            SessionHandle::new(wiped, test_session_signer(), challenge).with_authentication(proof);
+
+        let err = session
+            .process(&handle.use_header().await.unwrap())
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("predates proof binding"),
             "got: {err}"
         );
     }
