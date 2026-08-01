@@ -772,6 +772,15 @@ fn has_default_pricing_variant(endpoints: &[pay_core::skills::Endpoint]) -> bool
 /// advertised list — hiding a model here would desynchronize the picker
 /// from the gateway's support policy. Non-chat noise in those lists is
 /// removed by the capability filter in [`parse_model_names`] instead.
+///
+/// Top-level endpoint `dimensions` are also a runtime pricing fallback
+/// (`resolve_price` never leaves a metered endpoint unpriced), but they
+/// deliberately do *not* admit models here: the `default` sentinel is the
+/// catalog author's promise that unlisted models are first-class, while
+/// top-level dimensions are a quote-safety backstop at a conservative
+/// (punitive) rate. Hiding unlisted models from such providers steers
+/// users toward correctly-priced families instead of silently billing
+/// them at the backstop rate.
 fn models_matching_configured_families(
     advertised_models: Vec<String>,
     endpoints: &[pay_core::skills::Endpoint],
