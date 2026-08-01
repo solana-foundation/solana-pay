@@ -1349,15 +1349,24 @@ async fn fetch_gcp_metadata_token(
 /// user credentials cannot mint identity tokens without service-account
 /// impersonation, so local dev either impersonates out-of-band or uses the
 /// spec's `header` auth mode instead.
+/// Identity-endpoint URL with the audience as a properly encoded query pair —
+/// an audience like `https://svc/path?tenant=a&region=b` must arrive intact,
+/// not truncated at the first `&` (which would mint a wrong-audience token).
+fn gcp_identity_url(audience: &str) -> reqwest::Url {
+    let mut url = reqwest::Url::parse(
+        "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/identity",
+    )
+    .expect("static metadata URL parses");
+    url.query_pairs_mut().append_pair("audience", audience);
+    url
+}
+
 async fn fetch_gcp_metadata_identity_token(
     client: &reqwest::Client,
     audience: &str,
 ) -> Result<FetchedToken, String> {
-    let url = format!(
-        "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/identity?audience={audience}"
-    );
     let resp = client
-        .get(&url)
+        .get(gcp_identity_url(audience))
         .header("Metadata-Flavor", "Google")
         .timeout(std::time::Duration::from_secs(2))
         .send()
@@ -1419,6 +1428,27 @@ mod tests {
         let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
             .encode(serde_json::json!({ "aud": "https://svc", "exp": exp }).to_string());
         format!("{header}.{payload}.sig")
+    }
+
+    #[test]
+    fn gcp_identity_url_encodes_audience_with_query_metacharacters() {
+        let url = gcp_identity_url("https://service.example/path?tenant=a&region=b");
+        assert_eq!(
+            url.as_str(),
+            "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/identity?audience=https%3A%2F%2Fservice.example%2Fpath%3Ftenant%3Da%26region%3Db"
+        );
+        // the audience round-trips as ONE pair, not a truncated prefix
+        let pairs: Vec<(String, String)> = url
+            .query_pairs()
+            .map(|(k, v)| (k.into_owned(), v.into_owned()))
+            .collect();
+        assert_eq!(
+            pairs,
+            vec![(
+                "audience".to_string(),
+                "https://service.example/path?tenant=a&region=b".to_string()
+            )]
+        );
     }
 
     #[test]
