@@ -384,7 +384,15 @@ pub enum AuthConfig {
     Oauth2 {
         /// Token endpoint URL (e.g. `https://oauth2.googleapis.com/token`).
         /// Special value `"gcp_metadata"` uses the GCP metadata server.
+        /// Special value `"gcp_metadata_identity"` mints an audience-bound
+        /// OIDC identity token instead of an access token — required for
+        /// invoking IAM-locked Cloud Run services (`audience` must be set).
         token_url: String,
+        /// OIDC audience, exactly the upstream service URL. Required with
+        /// `token_url: "gcp_metadata_identity"`; rejected elsewhere (access
+        /// tokens are not audience-bound).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        audience: Option<String>,
         /// OAuth2 scopes to request.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         scopes: Vec<String>,
@@ -1718,6 +1726,25 @@ fn validate_auth_config(auth: &AuthConfig, context: &str, errs: &mut Vec<String>
             fetch,
             inject,
         } => validate_access_token_auth(prepare, fetch, inject, context, errs),
+        AuthConfig::Oauth2 {
+            token_url,
+            audience,
+            ..
+        } => {
+            let is_identity = token_url == "gcp_metadata_identity";
+            match (is_identity, audience) {
+                (true, None) => errs.push(format!(
+                    "{context}: oauth2.token_url \"gcp_metadata_identity\" requires oauth2.audience                      (the IAM-locked upstream service URL the identity token is minted for)"
+                )),
+                (true, Some(audience)) if audience.trim().is_empty() => errs.push(format!(
+                    "{context}: oauth2.audience is empty — set it to the upstream service URL"
+                )),
+                (false, Some(_)) => errs.push(format!(
+                    "{context}: oauth2.audience is only valid with token_url \"gcp_metadata_identity\"                      (access tokens are not audience-bound)"
+                )),
+                _ => {}
+            }
+        }
         _ => {}
     }
 }
@@ -4684,6 +4711,61 @@ endpoints:
             duplicate_errs
                 .iter()
                 .any(|e| e.contains("must set exactly one"))
+        );
+    }
+
+    #[test]
+    fn oauth2_identity_mode_requires_audience_and_rejects_it_elsewhere() {
+        // identity mode without audience: refused, actionably
+        let spec: ApiSpec = serde_yml::from_str(&access_token_auth_yaml(
+            r#"    method: oauth2
+    token_url: gcp_metadata_identity"#,
+        ))
+        .unwrap();
+        let errs = validate_api_spec(&spec);
+        assert!(
+            errs.iter().any(|e| e.contains("requires oauth2.audience")),
+            "{errs:?}"
+        );
+
+        // audience on a non-identity token_url: refused
+        let spec: ApiSpec = serde_yml::from_str(&access_token_auth_yaml(
+            r#"    method: oauth2
+    token_url: https://oauth2.googleapis.com/token
+    audience: https://svc-hash-uc.a.run.app"#,
+        ))
+        .unwrap();
+        let errs = validate_api_spec(&spec);
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("only valid with token_url \"gcp_metadata_identity\"")),
+            "{errs:?}"
+        );
+
+        // the happy pair: identity mode + audience — no oauth2 errors
+        let spec: ApiSpec = serde_yml::from_str(&access_token_auth_yaml(
+            r#"    method: oauth2
+    token_url: gcp_metadata_identity
+    audience: https://svc-hash-uc.a.run.app"#,
+        ))
+        .unwrap();
+        let errs = validate_api_spec(&spec);
+        assert!(
+            !errs.iter().any(|e| e.contains("oauth2")),
+            "identity+audience must validate: {errs:?}"
+        );
+
+        // empty audience: refused
+        let spec: ApiSpec = serde_yml::from_str(&access_token_auth_yaml(
+            r#"    method: oauth2
+    token_url: gcp_metadata_identity
+    audience: " ""#,
+        ))
+        .unwrap();
+        let errs = validate_api_spec(&spec);
+        assert!(
+            errs.iter().any(|e| e.contains("oauth2.audience is empty")),
+            "{errs:?}"
         );
     }
 

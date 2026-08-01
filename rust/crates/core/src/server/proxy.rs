@@ -305,6 +305,7 @@ pub async fn prepare_upstream(
         }
         Some(AuthConfig::Oauth2 {
             token_url,
+            audience,
             scopes,
             client_id_from_env,
             client_secret_from_env,
@@ -312,6 +313,7 @@ pub async fn prepare_upstream(
         }) => {
             match oauth2_token(
                 token_url,
+                audience.as_deref(),
                 scopes,
                 client_id_from_env.as_deref(),
                 client_secret_from_env.as_deref(),
@@ -1131,6 +1133,9 @@ struct FetchedToken {
 #[derive(PartialEq, Eq, Hash)]
 struct TokenKey {
     token_url: String,
+    /// Identity tokens are audience-bound — two upstreams sharing the
+    /// metadata endpoint must not share a cache slot.
+    audience: Option<String>,
     scopes: Vec<String>,
     client_id: Option<String>,
 }
@@ -1145,12 +1150,14 @@ fn token_cache() -> &'static Arc<RwLock<HashMap<TokenKey, CachedToken>>> {
 /// Fetch an OAuth2 access token, using a cached value if still valid.
 async fn oauth2_token(
     token_url: &str,
+    audience: Option<&str>,
     scopes: &[String],
     client_id_env: Option<&str>,
     client_secret_env: Option<&str>,
 ) -> Result<String, String> {
     let key = TokenKey {
         token_url: token_url.to_string(),
+        audience: audience.map(str::to_string),
         scopes: scopes.to_vec(),
         client_id: client_id_env.and_then(|e| std::env::var(e).ok()),
     };
@@ -1166,7 +1173,14 @@ async fn oauth2_token(
         }
     }
 
-    let fetched = fetch_oauth2_token(token_url, scopes, client_id_env, client_secret_env).await?;
+    let fetched = fetch_oauth2_token(
+        token_url,
+        audience,
+        scopes,
+        client_id_env,
+        client_secret_env,
+    )
+    .await?;
 
     // Refresh 60s before the provider-reported expiry. Providers (especially
     // the GCP metadata server) may return a token that's already partially
@@ -1191,6 +1205,7 @@ async fn oauth2_token(
 
 async fn fetch_oauth2_token(
     token_url: &str,
+    audience: Option<&str>,
     scopes: &[String],
     client_id_env: Option<&str>,
     client_secret_env: Option<&str>,
@@ -1200,6 +1215,12 @@ async fn fetch_oauth2_token(
     // Special: GCP metadata server.
     if token_url == "gcp_metadata" {
         return fetch_gcp_metadata_token(&client, scopes).await;
+    }
+    if token_url == "gcp_metadata_identity" {
+        // Spec validation enforces this; defensive for programmatic callers.
+        let audience = audience
+            .ok_or("token_url \"gcp_metadata_identity\" requires oauth2.audience to be set")?;
+        return fetch_gcp_metadata_identity_token(&client, audience).await;
     }
 
     // Standard OAuth2 client_credentials grant.
@@ -1322,9 +1343,109 @@ async fn fetch_gcp_metadata_token(
     })
 }
 
+/// Fetch an audience-bound OIDC identity token from the GCP metadata server
+/// (Cloud Run / GCE) — what invoking an IAM-locked Cloud Run service needs;
+/// the access-token sibling above cannot open that door. No ADC fallback:
+/// user credentials cannot mint identity tokens without service-account
+/// impersonation, so local dev either impersonates out-of-band or uses the
+/// spec's `header` auth mode instead.
+async fn fetch_gcp_metadata_identity_token(
+    client: &reqwest::Client,
+    audience: &str,
+) -> Result<FetchedToken, String> {
+    let url = format!(
+        "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/identity?audience={audience}"
+    );
+    let resp = client
+        .get(&url)
+        .header("Metadata-Flavor", "Google")
+        .timeout(std::time::Duration::from_secs(2))
+        .send()
+        .await
+        .map_err(|e| {
+            format!(
+                "GCP metadata server unreachable ({e}) — identity tokens require running on \
+                 GCP (Cloud Run/GCE); for local dev use `auth.method: header` or impersonate \
+                 a service account out-of-band"
+            )
+        })?;
+    if !resp.status().is_success() {
+        return Err(format!(
+            "GCP metadata identity endpoint returned {} for audience `{audience}`",
+            resp.status()
+        ));
+    }
+    // The identity endpoint returns the raw JWT as the body, not JSON.
+    let token = resp
+        .text()
+        .await
+        .map_err(|e| format!("reading identity token body: {e}"))?
+        .trim()
+        .to_string();
+
+    // The token carries its own lifetime; honour it instead of assuming 1h.
+    let expires_in_secs = jwt_seconds_until_expiry(&token).unwrap_or(3600);
+    tracing::debug!(audience, "OIDC identity token from GCP metadata server");
+    Ok(FetchedToken {
+        access_token: token,
+        expires_in_secs,
+    })
+}
+
+/// Remaining lifetime of a JWT from its `exp` claim (seconds from now).
+/// `None` when the token does not decode — callers fall back to a
+/// conservative default rather than failing a token that GCP just minted.
+fn jwt_seconds_until_expiry(jwt: &str) -> Option<u64> {
+    let payload_b64 = jwt.split('.').nth(1)?;
+    let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload_b64)
+        .ok()?;
+    let claims: serde_json::Value = serde_json::from_slice(&payload).ok()?;
+    let exp = claims["exp"].as_u64()?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs();
+    Some(exp.saturating_sub(now))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn jwt_with_exp(exp: serde_json::Value) -> String {
+        let header = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(br#"{"alg":"RS256","typ":"JWT"}"#);
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(serde_json::json!({ "aud": "https://svc", "exp": exp }).to_string());
+        format!("{header}.{payload}.sig")
+    }
+
+    #[test]
+    fn jwt_expiry_reads_exp_claim_and_degrades_to_none() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        let remaining =
+            jwt_seconds_until_expiry(&jwt_with_exp(serde_json::json!(now + 600))).unwrap();
+        assert!((595..=600).contains(&remaining), "got {remaining}");
+
+        // already-expired token clamps to zero rather than underflowing
+        assert_eq!(
+            jwt_seconds_until_expiry(&jwt_with_exp(serde_json::json!(now - 100))),
+            Some(0)
+        );
+
+        // garbage shapes degrade to None (caller falls back to a default)
+        assert_eq!(jwt_seconds_until_expiry("not-a-jwt"), None);
+        assert_eq!(jwt_seconds_until_expiry("a.b.c"), None);
+        assert_eq!(
+            jwt_seconds_until_expiry(&jwt_with_exp(serde_json::json!("soon"))),
+            None
+        );
+    }
     use pay_types::metering::{
         AccessTokenFetchConfig, AccessTokenInjectConfig, AccessTokenResponseConfig,
         HmacCanonicalComponent, HmacCanonicalConfig, HmacDigestAlgorithm, HmacEncoding,
@@ -2563,6 +2684,7 @@ mod tests {
                 url: "https://api.example.com".to_string(),
                 path_rewrites: vec![],
                 auth: Some(Box::new(AuthConfig::Oauth2 {
+                    audience: None,
                     token_url: "https://oauth.example.com/token".to_string(),
                     scopes: vec!["scope-a".to_string()],
                     client_id_from_env: Some("_TEST_MISSING_CLIENT_ID".to_string()),
