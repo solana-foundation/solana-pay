@@ -1279,6 +1279,7 @@ impl SessionMpp {
         let accepted = self
             .server
             .verify_voucher(&VoucherPayload {
+                channel_id: channel_id.to_string(),
                 voucher: SignedVoucher {
                     data,
                     signer: operator.to_string(),
@@ -1773,6 +1774,7 @@ pub fn test_channel_state(
         spent_amount: 0,
         settled_on_chain: 0,
         processed_uses: vec![],
+        processed_topup_signatures: vec![],
         next_delivery_sequence: 0,
         pending_deliveries: vec![],
         committed_deliveries: vec![],

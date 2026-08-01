@@ -1459,7 +1459,7 @@ fn session_from_authorization(
     let receipt = parse_commit_receipt(entry.res_body.as_deref());
     let voucher_data = payload
         .get("voucher")
-        .and_then(|voucher| voucher.get("data"));
+        .and_then(|voucher| voucher.get("voucher").or_else(|| voucher.get("data")));
     let cumulative = receipt
         .as_ref()
         .and_then(|r| r.cumulative.clone())
@@ -1892,7 +1892,7 @@ mod tests {
                 "action": "commit",
                 "deliveryId": "delivery-1",
                 "voucher": {
-                    "data": {
+                    "voucher": {
                         "channelId": "channel-111",
                         "cumulativeAmount": "25",
                         "expiresAt": 4102444800_u64
@@ -1930,6 +1930,45 @@ mod tests {
         assert_eq!(session.delivery_id.as_deref(), Some("delivery-1"));
         assert_eq!(session.voucher_count, Some(1));
         assert_eq!(session.currency.as_deref(), Some("USDC"));
+    }
+
+    #[test]
+    fn session_voucher_parses_legacy_inner_data_key() {
+        // Captures recorded before the kit's spec-shape rename (inner key
+        // `data` -> `voucher`, mpp-specs e702dd8) must keep parsing.
+        let (tx, _rx) = broadcast::channel(16);
+        let mut engine = FlowCorrelation::new(tx);
+
+        let mut challenge = make_entry("POST", "/v1/generate", 402);
+        challenge
+            .res_headers
+            .insert("www-authenticate".into(), session_challenge_header());
+        engine.ingest(challenge);
+
+        let mut commit = make_entry("POST", "/v1/generate", 200);
+        commit.req_headers.insert(
+            "authorization".into(),
+            session_authorization(serde_json::json!({
+                "action": "commit",
+                "deliveryId": "delivery-1",
+                "voucher": {
+                    "data": {
+                        "channelId": "channel-111",
+                        "cumulativeAmount": "25",
+                        "expiresAt": 4102444800_u64
+                    },
+                    "signature": "voucher-signature"
+                }
+            })),
+        );
+        engine.ingest(commit);
+
+        let flows = engine.snapshot();
+        assert_eq!(flows.len(), 1);
+        let session = flows[0].session.as_ref().expect("session metadata");
+        assert_eq!(session.session_id.as_deref(), Some("channel-111"));
+        assert_eq!(session.cumulative.as_deref(), Some("25"));
+        assert_eq!(session.voucher_count, Some(1));
     }
 
     #[test]
