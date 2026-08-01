@@ -810,13 +810,14 @@ impl SignerConfig {
 /// is configured for MPP session payments (off-chain vouchers).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
-pub enum SessionSettlementAuthority {
+pub enum SessionVoucherSigner {
     /// The client owns the channel voucher key and signs each cumulative debit.
     #[default]
-    ClientVoucher,
-    /// The client delegates voucher authority to the gateway operator, which
-    /// meters successful responses and signs their cumulative settlement.
-    Delegated,
+    Client,
+    /// The client binds the gateway operator as the channel's voucher signer;
+    /// the operator meters successful responses and signs their cumulative
+    /// settlement while the client authenticates with a reusable payer proof.
+    Operator,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -828,39 +829,17 @@ pub struct SessionSpec {
     /// Prevents spam vouchers smaller than one API call's cost.
     #[serde(default)]
     pub min_voucher_delta: u64,
-    /// Who signs cumulative settlement vouchers. Independent from `modes`,
-    /// which controls how channel transactions are submitted.
+    /// Who signs cumulative settlement vouchers (`client` or `operator`).
     #[serde(default)]
-    pub settlement_authority: SessionSettlementAuthority,
-    /// Session modes this server accepts.
+    pub voucher_signer: SessionVoucherSigner,
+    /// Inactivity thresholds (seconds) offered to clients for negotiation.
     ///
-    /// Allowed values: `"push"` (payment channel, client-funded) and/or
-    /// `"pull"` (SPL token delegation, operator fee-pays the approve tx).
-    ///
-    /// Defaults to `["push"]` when omitted.
-    ///
-    /// Example YAML:
-    /// ```yaml
-    /// session:
-    ///   cap_usdc: 10.0
-    ///   modes: [push, pull]
-    /// ```
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub modes: Vec<String>,
-    /// Pull voucher strategy.
-    ///
-    /// This disambiguates pull-mode sessions:
-    /// - `disabled`: do not advertise or accept pull sessions.
-    /// - `client_voucher`: client signs vouchers; no multi-delegate setup.
-    /// - `operated_voucher`: operator signs vouchers after metering and uses
-    ///   multi-delegate setup for delegated token movement.
-    #[serde(default)]
-    pub pull_voucher_strategy: SessionPullVoucherStrategy,
-    /// Legacy pull-mode channel-open batch flush interval in milliseconds.
-    ///
-    /// Defaults to `400` when omitted.
-    #[serde(default = "default_session_batch_open_interval_ms")]
-    pub batch_open_interval_ms: u64,
+    /// When set, this must be a non-empty, strictly increasing list of
+    /// integers between 1 and 2592000 (30 days). The client may select one
+    /// value in its `open` credential; when omitted the server picks the
+    /// effective timeout from `close_delay_ms`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle_timeout_options_seconds: Option<Vec<u32>>,
     /// Idle delay before the operator closes and settles the payment channel.
     ///
     /// Defaults to `600000` (ten minutes) when omitted. Set to `0` to disable
@@ -886,22 +865,6 @@ pub struct SessionSpec {
     /// converted to basis points for the payment channel distribution.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub splits: Vec<SplitRule>,
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum SessionPullVoucherStrategy {
-    #[default]
-    Disabled,
-    ClientVoucher,
-    OperatedVoucher,
-}
-
-/// Compatibility default for legacy pull-mode channel-open batching. The
-/// current server retains the setting in parsed specs but does not schedule
-/// channel opens from it.
-fn default_session_batch_open_interval_ms() -> u64 {
-    400
 }
 
 /// Idle grace period restarted by each channel touch. The resulting deadline
@@ -2562,14 +2525,10 @@ mod tests {
     fn session_spec_defaults_lifecycle_intervals() {
         let session: SessionSpec = serde_json::from_str(r#"{"cap_usdc":10.0}"#).unwrap();
 
-        assert_eq!(session.batch_open_interval_ms, 400);
         assert_eq!(session.close_delay_ms, 600_000);
         assert_eq!(session.close_batch_interval_ms, 60_000);
         assert_eq!(session.settlement_interval_ms, 5_000);
-        assert_eq!(
-            session.settlement_authority,
-            SessionSettlementAuthority::ClientVoucher
-        );
+        assert_eq!(session.voucher_signer, SessionVoucherSigner::Client);
     }
 
     #[test]
@@ -2592,15 +2551,10 @@ mod tests {
     }
 
     #[test]
-    fn session_spec_parses_delegated_settlement_authority() {
+    fn session_spec_parses_operator_voucher_signer() {
         let session: SessionSpec =
-            serde_json::from_str(r#"{"cap_usdc":10.0,"settlement_authority":"delegated"}"#)
-                .unwrap();
-
-        assert_eq!(
-            session.settlement_authority,
-            SessionSettlementAuthority::Delegated
-        );
+            serde_json::from_str(r#"{"cap_usdc":10.0,"voucher_signer":"operator"}"#).unwrap();
+        assert_eq!(session.voucher_signer, SessionVoucherSigner::Operator);
     }
 
     #[test]
@@ -3783,10 +3737,8 @@ value_from_env: PAY_SIGNER_KEYPAIR
         spec.session = Some(SessionSpec {
             cap_usdc: 10.0,
             min_voucher_delta: 0,
-            settlement_authority: SessionSettlementAuthority::ClientVoucher,
-            modes: vec![],
-            pull_voucher_strategy: SessionPullVoucherStrategy::Disabled,
-            batch_open_interval_ms: 400,
+            voucher_signer: SessionVoucherSigner::Client,
+            idle_timeout_options_seconds: None,
             close_delay_ms: 15_000,
             close_batch_interval_ms: 60_000,
             settlement_interval_ms: 5_000,
@@ -3950,10 +3902,8 @@ value_from_env: PAY_SIGNER_KEYPAIR
         spec.session = Some(SessionSpec {
             cap_usdc: 10.0,
             min_voucher_delta: 0,
-            settlement_authority: SessionSettlementAuthority::ClientVoucher,
-            modes: vec![],
-            pull_voucher_strategy: SessionPullVoucherStrategy::Disabled,
-            batch_open_interval_ms: 400,
+            voucher_signer: SessionVoucherSigner::Client,
+            idle_timeout_options_seconds: None,
             close_delay_ms: 15_000,
             close_batch_interval_ms: 60_000,
             settlement_interval_ms: 5_000,

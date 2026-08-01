@@ -383,6 +383,17 @@ async fn settle_axum_delegated_response(
 /// resolved price; falls back to "0.01" when no price is configured. Shared
 /// by the 402-issuing and verify paths so the advertised and expected amounts
 /// always match.
+/// Resolved per-unit price in token base units — the session challenge's
+/// `amount` field (price per unit of service).
+pub(crate) fn price_unit_base_amount(price: &metering::ResolvedPrice, decimals: u8) -> u64 {
+    let per_unit = price
+        .dimensions
+        .first()
+        .map(|d| d.price_usd / d.scale.max(1) as f64)
+        .unwrap_or(0.01);
+    ((per_unit * 10f64.powi(i32::from(decimals))).round() as u64).max(1)
+}
+
 pub(crate) fn charge_amount_from_price(price: Option<&metering::ResolvedPrice>) -> String {
     price
         .and_then(|p| p.dimensions.first())

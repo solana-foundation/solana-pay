@@ -481,7 +481,7 @@ async fn proxy(State(state): State<Arc<PayerState>>, req: Request) -> Response {
         });
     }
 
-    // A cached delegated session is represented by its idempotent `open`
+    // A cached operator-signed session is represented by its reusable `use`
     // credential. Only a definitive terminal error or a fresh session
     // challenge proves that the cached channel should be replaced. Transient
     // store contention must preserve it for the next request.
@@ -975,60 +975,61 @@ impl PaidHeaders {
     }
 }
 
-/// Open a delegated push session and return the authorization reused for all
-/// subsequent requests handled by this payer proxy.
+/// Open an operator-signed session and return the initial `open`
+/// authorization plus the reusable `use` credential cached for all subsequent
+/// requests handled by this payer proxy.
 fn build_session_authorization(
     state: &PayerState,
     challenge: &pay_core::mpp::Challenge,
 ) -> pay_core::Result<(PaidHeaders, String)> {
-    use pay_kit::mpp::{SessionMode, SessionRequest, SessionSettlementAuthority};
+    use pay_kit::mpp::{SessionRequest, SessionVoucherSigner};
 
     let request: SessionRequest = challenge
         .request
         .decode()
         .map_err(|error| pay_core::Error::Mpp(format!("invalid MPP session challenge: {error}")))?;
-    if request.settlement_authority != SessionSettlementAuthority::Delegated {
+    if request.method_details.voucher_signer != Some(SessionVoucherSigner::Operator) {
         return Err(pay_core::Error::Mpp(
-            "agent payer requires a delegated MPP session".to_string(),
+            "agent payer requires an operator-signed MPP session".to_string(),
         ));
     }
-    if !request.modes.is_empty() && !request.modes.contains(&SessionMode::Push) {
-        return Err(pay_core::Error::Mpp(
-            "agent payer requires MPP session push mode".to_string(),
-        ));
-    }
-    if let (Some(forced), Some(offered)) = (
-        state.network_override.as_deref(),
-        request.network.as_deref(),
-    ) && forced != offered
+    if let Some(forced) = state.network_override.as_deref()
+        && forced != request.method_details.network
     {
         return Err(pay_core::Error::Mpp(format!(
-            "MPP session network mismatch: payer requires `{forced}`, gateway offered `{offered}`"
+            "MPP session network mismatch: payer requires `{forced}`, gateway offered `{}`",
+            request.method_details.network
         )));
     }
 
-    let cap = request.cap.parse::<u64>().map_err(|_| {
-        pay_core::Error::Mpp(format!(
-            "MPP session challenge advertised a non-numeric cap: {}",
-            request.cap
-        ))
-    })?;
-    if cap == 0 {
-        return Err(pay_core::Error::Mpp(
-            "MPP session challenge advertised a zero cap".to_string(),
-        ));
-    }
-    let min_delta = request
-        .min_voucher_delta
+    let minimum = request
+        .minimum_deposit
         .as_deref()
-        .unwrap_or("1")
-        .parse::<u64>()
-        .map_err(|_| {
-            pay_core::Error::Mpp("MPP session challenge has invalid minVoucherDelta".to_string())
-        })?;
-    let deposit = min_delta.saturating_mul(1_000).max(1_000_000).min(cap);
+        .map(|value| {
+            value.parse::<u64>().map_err(|_| {
+                pay_core::Error::Mpp(format!(
+                    "MPP session challenge advertised a non-numeric minimumDeposit: {value}"
+                ))
+            })
+        })
+        .transpose()?
+        .unwrap_or(0);
+    let deposit = request
+        .suggested_deposit
+        .as_deref()
+        .map(|value| {
+            value.parse::<u64>().map_err(|_| {
+                pay_core::Error::Mpp(format!(
+                    "MPP session challenge advertised a non-numeric suggestedDeposit: {value}"
+                ))
+            })
+        })
+        .transpose()?
+        .unwrap_or(1_000_000)
+        .max(minimum)
+        .max(1);
     let sandbox = state.network_override.as_deref() == Some("localnet");
-    let (_handle, authorization) = pay_core::session::open_payment_channel_session_header(
+    let (handle, open_authorization) = pay_core::session::open_payment_channel_session_header(
         challenge,
         &request,
         state.store.as_ref(),
@@ -1039,7 +1040,15 @@ fn build_session_authorization(
         sandbox,
     )?;
 
-    Ok((PaidHeaders::mpp(authorization.clone()), authorization))
+    // Subsequent requests authenticate with the reusable payer proof bound at
+    // open; the operator meters delivered service and signs the vouchers.
+    let use_authorization = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| pay_core::Error::Mpp(format!("Failed to build runtime: {error}")))?
+        .block_on(handle.use_header())?;
+
+    Ok((PaidHeaders::mpp(open_authorization), use_authorization))
 }
 
 /// Select a payable MPP challenge and build the `Authorization: Payment …`

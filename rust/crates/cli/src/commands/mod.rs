@@ -587,7 +587,10 @@ fn handle_outcome(
             let req: Option<SessionRequest> = challenge.request.decode().ok();
             let cap_display = req
                 .as_ref()
-                .map(|request| display_token_amount(&request.cap, &request.currency))
+                .and_then(|request| {
+                    session_deposit_amount(request)
+                        .map(|deposit| display_token_amount(deposit, &request.currency))
+                })
                 .unwrap_or_else(|| "unknown".to_string());
 
             if auto_pay {
@@ -611,11 +614,13 @@ fn handle_outcome(
                     "status": 402,
                     "protocol": "mpp-session",
                     "challenge": {
-                        "cap": req.as_ref().map(|r| &r.cap),
+                        "suggested_deposit": req.as_ref().and_then(session_deposit_amount),
                         "cap_display": cap_display,
                         "currency": req.as_ref().map(|r| &r.currency),
-                        "network": req.as_ref().and_then(|r| r.network.as_deref()),
-                        "min_voucher_delta": req.as_ref().and_then(|r| r.min_voucher_delta.as_deref()),
+                        "network": req.as_ref().map(|r| &r.method_details.network),
+                        "min_voucher_delta": req
+                            .as_ref()
+                            .and_then(|r| r.method_details.min_voucher_delta.as_deref()),
                         "recipient": req.as_ref().map(|r| &r.recipient),
                     },
                     "resource": resource_url,
@@ -1164,6 +1169,15 @@ fn mpp_challenges_within_cap(
     ))
 }
 
+/// Deposit a session challenge asks the client to lock: the server's
+/// suggestion, falling back to its minimum.
+fn session_deposit_amount(request: &SessionRequest) -> Option<&str> {
+    request
+        .suggested_deposit
+        .as_deref()
+        .or(request.minimum_deposit.as_deref())
+}
+
 fn enforce_session_cap(
     request: Option<&SessionRequest>,
     payment_cap: Option<u64>,
@@ -1176,7 +1190,8 @@ fn enforce_session_cap(
             "session payment cap requires a decoded SessionRequest".to_string(),
         ));
     };
-    let required_micro = amount_as_stablecoin_micro(&request.cap, &request.currency)?;
+    let required = session_deposit_amount(request).unwrap_or("0");
+    let required_micro = amount_as_stablecoin_micro(required, &request.currency)?;
 
     if required_micro <= payment_cap {
         return Ok(());
@@ -1705,105 +1720,49 @@ fn pay_session_and_retry(
     sandbox: bool,
     verbose: bool,
 ) -> pay_core::Result<()> {
-    use pay_kit::mpp::{SessionMode, SessionPullVoucherStrategy};
-
     let is_json = no_dna::should_json(output_fmt);
     validate_tool_request_before_signing(tool)?;
 
-    // Deposit = min_voucher_delta * 1000, clamped to [1 USDC, cap].
-    let min_delta = req
-        .and_then(|r| r.min_voucher_delta.as_deref())
-        .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(1_000);
-    let cap = req
-        .and_then(|r| r.cap.parse::<u64>().ok())
-        .unwrap_or(1_000_000);
-    let deposit = (min_delta * 1_000).max(1_000_000).min(cap);
-    let cap_display = req
-        .map(|request| display_token_amount(&request.cap, &request.currency))
-        .unwrap_or_else(|| format!("{cap} base units"));
-    let deposit_display = req
-        .map(|request| display_token_amount(&deposit.to_string(), &request.currency))
-        .unwrap_or_else(|| format!("{deposit} base units"));
+    let Some(request) = req else {
+        return Err(pay_core::Error::Mpp(
+            "session challenge did not decode into a SessionRequest".to_string(),
+        ));
+    };
+
+    // Deposit: server suggestion, floored by its minimum; fall back to 1 USDC.
+    let minimum = request
+        .minimum_deposit
+        .as_deref()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(0);
+    let deposit = request
+        .suggested_deposit
+        .as_deref()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(1_000_000)
+        .max(minimum)
+        .max(1);
+    let deposit_display = display_token_amount(&deposit.to_string(), &request.currency);
 
     if verbose && !is_json {
         crate::components::print_notice(
             crate::components::NoticeLevel::Success,
             "Authorizing MPP session",
-            &payment_authorization_notice_body(&cap_display, Some(&deposit_display)),
+            &payment_authorization_notice_body(&deposit_display, Some(&deposit_display)),
         );
     }
 
-    let supports_push = req
-        .map(|r| r.modes.is_empty() || r.modes.contains(&SessionMode::Push))
-        .unwrap_or(true);
-    let use_pull = req
-        .map(|r| {
-            r.modes.contains(&SessionMode::Pull)
-                && (!supports_push
-                    || matches!(
-                        r.pull_voucher_strategy.as_ref(),
-                        Some(SessionPullVoucherStrategy::ClientVoucher)
-                    ))
-        })
-        .unwrap_or(false);
-
-    let auth_header = if use_pull {
-        let Some(request) = req else {
-            return Err(pay_core::Error::Mpp(
-                "pull-mode session requires a decoded SessionRequest".to_string(),
-            ));
-        };
-
-        let store = pay_core::accounts::FileAccountsStore::default_path();
-        match request.pull_voucher_strategy.as_ref() {
-            Some(SessionPullVoucherStrategy::ClientVoucher) => {
-                let (_handle, header) =
-                    pay_core::session::open_payment_channel_session_header_with_mode(
-                        challenge,
-                        request,
-                        &store,
-                        network_override,
-                        account_override,
-                        deposit,
-                        SessionMode::Pull,
-                        resource_url,
-                        sandbox,
-                    )?;
-                header
-            }
-            Some(SessionPullVoucherStrategy::OperatedVoucher) => {
-                return Err(pay_core::Error::Mpp(
-                    "operated-voucher pull sessions are no longer supported; \
-                     use a client-voucher payment-channel session instead"
-                        .to_string(),
-                ));
-            }
-            None => {
-                return Err(pay_core::Error::Mpp(
-                    "pull-mode session challenge missing pullVoucherStrategy".to_string(),
-                ));
-            }
-        }
-    } else {
-        if let Some(request) = req {
-            let store = pay_core::accounts::FileAccountsStore::default_path();
-            let (_handle, header) = pay_core::session::open_payment_channel_session_header(
-                challenge,
-                request,
-                &store,
-                network_override,
-                account_override,
-                deposit,
-                resource_url,
-                sandbox,
-            )?;
-            header
-        } else {
-            let (_handle, header) = pay_core::session::open_session_header(challenge, deposit)?;
-            header
-        }
-    };
+    let store = pay_core::accounts::FileAccountsStore::default_path();
+    let (_handle, auth_header) = pay_core::session::open_payment_channel_session_header(
+        challenge,
+        request,
+        &store,
+        network_override,
+        account_override,
+        deposit,
+        resource_url,
+        sandbox,
+    )?;
 
     let receipt_network = network_override
         .map(str::to_string)
