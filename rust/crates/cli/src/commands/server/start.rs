@@ -267,6 +267,28 @@ fn x402_currency_configs(
     configs
 }
 
+/// Session challenges and metered settlement convert USD prices into token
+/// base units by decimal scaling alone (`payment::price_unit_base_amount`),
+/// which is only sound when one whole token is worth exactly one USD. A
+/// non-pegged session currency (e.g. `SOL`) would advertise and settle a
+/// `$0.01` price as `0.01 SOL`, so refuse to boot instead of mispricing
+/// every voucher.
+fn ensure_session_currencies_usd_pegged(
+    currency_configs: &[(String, String, u8)],
+) -> pay_core::Result<()> {
+    for (symbol, mint, _decimals) in currency_configs {
+        if Stablecoin::parse_symbol(symbol).is_none() && Stablecoin::from_mint(mint).is_none() {
+            return Err(pay_core::Error::Config(format!(
+                "session currency `{symbol}` is not a recognized USD-pegged stablecoin: \
+                 session prices are USD amounts settled 1:1 in token base units, so a \
+                 non-pegged asset would be mispriced; use {}",
+                Stablecoin::SYMBOL_LIST
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn resolve_session_splits(
     api: &ApiSpec,
     session: &pay_types::metering::SessionSpec,
@@ -943,6 +965,8 @@ impl StartCommand {
                 use pay_kit::mpp::server::session::{SessionConfig, VoucherSigner};
                 use pay_types::metering::SessionVoucherSigner as ConfigVoucherSigner;
                 use std::str::FromStr;
+
+                ensure_session_currencies_usd_pegged(&currency_configs)?;
 
                 let session_secret = std::env::var("PAY_SESSION_SECRET")
                     .unwrap_or_else(|_| challenge_binding_secret.clone());
@@ -2958,8 +2982,9 @@ mod tests {
         surfpool_funding_targets, surfpool_prep_notice_body,
     };
     use super::{
-        build_pdb_config, default_bind, delegated_session_channel_payout, payout_recipient_pubkeys,
-        payout_recipient_targets, resolve_operator_currencies, session_lifecycle_reconciliation,
+        build_pdb_config, default_bind, delegated_session_channel_payout,
+        ensure_session_currencies_usd_pegged, payout_recipient_pubkeys, payout_recipient_targets,
+        resolve_operator_currencies, session_lifecycle_reconciliation,
         validate_browser_rpc_request, x402_currency_configs, x402_upto_beneficiary_pubkey,
         x402_upto_payout_for_recipient,
     };
@@ -3471,6 +3496,41 @@ endpoints:
             resolve_currency("USDG", "mainnet").0,
             pay_types::stablecoin_mints::USDG_MAINNET
         );
+    }
+
+    #[test]
+    fn session_currencies_require_usd_pegged_stablecoins() {
+        // Stablecoin symbols and recognized stablecoin mints pass.
+        let pegged: Vec<(String, String, u8)> = vec![
+            resolve_currency_config("USDC", "mainnet"),
+            resolve_currency_config("usdt", "mainnet"),
+            (
+                pay_types::stablecoin_mints::PYUSD_MAINNET.to_string(),
+                pay_types::stablecoin_mints::PYUSD_MAINNET.to_string(),
+                6,
+            ),
+        ];
+        assert!(ensure_session_currencies_usd_pegged(&pegged).is_ok());
+
+        // SOL resolves (9 decimals) for other schemes but must not open
+        // sessions: $0.01 would be advertised and settled as 0.01 SOL.
+        let sol = vec![resolve_currency_config("SOL", "mainnet")];
+        let err = ensure_session_currencies_usd_pegged(&sol).unwrap_err();
+        assert!(err.to_string().contains("not a recognized USD-pegged"));
+        assert!(err.to_string().contains("SOL"));
+
+        // Unrecognized raw mints fail closed rather than assume a peg.
+        let unknown = vec![(
+            "BonkMintAddress111111111111111111111111111".to_string(),
+            "BonkMintAddress111111111111111111111111111".to_string(),
+            6,
+        )];
+        assert!(ensure_session_currencies_usd_pegged(&unknown).is_err());
+    }
+
+    fn resolve_currency_config(symbol: &str, network: &str) -> (String, String, u8) {
+        let (mint, decimals) = resolve_currency(symbol, network);
+        (symbol.to_string(), mint, decimals)
     }
 
     #[test]

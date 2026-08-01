@@ -379,12 +379,13 @@ async fn settle_axum_delegated_response(
     }
 }
 
-/// Per-unit charge amount (USD, as a decimal string) derived from the
-/// resolved price; falls back to "0.01" when no price is configured. Shared
-/// by the 402-issuing and verify paths so the advertised and expected amounts
-/// always match.
 /// Resolved per-unit price in token base units — the session challenge's
 /// `amount` field (price per unit of service).
+///
+/// Converts the USD price by decimal scaling alone, so it is only sound for
+/// USD-pegged settlement tokens (1 whole token == $1). Server startup
+/// enforces that invariant by refusing non-pegged session currencies
+/// (`ensure_session_currencies_usd_pegged` in the CLI server start path).
 pub(crate) fn price_unit_base_amount(price: &metering::ResolvedPrice, decimals: u8) -> u64 {
     let per_unit = price
         .dimensions
@@ -394,6 +395,10 @@ pub(crate) fn price_unit_base_amount(price: &metering::ResolvedPrice, decimals: 
     ((per_unit * 10f64.powi(i32::from(decimals))).round() as u64).max(1)
 }
 
+/// Per-unit charge amount (USD, as a decimal string) derived from the
+/// resolved price; falls back to "0.01" when no price is configured. Shared
+/// by the 402-issuing and verify paths so the advertised and expected amounts
+/// always match.
 pub(crate) fn charge_amount_from_price(price: Option<&metering::ResolvedPrice>) -> String {
     price
         .and_then(|p| p.dimensions.first())
