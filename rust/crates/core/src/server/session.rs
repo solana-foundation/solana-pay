@@ -32,7 +32,7 @@ use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::{Duration, Instant};
 
 use crate::server::telemetry;
@@ -454,11 +454,13 @@ fn close_voucher_required(onchain_settled: u64, latest_accepted: u64) -> bool {
 pub struct DelegatedCapacityLease {
     runtime: SessionOperatorRuntime,
     channel_id: String,
+    cancel: watch::Sender<bool>,
     heartbeat: tokio::task::JoinHandle<()>,
 }
 
 impl Drop for DelegatedCapacityLease {
     fn drop(&mut self) {
+        let _ = self.cancel.send(true);
         self.heartbeat.abort();
         self.runtime.release_capacity(&self.channel_id);
     }
@@ -477,11 +479,22 @@ impl SessionLifecycleHandle {
     }
 
     async fn touch(&self, channel_id: String, touched_at_ms: u64) -> Result<Option<ChannelState>> {
+        self.touch_with_cancellation(channel_id, touched_at_ms, None)
+            .await
+    }
+
+    async fn touch_with_cancellation(
+        &self,
+        channel_id: String,
+        touched_at_ms: u64,
+        cancellation: Option<watch::Receiver<bool>>,
+    ) -> Result<Option<ChannelState>> {
         let (response_tx, response_rx) = oneshot::channel();
         self.tx
             .send(SessionLifecycleCommand::Touch {
                 channel_id,
                 touched_at_ms,
+                cancellation,
                 response: response_tx,
             })
             .map_err(|_| Error::Mpp("session lifecycle runloop is unavailable".to_string()))?;
@@ -496,6 +509,7 @@ impl SessionLifecycleHandle {
         self.send(SessionLifecycleCommand::Touch {
             channel_id,
             touched_at_ms,
+            cancellation: None,
             response,
         });
     }
@@ -512,6 +526,7 @@ enum SessionLifecycleCommand {
     Touch {
         channel_id: String,
         touched_at_ms: u64,
+        cancellation: Option<watch::Receiver<bool>>,
         response: oneshot::Sender<std::result::Result<Option<ChannelState>, String>>,
     },
 }
@@ -530,6 +545,20 @@ const MIN_LIFECYCLE_OWNER_LEASE: Duration = Duration::from_secs(30);
 const DELEGATED_ACTIVITY_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 #[cfg(test)]
 const DELEGATED_ACTIVITY_HEARTBEAT_INTERVAL: Duration = Duration::from_millis(10);
+
+async fn run_while_lease_active<T>(
+    mut cancellation: watch::Receiver<bool>,
+    operation: impl std::future::Future<Output = T>,
+) -> Option<T> {
+    if *cancellation.borrow() {
+        return None;
+    }
+    tokio::select! {
+        biased;
+        _ = cancellation.changed() => None,
+        result = operation => Some(result),
+    }
+}
 
 fn parse_lifecycle_owner_lease(owner: &str) -> Option<(&str, u64)> {
     let owner = owner.strip_prefix(LIFECYCLE_OWNER_LEASE_PREFIX)?;
@@ -615,12 +644,24 @@ impl SessionLifecycleRunloop {
             Some(SessionLifecycleCommand::Touch {
                 channel_id,
                 touched_at_ms,
+                cancellation,
                 response,
             }) => {
-                let result = self
-                    .persist_touch(&channel_id, touched_at_ms)
-                    .await
-                    .map_err(|error| error.to_string());
+                let result = match cancellation {
+                    Some(cancellation) => {
+                        let Some(result) = run_while_lease_active(
+                            cancellation,
+                            self.persist_touch(&channel_id, touched_at_ms),
+                        )
+                        .await
+                        else {
+                            return true;
+                        };
+                        result
+                    }
+                    None => self.persist_touch(&channel_id, touched_at_ms).await,
+                }
+                .map_err(|error| error.to_string());
                 if let Err(error) = &result {
                     tracing::warn!(
                         channel_id,
@@ -1254,21 +1295,32 @@ impl SessionMpp {
 
         let lifecycle = self.lifecycle.clone();
         let heartbeat_channel_id = channel_id.to_string();
+        let (cancel, mut cancellation) = watch::channel(false);
         let heartbeat = tokio::spawn(async move {
             let mut interval = tokio::time::interval(DELEGATED_ACTIVITY_HEARTBEAT_INTERVAL);
             interval.tick().await;
             loop {
-                interval.tick().await;
+                tokio::select! {
+                    biased;
+                    _ = cancellation.changed() => break,
+                    _ = interval.tick() => {}
+                }
                 if let Err(error) = lifecycle
-                    .touch(heartbeat_channel_id.clone(), unix_millis())
+                    .touch_with_cancellation(
+                        heartbeat_channel_id.clone(),
+                        unix_millis(),
+                        Some(cancellation.clone()),
+                    )
                     .await
                 {
+                    if *cancellation.borrow() {
+                        break;
+                    }
                     tracing::warn!(
                         channel_id = heartbeat_channel_id,
                         %error,
                         "failed to heartbeat active delegated session"
                     );
-                    break;
                 }
             }
         });
@@ -1276,6 +1328,7 @@ impl SessionMpp {
         Ok(Some(DelegatedCapacityLease {
             runtime: self.operator_runtime.clone(),
             channel_id: channel_id.to_string(),
+            cancel,
             heartbeat,
         }))
     }
@@ -2406,6 +2459,27 @@ mod tests {
         assert_eq!(
             next_lifecycle_wakeup(Some(Duration::from_secs(5)), Some(Duration::from_secs(5))),
             Some((Duration::from_secs(5), true))
+        );
+    }
+
+    #[tokio::test]
+    async fn lease_cancellation_interrupts_in_flight_heartbeat() {
+        let (cancel, cancellation) = watch::channel(false);
+        let (started_tx, started_rx) = oneshot::channel();
+        let heartbeat = tokio::spawn(run_while_lease_active(cancellation, async move {
+            started_tx.send(()).unwrap();
+            std::future::pending::<()>().await;
+        }));
+
+        started_rx.await.unwrap();
+        cancel.send(true).unwrap();
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), heartbeat)
+                .await
+                .unwrap()
+                .unwrap()
+                .is_none()
         );
     }
 
