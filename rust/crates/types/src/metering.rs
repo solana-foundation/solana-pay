@@ -383,11 +383,20 @@ pub enum AuthConfig {
     /// OAuth2 — fetch access token and inject as `Authorization: Bearer`.
     Oauth2 {
         /// Token endpoint URL (e.g. `https://oauth2.googleapis.com/token`).
-        /// Special value `"gcp_metadata"` uses the GCP metadata server.
+        /// Special value `"gcp_metadata"` uses the GCP metadata server to
+        /// mint an OAuth2 access token; `"gcp_metadata_identity"` mints an
+        /// audience-bound OIDC identity token instead (for invoking
+        /// IAM-protected services such as private Cloud Run) and requires
+        /// `audience`.
         token_url: String,
         /// OAuth2 scopes to request.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         scopes: Vec<String>,
+        /// OIDC audience for `token_url: gcp_metadata_identity` — the URL of
+        /// the IAM-protected service being invoked (e.g. the Cloud Run
+        /// service URL). Required in identity mode, rejected otherwise.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        audience: Option<String>,
         /// Env var for client_id (for client_credentials grant).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         client_id_from_env: Option<String>,
@@ -1691,6 +1700,30 @@ fn validate_auth_config(auth: &AuthConfig, context: &str, errs: &mut Vec<String>
             fetch,
             inject,
         } => validate_access_token_auth(prepare, fetch, inject, context, errs),
+        AuthConfig::Oauth2 {
+            token_url,
+            scopes,
+            audience,
+            ..
+        } => {
+            let identity = token_url == "gcp_metadata_identity";
+            let has_audience = audience.as_deref().is_some_and(|a| !a.trim().is_empty());
+            if identity && !has_audience {
+                errs.push(format!(
+                    "{context}: oauth2.token_url `gcp_metadata_identity` requires oauth2.audience — set it to the URL of the IAM-protected service being invoked (e.g. the Cloud Run service URL)"
+                ));
+            }
+            if !identity && audience.is_some() {
+                errs.push(format!(
+                    "{context}: oauth2.audience is only valid with token_url `gcp_metadata_identity` (got token_url `{token_url}`)"
+                ));
+            }
+            if identity && !scopes.is_empty() {
+                errs.push(format!(
+                    "{context}: oauth2.scopes are not supported with token_url `gcp_metadata_identity` — identity tokens are bound to an audience, not scopes"
+                ));
+            }
+        }
         _ => {}
     }
 }
@@ -4672,6 +4705,85 @@ endpoints:
             errs.iter()
                 .any(|e| e.contains("does not support nested oauth2 auth")),
             "expected nested oauth2 validation error, got: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn validate_oauth2_identity_requires_audience() {
+        let spec: ApiSpec = serde_yml::from_str(&access_token_auth_yaml(
+            r#"    method: oauth2
+    token_url: gcp_metadata_identity"#,
+        ))
+        .unwrap();
+
+        let errs = validate_api_spec(&spec);
+        assert!(
+            errs.iter().any(|e| e.contains("requires oauth2.audience")),
+            "expected missing-audience validation error, got: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn validate_oauth2_audience_requires_identity_token_url() {
+        let spec: ApiSpec = serde_yml::from_str(&access_token_auth_yaml(
+            r#"    method: oauth2
+    token_url: https://oauth.example.com/token
+    audience: https://svc-xyz.a.run.app"#,
+        ))
+        .unwrap();
+
+        let errs = validate_api_spec(&spec);
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("oauth2.audience is only valid with token_url")),
+            "expected audience-without-identity validation error, got: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn validate_oauth2_identity_rejects_scopes() {
+        let spec: ApiSpec = serde_yml::from_str(&access_token_auth_yaml(
+            r#"    method: oauth2
+    token_url: gcp_metadata_identity
+    audience: https://svc-xyz.a.run.app
+    scopes:
+      - https://www.googleapis.com/auth/cloud-platform"#,
+        ))
+        .unwrap();
+
+        let errs = validate_api_spec(&spec);
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("oauth2.scopes are not supported")),
+            "expected scopes-with-identity validation error, got: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn validate_oauth2_identity_with_audience_is_valid() {
+        let spec: ApiSpec = serde_yml::from_str(&access_token_auth_yaml(
+            r#"    method: oauth2
+    token_url: gcp_metadata_identity
+    audience: https://svc-xyz.a.run.app"#,
+        ))
+        .unwrap();
+
+        match spec.routing.auth() {
+            Some(AuthConfig::Oauth2 {
+                token_url,
+                audience,
+                ..
+            }) => {
+                assert_eq!(token_url, "gcp_metadata_identity");
+                assert_eq!(audience.as_deref(), Some("https://svc-xyz.a.run.app"));
+            }
+            other => panic!("expected oauth2 auth, got: {other:?}"),
+        }
+
+        let errs = validate_api_spec(&spec);
+        assert!(
+            !errs.iter().any(|e| e.contains("oauth2")),
+            "expected no oauth2 validation errors, got: {errs:?}"
         );
     }
 

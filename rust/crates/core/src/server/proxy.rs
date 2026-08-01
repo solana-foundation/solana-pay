@@ -306,6 +306,7 @@ pub async fn prepare_upstream(
         Some(AuthConfig::Oauth2 {
             token_url,
             scopes,
+            audience,
             client_id_from_env,
             client_secret_from_env,
             headers,
@@ -313,6 +314,7 @@ pub async fn prepare_upstream(
             match oauth2_token(
                 token_url,
                 scopes,
+                audience.as_deref(),
                 client_id_from_env.as_deref(),
                 client_secret_from_env.as_deref(),
             )
@@ -1124,14 +1126,16 @@ struct FetchedToken {
     expires_in_secs: u64,
 }
 
-/// Cache key: one entry per distinct (token_url, scopes, client_id) tuple.
-/// The metadata server returns different tokens for different scope sets,
-/// and standard OAuth2 providers key tokens by client. Caching them all under
-/// a single slot would cause one upstream's token to evict another's.
+/// Cache key: one entry per distinct (token_url, scopes, audience, client_id)
+/// tuple. The metadata server returns different tokens for different scope
+/// sets (and different audiences in identity mode), and standard OAuth2
+/// providers key tokens by client. Caching them all under a single slot would
+/// cause one upstream's token to evict another's.
 #[derive(PartialEq, Eq, Hash)]
 struct TokenKey {
     token_url: String,
     scopes: Vec<String>,
+    audience: Option<String>,
     client_id: Option<String>,
 }
 
@@ -1146,12 +1150,14 @@ fn token_cache() -> &'static Arc<RwLock<HashMap<TokenKey, CachedToken>>> {
 async fn oauth2_token(
     token_url: &str,
     scopes: &[String],
+    audience: Option<&str>,
     client_id_env: Option<&str>,
     client_secret_env: Option<&str>,
 ) -> Result<String, String> {
     let key = TokenKey {
         token_url: token_url.to_string(),
         scopes: scopes.to_vec(),
+        audience: audience.map(str::to_string),
         client_id: client_id_env.and_then(|e| std::env::var(e).ok()),
     };
 
@@ -1166,7 +1172,14 @@ async fn oauth2_token(
         }
     }
 
-    let fetched = fetch_oauth2_token(token_url, scopes, client_id_env, client_secret_env).await?;
+    let fetched = fetch_oauth2_token(
+        token_url,
+        scopes,
+        audience,
+        client_id_env,
+        client_secret_env,
+    )
+    .await?;
 
     // Refresh 60s before the provider-reported expiry. Providers (especially
     // the GCP metadata server) may return a token that's already partially
@@ -1192,6 +1205,7 @@ async fn oauth2_token(
 async fn fetch_oauth2_token(
     token_url: &str,
     scopes: &[String],
+    audience: Option<&str>,
     client_id_env: Option<&str>,
     client_secret_env: Option<&str>,
 ) -> Result<FetchedToken, String> {
@@ -1200,6 +1214,12 @@ async fn fetch_oauth2_token(
     // Special: GCP metadata server.
     if token_url == "gcp_metadata" {
         return fetch_gcp_metadata_token(&client, scopes).await;
+    }
+    if token_url == "gcp_metadata_identity" {
+        let audience = audience.ok_or_else(|| {
+            "oauth2.audience is required for token_url `gcp_metadata_identity`".to_string()
+        })?;
+        return fetch_gcp_metadata_identity_token(&client, audience).await;
     }
 
     // Standard OAuth2 client_credentials grant.
@@ -1320,6 +1340,75 @@ async fn fetch_gcp_metadata_token(
         access_token,
         expires_in_secs,
     })
+}
+
+/// Fetch an audience-bound OIDC identity token from the GCP metadata server
+/// (Cloud Run / GCE), used to invoke IAM-protected services such as private
+/// Cloud Run. Unlike access tokens there is no ADC fallback: user credentials
+/// cannot mint audience-bound identity tokens.
+async fn fetch_gcp_metadata_identity_token(
+    client: &reqwest::Client,
+    audience: &str,
+) -> Result<FetchedToken, String> {
+    let resp = client
+        .get("http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/identity")
+        .query(&[("audience", audience)])
+        .header("Metadata-Flavor", "Google")
+        .timeout(std::time::Duration::from_secs(2))
+        .send()
+        .await
+        .map_err(|e| {
+            format!(
+                "GCP metadata server unreachable ({e}): identity tokens require running on GCP (Cloud Run/GCE); there is no ADC fallback"
+            )
+        })?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(format!(
+            "GCP metadata identity endpoint returned {status}: {body}"
+        ));
+    }
+
+    let token = resp
+        .text()
+        .await
+        .map_err(|e| format!("Failed to read identity token: {e}"))?;
+    let token = token.trim().to_string();
+
+    // The /identity endpoint returns a raw JWT with no expiry envelope —
+    // read the remaining lifetime from the token's own `exp` claim.
+    let exp = jwt_exp_claim(&token)?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| format!("System clock before UNIX epoch: {e}"))?
+        .as_secs();
+
+    tracing::debug!("OIDC identity token from GCP metadata server");
+    Ok(FetchedToken {
+        access_token: token,
+        expires_in_secs: exp.saturating_sub(now),
+    })
+}
+
+/// Extract the `exp` claim (unix seconds) from a JWT without verifying the
+/// signature — the token is opaque to us; only its remaining lifetime matters
+/// for the cache.
+fn jwt_exp_claim(jwt: &str) -> Result<u64, String> {
+    let mut segments = jwt.split('.');
+    let payload_b64 = match (segments.next(), segments.next(), segments.next()) {
+        (Some(_), Some(payload), Some(_)) => payload,
+        _ => return Err("identity token is not a JWT (expected 3 dot-separated segments)".into()),
+    };
+    let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload_b64)
+        .map_err(|e| format!("identity token payload is not base64url: {e}"))?;
+    let claims: serde_json::Value = serde_json::from_slice(&payload)
+        .map_err(|e| format!("identity token payload is not JSON: {e}"))?;
+    claims["exp"]
+        .as_u64()
+        .ok_or_else(|| "identity token has no numeric `exp` claim".to_string())
 }
 
 #[cfg(test)]
@@ -2565,6 +2654,7 @@ mod tests {
                 auth: Some(Box::new(AuthConfig::Oauth2 {
                     token_url: "https://oauth.example.com/token".to_string(),
                     scopes: vec!["scope-a".to_string()],
+                    audience: None,
                     client_id_from_env: Some("_TEST_MISSING_CLIENT_ID".to_string()),
                     client_secret_from_env: Some("_TEST_MISSING_CLIENT_SECRET".to_string()),
                     headers: HashMap::new(),
@@ -2587,6 +2677,72 @@ mod tests {
                 .unwrap()
                 .contains("client_id env var not set")
         );
+    }
+
+    #[tokio::test]
+    async fn forward_request_oauth2_identity_without_audience_returns_bad_gateway() {
+        let api = ApiSpec {
+            routing: RoutingConfig::Proxy {
+                url: "https://api.example.com".to_string(),
+                path_rewrites: vec![],
+                auth: Some(Box::new(AuthConfig::Oauth2 {
+                    token_url: "gcp_metadata_identity".to_string(),
+                    scopes: vec![],
+                    audience: None,
+                    client_id_from_env: None,
+                    client_secret_from_env: None,
+                    headers: HashMap::new(),
+                })),
+            },
+            ..make_api("test")
+        };
+
+        let uri: Uri = "/v1/protected".parse().unwrap();
+        let result =
+            forward_request(&api, Method::GET, &uri, &HeaderMap::new(), Bytes::new()).await;
+
+        let err = result.unwrap_err();
+        assert_eq!(err.status(), StatusCode::BAD_GATEWAY);
+        let body = axum::body::to_bytes(err.into_body(), 1024).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            json["message"]
+                .as_str()
+                .unwrap()
+                .contains("oauth2.audience is required")
+        );
+    }
+
+    // ── jwt_exp_claim ────────────────────────────────────────────────────
+
+    fn make_jwt(payload: &serde_json::Value) -> String {
+        let encode = |bytes: &[u8]| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
+        let header = encode(br#"{"alg":"RS256","typ":"JWT"}"#);
+        let body = encode(payload.to_string().as_bytes());
+        format!("{header}.{body}.signature")
+    }
+
+    #[test]
+    fn jwt_exp_claim_reads_exp() {
+        let jwt = make_jwt(&serde_json::json!({
+            "aud": "https://svc-xyz.a.run.app",
+            "exp": 1_754_100_000u64,
+            "iat": 1_754_096_400u64,
+        }));
+        assert_eq!(jwt_exp_claim(&jwt).unwrap(), 1_754_100_000);
+    }
+
+    #[test]
+    fn jwt_exp_claim_rejects_non_jwt() {
+        let err = jwt_exp_claim("not-a-jwt").unwrap_err();
+        assert!(err.contains("3 dot-separated segments"), "got: {err}");
+    }
+
+    #[test]
+    fn jwt_exp_claim_rejects_missing_exp() {
+        let jwt = make_jwt(&serde_json::json!({"aud": "https://svc.example"}));
+        let err = jwt_exp_claim(&jwt).unwrap_err();
+        assert!(err.contains("no numeric `exp` claim"), "got: {err}");
     }
 
     // ── resolve_routing ──────────────────────────────────────────────────
