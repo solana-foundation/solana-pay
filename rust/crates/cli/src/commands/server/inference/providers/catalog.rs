@@ -608,7 +608,7 @@ fn match_variant<'a>(
         let Some(value) = variant.get("value").and_then(|v| v.as_str()) else {
             continue;
         };
-        if value == "default" {
+        if value.eq_ignore_ascii_case("default") {
             default = default.or(Some(variant));
         } else if model.contains(value) {
             return Some(variant);
@@ -644,10 +644,16 @@ fn dimension_prices(variant: &serde_json::Value) -> Vec<(f64, f64)> {
 /// Model names from a model-list response body. Understands Gemini's
 /// `{"models":[{"name":"models/gemini-…"}]}` (the `models/` prefix is
 /// stripped) and the OpenAI-compatible `{"data":[{"id":"…"}]}`.
+///
+/// Gemini entries advertise their capabilities in
+/// `supportedGenerationMethods`; models that cannot serve `generateContent`
+/// (embeddings, imagen, aqa) are dropped so the picker only offers models
+/// the chat route can call. Entries without the field are kept.
 fn parse_model_names(json: &serde_json::Value) -> Vec<String> {
     if let Some(items) = json.get("models").and_then(|v| v.as_array()) {
         return items
             .iter()
+            .filter(|item| supports_generate_content(item))
             .filter_map(|item| item.get("name")?.as_str())
             .map(|name| name.strip_prefix("models/").unwrap_or(name).to_string())
             .collect();
@@ -659,6 +665,22 @@ fn parse_model_names(json: &serde_json::Value) -> Vec<String> {
             .collect();
     }
     Vec::new()
+}
+
+/// Whether a Gemini model-list entry can serve the chat route. Entries
+/// without capability metadata are kept — absence of the field must not
+/// hide a model.
+fn supports_generate_content(item: &serde_json::Value) -> bool {
+    let Some(methods) = item
+        .get("supportedGenerationMethods")
+        .and_then(serde_json::Value::as_array)
+    else {
+        return true;
+    };
+    methods
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .any(|method| method == "generateContent" || method == "streamGenerateContent")
 }
 
 /// Per-million-token rates returned by OpenAI-style model catalogs such as
@@ -713,13 +735,27 @@ fn models_from_pricing_variants(endpoints: &[pay_core::skills::Endpoint]) -> Vec
         .flatten()
         .filter_map(|variant| variant.get("value"))
         .filter_map(serde_json::Value::as_str)
-        .filter(|value| *value != "default")
+        .filter(|value| !value.eq_ignore_ascii_case("default"))
     {
         if !models.iter().any(|model| model == value) {
             models.push(value.to_string());
         }
     }
     models
+}
+
+/// Whether any priced endpoint declares the `default` pricing sentinel —
+/// the runtime accepts and prices every model for such providers.
+fn has_default_pricing_variant(endpoints: &[pay_core::skills::Endpoint]) -> bool {
+    endpoints
+        .iter()
+        .filter_map(|endpoint| endpoint.pricing.as_ref())
+        .filter_map(|pricing| pricing.get("variants"))
+        .filter_map(serde_json::Value::as_array)
+        .flatten()
+        .filter_map(|variant| variant.get("value"))
+        .filter_map(serde_json::Value::as_str)
+        .any(|value| value.eq_ignore_ascii_case("default"))
 }
 
 /// Restrict a provider's broad model catalog to the model families priced by
@@ -730,13 +766,20 @@ fn models_from_pricing_variants(endpoints: &[pay_core::skills::Endpoint]) -> Vec
 ///
 /// Matching intentionally mirrors runtime pricing: a variant value is a
 /// substring of the advertised model id, so dated aliases remain available.
-/// The `default` pricing sentinel is excluded by
-/// [`models_from_pricing_variants`] and therefore cannot admit every model.
+/// A `default` pricing sentinel is the catalog's explicit promise that
+/// unlisted models are accepted and priced (metering's `resolve_variant`
+/// falls back to it), so providers that declare one keep their full
+/// advertised list — hiding a model here would desynchronize the picker
+/// from the gateway's support policy. Non-chat noise in those lists is
+/// removed by the capability filter in [`parse_model_names`] instead.
 fn models_matching_configured_families(
     advertised_models: Vec<String>,
     endpoints: &[pay_core::skills::Endpoint],
     fallback_models: &[String],
 ) -> Vec<String> {
+    if has_default_pricing_variant(endpoints) {
+        return advertised_models;
+    }
     let mut configured_models = models_from_pricing_variants(endpoints);
     if configured_models.is_empty() {
         configured_models.extend_from_slice(fallback_models);
@@ -1156,8 +1199,9 @@ mod tests {
         assert_eq!(hint, provider.pricing_hint().unwrap());
     }
 
-    #[test]
-    fn unmatched_model_is_unpriced_when_variants_are_model_specific() {
+    /// The Gemini fixture with its `default` sentinel stripped: a provider
+    /// that prices only the named model families.
+    fn variant_priced_without_default() -> CatalogProvider {
         let mut provider = gemini_variant_priced();
         for endpoint in &mut provider.endpoints {
             if let Some(variants) = endpoint
@@ -1169,6 +1213,12 @@ mod tests {
                 variants.retain(|variant| variant["value"] != "default");
             }
         }
+        provider
+    }
+
+    #[test]
+    fn unmatched_model_is_unpriced_when_variants_are_model_specific() {
+        let provider = variant_priced_without_default();
 
         assert!(
             provider
@@ -1288,6 +1338,25 @@ mod tests {
     }
 
     #[test]
+    fn parse_model_names_drops_models_that_cannot_generate_content() {
+        let json = serde_json::json!({
+            "models": [
+                { "name": "models/gemini-2.5-flash",
+                  "supportedGenerationMethods": ["generateContent", "countTokens"] },
+                { "name": "models/text-embedding-004",
+                  "supportedGenerationMethods": ["embedContent"] },
+                { "name": "models/gemini-mystery" }
+            ]
+        });
+        assert_eq!(
+            parse_model_names(&json),
+            vec!["gemini-2.5-flash", "gemini-mystery"],
+            "non-chat models must not reach the agent picker; entries \
+             without capability metadata stay"
+        );
+    }
+
+    #[test]
     fn parse_model_names_handles_openai_compat_data_ids() {
         let json: serde_json::Value =
             serde_json::from_str(r#"{"data":[{"id":"qwen-max"},{"id":"qwen-plus"}]}"#).unwrap();
@@ -1306,7 +1375,7 @@ mod tests {
 
     #[test]
     fn live_models_are_intersected_with_priced_model_families() {
-        let provider = gemini_variant_priced();
+        let provider = variant_priced_without_default();
         assert_eq!(
             models_matching_configured_families(
                 vec![
@@ -1320,6 +1389,30 @@ mod tests {
             ),
             ["gemini-2.5-flash", "gemini-2.5-flash-2026-07-15",],
             "unpriced model families must not leak into an agent picker"
+        );
+    }
+
+    #[test]
+    fn default_priced_catalogs_keep_every_live_model() {
+        // The live Gemini entry describes its `default` variant as the
+        // "Fallback for unlisted Gemini models": the runtime accepts and
+        // prices models beyond the named families, so the picker must not
+        // hide them (pay#416 review). Non-chat models are dropped earlier,
+        // by capability, in `parse_model_names`.
+        let provider = gemini_variant_priced();
+        let advertised = vec![
+            "gemini-2.5-flash".to_string(),
+            "gemini-2.0-flash".to_string(),
+            "gemini-exp-2026".to_string(),
+        ];
+        assert_eq!(
+            models_matching_configured_families(
+                advertised.clone(),
+                &provider.endpoints,
+                &provider.fallback_models,
+            ),
+            advertised,
+            "models priced by the `default` sentinel must stay in the picker"
         );
     }
 
