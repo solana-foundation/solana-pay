@@ -708,7 +708,23 @@ impl SessionLifecycleRunloop {
         let Some(close_delay) = self.close_delay else {
             return Ok(None);
         };
-        let idle_deadline = touched_at_ms.saturating_add(duration_millis(close_delay));
+        let mut effective_delay_ms = duration_millis(close_delay);
+        let negotiated_idle_timeout_seconds = self
+            .runtime
+            .channel_store
+            .get_channel(channel_id)
+            .await
+            .map_err(|error| {
+                Error::Mpp(format!(
+                    "failed to load channel {channel_id} for lifecycle touch: {error}"
+                ))
+            })?
+            .and_then(|state| state.idle_timeout_seconds);
+        if let Some(idle_timeout_seconds) = negotiated_idle_timeout_seconds {
+            effective_delay_ms =
+                effective_delay_ms.min(u64::from(idle_timeout_seconds).saturating_mul(1_000));
+        }
+        let idle_deadline = touched_at_ms.saturating_add(effective_delay_ms);
         let close_after =
             round_up_timestamp(idle_deadline, duration_millis(self.close_batch_interval));
         let owner = if self.reconciliation == SessionLifecycleReconciliation::Embedded {
@@ -2726,6 +2742,73 @@ mod tests {
             persisted.lifecycle.unwrap().close_after
                 >= touched_after.saturating_add(duration_millis(close_delay)),
             "capacity reservation must persist the request-start deadline before forwarding"
+        );
+    }
+
+    #[tokio::test]
+    async fn touch_honors_negotiated_idle_timeout_shorter_than_close_delay() {
+        let session = Arc::new(test_session_mpp());
+        let close_delay = Duration::from_secs(120);
+        let negotiated_idle_timeout_seconds = 5u32;
+        session.start_lifecycle_runloop_with_settlement_and_batching(
+            close_delay,
+            Duration::from_secs(60),
+            Duration::ZERO,
+            SessionLifecycleReconciliation::External,
+        );
+        let challenge = session.challenge(None).unwrap();
+        let channel = solana_pubkey::Pubkey::new_unique().to_string();
+        seed_channel(
+            &session,
+            &channel,
+            CAP,
+            &solana_pubkey::Pubkey::new_unique().to_string(),
+            "client",
+            &challenge.id,
+            &solana_pubkey::Pubkey::new_unique().to_string(),
+            None,
+        )
+        .await;
+        session
+            .operator_runtime
+            .channel_store
+            .update_channel(
+                &channel,
+                Box::new(move |state| {
+                    let mut state = state.unwrap();
+                    state.idle_timeout_seconds = Some(negotiated_idle_timeout_seconds);
+                    Ok(state)
+                }),
+            )
+            .await
+            .unwrap();
+
+        let touched_after = unix_millis();
+        let _lease = session
+            .reserve_delegated_capacity(&channel, CAP)
+            .await
+            .unwrap()
+            .expect("request should reserve channel capacity");
+
+        let persisted = session
+            .operator_runtime
+            .channel_store
+            .get_channel(&channel)
+            .await
+            .unwrap()
+            .unwrap();
+        let close_after = persisted.lifecycle.unwrap().close_after;
+        let negotiated_deadline_ms =
+            u64::from(negotiated_idle_timeout_seconds).saturating_mul(1_000);
+        assert!(
+            close_after < touched_after.saturating_add(duration_millis(close_delay)),
+            "touch must not fall back to the un-negotiated close_delay when the channel \
+             selected a shorter idle_timeout_seconds"
+        );
+        assert!(
+            close_after <= touched_after.saturating_add(negotiated_deadline_ms) + 60_000,
+            "persisted deadline must be bounded by the negotiated idle timeout \
+             (plus one close-batch-interval of rounding), got {close_after}"
         );
     }
 
