@@ -1,3 +1,4 @@
+pub mod commission_capability;
 pub mod create_skill;
 pub mod curl;
 pub mod get_balance;

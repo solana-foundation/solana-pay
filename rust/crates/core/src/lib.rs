@@ -7,6 +7,7 @@ pub mod instructions;
 pub mod keystore;
 pub mod signer;
 pub mod skills;
+pub mod studios;
 pub mod user_agent;
 
 // Client modules (CLI)
