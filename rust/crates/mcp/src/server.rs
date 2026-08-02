@@ -92,8 +92,9 @@ prompt is the consent step).
         &self,
         Parameters(params): Parameters<tools::search_catalog::Params>,
         peer: rmcp::Peer<rmcp::service::RoleServer>,
+        meta: rmcp::model::Meta,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        tools::search_catalog::run(params, peer).await
+        tools::search_catalog::run(params, peer, meta.get_progress_token()).await
     }
 
     #[tool(description = r#"List all available Pay APIs/skills.
@@ -203,24 +204,25 @@ do not call this again for the same query. In every other uncovered case,
 call it directly: search returned only weak keyword matches that don't
 actually do the user's task, `list_catalog` showed nothing fitting, or the
 user asks to have something built. NEVER pre-ask for permission in chat —
-the tool's single accept-to-send prompt (optional details and budget) IS
-the consent step, so a chat-level ask is a duplicate; calling on a
-suspected miss is safe because declining costs nothing and submits
-nothing. When you talk about it, frame it as what it is: the user found
-unmet demand, a studio builds and deploys the API, and the user publishes
-and monetizes it — an agentic business opportunity, not paperwork. On
-accept it attributes the request to the user's Pay wallet, submits it to
-every registered studio, and reports back either a quote or that the
-request is pending. This never spends funds; accepting and funding a quote
-is a separate step.
+the tool's single accept-to-send prompt (two optional free-form questions:
+what to build, what they'd use today) IS the consent step, so a chat-level
+ask is a duplicate; calling on a suspected miss is safe because declining
+costs nothing and submits nothing. When you talk about it, frame it as
+what it is: the user found unmet demand, a studio builds and deploys the
+API, and the user publishes and monetizes it — an agentic business
+opportunity, not paperwork. On accept the answers are structured into a
+brief and the request is attributed to the user's Pay wallet, submitted to
+every registered studio, and reported back as either a quote or pending.
+This never spends funds; accepting and funding a quote is a separate step.
 "#
     )]
     async fn request_capability(
         &self,
         Parameters(params): Parameters<tools::request_capability::Params>,
         peer: rmcp::Peer<rmcp::service::RoleServer>,
+        meta: rmcp::model::Meta,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        tools::request_capability::run(params, peer).await
+        tools::request_capability::run(params, peer, meta.get_progress_token()).await
     }
 }
 

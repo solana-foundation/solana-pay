@@ -97,6 +97,7 @@ fn default_max_results() -> usize {
 pub async fn run(
     params: Params,
     peer: rmcp::Peer<rmcp::service::RoleServer>,
+    progress_token: Option<rmcp::model::ProgressToken>,
 ) -> Result<CallToolResult, rmcp::ErrorData> {
     let query = params.query.trim().to_string();
     if query.is_empty() {
@@ -137,7 +138,7 @@ pub async fn run(
     // to `request_capability` instead of prompting the user directly.
     if response.catalog_miss
         && let Some(capability_request) =
-            offer_capability_request(&peer, &query, response.candidates.len()).await
+            offer_capability_request(&peer, progress_token, &query).await
     {
         response.next_step = next_step_for_capability_request(&capability_request);
         response.capability_request = Some(capability_request);
@@ -164,11 +165,11 @@ pub async fn run(
 /// in [`next_step_for_candidates`] instead of erroring the whole search.
 async fn offer_capability_request(
     peer: &rmcp::Peer<rmcp::service::RoleServer>,
+    progress_token: Option<rmcp::model::ProgressToken>,
     query: &str,
-    weak_candidates: usize,
 ) -> Option<serde_json::Value> {
     use super::request_capability::{CapabilityRequestError, CapabilityRequestOutcome};
-    match super::request_capability::run_capability_request(peer, query, weak_candidates).await {
+    match super::request_capability::run_capability_request(peer, progress_token, query).await {
         Ok(CapabilityRequestOutcome::Submitted(value)) => Some(value),
         Ok(CapabilityRequestOutcome::Declined) => Some(serde_json::json!({
             "status": "declined",

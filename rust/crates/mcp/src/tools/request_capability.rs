@@ -3,19 +3,23 @@
 //!
 //! Never auto-invoked: a single elicitation is both the pitch and the
 //! consent gate — Accept submits, Decline/Cancel walks away with nothing
-//! sent. The buyer is attributed by the Solana pubkey of the local Pay
-//! wallet (the key the engagement would be funded with), never prompted
-//! for. v0 sends only the fields the studio's `NewRfq` wire shape accepts;
-//! the richer cost-metrics brief (freshness, volume, upstream deps) lands
-//! once the studio side's `brief` object ships — `NewRfq` is
-//! `deny_unknown_fields`, so sending those fields today would 422.
+//! sent. The prompt is two free-form questions (what to build, what they'd
+//! use today); after Accept the client's own model (MCP sampling, briefed
+//! by `request_capability_brief.md`) turns those answers into the
+//! structured brief — no typed form fields, no schema the user has to fit.
+//! The buyer is attributed by the Solana pubkey of the local Pay wallet
+//! (the key the engagement would be funded with), never prompted for.
 
+use std::future::Future;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use pay_core::studios::{BudgetAmount, NewCapabilityRequest, StudioRegistry, StudioSubmission};
 use rmcp::Peer;
 use rmcp::model::{
-    CallToolResult, Content, CreateElicitationRequestParam, ElicitationAction, ElicitationSchema,
+    CallToolResult, Content, CreateElicitationRequestParam, CreateMessageRequestParam,
+    ElicitationAction, ElicitationSchema, LoggingLevel, LoggingMessageNotificationParam,
+    ProgressNotificationParam, ProgressToken, Role, SamplingMessage,
 };
 use rmcp::schemars;
 use rmcp::service::RoleServer;
@@ -30,6 +34,22 @@ const ELICITATION_TIMEOUT: Duration = Duration::from_secs(300);
 /// arbitrary time a studio may take to review and quote an RFQ.
 const QUOTE_POLL_ATTEMPTS: u32 = 3;
 const QUOTE_POLL_INTERVAL: Duration = Duration::from_secs(2);
+/// Ceiling on the client-side sampling round-trip that structures the
+/// brief — local inference can be slow, but not unbounded; on timeout the
+/// raw answers ship instead.
+const SAMPLING_TIMEOUT: Duration = Duration::from_secs(60);
+const SAMPLING_MAX_TOKENS: u32 = 600;
+/// How often the in-flight status line rotates during a long stage.
+const STATUS_ROTATION_INTERVAL: Duration = Duration::from_secs(4);
+
+/// The elicitation pitch is a short YC-style hook, never a wall of text:
+/// hard cap 256 chars, with the quoted need truncated so any query fits.
+const PITCH_MAX_CHARS: usize = 256;
+const PITCH_NEED_MAX_CHARS: usize = 48;
+
+/// System prompt for the sampling call that structures the free-form
+/// answers (see module docs).
+const BRIEF_SKILL: &str = include_str!("request_capability_brief.md");
 
 /// The account whose pubkey attributes the request — same default network
 /// as `get_balance`.
@@ -72,6 +92,7 @@ pub(crate) enum CapabilityRequestOutcome {
 pub async fn run(
     params: Params,
     peer: Peer<RoleServer>,
+    progress_token: Option<ProgressToken>,
 ) -> Result<CallToolResult, rmcp::ErrorData> {
     let query = params.query.trim().to_string();
     if query.is_empty() {
@@ -80,7 +101,7 @@ pub async fn run(
         ));
     }
 
-    match run_capability_request(&peer, &query, 0).await {
+    match run_capability_request(&peer, progress_token, &query).await {
         Ok(CapabilityRequestOutcome::Declined) => Ok(CallToolResult::success(vec![Content::text(
             "The user declined to request this capability.".to_string(),
         )])),
@@ -99,28 +120,52 @@ pub async fn run(
     }
 }
 
-/// One elicitation (pitch + optional details/budget, Accept = consent),
-/// then submit to every registered studio and poll for quotes. Shared by
-/// [`run`] (direct call) and `search_catalog`'s miss path. The wallet is
-/// resolved before prompting so a missing `pay setup` fails fast instead
-/// of interviewing the user and then erroring.
+/// One elicitation (pitch + two optional free-form questions, Accept =
+/// consent), a sampling pass that structures the answers, then submit to
+/// every registered studio and poll for quotes. Shared by [`run`] (direct
+/// call) and `search_catalog`'s miss path. The wallet is resolved before
+/// prompting so a missing `pay setup` fails fast instead of interviewing
+/// the user and then erroring.
 pub(crate) async fn run_capability_request(
     peer: &Peer<RoleServer>,
+    progress_token: Option<ProgressToken>,
     query: &str,
-    weak_candidates: usize,
 ) -> Result<CapabilityRequestOutcome, CapabilityRequestError> {
     let buyer_solana_pubkey = wallet_pubkey().map_err(CapabilityRequestError::Other)?;
 
-    let Some(brief) = ask_to_build(peer, query, weak_candidates).await? else {
+    let Some(brief) = ask_to_build(peer, query).await? else {
         return Ok(CapabilityRequestOutcome::Declined);
+    };
+
+    let status = Status::new(peer.clone(), progress_token);
+
+    // Nothing typed means nothing to extract — the query itself is the
+    // whole brief, so skip the model round-trip.
+    let structured = if brief.build.is_none() && brief.today.is_none() {
+        StructuredBrief::default()
+    } else {
+        with_rotating_status(
+            &status,
+            &[
+                "Reading your brief…",
+                "Pulling out scope, comparables, and budget…",
+                "Writing the request studios will quote…",
+            ],
+            structure_brief(peer, query, &brief),
+        )
+        .await
     };
 
     let request = NewCapabilityRequest {
         query: query.to_string(),
-        product: brief.details,
-        monetization: None,
-        competition: vec![],
-        budget_ceiling: brief.budget_usd.and_then(budget_from_usd),
+        product: structured.product.or_else(|| brief.build.clone()),
+        monetization: structured.monetization,
+        competition: if structured.competition.is_empty() {
+            brief.today.clone().into_iter().collect()
+        } else {
+            structured.competition
+        },
+        budget_ceiling: structured.budget_usd.and_then(budget_from_usd),
         buyer_npub: None,
         buyer_solana_pubkey: Some(buyer_solana_pubkey),
     };
@@ -134,14 +179,25 @@ pub(crate) async fn run_capability_request(
         ));
     }
 
-    let submissions =
-        pay_core::studios::submit_to_registry(&registry, &request, pay_core::ClientApp::Mcp)
-            .await
-            .map_err(|e| {
-                CapabilityRequestError::Other(format!("Failed to submit capability request: {e}"))
-            })?;
+    let submissions = with_rotating_status(
+        &status,
+        &["Pitching it to the studio network…"],
+        pay_core::studios::submit_to_registry(&registry, &request, pay_core::ClientApp::Mcp),
+    )
+    .await
+    .map_err(|e| {
+        CapabilityRequestError::Other(format!("Failed to submit capability request: {e}"))
+    })?;
 
-    let results = poll_for_quotes(submissions).await;
+    let results = with_rotating_status(
+        &status,
+        &[
+            "Waiting for studios to respond…",
+            "Checking for early quotes…",
+        ],
+        poll_for_quotes(submissions),
+    )
+    .await;
     let next_step = next_step_for(&results);
 
     Ok(CapabilityRequestOutcome::Submitted(serde_json::json!({
@@ -168,36 +224,37 @@ fn wallet_pubkey() -> Result<String, String> {
 }
 
 struct BriefInput {
-    details: Option<String>,
-    budget_usd: Option<f64>,
+    build: Option<String>,
+    today: Option<String>,
 }
 
-/// The single prompt: sell the gap, collect optional signal, and take
-/// Accept as consent to submit. Returns `Ok(None)` on Decline/Cancel.
+/// The single prompt: sell the gap, collect two free-form answers, and
+/// take Accept as consent to submit. Both answers are plain text on
+/// purpose — a model structures them afterwards, so the user never fights
+/// a form. Returns `Ok(None)` on Decline/Cancel.
 async fn ask_to_build(
     peer: &Peer<RoleServer>,
     query: &str,
-    weak_candidates: usize,
 ) -> Result<Option<BriefInput>, CapabilityRequestError> {
     let schema = ElicitationSchema::builder()
-        .optional_string_with("details", |s| {
-            s.title("What should it do?").description(
-                "Anything the builders should know — inputs, outputs, must-haves. Leave empty to send your search as the brief.",
+        .optional_string_with("build", |s| {
+            s.title("What do we want to build?").description(
+                "Say it like you'd pitch a friend — \"an API that forecasts Solana priority fees an hour ahead\". Any detail helps: inputs, outputs, budget.",
             )
         })
-        .optional_number_with("budget_usd", |n| {
-            n.range(0.0, 1_000_000.0)
-                .title("Budget ceiling (USD)")
-                .description("Rough signal for quoting — not a commitment, nothing is charged.")
+        .optional_string_with("today", |s| {
+            s.title("What service or app would you use today to achieve that?").description(
+                "Even a clunky workaround — \"I'd eyeball Jito's dashboard\". It shows studios the bar to beat.",
+            )
         })
-        .title("Let's get it built")
+        .title("Build something people want")
         .build()
         .map_err(|e| {
             CapabilityRequestError::Other(format!("failed to build capability-request schema: {e}"))
         })?;
 
     let params = CreateElicitationRequestParam {
-        message: pitch(query, weak_candidates),
+        message: pitch(query),
         requested_schema: schema,
     };
 
@@ -220,22 +277,164 @@ async fn ask_to_build(
 
     let content = outcome.content.unwrap_or_default();
     Ok(Some(BriefInput {
-        details: str_field(&content, "details"),
-        budget_usd: content.get("budget_usd").and_then(|v| v.as_f64()),
+        build: str_field(&content, "build"),
+        today: str_field(&content, "today"),
     }))
 }
 
-fn pitch(query: &str, weak_candidates: usize) -> String {
-    let gap = if weak_candidates == 0 {
-        format!("Nothing in Pay's catalog can do \"{query}\" yet — you've found a gap.")
-    } else {
-        format!(
-            "Nothing in Pay's catalog truly fits \"{query}\" (only {weak_candidates} loose keyword matches, listed in the results) — you've found a gap."
-        )
+fn pitch(query: &str) -> String {
+    let need = truncate_chars(query, PITCH_NEED_MAX_CHARS);
+    let pitch = format!(
+        "No API in Pay does \"{need}\" yet — you just found real demand.\nStudios can build & ship it: a live API, published under you, earning on every call.\nAsking is free; nothing's charged unless you accept a quote."
+    );
+    debug_assert!(pitch.chars().count() <= PITCH_MAX_CHARS);
+    pitch
+}
+
+/// Char-boundary-safe truncation with an ellipsis, counting chars (not
+/// bytes) to match the pitch's char budget.
+fn truncate_chars(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
+    out.push('…');
+    out
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct StructuredBrief {
+    product: Option<String>,
+    competition: Vec<String>,
+    budget_usd: Option<f64>,
+    monetization: Option<String>,
+}
+
+fn supports_sampling(peer: &Peer<RoleServer>) -> bool {
+    peer.peer_info()
+        .is_some_and(|info| info.capabilities.sampling.is_some())
+}
+
+/// Structure the free-form answers with the client's own model (MCP
+/// sampling), briefed by [`BRIEF_SKILL`]. Best-effort: returns the empty
+/// brief when the client can't sample, times out, or replies with
+/// something that isn't the JSON the skill asked for — the raw answers
+/// still ship in that case.
+async fn structure_brief(
+    peer: &Peer<RoleServer>,
+    query: &str,
+    brief: &BriefInput,
+) -> StructuredBrief {
+    if !supports_sampling(peer) {
+        return StructuredBrief::default();
+    }
+    let prompt = format!(
+        "Catalog search that missed: {query}\n\nWhat do we want to build:\n{}\n\nWhat would they use today:\n{}",
+        brief.build.as_deref().unwrap_or("(no answer)"),
+        brief.today.as_deref().unwrap_or("(no answer)"),
+    );
+    let request = CreateMessageRequestParam {
+        messages: vec![SamplingMessage {
+            role: Role::User,
+            content: Content::text(prompt),
+        }],
+        model_preferences: None,
+        system_prompt: Some(BRIEF_SKILL.to_string()),
+        include_context: None,
+        temperature: None,
+        max_tokens: SAMPLING_MAX_TOKENS,
+        stop_sequences: None,
+        metadata: None,
     };
-    format!(
-        "{gap} That's an opportunity: accept and the studio network is asked to build and deploy it — a real API tailored to your exact need, published under you, that other agents pay to use. You found the demand; you can own the service and monetize it. Both fields are optional. Asking is free: the request goes to studios under your Pay wallet, and nothing is charged unless you later accept a quote."
-    )
+    let Ok(Ok(result)) = tokio::time::timeout(SAMPLING_TIMEOUT, peer.create_message(request)).await
+    else {
+        return StructuredBrief::default();
+    };
+    result
+        .message
+        .content
+        .as_text()
+        .and_then(|t| parse_structured_brief(&t.text))
+        .unwrap_or_default()
+}
+
+/// Tolerates fences or prose around the JSON object the skill asked for.
+fn parse_structured_brief(raw: &str) -> Option<StructuredBrief> {
+    let start = raw.find('{')?;
+    let end = raw.rfind('}')?;
+    serde_json::from_str(raw.get(start..=end)?).ok()
+}
+
+/// Best-effort in-flight status line: MCP progress notifications when the
+/// client sent a `progressToken` with the call, logging notifications
+/// otherwise. Clients may ignore either — nothing here can fail the
+/// request.
+struct Status {
+    peer: Peer<RoleServer>,
+    token: Option<ProgressToken>,
+    step: AtomicU64,
+}
+
+impl Status {
+    fn new(peer: Peer<RoleServer>, token: Option<ProgressToken>) -> Self {
+        Self {
+            peer,
+            token,
+            step: AtomicU64::new(0),
+        }
+    }
+
+    async fn send(&self, message: &str) {
+        // Progress must be monotonically increasing per the MCP spec.
+        let step = self.step.fetch_add(1, Ordering::Relaxed) + 1;
+        match &self.token {
+            Some(token) => {
+                let _ = self
+                    .peer
+                    .notify_progress(ProgressNotificationParam {
+                        progress_token: token.clone(),
+                        progress: step as f64,
+                        total: None,
+                        message: Some(message.to_string()),
+                    })
+                    .await;
+            }
+            None => {
+                let _ = self
+                    .peer
+                    .notify_logging_message(LoggingMessageNotificationParam {
+                        level: LoggingLevel::Info,
+                        logger: Some("request_capability".to_string()),
+                        data: serde_json::Value::String(message.to_string()),
+                    })
+                    .await;
+            }
+        }
+    }
+}
+
+/// Run `fut` while rotating through `messages` on a timer, so the user
+/// sees what's happening during a long stage instead of a frozen spinner.
+async fn with_rotating_status<T>(
+    status: &Status,
+    messages: &[&str],
+    fut: impl Future<Output = T>,
+) -> T {
+    status.send(messages[0]).await;
+    tokio::pin!(fut);
+    let mut interval = tokio::time::interval(STATUS_ROTATION_INTERVAL);
+    interval.tick().await; // the first tick completes immediately
+    let mut next = 1usize;
+    loop {
+        tokio::select! {
+            out = &mut fut => return out,
+            _ = interval.tick() => {
+                status.send(messages[next % messages.len()]).await;
+                next += 1;
+            }
+        }
+    }
 }
 
 fn budget_from_usd(usd: f64) -> Option<BudgetAmount> {
@@ -429,15 +628,39 @@ mod tests {
     }
 
     #[test]
-    fn pitch_mentions_weak_matches_only_when_present() {
-        let clean = pitch("solana priority fee forecasts", 0);
-        assert!(clean.contains("can do"));
-        assert!(!clean.contains("loose keyword"));
-        let noisy = pitch("solana priority fee forecasts", 5);
-        assert!(noisy.contains("5 loose keyword matches"));
-        for message in [&clean, &noisy] {
-            assert!(message.contains("monetize"));
-            assert!(message.contains("nothing is charged"));
+    fn pitch_stays_short_and_multiline() {
+        let short = pitch("solana priority fee forecasts");
+        assert!(short.contains("solana priority fee forecasts"));
+        let long = pitch(&"x".repeat(500));
+        for message in [&short, &long] {
+            assert!(
+                message.chars().count() <= PITCH_MAX_CHARS,
+                "pitch is {} chars",
+                message.chars().count()
+            );
+            assert_eq!(message.matches('\n').count(), 2);
         }
+    }
+
+    #[test]
+    fn truncate_chars_is_char_boundary_safe() {
+        assert_eq!(truncate_chars("héllo", 10), "héllo");
+        assert_eq!(truncate_chars("héllo wörld", 6), "héllo…");
+        assert_eq!(truncate_chars("日本語のテキスト", 4), "日本語…");
+    }
+
+    #[test]
+    fn parse_structured_brief_tolerates_fences_and_prose() {
+        let fenced = "Here you go:\n```json\n{\"product\": \"fee forecast API\", \"competition\": [\"Jito dashboard\"], \"budget_usd\": 50}\n```";
+        let brief = parse_structured_brief(fenced).unwrap();
+        assert_eq!(brief.product.as_deref(), Some("fee forecast API"));
+        assert_eq!(brief.competition, vec!["Jito dashboard"]);
+        assert_eq!(brief.budget_usd, Some(50.0));
+        assert_eq!(brief.monetization, None);
+
+        // Partial objects deserialize with defaults; garbage does not.
+        assert!(parse_structured_brief("{}").is_some());
+        assert!(parse_structured_brief("no json here").is_none());
+        assert!(parse_structured_brief("{not json}").is_none());
     }
 }
