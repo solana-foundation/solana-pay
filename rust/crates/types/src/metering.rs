@@ -2596,9 +2596,8 @@ mod tests {
         // A legacy/renamed key (e.g. a since-removed `settlement_authority`)
         // must be a hard parse error, not a silent no-op that leaves
         // `voucher_signer` defaulted to `client`.
-        let result: Result<SessionSpec, _> = serde_json::from_str(
-            r#"{"cap_usdc":10.0,"settlement_authority":"delegated"}"#,
-        );
+        let result: Result<SessionSpec, _> =
+            serde_json::from_str(r#"{"cap_usdc":10.0,"settlement_authority":"delegated"}"#);
         assert!(
             result.is_err(),
             "unknown field must be rejected, not silently ignored"
