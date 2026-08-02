@@ -300,12 +300,12 @@ fn call_plan_fields() -> Vec<String> {
 
 fn next_step_for_candidates(candidates: &[CandidateEntry]) -> String {
     let Some(top) = candidates.first() else {
-        return "No matching provider was found. Retry search_catalog once with refresh=true if the catalog may be stale. This client could not be asked for capability-request consent, so nothing was submitted; call request_capability directly if the user wants a new provider built, otherwise ask before using a non-Pay fallback.".to_string();
+        return "No matching provider was found. Retry search_catalog once with refresh=true if the catalog may be stale. This client could not be asked for capability-request consent, so nothing was submitted; call request_capability to offer getting it built — frame it as the opportunity it is (the user found unmet demand; a studio builds and deploys the API and the user publishes and monetizes it), not as a formality — otherwise ask before using a non-Pay fallback.".to_string();
     };
 
     if !candidates.iter().any(|c| c.strong) {
         return format!(
-            "Every candidate is a weak keyword match; none clearly fits the task. Inspect `{}` with get_catalog_entry if it might still cover it — but if nothing here actually covers the user's need, call request_capability with the task: it asks the user for consent itself, so calling it on a suspected miss is safe.",
+            "Every candidate is a weak keyword match; none clearly fits the task. Inspect `{}` with get_catalog_entry if it might still cover it. If nothing here covers the user's need, they just found a gap in the catalog — an opportunity, not a dead end: call request_capability with the task directly instead of asking permission in chat (the tool prompts the user itself; a chat-level pre-ask is a duplicate consent step). If you mention it at all, pitch what it is — a studio builds and deploys the API and the user publishes and monetizes it — never a bureaucratic 'capability request submission'.",
             top.fqn
         );
     }

@@ -80,11 +80,12 @@ clearly matches the task; otherwise inspect one likely provider with
 On a real miss (no candidate clearly fits — weak keyword matches may still be
 listed), this tool itself asks the user — one prompt, accept-to-send — whether
 to have the studio registry build the capability, and on accept runs the same
-submission flow as `request_capability` before returning. If the connected
-client doesn't support elicitation, the response falls back to a text hint
-naming `request_capability` instead. You never need to call
-`request_capability` yourself right after a missed `search_catalog` — it has
-already been offered.
+submission flow as `request_capability` before returning. When the response
+contains a `capability_request`, the user has already been asked — do not ask
+again in chat and do not call `request_capability` for the same query.
+Otherwise follow the response's `next_step`: it says when to call
+`request_capability` directly (call it without pre-asking in chat — its own
+prompt is the consent step).
 "#
     )]
     async fn search_catalog(
@@ -109,9 +110,11 @@ Pay can do, present the catalog grouped by category so they can scan available
 APIs/skills.
 
 If the catalog does NOT cover the user's need, do not stop at "no": call
-`search_catalog` with the user's real task. On a miss it offers (via user
-consent) a capability request to the studio registry, so the unmet need is
-recorded instead of dead-ending.
+`search_catalog` with the user's real task. On a miss it prompts the user
+itself (never pre-ask in chat) with an offer to have the capability built
+by the studio registry — a gap in the catalog is an opportunity for the
+user to get an API built, published, and monetized under them, so present
+it that way instead of dead-ending at "no".
 "#)]
     async fn list_catalog(
         &self,
@@ -197,15 +200,19 @@ For detailed authoring guidance, use the Pay skill reference
 `search_catalog` offers this automatically on a clear miss — when its
 response already contains a `capability_request`, the user has been asked;
 do not call this again for the same query. In every other uncovered case,
-call it: search returned only weak keyword matches that don't actually do
-the user's task, `list_catalog` showed nothing fitting, or the user asks to
-have something built. The tool shows a single accept-to-send prompt
-(optional details and budget) and that prompt itself is the consent gate,
-so calling it on a suspected miss is safe — declining costs nothing and
-submits nothing. On accept it attributes the request to the user's Pay
-wallet, submits it to every registered studio, and reports back either a
-quote or that the request is pending. This never spends funds; accepting
-and funding a quote is a separate step.
+call it directly: search returned only weak keyword matches that don't
+actually do the user's task, `list_catalog` showed nothing fitting, or the
+user asks to have something built. NEVER pre-ask for permission in chat —
+the tool's single accept-to-send prompt (optional details and budget) IS
+the consent step, so a chat-level ask is a duplicate; calling on a
+suspected miss is safe because declining costs nothing and submits
+nothing. When you talk about it, frame it as what it is: the user found
+unmet demand, a studio builds and deploys the API, and the user publishes
+and monetizes it — an agentic business opportunity, not paperwork. On
+accept it attributes the request to the user's Pay wallet, submits it to
+every registered studio, and reports back either a quote or that the
+request is pending. This never spends funds; accepting and funding a quote
+is a separate step.
 "#
     )]
     async fn request_capability(

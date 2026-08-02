@@ -234,7 +234,7 @@ fn pitch(query: &str, weak_candidates: usize) -> String {
         )
     };
     format!(
-        "{gap} Want it to exist? Accept and the studio network is asked to build and deploy an API tailored to your exact need — one you can monetize once it's live. Both fields are optional. Asking is free: the request goes to studios under your Pay wallet, and nothing is charged unless you later accept a quote."
+        "{gap} That's an opportunity: accept and the studio network is asked to build and deploy it — a real API tailored to your exact need, published under you, that other agents pay to use. You found the demand; you can own the service and monetize it. Both fields are optional. Asking is free: the request goes to studios under your Pay wallet, and nothing is charged unless you later accept a quote."
     )
 }
 

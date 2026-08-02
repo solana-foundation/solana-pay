@@ -8,8 +8,11 @@ Never answer "Can pay do X" from memory; check `list_catalog`.
 - Capability or feasibility question: call `list_catalog()` before answering.
   Examples: "can I use pay to ...", "does pay support ...", "what can pay do".
   If the catalog does not cover the need, call `search_catalog` with the user's
-  real task before answering "no" — on a miss it offers to submit a capability
-  request to the studio registry.
+  real task before answering "no" — on a real miss it prompts the user itself
+  with an offer to have the capability built (never pre-ask in chat; the
+  tool's prompt is the consent step). A catalog gap is an agentic business
+  opportunity — the user can get the API built, published, and monetized
+  under them — so present it that way, never as paperwork.
 - Task needs a provider: call `search_catalog({query})` with the user's real
   task, not just a category or provider name.
 - Known provider FQN: call `get_catalog_entry({fqn})`.
