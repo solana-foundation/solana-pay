@@ -359,6 +359,7 @@ pub fn build_upto_payment_with_override(
             default_rpc_url(&network).to_string()
         }
     });
+    let rpc = RpcClient::new(rpc_url.clone());
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -389,6 +390,7 @@ pub fn build_upto_payment_with_override(
     let header = rt
         .block_on(pay_kit::x402::client::upto::build_upto_header(
             &signer,
+            &rpc,
             requirements,
             expires_at,
             nonce,
