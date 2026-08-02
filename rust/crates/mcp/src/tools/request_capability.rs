@@ -1,15 +1,14 @@
 //! `request_capability` — ask the studio registry to build a capability
 //! `search_catalog`/`list_catalog` couldn't find (commission-flow draft-00).
 //!
-//! Never auto-invoked: the first elicitation is consent to run the
-//! interview at all, a second (independent) safety net on top of
-//! `search_catalog`'s next-step text only *naming* this tool rather than
-//! calling it. v0 collects only the fields the studio's `NewRfq` wire shape
-//! already accepts (query/product/monetization/competition/budget_ceiling/
-//! buyer_npub); the richer cost-metrics interview (freshness, volume,
-//! upstream deps, WTP band) lands once the studio side adds a `brief`
-//! object to `schemas/rfq.json` — `NewRfq` is `deny_unknown_fields`, so
-//! sending those fields today would 422.
+//! Never auto-invoked: a single elicitation is both the pitch and the
+//! consent gate — Accept submits, Decline/Cancel walks away with nothing
+//! sent. The buyer is attributed by the Solana pubkey of the local Pay
+//! wallet (the key the engagement would be funded with), never prompted
+//! for. v0 sends only the fields the studio's `NewRfq` wire shape accepts;
+//! the richer cost-metrics brief (freshness, volume, upstream deps) lands
+//! once the studio side's `brief` object ships — `NewRfq` is
+//! `deny_unknown_fields`, so sending those fields today would 422.
 
 use std::time::Duration;
 
@@ -32,13 +31,42 @@ const ELICITATION_TIMEOUT: Duration = Duration::from_secs(300);
 const QUOTE_POLL_ATTEMPTS: u32 = 3;
 const QUOTE_POLL_INTERVAL: Duration = Duration::from_secs(2);
 
+/// The account whose pubkey attributes the request — same default network
+/// as `get_balance`.
+const WALLET_NETWORK: &str = "mainnet";
+/// Mainnet USDC — `budget_usd` is denominated in it (minor units = 1e-6).
+const USDC_MINT: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+const USDC_PER_MINOR_UNIT: f64 = 1_000_000.0;
+
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct Params {
     /// The capability the user wanted that no existing Pay provider covers.
     #[schemars(
-        description = "The task or capability the user wanted that search_catalog/list_catalog found no usable provider for. Only call this after a real catalog miss and only when the user wants to request a new one; do not call speculatively."
+        description = "The task or capability the user wanted that search_catalog/list_catalog found no usable provider for. The tool asks the user before anything is sent, so calling it on a suspected miss is safe."
     )]
     pub query: String,
+}
+
+/// Why a capability request didn't produce a submission. Split so callers
+/// with a graceful fallback (search_catalog's plain text hint) can treat a
+/// failed elicitation round-trip — commonly a client with no elicitation
+/// support — differently from a real error worth surfacing.
+pub(crate) enum CapabilityRequestError {
+    Elicitation(String),
+    Other(String),
+}
+
+impl CapabilityRequestError {
+    pub(crate) fn into_message(self) -> String {
+        match self {
+            Self::Elicitation(message) | Self::Other(message) => message,
+        }
+    }
+}
+
+pub(crate) enum CapabilityRequestOutcome {
+    Declined,
+    Submitted(serde_json::Value),
 }
 
 pub async fn run(
@@ -52,18 +80,11 @@ pub async fn run(
         ));
     }
 
-    match ask_consent(&peer, &query).await {
-        Ok(true) => {}
-        Ok(false) => {
-            return Ok(CallToolResult::success(vec![Content::text(
-                "The user declined to request this capability.".to_string(),
-            )]));
-        }
-        Err(message) => return Ok(super::tool_error(message)),
-    }
-
-    match run_capability_request(&peer, &query).await {
-        Ok(response) => {
+    match run_capability_request(&peer, &query, 0).await {
+        Ok(CapabilityRequestOutcome::Declined) => Ok(CallToolResult::success(vec![Content::text(
+            "The user declined to request this capability.".to_string(),
+        )])),
+        Ok(CapabilityRequestOutcome::Submitted(response)) => {
             let json = match serde_json::to_string_pretty(&response) {
                 Ok(json) => json,
                 Err(e) => {
@@ -74,155 +95,153 @@ pub async fn run(
             };
             Ok(CallToolResult::success(vec![Content::text(json)]))
         }
-        Err(message) => Ok(super::tool_error(message)),
+        Err(error) => Ok(super::tool_error(error.into_message())),
     }
 }
 
-/// Interview the user for a capability brief, submit it to every registered
-/// studio, and poll for quotes. Shared by [`run`] (direct call) and
-/// `search_catalog`'s miss-path elicitation — both callers must obtain
-/// [`ask_consent`] first; this function assumes consent is already granted.
+/// One elicitation (pitch + optional details/budget, Accept = consent),
+/// then submit to every registered studio and poll for quotes. Shared by
+/// [`run`] (direct call) and `search_catalog`'s miss path. The wallet is
+/// resolved before prompting so a missing `pay setup` fails fast instead
+/// of interviewing the user and then erroring.
 pub(crate) async fn run_capability_request(
     peer: &Peer<RoleServer>,
     query: &str,
-) -> Result<serde_json::Value, String> {
-    let brief = ask_brief(peer, query).await?;
+    weak_candidates: usize,
+) -> Result<CapabilityRequestOutcome, CapabilityRequestError> {
+    let buyer_solana_pubkey = wallet_pubkey().map_err(CapabilityRequestError::Other)?;
+
+    let Some(brief) = ask_to_build(peer, query, weak_candidates).await? else {
+        return Ok(CapabilityRequestOutcome::Declined);
+    };
 
     let request = NewCapabilityRequest {
         query: query.to_string(),
-        product: brief.product,
-        monetization: brief.monetization,
-        competition: brief.competition,
-        budget_ceiling: brief.budget_ceiling,
-        buyer_npub: brief.buyer_npub,
+        product: brief.details,
+        monetization: None,
+        competition: vec![],
+        budget_ceiling: brief.budget_usd.and_then(budget_from_usd),
+        buyer_npub: None,
+        buyer_solana_pubkey: Some(buyer_solana_pubkey),
     };
 
-    let registry =
-        StudioRegistry::load().map_err(|e| format!("Failed to load studio registry: {e}"))?;
+    let registry = StudioRegistry::load().map_err(|e| {
+        CapabilityRequestError::Other(format!("Failed to load studio registry: {e}"))
+    })?;
     if registry.studios.is_empty() {
-        return Err("No studios are registered in ~/.config/pay/studios.yaml.".to_string());
+        return Err(CapabilityRequestError::Other(
+            "No studios are registered in ~/.config/pay/studios.yaml.".to_string(),
+        ));
     }
 
     let submissions =
         pay_core::studios::submit_to_registry(&registry, &request, pay_core::ClientApp::Mcp)
             .await
-            .map_err(|e| format!("Failed to submit capability request: {e}"))?;
+            .map_err(|e| {
+                CapabilityRequestError::Other(format!("Failed to submit capability request: {e}"))
+            })?;
 
     let results = poll_for_quotes(submissions).await;
     let next_step = next_step_for(&results);
 
-    Ok(serde_json::json!({
+    Ok(CapabilityRequestOutcome::Submitted(serde_json::json!({
         "query": query,
         "submissions": results,
         "next_step": next_step,
-    }))
+    })))
 }
 
-pub(crate) async fn ask_consent(peer: &Peer<RoleServer>, query: &str) -> Result<bool, String> {
+/// The Solana pubkey the request is attributed to — read-only account
+/// metadata, no keypair load and no signing prompt.
+fn wallet_pubkey() -> Result<String, String> {
+    let accounts = pay_core::accounts::AccountsFile::load()
+        .map_err(|e| format!("Failed to load Pay accounts: {e}"))?;
+    let Some((_name, account)) = accounts.account_for_network(WALLET_NETWORK) else {
+        return Err(format!(
+            "No Pay account is configured for {WALLET_NETWORK}; run `pay setup` first — the capability request is attributed to your wallet."
+        ));
+    };
+    account
+        .pubkey
+        .clone()
+        .ok_or_else(|| "Pay account has no pubkey. Run `pay setup` again.".to_string())
+}
+
+struct BriefInput {
+    details: Option<String>,
+    budget_usd: Option<f64>,
+}
+
+/// The single prompt: sell the gap, collect optional signal, and take
+/// Accept as consent to submit. Returns `Ok(None)` on Decline/Cancel.
+async fn ask_to_build(
+    peer: &Peer<RoleServer>,
+    query: &str,
+    weak_candidates: usize,
+) -> Result<Option<BriefInput>, CapabilityRequestError> {
     let schema = ElicitationSchema::builder()
-        .required_bool("proceed")
+        .optional_string_with("details", |s| {
+            s.title("What should it do?").description(
+                "Anything the builders should know — inputs, outputs, must-haves. Leave empty to send your search as the brief.",
+            )
+        })
+        .optional_number_with("budget_usd", |n| {
+            n.range(0.0, 1_000_000.0)
+                .title("Budget ceiling (USD)")
+                .description("Rough signal for quoting — not a commitment, nothing is charged.")
+        })
+        .title("Let's get it built")
         .build()
-        .expect("required_bool registers `proceed` in properties");
+        .map_err(|e| {
+            CapabilityRequestError::Other(format!("failed to build capability-request schema: {e}"))
+        })?;
+
     let params = CreateElicitationRequestParam {
-        message: format!(
-            "Pay found no existing provider for \"{query}\". Start a capability-request interview to ask the studio registry for a custom-built endpoint? This submits a public demand record (RFQ) attributed to your identity; no payment is taken yet."
-        ),
+        message: pitch(query, weak_candidates),
         requested_schema: schema,
     };
 
     let outcome = tokio::time::timeout(ELICITATION_TIMEOUT, peer.create_elicitation(params))
         .await
-        .map_err(|_| "Timed out waiting for capability-request consent.".to_string())?
-        .map_err(|e| format!("Could not obtain capability-request consent: {e}"))?;
+        .map_err(|_| {
+            CapabilityRequestError::Elicitation(
+                "Timed out waiting for the capability-request prompt.".to_string(),
+            )
+        })?
+        .map_err(|e| {
+            CapabilityRequestError::Elicitation(format!(
+                "Could not prompt for a capability request: {e}"
+            ))
+        })?;
 
-    Ok(matches!(outcome.action, ElicitationAction::Accept)
-        && outcome
-            .content
-            .as_ref()
-            .and_then(|v| v.get("proceed"))
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false))
-}
-
-struct Brief {
-    product: Option<String>,
-    monetization: Option<String>,
-    competition: Vec<String>,
-    budget_ceiling: Option<BudgetAmount>,
-    buyer_npub: String,
-}
-
-async fn ask_brief(peer: &Peer<RoleServer>, query: &str) -> Result<Brief, String> {
-    let schema = ElicitationSchema::builder()
-        .required_string("buyer_npub")
-        .optional_string("product")
-        .optional_string("monetization")
-        .optional_string("competition")
-        .optional_number("budget_ceiling_amount", 0.0, 1_000_000_000.0)
-        .optional_string("budget_ceiling_mint")
-        .title("Capability brief")
-        .description(format!(
-            "Tell the studio what you need built for: \"{query}\""
-        ))
-        .build()
-        .map_err(|e| format!("failed to build brief schema: {e}"))?;
-
-    let params = CreateElicitationRequestParam {
-        message: "Describe what you want built. `buyer_npub` is your Nostr identity (e.g. your Buzz npub) — the studio attributes the demand record to it. Everything else is optional signal that helps the studio quote.".to_string(),
-        requested_schema: schema,
-    };
-
-    let outcome = tokio::time::timeout(ELICITATION_TIMEOUT, peer.create_elicitation(params))
-        .await
-        .map_err(|_| "Timed out waiting for the capability brief.".to_string())?
-        .map_err(|e| format!("Could not obtain the capability brief: {e}"))?;
-
-    match outcome.action {
-        ElicitationAction::Accept => {}
-        ElicitationAction::Decline => {
-            return Err("The user declined to provide a capability brief.".to_string());
-        }
-        ElicitationAction::Cancel => {
-            return Err("The user cancelled the capability brief.".to_string());
-        }
+    if !matches!(outcome.action, ElicitationAction::Accept) {
+        return Ok(None);
     }
 
     let content = outcome.content.unwrap_or_default();
+    Ok(Some(BriefInput {
+        details: str_field(&content, "details"),
+        budget_usd: content.get("budget_usd").and_then(|v| v.as_f64()),
+    }))
+}
 
-    let buyer_npub = str_field(&content, "buyer_npub").unwrap_or_default();
-    if buyer_npub.is_empty() {
-        return Err("`buyer_npub` is required to attribute the capability request.".to_string());
-    }
-
-    let product = str_field(&content, "product");
-    let monetization = str_field(&content, "monetization");
-    let competition = str_field(&content, "competition")
-        .map(|raw| {
-            raw.split(',')
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .collect()
-        })
-        .unwrap_or_default();
-
-    let budget_amount = content
-        .get("budget_ceiling_amount")
-        .and_then(|v| v.as_f64());
-    let budget_mint = str_field(&content, "budget_ceiling_mint");
-    let budget_ceiling = match (budget_amount, budget_mint) {
-        (Some(amount), Some(mint)) if amount > 0.0 => Some(BudgetAmount {
-            amount: amount.round() as u64,
-            mint,
-        }),
-        _ => None,
+fn pitch(query: &str, weak_candidates: usize) -> String {
+    let gap = if weak_candidates == 0 {
+        format!("Nothing in Pay's catalog can do \"{query}\" yet — you've found a gap.")
+    } else {
+        format!(
+            "Nothing in Pay's catalog truly fits \"{query}\" (only {weak_candidates} loose keyword matches, listed in the results) — you've found a gap."
+        )
     };
+    format!(
+        "{gap} Want it to exist? Accept and the studio network is asked to build and deploy an API tailored to your exact need — one you can monetize once it's live. Both fields are optional. Asking is free: the request goes to studios under your Pay wallet, and nothing is charged unless you later accept a quote."
+    )
+}
 
-    Ok(Brief {
-        product,
-        monetization,
-        competition,
-        budget_ceiling,
-        buyer_npub,
+fn budget_from_usd(usd: f64) -> Option<BudgetAmount> {
+    (usd.is_finite() && usd > 0.0).then(|| BudgetAmount {
+        amount: (usd * USDC_PER_MINOR_UNIT).round() as u64,
+        mint: USDC_MINT.to_string(),
     })
 }
 
@@ -392,5 +411,33 @@ mod tests {
         assert_eq!(str_field(&content, "b"), None);
         assert_eq!(str_field(&content, "c"), None);
         assert_eq!(str_field(&content, "missing"), None);
+    }
+
+    #[test]
+    fn budget_from_usd_converts_to_usdc_minor_units() {
+        let budget = budget_from_usd(12.5).unwrap();
+        assert_eq!(budget.amount, 12_500_000);
+        assert_eq!(budget.mint, USDC_MINT);
+    }
+
+    #[test]
+    fn budget_from_usd_rejects_non_positive_and_non_finite() {
+        assert!(budget_from_usd(0.0).is_none());
+        assert!(budget_from_usd(-3.0).is_none());
+        assert!(budget_from_usd(f64::NAN).is_none());
+        assert!(budget_from_usd(f64::INFINITY).is_none());
+    }
+
+    #[test]
+    fn pitch_mentions_weak_matches_only_when_present() {
+        let clean = pitch("solana priority fee forecasts", 0);
+        assert!(clean.contains("can do"));
+        assert!(!clean.contains("loose keyword"));
+        let noisy = pitch("solana priority fee forecasts", 5);
+        assert!(noisy.contains("5 loose keyword matches"));
+        for message in [&clean, &noisy] {
+            assert!(message.contains("monetize"));
+            assert!(message.contains("nothing is charged"));
+        }
     }
 }

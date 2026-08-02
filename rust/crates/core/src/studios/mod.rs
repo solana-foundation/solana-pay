@@ -96,7 +96,15 @@ pub struct NewCapabilityRequest {
     pub competition: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub budget_ceiling: Option<BudgetAmount>,
-    pub buyer_npub: String,
+    /// Buyer identity, Nostr side. The studio requires at least one of
+    /// `buyer_npub` / `buyer_solana_pubkey`; the MCP intake path attributes
+    /// with the Solana key the engagement would be funded with and never
+    /// collects an npub.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub buyer_npub: Option<String>,
+    /// Buyer identity, Solana side — the local Pay wallet's pubkey.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub buyer_solana_pubkey: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -229,8 +237,8 @@ mod tests {
             monetization: None,
             competition: vec![],
             budget_ceiling: None,
-            buyer_npub: "npub1cscv4empnwmfyurd6utlwmq3h3dzpesjyhtttt6rk69hndk9w0nqr65xpy"
-                .to_string(),
+            buyer_npub: None,
+            buyer_solana_pubkey: Some("4Nd1mBQtrMJVYVfKf2PJy9NZUZdTAsp7D4xWLs4gDB4T".to_string()),
         };
         let json = serde_json::to_value(&request).unwrap();
         let obj = json.as_object().unwrap();
@@ -238,6 +246,14 @@ mod tests {
         assert!(!obj.contains_key("monetization"));
         assert!(!obj.contains_key("competition"));
         assert!(!obj.contains_key("budget_ceiling"));
+        // Absent identity halves must be omitted, not serialized as null —
+        // the studio's `NewRfq` treats explicit null as a present-but-invalid
+        // value for the schema regex.
+        assert!(!obj.contains_key("buyer_npub"));
+        assert_eq!(
+            obj["buyer_solana_pubkey"],
+            "4Nd1mBQtrMJVYVfKf2PJy9NZUZdTAsp7D4xWLs4gDB4T"
+        );
         assert_eq!(obj["query"], "solana priority fee forecast api");
     }
 
@@ -252,10 +268,16 @@ mod tests {
                 amount: 10_000_000,
                 mint: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v".to_string(),
             }),
-            buyer_npub: "npub1cscv4empnwmfyurd6utlwmq3h3dzpesjyhtttt6rk69hndk9w0nqr65xpy"
-                .to_string(),
+            buyer_npub: Some(
+                "npub1cscv4empnwmfyurd6utlwmq3h3dzpesjyhtttt6rk69hndk9w0nqr65xpy".to_string(),
+            ),
+            buyer_solana_pubkey: None,
         };
         let json = serde_json::to_value(&request).unwrap();
+        assert_eq!(
+            json["buyer_npub"],
+            "npub1cscv4empnwmfyurd6utlwmq3h3dzpesjyhtttt6rk69hndk9w0nqr65xpy"
+        );
         assert_eq!(json["product"], "a live forecast endpoint");
         assert_eq!(json["competition"][0], "incumbent/api");
         assert_eq!(json["budget_ceiling"]["amount"], 10_000_000);

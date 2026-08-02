@@ -43,6 +43,11 @@ struct SearchCatalogResponse {
     next_step: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     capability_request: Option<serde_json::Value>,
+    /// Internal gate for the capability-request offer (see
+    /// `pay_core::skills::is_catalog_miss`) — not part of the wire response;
+    /// the offer's outcome is reported via `capability_request`/`next_step`.
+    #[serde(skip)]
+    catalog_miss: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -59,6 +64,11 @@ struct CandidateEntry {
     max_price_usd: f64,
     score: u32,
     reasons: Vec<String>,
+    /// Whether this candidate clearly fits the query (see
+    /// `pay_core::skills::RankedServiceSummary::strong`). When no candidate
+    /// is strong, the search counts as a catalog miss for the
+    /// capability-request offer even though weak matches are listed.
+    strong: bool,
     endpoints: Vec<EndpointEntry>,
     #[serde(skip_serializing_if = "Option::is_none")]
     endpoint_lookup_error: Option<String>,
@@ -119,8 +129,15 @@ pub async fn run(
     )
     .await;
 
-    if response.candidates.is_empty()
-        && let Some(capability_request) = offer_capability_request(&peer, &query).await
+    // Offer gate: a hard miss, or a specific query with only weak keyword
+    // noise (an is_empty() gate never fired — term-overlap noise once scored
+    // an air-quality API at 96 on "solana priority fee forecasts" — while a
+    // bare no-strong gate fires on over half of ordinary fuzzy searches).
+    // For weak-only vague queries the next_step hint below routes the model
+    // to `request_capability` instead of prompting the user directly.
+    if response.catalog_miss
+        && let Some(capability_request) =
+            offer_capability_request(&peer, &query, response.candidates.len()).await
     {
         response.next_step = next_step_for_capability_request(&capability_request);
         response.capability_request = Some(capability_request);
@@ -140,26 +157,27 @@ pub async fn run(
     )]))
 }
 
-/// On a catalog miss, ask the connected MCP client for consent to submit a
-/// capability request, then run the same interview + studio-submission flow
-/// `request_capability` uses. Returns `None` when the client doesn't support
-/// elicitation (or the round-trip otherwise fails) so callers fall back to
-/// the plain text hint in [`next_step_for_candidates`] instead of erroring
-/// the whole search.
+/// On a catalog miss, run the same single-prompt build-request flow
+/// `request_capability` uses — the elicitation itself is the consent gate.
+/// Returns `None` when the elicitation round-trip fails (commonly a client
+/// with no elicitation support) so callers fall back to the plain text hint
+/// in [`next_step_for_candidates`] instead of erroring the whole search.
 async fn offer_capability_request(
     peer: &rmcp::Peer<rmcp::service::RoleServer>,
     query: &str,
+    weak_candidates: usize,
 ) -> Option<serde_json::Value> {
-    match super::request_capability::ask_consent(peer, query).await {
-        Ok(true) => match super::request_capability::run_capability_request(peer, query).await {
-            Ok(value) => Some(value),
-            Err(message) => Some(serde_json::json!({ "status": "failed", "error": message })),
-        },
-        Ok(false) => Some(serde_json::json!({
+    use super::request_capability::{CapabilityRequestError, CapabilityRequestOutcome};
+    match super::request_capability::run_capability_request(peer, query, weak_candidates).await {
+        Ok(CapabilityRequestOutcome::Submitted(value)) => Some(value),
+        Ok(CapabilityRequestOutcome::Declined) => Some(serde_json::json!({
             "status": "declined",
             "message": "The user declined to request this capability.",
         })),
-        Err(_) => None,
+        Err(CapabilityRequestError::Elicitation(_)) => None,
+        Err(CapabilityRequestError::Other(message)) => {
+            Some(serde_json::json!({ "status": "failed", "error": message }))
+        }
     }
 }
 
@@ -207,6 +225,7 @@ async fn build_search_catalog_response(
         category.as_deref(),
         max_results,
     );
+    let catalog_miss = pay_core::skills::is_catalog_miss(&query, &ranked);
 
     let candidates: Vec<CandidateEntry> = ranked
         .into_iter()
@@ -232,6 +251,7 @@ async fn build_search_catalog_response(
                 max_price_usd: candidate.service.max_price_usd,
                 score: candidate.score,
                 reasons: candidate.reasons,
+                strong: candidate.strong,
                 endpoints,
             }
         })
@@ -245,6 +265,7 @@ async fn build_search_catalog_response(
         call_plan_fields: call_plan_fields(),
         next_step,
         capability_request: None,
+        catalog_miss,
     }
 }
 
@@ -281,6 +302,13 @@ fn next_step_for_candidates(candidates: &[CandidateEntry]) -> String {
     let Some(top) = candidates.first() else {
         return "No matching provider was found. Retry search_catalog once with refresh=true if the catalog may be stale. This client could not be asked for capability-request consent, so nothing was submitted; call request_capability directly if the user wants a new provider built, otherwise ask before using a non-Pay fallback.".to_string();
     };
+
+    if !candidates.iter().any(|c| c.strong) {
+        return format!(
+            "Every candidate is a weak keyword match; none clearly fits the task. Inspect `{}` with get_catalog_entry if it might still cover it — but if nothing here actually covers the user's need, call request_capability with the task: it asks the user for consent itself, so calling it on a suspected miss is safe.",
+            top.fqn
+        );
+    }
 
     if top.endpoint_lookup_error.is_some() || top.endpoints.is_empty() {
         return format!(
@@ -424,7 +452,15 @@ mod tests {
     use super::*;
     use std::collections::BTreeMap;
 
-    const GLOBAL_CURRENT_BENCHMARK: f64 = 83.722;
+    // Repinned after the miss-detection scoring fixes (shared curation-org
+    // prefixes stop earning term-match credit; the provider-size bonus no
+    // longer keeps zero-term-match providers in the list): rank-weighted
+    // 83.722 -> 83.117, top1 unchanged at 77.111 (694/900 rank-1). The
+    // rank-weighted drop is 94 fuzzy prompts whose expected provider used
+    // to appear at rank 2-5 purely via the size bonus (score 6-12, no term
+    // matched) — luck, not routing signal, and the same floor that made a
+    // catalog miss undetectable.
+    const GLOBAL_CURRENT_BENCHMARK: f64 = 83.117;
     const GLOBAL_CURRENT_TOP1_BENCHMARK: f64 = 77.111;
     const BENCHMARK_EPSILON: f64 = 0.001;
 
@@ -469,7 +505,26 @@ mod tests {
                 .iter()
                 .any(|field| field == "estimated total spend")
         );
-        assert!(response.next_step.contains("call plan") || response.next_step.contains("Compare"));
+        // Every candidate for this fuzzy phrasing is a weak keyword match,
+        // so next_step routes the model to the consent-gated
+        // request_capability escape hatch instead of endpoint comparison.
+        assert!(response.next_step.contains("request_capability"));
+    }
+
+    #[tokio::test]
+    async fn search_catalog_next_step_compares_when_fit_is_clear() {
+        let response = build_search_catalog_response(
+            bench_catalog(),
+            "instagram influencer search by location".to_string(),
+            None,
+            5,
+            pay_core::ClientApp::Cli,
+        )
+        .await;
+        assert!(!response.candidates.is_empty());
+        assert!(response.candidates.iter().any(|c| c.strong));
+        assert!(!response.catalog_miss);
+        assert!(!response.next_step.contains("request_capability"));
     }
 
     #[test]

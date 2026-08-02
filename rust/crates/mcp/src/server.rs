@@ -77,13 +77,14 @@ fields, and the next provider-selection step. Select an endpoint only when it
 clearly matches the task; otherwise inspect one likely provider with
 `get_catalog_entry` or ask the user.
 
-On a real miss (no candidates), this tool itself elicits the user for
-consent to submit a capability request to the studio registry, and on accept
-runs the same brief-interview and submission flow as `request_capability`
-before returning. If the connected client doesn't support elicitation, the
-response falls back to a text hint naming `request_capability` instead. You
-never need to call `request_capability` yourself right after an empty
-`search_catalog` result — it has already been offered.
+On a real miss (no candidate clearly fits — weak keyword matches may still be
+listed), this tool itself asks the user — one prompt, accept-to-send — whether
+to have the studio registry build the capability, and on accept runs the same
+submission flow as `request_capability` before returning. If the connected
+client doesn't support elicitation, the response falls back to a text hint
+naming `request_capability` instead. You never need to call
+`request_capability` yourself right after a missed `search_catalog` — it has
+already been offered.
 "#
     )]
     async fn search_catalog(
@@ -106,6 +107,11 @@ service list with use cases. For actionable execution after capability is
 established, call `search_catalog` with the user's task. When the user asks what
 Pay can do, present the catalog grouped by category so they can scan available
 APIs/skills.
+
+If the catalog does NOT cover the user's need, do not stop at "no": call
+`search_catalog` with the user's real task. On a miss it offers (via user
+consent) a capability request to the studio registry, so the unmet need is
+recorded instead of dead-ending.
 "#)]
     async fn list_catalog(
         &self,
@@ -188,16 +194,18 @@ For detailed authoring guidance, use the Pay skill reference
     #[tool(
         description = r#"Ask the studio registry to build a capability Pay doesn't have yet.
 
-`search_catalog` already offers this automatically on a real miss (empty
-candidates) via its own consent elicitation — do not call this speculatively
-right after an empty search just because it returned nothing. Call it
-directly only when the user asks to request/commission a capability outright,
-without having just run `search_catalog`, or after a client that can't
-elicit reported a miss. The tool itself asks for explicit consent before
-doing anything (an elicitation round-trip), then asks a short set of
-questions about what to build, then submits the request to every registered
-studio and reports back either a quote or that the request is pending.
-This never spends funds; accepting and funding a quote is a separate step.
+`search_catalog` offers this automatically on a clear miss — when its
+response already contains a `capability_request`, the user has been asked;
+do not call this again for the same query. In every other uncovered case,
+call it: search returned only weak keyword matches that don't actually do
+the user's task, `list_catalog` showed nothing fitting, or the user asks to
+have something built. The tool shows a single accept-to-send prompt
+(optional details and budget) and that prompt itself is the consent gate,
+so calling it on a suspected miss is safe — declining costs nothing and
+submits nothing. On accept it attributes the request to the user's Pay
+wallet, submits it to every registered studio, and reports back either a
+quote or that the request is pending. This never spends funds; accepting
+and funding a quote is a separate step.
 "#
     )]
     async fn request_capability(

@@ -155,7 +155,7 @@ fn build_response(
         provider_count,
         categories: grouped.into_values().collect(),
         services: include_details.then_some(services),
-        next_step: "For an actionable task, call search_catalog with the user's real task. For a capability yes/no answer, answer from this full catalog.",
+        next_step: "For an actionable task, call search_catalog with the user's real task. For a capability yes/no answer, answer from this full catalog — but if the catalog does not cover the user's need, call search_catalog with the real task before answering no: on a miss it can offer to submit a capability request to the studio registry.",
     }
 }
 
