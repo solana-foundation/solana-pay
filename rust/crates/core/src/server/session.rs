@@ -41,6 +41,26 @@ use crate::{Error, Result};
 const INTENT: &str = "session";
 const METHOD: &str = "solana";
 const DEFAULT_REALM: &str = "MPP Session";
+
+/// Rejection message fragments for session errors that will never clear on
+/// retry: the channel, credential, or proof they name cannot become valid
+/// again without a fresh session. A payer proxy caching a `use` credential
+/// must treat any of these as proof the cached session is dead, not a
+/// transient store hiccup — pinned here so the two sides can't drift apart.
+pub mod terminal_errors {
+    /// The channel a cached credential names no longer exists in the store.
+    pub const UNKNOWN_CHANNEL: &str = "unknown session channel";
+    /// The credential's challenge echo does not verify against this server's
+    /// challenge-binding secret (forged, replayed, or for a different server).
+    pub const CHALLENGE_ECHO_MISMATCH: &str =
+        "session credential echoes a challenge this server did not issue";
+    /// A `use` action against a channel that isn't operator-signed.
+    pub const OPERATOR_ONLY: &str = "use is only valid for operator-signed sessions";
+    /// The channel predates reusable-proof binding; only re-opening fixes it.
+    pub const PREDATES_PROOF_BINDING: &str = "predates proof binding";
+    /// The bearer proof presented doesn't match what was bound at open.
+    pub const PROOF_MISMATCH: &str = "does not match the proof bound at open";
+}
 fn session_close_already_finalized(message: &str) -> bool {
     message.contains("already finalized")
 }
@@ -1458,7 +1478,7 @@ impl SessionMpp {
         };
         if !challenge.verify(&self.challenge_binding_secret) {
             return Err(Error::Mpp(
-                "session credential echoes a challenge this server did not issue".to_string(),
+                terminal_errors::CHALLENGE_ECHO_MISMATCH.to_string(),
             ));
         }
         echo.request
@@ -1690,9 +1710,7 @@ impl SessionMpp {
     /// service and persists the operator-signed cumulative voucher.
     async fn verify_use_authentication(&self, payload: &UsePayload) -> Result<ChannelState> {
         if self.voucher_signer() != SessionVoucherSigner::Operator {
-            return Err(Error::Mpp(
-                "use is only valid for operator-signed sessions".to_string(),
-            ));
+            return Err(Error::Mpp(terminal_errors::OPERATOR_ONLY.to_string()));
         }
         let state = self
             .operator_runtime
@@ -1706,7 +1724,11 @@ impl SessionMpp {
                 ))
             })?
             .ok_or_else(|| {
-                Error::PaymentRejected(format!("unknown session channel: {}", payload.channel_id))
+                Error::PaymentRejected(format!(
+                    "{}: {}",
+                    terminal_errors::UNKNOWN_CHANNEL,
+                    payload.channel_id
+                ))
             })?;
         if state.sealed || state.close_requested_at.is_some() {
             return Err(Error::PaymentRejected(
@@ -1718,9 +1740,10 @@ impl SessionMpp {
         // Name it so the client knows re-opening — not retrying the proof —
         // is the fix. Mirrors PayKit's process_use.
         if state.opening_challenge_id.is_empty() && state.authentication.is_none() {
-            return Err(Error::PaymentRejected(
-                "session channel predates proof binding; open a new session".to_string(),
-            ));
+            return Err(Error::PaymentRejected(format!(
+                "session channel {}; open a new session",
+                terminal_errors::PREDATES_PROOF_BINDING
+            )));
         }
         let bound = serde_json::to_string(&payload.authentication)
             .map_err(|error| Error::Mpp(format!("serialize authentication: {error}")))?;
@@ -1738,9 +1761,10 @@ impl SessionMpp {
                 .verify(&state.channel_id)
                 .map_err(|error| Error::Mpp(error.to_string()))?
         {
-            return Err(Error::PaymentRejected(
-                "use authentication does not match the proof bound at open".to_string(),
-            ));
+            return Err(Error::PaymentRejected(format!(
+                "use authentication {}",
+                terminal_errors::PROOF_MISMATCH
+            )));
         }
         Ok(state)
     }

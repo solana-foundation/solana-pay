@@ -621,29 +621,35 @@ async fn proxy(State(state): State<Arc<PayerState>>, req: Request) -> Response {
             return buffered_response(status, &resp_headers, resp_body);
         }
     };
-    if let (Some(cache), Some(authorization)) = (
-        session_authorization.as_mut(),
-        new_session_authorization.as_ref(),
-    ) {
-        **cache = Some(authorization.clone());
-    }
-
     tracing::info!(%url, "payer proxy: 402 paid — retrying once with payment credential");
     match send_upstream(&state, &method, &url, &headers, body, Some(&payment)).await {
         Ok(retry) => {
-            if retry.status() == StatusCode::PAYMENT_REQUIRED
-                && let Some(cache) = session_authorization.as_mut()
-            {
-                **cache = None;
+            // Only adopt the new credential once a request has actually gone
+            // through on it. Caching it before this point risks stranding a
+            // credential for a channel whose open transaction never landed
+            // (or whose response was lost) — a use of that credential then
+            // fails with a terminal-looking rejection (e.g. "unknown session
+            // channel") that never clears without a manual restart.
+            if retry.status() == StatusCode::PAYMENT_REQUIRED {
+                if let Some(cache) = session_authorization.as_mut() {
+                    **cache = None;
+                }
+            } else if let (Some(cache), Some(authorization)) = (
+                session_authorization.as_mut(),
+                new_session_authorization.as_ref(),
+            ) {
+                **cache = Some(authorization.clone());
             }
             deliver(retry, translated, session_authorization.take()).await
         }
         Err(e) => {
-            // The open credential is idempotent and the channel may already
-            // have been funded even though the response was lost. Preserve it
-            // across transport failures; only a definitive 402 rejection
-            // above proves that the cached session cannot be reused.
-            tracing::warn!(%url, error = %e, "payer proxy: paid retry failed — preserving the session and returning the original 402");
+            // A transport failure here means we don't know whether the paid
+            // request (and, for a first use, the channel open it carried)
+            // landed upstream. Leave the cache exactly as it was before this
+            // attempt — do not adopt the unconfirmed new credential — so the
+            // next request renegotiates instead of reusing a channel that
+            // may never have opened.
+            tracing::warn!(%url, error = %e, "payer proxy: paid retry failed — preserving the prior session and returning the original 402");
             buffered_response(status, &resp_headers, resp_body)
         }
     }
@@ -675,6 +681,7 @@ fn retryable_cached_session_error(body: &[u8]) -> bool {
 }
 
 fn terminal_cached_session_error(body: &[u8]) -> bool {
+    use pay_core::server::session::terminal_errors;
     let text = cached_session_error_text(body);
     text.contains("session_cap_exhausted")
         || text.contains("session_close_pending")
@@ -682,6 +689,11 @@ fn terminal_cached_session_error(body: &[u8]) -> bool {
         || text.contains("close is pending")
         || text.contains("cap has been exhausted")
         || text.contains("exceeds available deposit")
+        || text.contains(terminal_errors::UNKNOWN_CHANNEL)
+        || text.contains(terminal_errors::CHALLENGE_ECHO_MISMATCH)
+        || text.contains(terminal_errors::OPERATOR_ONLY)
+        || text.contains(terminal_errors::PREDATES_PROOF_BINDING)
+        || text.contains(terminal_errors::PROOF_MISMATCH)
 }
 
 /// Hosted providers must challenge successful inference requests, but model
@@ -1349,6 +1361,58 @@ mod tests {
     fn payer_proxy_bind_address_is_loopback_only() {
         assert!(PAYER_PROXY_BIND_IP.is_loopback());
         assert_eq!(PAYER_PROXY_BIND_IP, Ipv4Addr::LOCALHOST);
+    }
+
+    /// One case per real `session_failed` rejection the server can produce
+    /// for a stale cached credential (see `pay_core::server::session`'s
+    /// `verify_use_authentication` and `verify_challenge_echo`). Every one
+    /// of these is terminal — the exact same cached credential will fail
+    /// identically forever, so the proxy must discard it and renegotiate
+    /// rather than preserve-and-retry. Pinned against the server's own
+    /// error text so a rewording can't silently reopen the wedge.
+    #[test]
+    fn terminal_cached_session_error_recognizes_every_server_rejection() {
+        use pay_core::server::session::terminal_errors;
+
+        let session_failed_body = |message: &str| {
+            serde_json::to_vec(&serde_json::json!({
+                "error": "session_failed",
+                "message": message,
+                "retryable": true,
+            }))
+            .unwrap()
+        };
+
+        for message in [
+            &format!("{}: 6y6WeJ8H4o", terminal_errors::UNKNOWN_CHANNEL),
+            terminal_errors::CHALLENGE_ECHO_MISMATCH,
+            terminal_errors::OPERATOR_ONLY,
+            &format!(
+                "session channel {}; open a new session",
+                terminal_errors::PREDATES_PROOF_BINDING
+            ),
+            &format!("use authentication {}", terminal_errors::PROOF_MISMATCH),
+        ] {
+            let body = session_failed_body(message);
+            assert!(
+                terminal_cached_session_error(&body),
+                "expected terminal classification for: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn terminal_cached_session_error_does_not_misclassify_a_transient_store_error() {
+        let body = serde_json::to_vec(&serde_json::json!({
+            "error": "session_failed",
+            "message": "failed to read session channel abc123: store timeout",
+            "retryable": true,
+        }))
+        .unwrap();
+        assert!(
+            !terminal_cached_session_error(&body),
+            "a store read hiccup must stay retryable, not be treated as terminal"
+        );
     }
 
     /// A canned MPP charge challenge that signs fully offline: the
@@ -2087,7 +2151,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn session_open_credential_survives_a_paid_retry_transport_error() {
+    async fn session_open_credential_does_not_survive_a_paid_retry_transport_error() {
         fn open_test_session(
             _state: &PayerState,
             _challenge: &pay_core::mpp::Challenge,
@@ -2097,8 +2161,9 @@ mod tests {
         }
 
         // Serve exactly the challenge response, then stop listening before the
-        // paid retry. This models a connection failure after the open may
-        // already have funded its channel.
+        // paid retry. This models a connection failure after the open may or
+        // may not have landed upstream — genuinely ambiguous, since nothing
+        // confirms whether the retry was even received.
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let challenge = session_challenge_header();
@@ -2147,8 +2212,11 @@ mod tests {
         assert_eq!(response.status(), StatusCode::PAYMENT_REQUIRED);
         assert_eq!(
             state.session_authorization.lock().await.as_deref(),
-            Some("Payment durable-open"),
-            "an ambiguous transport failure must retain the idempotent open credential"
+            None,
+            "an unconfirmed open credential must not be cached — adopting it before \
+             a paid retry proves it landed risks stranding a credential for a \
+             channel that never opened; the next request must renegotiate instead \
+             of trusting a credential no response ever confirmed"
         );
     }
 
