@@ -68,6 +68,10 @@ recipients:
 session:
   cap_usdc: 1.0
   close_delay_ms: 2000
+  # Inactivity thresholds (seconds) the client may pick between when opening
+  # the session; the server clamps the idle-close deadline to whichever is
+  # shorter than close_delay_ms.
+  idle_timeout_options_seconds: [30, 120, 600]
   # Settlement split: the platform takes 30% of the settled session total at
   # idle-close, the seller (operator) nets the remaining 70%. Session splits are
   # percentage-only (the channel settles a single cumulative amount).
