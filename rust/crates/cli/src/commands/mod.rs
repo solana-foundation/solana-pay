@@ -1178,6 +1178,26 @@ fn session_deposit_amount(request: &SessionRequest) -> Option<&str> {
         .or(request.minimum_deposit.as_deref())
 }
 
+/// The exact base-unit deposit `pay_session_and_retry` will sign for. Shared
+/// with `enforce_session_cap` so the cap can never be checked against a
+/// different amount than the one that gets locked: server suggestion,
+/// floored by its minimum, falling back to 1 USDC when the challenge omits
+/// both.
+fn resolve_session_deposit(request: &SessionRequest) -> u64 {
+    let minimum = request
+        .minimum_deposit
+        .as_deref()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(0);
+    request
+        .suggested_deposit
+        .as_deref()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(1_000_000)
+        .max(minimum)
+        .max(1)
+}
+
 fn enforce_session_cap(
     request: Option<&SessionRequest>,
     payment_cap: Option<u64>,
@@ -1190,8 +1210,8 @@ fn enforce_session_cap(
             "session payment cap requires a decoded SessionRequest".to_string(),
         ));
     };
-    let required = session_deposit_amount(request).unwrap_or("0");
-    let required_micro = amount_as_stablecoin_micro(required, &request.currency)?;
+    let required = resolve_session_deposit(request).to_string();
+    let required_micro = amount_as_stablecoin_micro(&required, &request.currency)?;
 
     if required_micro <= payment_cap {
         return Ok(());
@@ -1729,19 +1749,7 @@ fn pay_session_and_retry(
         ));
     };
 
-    // Deposit: server suggestion, floored by its minimum; fall back to 1 USDC.
-    let minimum = request
-        .minimum_deposit
-        .as_deref()
-        .and_then(|value| value.parse::<u64>().ok())
-        .unwrap_or(0);
-    let deposit = request
-        .suggested_deposit
-        .as_deref()
-        .and_then(|value| value.parse::<u64>().ok())
-        .unwrap_or(1_000_000)
-        .max(minimum)
-        .max(1);
+    let deposit = resolve_session_deposit(request);
     let deposit_display = display_token_amount(&deposit.to_string(), &request.currency);
 
     if verbose && !is_json {
@@ -1983,6 +1991,60 @@ fn handle_retry_outcome(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pay_kit::mpp::SessionMethodDetails;
+
+    fn test_session_request_with_deposits(
+        minimum_deposit: Option<&str>,
+        suggested_deposit: Option<&str>,
+    ) -> SessionRequest {
+        SessionRequest {
+            amount: "25".to_string(),
+            currency: "USDC".to_string(),
+            recipient: solana_pubkey::Pubkey::new_unique().to_string(),
+            description: None,
+            external_id: None,
+            minimum_deposit: minimum_deposit.map(str::to_string),
+            suggested_deposit: suggested_deposit.map(str::to_string),
+            unit_type: None,
+            method_details: SessionMethodDetails {
+                network: "localnet".to_string(),
+                channel_program: solana_pubkey::Pubkey::new_unique().to_string(),
+                channel_id: None,
+                recent_blockhash: Some("11111111111111111111111111111111".to_string()),
+                recent_slot: Some(1),
+                decimals: Some(6),
+                token_program: None,
+                fee_payer: None,
+                fee_payer_key: None,
+                voucher_signer: None,
+                operator: None,
+                min_voucher_delta: None,
+                ttl_seconds: None,
+                idle_timeout_options_seconds: None,
+                idle_timeout_seconds: None,
+                grace_period_seconds: None,
+                distribution_splits: vec![],
+            },
+        }
+    }
+
+    #[test]
+    fn enforce_session_cap_bounds_the_exact_amount_that_gets_signed() {
+        // A challenge with neither `suggested_deposit` nor `minimum_deposit`
+        // set: `resolve_session_deposit` (and therefore
+        // `pay_session_and_retry`) falls back to signing 1 USDC. The cap
+        // check must reject this against a $0.10 cap instead of silently
+        // treating the required amount as zero.
+        let request = test_session_request_with_deposits(None, None);
+        assert_eq!(resolve_session_deposit(&request), 1_000_000);
+
+        let cap_10_cents = 100_000u64;
+        let result = enforce_session_cap(Some(&request), Some(cap_10_cents));
+        assert!(
+            result.is_err(),
+            "a deposit-less challenge must be capped at what it will actually sign, not 0"
+        );
+    }
 
     #[test]
     fn verbose_challenge_rendering_groups_decoded_protocols() {
