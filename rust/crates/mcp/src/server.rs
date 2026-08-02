@@ -76,13 +76,22 @@ includes reasons, endpoint/pricing candidates, tie-breaker guidance, call-plan
 fields, and the next provider-selection step. Select an endpoint only when it
 clearly matches the task; otherwise inspect one likely provider with
 `get_catalog_entry` or ask the user.
+
+On a real miss (no candidates), this tool itself elicits the user for
+consent to submit a capability request to the studio registry, and on accept
+runs the same brief-interview and submission flow as `request_capability`
+before returning. If the connected client doesn't support elicitation, the
+response falls back to a text hint naming `request_capability` instead. You
+never need to call `request_capability` yourself right after an empty
+`search_catalog` result — it has already been offered.
 "#
     )]
     async fn search_catalog(
         &self,
         Parameters(params): Parameters<tools::search_catalog::Params>,
+        peer: rmcp::Peer<rmcp::service::RoleServer>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        tools::search_catalog::run(params).await
+        tools::search_catalog::run(params, peer).await
     }
 
     #[tool(description = r#"List all available Pay APIs/skills.
@@ -179,10 +188,12 @@ For detailed authoring guidance, use the Pay skill reference
     #[tool(
         description = r#"Ask the studio registry to build a capability Pay doesn't have yet.
 
-Only call this after `search_catalog` returns no usable candidate for an
-actionable task, and only when the user actually wants a new provider
-requested — never speculatively, and never automatically just because a
-search came back empty. The tool itself asks for explicit consent before
+`search_catalog` already offers this automatically on a real miss (empty
+candidates) via its own consent elicitation — do not call this speculatively
+right after an empty search just because it returned nothing. Call it
+directly only when the user asks to request/commission a capability outright,
+without having just run `search_catalog`, or after a client that can't
+elicit reported a miss. The tool itself asks for explicit consent before
 doing anything (an elicitation round-trip), then asks a short set of
 questions about what to build, then submits the request to every registered
 studio and reports back either a quote or that the request is pending.

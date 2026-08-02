@@ -55,7 +55,10 @@ ad-hoc page scraping.
 - Wrong network/currency, unsupported payment protocol, or price above the
   user's limit: stop and explain.
 - Empty or stale provider results: retry once with `search_catalog({refresh:
-  true})`; if still empty, ask before using a non-Pay fallback.
+  true})`; if still empty, `search_catalog` itself elicits consent to submit a
+  capability request to the studio registry — do not call `request_capability`
+  again afterward for the same query. If elicitation isn't supported, ask
+  before using a non-Pay fallback.
 - Missing stablecoin balance: call `get_balance()` and explain the shortfall.
 - 404 or unusable endpoint shape: try at most one documented fallback endpoint,
   then ask.

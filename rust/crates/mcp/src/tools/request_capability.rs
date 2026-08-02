@@ -62,13 +62,34 @@ pub async fn run(
         Err(message) => return Ok(super::tool_error(message)),
     }
 
-    let brief = match ask_brief(&peer, &query).await {
-        Ok(brief) => brief,
-        Err(message) => return Ok(super::tool_error(message)),
-    };
+    match run_capability_request(&peer, &query).await {
+        Ok(response) => {
+            let json = match serde_json::to_string_pretty(&response) {
+                Ok(json) => json,
+                Err(e) => {
+                    return Ok(super::tool_error(format!(
+                        "Failed to serialize response: {e}"
+                    )));
+                }
+            };
+            Ok(CallToolResult::success(vec![Content::text(json)]))
+        }
+        Err(message) => Ok(super::tool_error(message)),
+    }
+}
+
+/// Interview the user for a capability brief, submit it to every registered
+/// studio, and poll for quotes. Shared by [`run`] (direct call) and
+/// `search_catalog`'s miss-path elicitation — both callers must obtain
+/// [`ask_consent`] first; this function assumes consent is already granted.
+pub(crate) async fn run_capability_request(
+    peer: &Peer<RoleServer>,
+    query: &str,
+) -> Result<serde_json::Value, String> {
+    let brief = ask_brief(peer, query).await?;
 
     let request = NewCapabilityRequest {
-        query: query.clone(),
+        query: query.to_string(),
         product: brief.product,
         monetization: brief.monetization,
         competition: brief.competition,
@@ -76,54 +97,28 @@ pub async fn run(
         buyer_npub: brief.buyer_npub,
     };
 
-    let registry = match StudioRegistry::load() {
-        Ok(registry) => registry,
-        Err(e) => {
-            return Ok(super::tool_error(format!(
-                "Failed to load studio registry: {e}"
-            )));
-        }
-    };
+    let registry =
+        StudioRegistry::load().map_err(|e| format!("Failed to load studio registry: {e}"))?;
     if registry.studios.is_empty() {
-        return Ok(super::tool_error(
-            "No studios are registered in ~/.config/pay/studios.yaml.",
-        ));
+        return Err("No studios are registered in ~/.config/pay/studios.yaml.".to_string());
     }
 
     let submissions =
-        match pay_core::studios::submit_to_registry(&registry, &request, pay_core::ClientApp::Mcp)
+        pay_core::studios::submit_to_registry(&registry, &request, pay_core::ClientApp::Mcp)
             .await
-        {
-            Ok(submissions) => submissions,
-            Err(e) => {
-                return Ok(super::tool_error(format!(
-                    "Failed to submit capability request: {e}"
-                )));
-            }
-        };
+            .map_err(|e| format!("Failed to submit capability request: {e}"))?;
 
     let results = poll_for_quotes(submissions).await;
     let next_step = next_step_for(&results);
 
-    let response = serde_json::json!({
+    Ok(serde_json::json!({
         "query": query,
         "submissions": results,
         "next_step": next_step,
-    });
-
-    let json = match serde_json::to_string_pretty(&response) {
-        Ok(json) => json,
-        Err(e) => {
-            return Ok(super::tool_error(format!(
-                "Failed to serialize response: {e}"
-            )));
-        }
-    };
-
-    Ok(CallToolResult::success(vec![Content::text(json)]))
+    }))
 }
 
-async fn ask_consent(peer: &Peer<RoleServer>, query: &str) -> Result<bool, String> {
+pub(crate) async fn ask_consent(peer: &Peer<RoleServer>, query: &str) -> Result<bool, String> {
     let schema = ElicitationSchema::builder()
         .required_bool("proceed")
         .build()

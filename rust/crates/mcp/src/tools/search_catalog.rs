@@ -41,6 +41,8 @@ struct SearchCatalogResponse {
     selection_guidance: Vec<String>,
     call_plan_fields: Vec<String>,
     next_step: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    capability_request: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Serialize)]
@@ -82,7 +84,10 @@ fn default_max_results() -> usize {
     5
 }
 
-pub async fn run(params: Params) -> Result<CallToolResult, rmcp::ErrorData> {
+pub async fn run(
+    params: Params,
+    peer: rmcp::Peer<rmcp::service::RoleServer>,
+) -> Result<CallToolResult, rmcp::ErrorData> {
     let query = params.query.trim().to_string();
     if query.is_empty() {
         return Ok(super::tool_error("`query` must describe the user's task"));
@@ -105,14 +110,21 @@ pub async fn run(params: Params) -> Result<CallToolResult, rmcp::ErrorData> {
 
     let max_results = params.max_results.clamp(1, 10);
     let category = params.category.clone();
-    let response = build_search_catalog_response(
+    let mut response = build_search_catalog_response(
         catalog,
-        query,
+        query.clone(),
         category,
         max_results,
         pay_core::ClientApp::Mcp,
     )
     .await;
+
+    if response.candidates.is_empty()
+        && let Some(capability_request) = offer_capability_request(&peer, &query).await
+    {
+        response.next_step = next_step_for_capability_request(&capability_request);
+        response.capability_request = Some(capability_request);
+    }
 
     let json = match serde_json::to_string_pretty(&response) {
         Ok(json) => json,
@@ -126,6 +138,42 @@ pub async fn run(params: Params) -> Result<CallToolResult, rmcp::ErrorData> {
     Ok(CallToolResult::success(vec![rmcp::model::Content::text(
         json,
     )]))
+}
+
+/// On a catalog miss, ask the connected MCP client for consent to submit a
+/// capability request, then run the same interview + studio-submission flow
+/// `request_capability` uses. Returns `None` when the client doesn't support
+/// elicitation (or the round-trip otherwise fails) so callers fall back to
+/// the plain text hint in [`next_step_for_candidates`] instead of erroring
+/// the whole search.
+async fn offer_capability_request(
+    peer: &rmcp::Peer<rmcp::service::RoleServer>,
+    query: &str,
+) -> Option<serde_json::Value> {
+    match super::request_capability::ask_consent(peer, query).await {
+        Ok(true) => match super::request_capability::run_capability_request(peer, query).await {
+            Ok(value) => Some(value),
+            Err(message) => Some(serde_json::json!({ "status": "failed", "error": message })),
+        },
+        Ok(false) => Some(serde_json::json!({
+            "status": "declined",
+            "message": "The user declined to request this capability.",
+        })),
+        Err(_) => None,
+    }
+}
+
+fn next_step_for_capability_request(value: &serde_json::Value) -> String {
+    if let Some(next_step) = value.get("next_step").and_then(|v| v.as_str()) {
+        return next_step.to_string();
+    }
+
+    match value.get("status").and_then(|v| v.as_str()) {
+        Some("declined") => {
+            "The user declined a capability request for this query; ask before using a non-Pay fallback.".to_string()
+        }
+        _ => "The capability request could not be completed; show the user the error before retrying.".to_string(),
+    }
 }
 
 async fn build_search_catalog_response(
@@ -196,6 +244,7 @@ async fn build_search_catalog_response(
         selection_guidance: selection_guidance(),
         call_plan_fields: call_plan_fields(),
         next_step,
+        capability_request: None,
     }
 }
 
@@ -230,7 +279,7 @@ fn call_plan_fields() -> Vec<String> {
 
 fn next_step_for_candidates(candidates: &[CandidateEntry]) -> String {
     let Some(top) = candidates.first() else {
-        return "No matching provider was found. Retry search_catalog once with refresh=true if the catalog may be stale. If the user wants a new provider built for this, call request_capability (it asks for consent and details itself — do not call it speculatively); otherwise ask the user before using a non-Pay fallback.".to_string();
+        return "No matching provider was found. Retry search_catalog once with refresh=true if the catalog may be stale. This client could not be asked for capability-request consent, so nothing was submitted; call request_capability directly if the user wants a new provider built, otherwise ask before using a non-Pay fallback.".to_string();
     };
 
     if top.endpoint_lookup_error.is_some() || top.endpoints.is_empty() {
@@ -421,6 +470,29 @@ mod tests {
                 .any(|field| field == "estimated total spend")
         );
         assert!(response.next_step.contains("call plan") || response.next_step.contains("Compare"));
+    }
+
+    #[test]
+    fn next_step_for_capability_request_prefers_inner_next_step() {
+        let value = serde_json::json!({
+            "next_step": "A studio returned a quote. Present price, timeline, and terms to the user before accepting; do not fund automatically.",
+        });
+        assert_eq!(
+            next_step_for_capability_request(&value),
+            "A studio returned a quote. Present price, timeline, and terms to the user before accepting; do not fund automatically."
+        );
+    }
+
+    #[test]
+    fn next_step_for_capability_request_handles_declined_status() {
+        let value = serde_json::json!({ "status": "declined" });
+        assert!(next_step_for_capability_request(&value).contains("declined"));
+    }
+
+    #[test]
+    fn next_step_for_capability_request_handles_failed_status() {
+        let value = serde_json::json!({ "status": "failed", "error": "boom" });
+        assert!(next_step_for_capability_request(&value).contains("could not be completed"));
     }
 
     #[tokio::test]
