@@ -1,5 +1,5 @@
 //! Studio registry — v0 static config naming which studios receive RFQ
-//! fan-out from the MCP `commission_capability` tool (commission-flow
+//! fan-out from the MCP `request_capability` tool (commission-flow
 //! draft-00, concrete delta 3). One entry per studio; `~/.config/pay/studios.yaml`
 //! overrides the shipped default so a local `scarced` dev instance can stand
 //! in for the production endpoint during development.
@@ -24,7 +24,7 @@ const POLL_TIMEOUT: Duration = Duration::from_secs(10);
 pub struct Studio {
     /// Display name (e.g. "scarce").
     pub name: String,
-    /// `POST` target that accepts the `NewCommission` wire body (mirrors
+    /// `POST` target that accepts the `NewCapabilityRequest` wire body (mirrors
     /// `scarce-studio`'s `studio-types::NewRfq` / `schemas/rfq.json`) and
     /// returns the captured RFQ record.
     pub rfq_url: String,
@@ -86,7 +86,7 @@ fn config_path() -> PathBuf {
 /// crate; a field mismatch surfaces as a 422 from the studio, which
 /// [`submit_to_registry`] reports verbatim rather than papering over.
 #[derive(Debug, Clone, Serialize)]
-pub struct NewCommission {
+pub struct NewCapabilityRequest {
     pub query: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub product: Option<String>,
@@ -95,17 +95,17 @@ pub struct NewCommission {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub competition: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub budget_ceiling: Option<CommissionAmount>,
+    pub budget_ceiling: Option<BudgetAmount>,
     pub buyer_npub: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub struct CommissionAmount {
+pub struct BudgetAmount {
     pub amount: u64,
     pub mint: String,
 }
 
-/// Outcome of POSTing a commission RFQ to one studio.
+/// Outcome of POSTing a capability-request RFQ to one studio.
 #[derive(Debug, Clone, Serialize)]
 pub struct StudioSubmission {
     pub studio: String,
@@ -116,13 +116,13 @@ pub struct StudioSubmission {
     pub error: Option<String>,
 }
 
-/// POST `commission` to every registered studio. Independent per studio —
+/// POST `request` to every registered studio. Independent per studio —
 /// one being unreachable or rejecting the submission never fails the
 /// others (commission-flow draft-00 step 3: "quotes return by deadline or
 /// silently decline").
 pub async fn submit_to_registry(
     registry: &StudioRegistry,
-    commission: &NewCommission,
+    request: &NewCapabilityRequest,
     client_app: ClientApp,
 ) -> Result<Vec<StudioSubmission>> {
     let client = reqwest::Client::builder()
@@ -133,7 +133,7 @@ pub async fn submit_to_registry(
 
     let mut submissions = Vec::with_capacity(registry.studios.len());
     for studio in &registry.studios {
-        submissions.push(submit_one(&client, studio, commission).await);
+        submissions.push(submit_one(&client, studio, request).await);
     }
     Ok(submissions)
 }
@@ -141,7 +141,7 @@ pub async fn submit_to_registry(
 async fn submit_one(
     client: &reqwest::Client,
     studio: &Studio,
-    commission: &NewCommission,
+    request: &NewCapabilityRequest,
 ) -> StudioSubmission {
     let base = StudioSubmission {
         studio: studio.name.clone(),
@@ -149,7 +149,7 @@ async fn submit_one(
         rfq: None,
         error: None,
     };
-    match client.post(&studio.rfq_url).json(commission).send().await {
+    match client.post(&studio.rfq_url).json(request).send().await {
         Ok(resp) if resp.status().is_success() => match resp.json::<serde_json::Value>().await {
             Ok(rfq) => StudioSubmission {
                 rfq: Some(rfq),
@@ -222,8 +222,8 @@ mod tests {
     }
 
     #[test]
-    fn new_commission_omits_absent_optional_fields() {
-        let commission = NewCommission {
+    fn new_capability_request_omits_absent_optional_fields() {
+        let request = NewCapabilityRequest {
             query: "solana priority fee forecast api".to_string(),
             product: None,
             monetization: None,
@@ -232,7 +232,7 @@ mod tests {
             buyer_npub: "npub1cscv4empnwmfyurd6utlwmq3h3dzpesjyhtttt6rk69hndk9w0nqr65xpy"
                 .to_string(),
         };
-        let json = serde_json::to_value(&commission).unwrap();
+        let json = serde_json::to_value(&request).unwrap();
         let obj = json.as_object().unwrap();
         assert!(!obj.contains_key("product"));
         assert!(!obj.contains_key("monetization"));
@@ -242,20 +242,20 @@ mod tests {
     }
 
     #[test]
-    fn new_commission_includes_present_optional_fields() {
-        let commission = NewCommission {
+    fn new_capability_request_includes_present_optional_fields() {
+        let request = NewCapabilityRequest {
             query: "q".to_string(),
             product: Some("a live forecast endpoint".to_string()),
             monetization: Some("per-call".to_string()),
             competition: vec!["incumbent/api".to_string()],
-            budget_ceiling: Some(CommissionAmount {
+            budget_ceiling: Some(BudgetAmount {
                 amount: 10_000_000,
                 mint: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v".to_string(),
             }),
             buyer_npub: "npub1cscv4empnwmfyurd6utlwmq3h3dzpesjyhtttt6rk69hndk9w0nqr65xpy"
                 .to_string(),
         };
-        let json = serde_json::to_value(&commission).unwrap();
+        let json = serde_json::to_value(&request).unwrap();
         assert_eq!(json["product"], "a live forecast endpoint");
         assert_eq!(json["competition"][0], "incumbent/api");
         assert_eq!(json["budget_ceiling"]["amount"], 10_000_000);

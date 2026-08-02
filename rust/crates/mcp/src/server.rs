@@ -180,8 +180,8 @@ For detailed authoring guidance, use the Pay skill reference
         description = r#"Ask the studio registry to build a capability Pay doesn't have yet.
 
 Only call this after `search_catalog` returns no usable candidate for an
-actionable task, and only when the user actually wants to commission a new
-provider — never speculatively, and never automatically just because a
+actionable task, and only when the user actually wants a new provider
+requested — never speculatively, and never automatically just because a
 search came back empty. The tool itself asks for explicit consent before
 doing anything (an elicitation round-trip), then asks a short set of
 questions about what to build, then submits the request to every registered
@@ -189,12 +189,12 @@ studio and reports back either a quote or that the request is pending.
 This never spends funds; accepting and funding a quote is a separate step.
 "#
     )]
-    async fn commission_capability(
+    async fn request_capability(
         &self,
-        Parameters(params): Parameters<tools::commission_capability::Params>,
+        Parameters(params): Parameters<tools::request_capability::Params>,
         peer: rmcp::Peer<rmcp::service::RoleServer>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        tools::commission_capability::run(params, peer).await
+        tools::request_capability::run(params, peer).await
     }
 }
 

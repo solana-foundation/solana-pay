@@ -1,4 +1,4 @@
-//! `commission_capability` — ask the studio registry to build a capability
+//! `request_capability` — ask the studio registry to build a capability
 //! `search_catalog`/`list_catalog` couldn't find (commission-flow draft-00).
 //!
 //! Never auto-invoked: the first elicitation is consent to run the
@@ -13,7 +13,7 @@
 
 use std::time::Duration;
 
-use pay_core::studios::{CommissionAmount, NewCommission, StudioRegistry, StudioSubmission};
+use pay_core::studios::{BudgetAmount, NewCapabilityRequest, StudioRegistry, StudioSubmission};
 use rmcp::Peer;
 use rmcp::model::{
     CallToolResult, Content, CreateElicitationRequestParam, ElicitationAction, ElicitationSchema,
@@ -36,7 +36,7 @@ const QUOTE_POLL_INTERVAL: Duration = Duration::from_secs(2);
 pub struct Params {
     /// The capability the user wanted that no existing Pay provider covers.
     #[schemars(
-        description = "The task or capability the user wanted that search_catalog/list_catalog found no usable provider for. Only call this after a real catalog miss and only when the user wants to commission a new one; do not call speculatively."
+        description = "The task or capability the user wanted that search_catalog/list_catalog found no usable provider for. Only call this after a real catalog miss and only when the user wants to request a new one; do not call speculatively."
     )]
     pub query: String,
 }
@@ -56,7 +56,7 @@ pub async fn run(
         Ok(true) => {}
         Ok(false) => {
             return Ok(CallToolResult::success(vec![Content::text(
-                "The user declined to commission this capability.".to_string(),
+                "The user declined to request this capability.".to_string(),
             )]));
         }
         Err(message) => return Ok(super::tool_error(message)),
@@ -67,7 +67,7 @@ pub async fn run(
         Err(message) => return Ok(super::tool_error(message)),
     };
 
-    let commission = NewCommission {
+    let request = NewCapabilityRequest {
         query: query.clone(),
         product: brief.product,
         monetization: brief.monetization,
@@ -90,20 +90,17 @@ pub async fn run(
         ));
     }
 
-    let submissions = match pay_core::studios::submit_to_registry(
-        &registry,
-        &commission,
-        pay_core::ClientApp::Mcp,
-    )
-    .await
-    {
-        Ok(submissions) => submissions,
-        Err(e) => {
-            return Ok(super::tool_error(format!(
-                "Failed to submit commission: {e}"
-            )));
-        }
-    };
+    let submissions =
+        match pay_core::studios::submit_to_registry(&registry, &request, pay_core::ClientApp::Mcp)
+            .await
+        {
+            Ok(submissions) => submissions,
+            Err(e) => {
+                return Ok(super::tool_error(format!(
+                    "Failed to submit capability request: {e}"
+                )));
+            }
+        };
 
     let results = poll_for_quotes(submissions).await;
     let next_step = next_step_for(&results);
@@ -133,15 +130,15 @@ async fn ask_consent(peer: &Peer<RoleServer>, query: &str) -> Result<bool, Strin
         .expect("required_bool registers `proceed` in properties");
     let params = CreateElicitationRequestParam {
         message: format!(
-            "Pay found no existing provider for \"{query}\". Start a commission interview to ask the studio registry for a custom-built endpoint? This submits a public demand record (RFQ) attributed to your identity; no payment is taken yet."
+            "Pay found no existing provider for \"{query}\". Start a capability-request interview to ask the studio registry for a custom-built endpoint? This submits a public demand record (RFQ) attributed to your identity; no payment is taken yet."
         ),
         requested_schema: schema,
     };
 
     let outcome = tokio::time::timeout(ELICITATION_TIMEOUT, peer.create_elicitation(params))
         .await
-        .map_err(|_| "Timed out waiting for commission consent.".to_string())?
-        .map_err(|e| format!("Could not request commission consent: {e}"))?;
+        .map_err(|_| "Timed out waiting for capability-request consent.".to_string())?
+        .map_err(|e| format!("Could not obtain capability-request consent: {e}"))?;
 
     Ok(matches!(outcome.action, ElicitationAction::Accept)
         && outcome
@@ -156,7 +153,7 @@ struct Brief {
     product: Option<String>,
     monetization: Option<String>,
     competition: Vec<String>,
-    budget_ceiling: Option<CommissionAmount>,
+    budget_ceiling: Option<BudgetAmount>,
     buyer_npub: String,
 }
 
@@ -168,7 +165,7 @@ async fn ask_brief(peer: &Peer<RoleServer>, query: &str) -> Result<Brief, String
         .optional_string("competition")
         .optional_number("budget_ceiling_amount", 0.0, 1_000_000_000.0)
         .optional_string("budget_ceiling_mint")
-        .title("Commission brief")
+        .title("Capability brief")
         .description(format!(
             "Tell the studio what you need built for: \"{query}\""
         ))
@@ -182,16 +179,16 @@ async fn ask_brief(peer: &Peer<RoleServer>, query: &str) -> Result<Brief, String
 
     let outcome = tokio::time::timeout(ELICITATION_TIMEOUT, peer.create_elicitation(params))
         .await
-        .map_err(|_| "Timed out waiting for the commission brief.".to_string())?
-        .map_err(|e| format!("Could not request the commission brief: {e}"))?;
+        .map_err(|_| "Timed out waiting for the capability brief.".to_string())?
+        .map_err(|e| format!("Could not obtain the capability brief: {e}"))?;
 
     match outcome.action {
         ElicitationAction::Accept => {}
         ElicitationAction::Decline => {
-            return Err("The user declined to provide a commission brief.".to_string());
+            return Err("The user declined to provide a capability brief.".to_string());
         }
         ElicitationAction::Cancel => {
-            return Err("The user cancelled the commission brief.".to_string());
+            return Err("The user cancelled the capability brief.".to_string());
         }
     }
 
@@ -199,7 +196,7 @@ async fn ask_brief(peer: &Peer<RoleServer>, query: &str) -> Result<Brief, String
 
     let buyer_npub = str_field(&content, "buyer_npub").unwrap_or_default();
     if buyer_npub.is_empty() {
-        return Err("`buyer_npub` is required to attribute the commission.".to_string());
+        return Err("`buyer_npub` is required to attribute the capability request.".to_string());
     }
 
     let product = str_field(&content, "product");
@@ -218,7 +215,7 @@ async fn ask_brief(peer: &Peer<RoleServer>, query: &str) -> Result<Brief, String
         .and_then(|v| v.as_f64());
     let budget_mint = str_field(&content, "budget_ceiling_mint");
     let budget_ceiling = match (budget_amount, budget_mint) {
-        (Some(amount), Some(mint)) if amount > 0.0 => Some(CommissionAmount {
+        (Some(amount), Some(mint)) if amount > 0.0 => Some(BudgetAmount {
             amount: amount.round() as u64,
             mint,
         }),
@@ -334,7 +331,7 @@ fn next_step_for(results: &[SubmissionResult]) -> &'static str {
     } else if results.iter().any(|r| r.status == "quoted") {
         "A studio returned a quote. Present price, timeline, and terms to the user before accepting; do not fund automatically."
     } else {
-        "No studio has quoted yet. Tell the user the commission was submitted and to check back later; do not resubmit the same query."
+        "No studio has quoted yet. Tell the user the capability request was submitted and to check back later; do not resubmit the same query."
     }
 }
 

@@ -230,7 +230,7 @@ fn call_plan_fields() -> Vec<String> {
 
 fn next_step_for_candidates(candidates: &[CandidateEntry]) -> String {
     let Some(top) = candidates.first() else {
-        return "No matching provider was found. Retry search_catalog once with refresh=true if the catalog may be stale. If the user wants a new provider built for this, call commission_capability (it asks for consent and details itself — do not call it speculatively); otherwise ask the user before using a non-Pay fallback.".to_string();
+        return "No matching provider was found. Retry search_catalog once with refresh=true if the catalog may be stale. If the user wants a new provider built for this, call request_capability (it asks for consent and details itself — do not call it speculatively); otherwise ask the user before using a non-Pay fallback.".to_string();
     };
 
     if top.endpoint_lookup_error.is_some() || top.endpoints.is_empty() {
