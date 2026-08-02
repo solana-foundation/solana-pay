@@ -569,7 +569,10 @@ impl<S: PaymentState> PaymentGate<S> {
 
         if accepted.contains(&Scheme::MppSession) && !session_mpps.is_empty() {
             for sm in session_mpps {
-                match sm.challenge_header(u64::MAX) {
+                let unit_amount = price.as_ref().map(|price| {
+                    crate::server::payment::price_unit_base_amount(price, sm.decimals())
+                });
+                match sm.challenge_header(unit_amount) {
                     Ok(h) => {
                         if let Ok(v) = HeaderValue::from_str(&h) {
                             challenge_headers.push((header::WWW_AUTHENTICATE, v));
@@ -1690,8 +1693,7 @@ async fn session_authorized(
 ) -> GateDecision {
     match sm.process(auth).await {
         Ok(SessionOutcome::Active { state, signature }) => {
-            if sm.settlement_authority() == pay_kit::mpp::SessionSettlementAuthority::ClientVoucher
-            {
+            if sm.voucher_signer() == pay_kit::mpp::SessionVoucherSigner::Client {
                 let mut response = GateResponse::json(
                     StatusCode::PAYMENT_REQUIRED,
                     serde_json::to_vec(&json!({
@@ -1803,10 +1805,6 @@ async fn session_authorized(
                 payment: None,
             }),
         },
-        Ok(SessionOutcome::Commit(receipt)) => GateDecision::Respond(GateResponse::json(
-            StatusCode::OK,
-            serde_json::to_vec(&receipt).unwrap_or_default(),
-        )),
         Ok(SessionOutcome::Closed { signature, .. }) => {
             let receipt_url = signature
                 .as_deref()

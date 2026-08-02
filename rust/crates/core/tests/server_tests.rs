@@ -247,34 +247,53 @@ async fn start_respond_server() -> (String, tokio::task::JoinHandle<()>) {
     (url, handle)
 }
 
-fn test_session_mpp_for_currency(currency: &str) -> SessionMpp {
-    SessionMpp::new(
+fn test_session_blockhash_cache() -> pay_kit::mpp::blockhash::BlockhashCache {
+    let cache = pay_kit::mpp::blockhash::BlockhashCache::new();
+    cache.set(
+        "SURFNETxSAFEHASHxxxxxxxxxxxxxxxxxxxxx11x".to_string(),
+        42,
+        123,
+    );
+    cache
+}
+
+fn test_session_mpp_with_store(
+    currency: &str,
+) -> (SessionMpp, Arc<dyn pay_kit::mpp::store::ChannelStore>) {
+    let store: Arc<dyn pay_kit::mpp::store::ChannelStore> =
+        Arc::new(pay_kit::mpp::store::MemoryChannelStore::new());
+    let session = SessionMpp::new_with_channel_store(
         SessionConfig {
             operator: solana_pubkey::Pubkey::new_unique().to_string(),
             recipient: solana_pubkey::Pubkey::new_unique().to_string(),
-            max_cap: 5_000_000,
+            suggested_deposit: Some(5_000_000),
             currency: currency.to_string(),
             network: "localnet".to_string(),
-            modes: vec![
-                pay_kit::mpp::SessionMode::Push,
-                pay_kit::mpp::SessionMode::Pull,
-            ],
             ..SessionConfig::default()
         },
         "test-secret-key-do-not-use-32b-pad",
+        Arc::clone(&store),
     )
+    .with_blockhash_cache(test_session_blockhash_cache());
+    (session, store)
 }
 
-fn test_session_mpp() -> SessionMpp {
-    test_session_mpp_for_currency(&solana_pubkey::Pubkey::new_unique().to_string())
+fn test_session_mpp_for_currency(currency: &str) -> SessionMpp {
+    test_session_mpp_with_store(currency).0
 }
 
-async fn start_session_server() -> (String, tokio::task::JoinHandle<()>) {
+async fn start_session_server() -> (
+    String,
+    tokio::task::JoinHandle<()>,
+    Arc<dyn pay_kit::mpp::store::ChannelStore>,
+) {
+    let (session, store) =
+        test_session_mpp_with_store(&solana_pubkey::Pubkey::new_unique().to_string());
     let api = load_test_api();
     let state = SessionTestState {
         apis: Arc::new(vec![api]),
         mpp: None,
-        session_mpp: Some(Arc::new(test_session_mpp())),
+        session_mpp: Some(Arc::new(session)),
     };
 
     let app = Router::new()
@@ -289,7 +308,7 @@ async fn start_session_server() -> (String, tokio::task::JoinHandle<()>) {
     let url = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
     let handle = tokio::spawn(async { axum::serve(listener, app).await.unwrap() });
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    (url, handle)
+    (url, handle, store)
 }
 
 async fn start_multi_currency_session_server() -> (String, tokio::task::JoinHandle<()>) {
@@ -581,7 +600,7 @@ async fn middleware_rejects_bearer_scheme() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn middleware_returns_session_challenge_when_session_mpp_configured() {
-    let (url, _h) = start_session_server().await;
+    let (url, _h, _store) = start_session_server().await;
     let client = reqwest::Client::new();
     let resp = client
         .post(format!("{url}/v1/simple/echo"))
@@ -650,8 +669,8 @@ async fn middleware_returns_one_session_challenge_per_configured_currency() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn middleware_accepts_session_open_and_voucher_then_close() {
-    let (url, _h) = start_session_server().await;
+async fn middleware_accepts_session_voucher_then_close() {
+    let (url, _h, store) = start_session_server().await;
     let client = reqwest::Client::new();
 
     let challenge_resp = client
@@ -670,25 +689,39 @@ async fn middleware_accepts_session_open_and_voucher_then_close() {
         .to_string();
     let challenge = pay_kit::mpp::parse_www_authenticate(&www_auth).unwrap();
 
-    let challenge_for_open = challenge.clone();
-    let (handle, open_header) = tokio::task::spawn_blocking(move || {
-        pay_core::session::open_session_header(&challenge_for_open, 1_000_000)
-    })
-    .await
-    .unwrap()
-    .unwrap();
-
-    let open_resp = client
-        .post(format!("{url}/v1/simple/echo"))
-        .headers(client_with_host("testapi"))
-        .header("authorization", open_header)
-        .body("{}")
-        .send()
+    // Opens now verify, broadcast, and confirm a real transaction (covered by
+    // the surfpool e2e tests); seed the confirmed channel state directly and
+    // drive the middleware with vouchers and close.
+    let channel = solana_pubkey::Pubkey::new_unique();
+    let (voucher_key, signer) = {
+        use ed25519_dalek::SigningKey;
+        let sk = SigningKey::generate(&mut rand::thread_rng());
+        let vk = sk.verifying_key();
+        let mut kp = [0u8; 64];
+        kp[..32].copy_from_slice(sk.as_bytes());
+        kp[32..].copy_from_slice(vk.as_bytes());
+        let signer: Box<dyn pay_kit::mpp::solana_keychain::SolanaSigner> =
+            Box::new(pay_kit::mpp::solana_keychain::memory::MemorySigner::from_bytes(&kp).unwrap());
+        (sk, signer)
+    };
+    let authorized_signer = signer.pubkey().to_string();
+    store
+        .put_channel(
+            &channel.to_string(),
+            pay_core::server::session::test_channel_state(
+                channel.to_string(),
+                1_000_000,
+                &authorized_signer,
+                "client",
+                &challenge.id,
+                solana_pubkey::Pubkey::new_unique().to_string(),
+                None,
+            ),
+        )
         .await
         .unwrap();
-    // Client-voucher sessions acknowledge the open before requiring the first
-    // client-signed voucher for paid service.
-    assert_eq!(open_resp.status(), 402);
+    let handle = pay_core::session::SessionHandle::new(channel, signer, challenge.clone())
+        .with_voucher_key(voucher_key);
 
     let voucher_header = handle.voucher_header(25).await.unwrap();
     let voucher_resp = client

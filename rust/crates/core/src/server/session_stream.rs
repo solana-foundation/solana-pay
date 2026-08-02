@@ -826,10 +826,11 @@ mod tests {
     use super::*;
     use crate::client::session::SessionHandle;
     use crate::server::metering::parse_tokens_per_quota_unit;
-    use crate::server::session::SessionOutcome;
-    use pay_kit::mpp::server::session::SessionConfig;
+    use crate::server::session::test_channel_state;
+    use pay_kit::mpp::blockhash::BlockhashCache;
+    use pay_kit::mpp::server::session::{SessionConfig, VoucherSigner};
     use pay_kit::mpp::solana_keychain::{SolanaSigner, memory::MemorySigner};
-    use pay_kit::mpp::{SessionMode, SessionSettlementAuthority};
+    use pay_kit::mpp::store::{ChannelStore, MemoryChannelStore};
     use pay_types::metering::{MeterDimension, PriceTier};
 
     fn dimension(
@@ -1146,33 +1147,57 @@ data: {"type":"message_delta","usage":{"output_tokens":5}}
         assert!(!has_stream_observable_dimension(&spec));
     }
 
+    fn stream_test_blockhash_cache() -> BlockhashCache {
+        let cache = BlockhashCache::new();
+        cache.set(
+            "SURFNETxSAFEHASHxxxxxxxxxxxxxxxxxxxxx11x".to_string(),
+            42,
+            123,
+        );
+        cache
+    }
+
     #[tokio::test]
     async fn chargeable_stream_chunk_waits_for_matching_commit() {
-        let session = Arc::new(SessionMpp::new(
-            SessionConfig {
-                operator: solana_pubkey::Pubkey::new_unique().to_string(),
-                recipient: solana_pubkey::Pubkey::new_unique().to_string(),
-                max_cap: 1_000,
-                currency: solana_pubkey::Pubkey::new_unique().to_string(),
-                network: "localnet".to_string(),
-                min_voucher_delta: 1,
-                modes: vec![SessionMode::Push],
-                ..SessionConfig::default()
-            },
-            "stream-test-secret",
-        ));
-        let challenge = session.challenge(1_000).unwrap();
-        let handle = SessionHandle::new(
-            solana_pubkey::Pubkey::new_unique(),
-            stream_test_signer(),
-            challenge,
+        let store: Arc<dyn ChannelStore> = Arc::new(MemoryChannelStore::new());
+        let session = Arc::new(
+            SessionMpp::new_with_channel_store(
+                SessionConfig {
+                    operator: solana_pubkey::Pubkey::new_unique().to_string(),
+                    recipient: solana_pubkey::Pubkey::new_unique().to_string(),
+                    suggested_deposit: Some(1_000),
+                    currency: solana_pubkey::Pubkey::new_unique().to_string(),
+                    network: "localnet".to_string(),
+                    min_voucher_delta: 1,
+                    ..SessionConfig::default()
+                },
+                "stream-test-secret",
+                Arc::clone(&store),
+            )
+            .with_blockhash_cache(stream_test_blockhash_cache()),
         );
-        let open_header = handle.open_header(1_000, "open_sig").await.unwrap();
-        let SessionOutcome::Active { state, .. } = session.process(&open_header).await.unwrap()
-        else {
-            panic!("expected an active session");
-        };
-        let context = SessionStreamContext::new(session.clone(), state.channel_id, 0);
+        let challenge = session.challenge(None).unwrap();
+        let channel = solana_pubkey::Pubkey::new_unique();
+        let signer = stream_test_signer();
+        let authorized_signer = signer.pubkey().to_string();
+        let handle = SessionHandle::new(channel, signer, challenge.clone());
+        let channel_id = channel.to_string();
+        store
+            .put_channel(
+                &channel_id,
+                test_channel_state(
+                    &channel_id,
+                    1_000,
+                    &authorized_signer,
+                    "client",
+                    &challenge.id,
+                    solana_pubkey::Pubkey::new_unique().to_string(),
+                    None,
+                ),
+            )
+            .await
+            .unwrap();
+        let context = SessionStreamContext::new(session.clone(), channel_id, 0);
         let spec = SessionMeterSpec::new([SessionMeterDimension::required(
             MeterDirection::Output,
             BillingUnit::Bytes,
@@ -1214,42 +1239,51 @@ data: {"type":"message_delta","usage":{"output_tokens":5}}
         operator_keypair[32..].copy_from_slice(verifying_key.as_bytes());
         let operator: Arc<dyn SolanaSigner> =
             Arc::new(MemorySigner::from_bytes(&operator_keypair).unwrap());
-        let client_operator: Box<dyn SolanaSigner> =
-            Box::new(MemorySigner::from_bytes(&operator_keypair).unwrap());
-        let mut config = SessionConfig {
+        let config = SessionConfig {
             operator: operator.pubkey().to_string(),
             recipient: solana_pubkey::Pubkey::new_unique().to_string(),
-            max_cap: 1_000,
+            suggested_deposit: Some(1_000),
             currency: solana_pubkey::Pubkey::new_unique().to_string(),
             network: "localnet".to_string(),
             min_voucher_delta: 1,
-            modes: vec![SessionMode::Push],
+            voucher_signer: VoucherSigner::Operator,
             ..SessionConfig::default()
         };
-        config.settlement_authority = SessionSettlementAuthority::Delegated;
+        let store: Arc<dyn ChannelStore> = Arc::new(MemoryChannelStore::new());
         let session = Arc::new(
-            SessionMpp::new(config, "delegated-stream-test-secret")
-                .with_payment_channel_signer(operator),
+            SessionMpp::new_with_channel_store(
+                config,
+                "delegated-stream-test-secret",
+                Arc::clone(&store),
+            )
+            .with_blockhash_cache(stream_test_blockhash_cache())
+            .with_payment_channel_signer(Arc::clone(&operator)),
         );
-        let challenge = session.challenge(1_000).unwrap();
-        let handle = SessionHandle::new(
-            solana_pubkey::Pubkey::new_unique(),
-            client_operator,
-            challenge,
-        );
-        let open_header = handle.open_header(1_000, "open_sig").await.unwrap();
-        let SessionOutcome::Active { state, .. } = session.process(&open_header).await.unwrap()
-        else {
-            panic!("expected an active delegated session");
-        };
+        let challenge = session.challenge(None).unwrap();
+        let channel_id = solana_pubkey::Pubkey::new_unique().to_string();
+        store
+            .put_channel(
+                &channel_id,
+                test_channel_state(
+                    &channel_id,
+                    1_000,
+                    operator.pubkey().to_string(),
+                    "operator",
+                    &challenge.id,
+                    solana_pubkey::Pubkey::new_unique().to_string(),
+                    None,
+                ),
+            )
+            .await
+            .unwrap();
         let reservation = session
-            .reserve_delegated_capacity(&state.channel_id, 1_000)
+            .reserve_delegated_capacity(&channel_id, 1_000)
             .await
             .unwrap()
             .expect("session capacity should be available");
         let forward = SessionForward::delegated(
             session.clone(),
-            state.channel_id.clone(),
+            channel_id.clone(),
             0,
             crate::server::metering::UptoSettlementPlan {
                 metering: metering(vec![MeterDimension {
@@ -1315,7 +1349,7 @@ data: {"type":"message_delta","usage":{"output_tokens":5}}
                 b"data: {\"choices\":[{\"delta\":{\"content\":\"one two three\"}}]}\n\n"
             )
         );
-        assert_eq!(session.committed_watermark(&state.channel_id), Some(3));
+        assert_eq!(session.committed_watermark(&channel_id), Some(3));
 
         assert!(
             tokio::time::timeout(Duration::from_millis(50), metered.next())
@@ -1336,7 +1370,7 @@ data: {"type":"message_delta","usage":{"output_tokens":5}}
             )
         );
         assert_eq!(
-            session.committed_watermark(&state.channel_id),
+            session.committed_watermark(&channel_id),
             Some(10),
             "retroactive repricing must collect the remaining authorization without failing the stream"
         );

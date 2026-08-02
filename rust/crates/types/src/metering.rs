@@ -383,11 +383,20 @@ pub enum AuthConfig {
     /// OAuth2 — fetch access token and inject as `Authorization: Bearer`.
     Oauth2 {
         /// Token endpoint URL (e.g. `https://oauth2.googleapis.com/token`).
-        /// Special value `"gcp_metadata"` uses the GCP metadata server.
+        /// Special value `"gcp_metadata"` uses the GCP metadata server to
+        /// mint an OAuth2 access token; `"gcp_metadata_identity"` mints an
+        /// audience-bound OIDC identity token instead (for invoking
+        /// IAM-protected services such as private Cloud Run) and requires
+        /// `audience`.
         token_url: String,
         /// OAuth2 scopes to request.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         scopes: Vec<String>,
+        /// OIDC audience for `token_url: gcp_metadata_identity` — the URL of
+        /// the IAM-protected service being invoked (e.g. the Cloud Run
+        /// service URL). Required in identity mode, rejected otherwise.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        audience: Option<String>,
         /// Env var for client_id (for client_credentials grant).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         client_id_from_env: Option<String>,
@@ -810,16 +819,18 @@ impl SignerConfig {
 /// is configured for MPP session payments (off-chain vouchers).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
-pub enum SessionSettlementAuthority {
+pub enum SessionVoucherSigner {
     /// The client owns the channel voucher key and signs each cumulative debit.
     #[default]
-    ClientVoucher,
-    /// The client delegates voucher authority to the gateway operator, which
-    /// meters successful responses and signs their cumulative settlement.
-    Delegated,
+    Client,
+    /// The client binds the gateway operator as the channel's voucher signer;
+    /// the operator meters successful responses and signs their cumulative
+    /// settlement while the client authenticates with a reusable payer proof.
+    Operator,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct SessionSpec {
     /// Default channel cap offered to clients (USDC, human-readable).
     /// Clients may request a lower cap; the server will not exceed this.
@@ -828,42 +839,21 @@ pub struct SessionSpec {
     /// Prevents spam vouchers smaller than one API call's cost.
     #[serde(default)]
     pub min_voucher_delta: u64,
-    /// Who signs cumulative settlement vouchers. Independent from `modes`,
-    /// which controls how channel transactions are submitted.
+    /// Who signs cumulative settlement vouchers (`client` or `operator`).
     #[serde(default)]
-    pub settlement_authority: SessionSettlementAuthority,
-    /// Session modes this server accepts.
+    pub voucher_signer: SessionVoucherSigner,
+    /// Inactivity thresholds (seconds) offered to clients for negotiation.
     ///
-    /// Allowed values: `"push"` (payment channel, client-funded) and/or
-    /// `"pull"` (SPL token delegation, operator fee-pays the approve tx).
-    ///
-    /// Defaults to `["push"]` when omitted.
-    ///
-    /// Example YAML:
-    /// ```yaml
-    /// session:
-    ///   cap_usdc: 10.0
-    ///   modes: [push, pull]
-    /// ```
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub modes: Vec<String>,
-    /// Pull voucher strategy.
-    ///
-    /// This disambiguates pull-mode sessions:
-    /// - `disabled`: do not advertise or accept pull sessions.
-    /// - `client_voucher`: client signs vouchers; no multi-delegate setup.
-    /// - `operated_voucher`: operator signs vouchers after metering and uses
-    ///   multi-delegate setup for delegated token movement.
-    #[serde(default)]
-    pub pull_voucher_strategy: SessionPullVoucherStrategy,
-    /// Legacy pull-mode channel-open batch flush interval in milliseconds.
-    ///
-    /// Defaults to `400` when omitted.
-    #[serde(default = "default_session_batch_open_interval_ms")]
-    pub batch_open_interval_ms: u64,
+    /// When set, this must be a non-empty, strictly increasing list of
+    /// integers between 1 and 2592000 (30 days). The client may select one
+    /// value in its `open` credential; when omitted the server picks the
+    /// effective timeout from `close_delay_ms`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle_timeout_options_seconds: Option<Vec<u32>>,
     /// Idle delay before the operator closes and settles the payment channel.
     ///
-    /// Defaults to `15000` when omitted. Set to `0` to disable automatic close.
+    /// Defaults to `600000` (ten minutes) when omitted. Set to `0` to disable
+    /// automatic close.
     #[serde(default = "default_session_close_delay_ms")]
     pub close_delay_ms: u64,
     /// Boundary used to group idle channel closes into settlement batches.
@@ -887,27 +877,20 @@ pub struct SessionSpec {
     pub splits: Vec<SplitRule>,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum SessionPullVoucherStrategy {
-    #[default]
-    Disabled,
-    ClientVoucher,
-    OperatedVoucher,
-}
-
-fn default_session_batch_open_interval_ms() -> u64 {
-    400
-}
-
+/// Idle grace period restarted by each channel touch. The resulting deadline
+/// is rounded separately by `close_batch_interval_ms`.
 fn default_session_close_delay_ms() -> u64 {
-    15_000
+    600_000
 }
 
+/// Deadline bucket width for grouping idle closes. This is neither the idle
+/// grace period nor the reconciliation worker's polling interval.
 fn default_session_close_batch_interval_ms() -> u64 {
     60_000
 }
 
+/// Cadence for pushing active-channel watermarks in embedded reconciliation
+/// mode. External reconciliation workers use their own configured cadence.
 fn default_session_settlement_interval_ms() -> u64 {
     5_000
 }
@@ -1718,6 +1701,30 @@ fn validate_auth_config(auth: &AuthConfig, context: &str, errs: &mut Vec<String>
             fetch,
             inject,
         } => validate_access_token_auth(prepare, fetch, inject, context, errs),
+        AuthConfig::Oauth2 {
+            token_url,
+            scopes,
+            audience,
+            ..
+        } => {
+            let identity = token_url == "gcp_metadata_identity";
+            let has_audience = audience.as_deref().is_some_and(|a| !a.trim().is_empty());
+            if identity && !has_audience {
+                errs.push(format!(
+                    "{context}: oauth2.token_url `gcp_metadata_identity` requires oauth2.audience — set it to the URL of the IAM-protected service being invoked (e.g. the Cloud Run service URL)"
+                ));
+            }
+            if !identity && audience.is_some() {
+                errs.push(format!(
+                    "{context}: oauth2.audience is only valid with token_url `gcp_metadata_identity` (got token_url `{token_url}`)"
+                ));
+            }
+            if identity && !scopes.is_empty() {
+                errs.push(format!(
+                    "{context}: oauth2.scopes are not supported with token_url `gcp_metadata_identity` — identity tokens are bound to an audience, not scopes"
+                ));
+            }
+        }
         _ => {}
     }
 }
@@ -2552,14 +2559,10 @@ mod tests {
     fn session_spec_defaults_lifecycle_intervals() {
         let session: SessionSpec = serde_json::from_str(r#"{"cap_usdc":10.0}"#).unwrap();
 
-        assert_eq!(session.batch_open_interval_ms, 400);
-        assert_eq!(session.close_delay_ms, 15_000);
+        assert_eq!(session.close_delay_ms, 600_000);
         assert_eq!(session.close_batch_interval_ms, 60_000);
         assert_eq!(session.settlement_interval_ms, 5_000);
-        assert_eq!(
-            session.settlement_authority,
-            SessionSettlementAuthority::ClientVoucher
-        );
+        assert_eq!(session.voucher_signer, SessionVoucherSigner::Client);
     }
 
     #[test]
@@ -2582,14 +2585,22 @@ mod tests {
     }
 
     #[test]
-    fn session_spec_parses_delegated_settlement_authority() {
+    fn session_spec_parses_operator_voucher_signer() {
         let session: SessionSpec =
-            serde_json::from_str(r#"{"cap_usdc":10.0,"settlement_authority":"delegated"}"#)
-                .unwrap();
+            serde_json::from_str(r#"{"cap_usdc":10.0,"voucher_signer":"operator"}"#).unwrap();
+        assert_eq!(session.voucher_signer, SessionVoucherSigner::Operator);
+    }
 
-        assert_eq!(
-            session.settlement_authority,
-            SessionSettlementAuthority::Delegated
+    #[test]
+    fn session_spec_rejects_unknown_fields() {
+        // A legacy/renamed key (e.g. a since-removed `settlement_authority`)
+        // must be a hard parse error, not a silent no-op that leaves
+        // `voucher_signer` defaulted to `client`.
+        let result: Result<SessionSpec, _> =
+            serde_json::from_str(r#"{"cap_usdc":10.0,"settlement_authority":"delegated"}"#);
+        assert!(
+            result.is_err(),
+            "unknown field must be rejected, not silently ignored"
         );
     }
 
@@ -3773,10 +3784,8 @@ value_from_env: PAY_SIGNER_KEYPAIR
         spec.session = Some(SessionSpec {
             cap_usdc: 10.0,
             min_voucher_delta: 0,
-            settlement_authority: SessionSettlementAuthority::ClientVoucher,
-            modes: vec![],
-            pull_voucher_strategy: SessionPullVoucherStrategy::Disabled,
-            batch_open_interval_ms: 400,
+            voucher_signer: SessionVoucherSigner::Client,
+            idle_timeout_options_seconds: None,
             close_delay_ms: 15_000,
             close_batch_interval_ms: 60_000,
             settlement_interval_ms: 5_000,
@@ -3940,10 +3949,8 @@ value_from_env: PAY_SIGNER_KEYPAIR
         spec.session = Some(SessionSpec {
             cap_usdc: 10.0,
             min_voucher_delta: 0,
-            settlement_authority: SessionSettlementAuthority::ClientVoucher,
-            modes: vec![],
-            pull_voucher_strategy: SessionPullVoucherStrategy::Disabled,
-            batch_open_interval_ms: 400,
+            voucher_signer: SessionVoucherSigner::Client,
+            idle_timeout_options_seconds: None,
             close_delay_ms: 15_000,
             close_batch_interval_ms: 60_000,
             settlement_interval_ms: 5_000,
@@ -4712,6 +4719,85 @@ endpoints:
             errs.iter()
                 .any(|e| e.contains("does not support nested oauth2 auth")),
             "expected nested oauth2 validation error, got: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn validate_oauth2_identity_requires_audience() {
+        let spec: ApiSpec = serde_yml::from_str(&access_token_auth_yaml(
+            r#"    method: oauth2
+    token_url: gcp_metadata_identity"#,
+        ))
+        .unwrap();
+
+        let errs = validate_api_spec(&spec);
+        assert!(
+            errs.iter().any(|e| e.contains("requires oauth2.audience")),
+            "expected missing-audience validation error, got: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn validate_oauth2_audience_requires_identity_token_url() {
+        let spec: ApiSpec = serde_yml::from_str(&access_token_auth_yaml(
+            r#"    method: oauth2
+    token_url: https://oauth.example.com/token
+    audience: https://svc-xyz.a.run.app"#,
+        ))
+        .unwrap();
+
+        let errs = validate_api_spec(&spec);
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("oauth2.audience is only valid with token_url")),
+            "expected audience-without-identity validation error, got: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn validate_oauth2_identity_rejects_scopes() {
+        let spec: ApiSpec = serde_yml::from_str(&access_token_auth_yaml(
+            r#"    method: oauth2
+    token_url: gcp_metadata_identity
+    audience: https://svc-xyz.a.run.app
+    scopes:
+      - https://www.googleapis.com/auth/cloud-platform"#,
+        ))
+        .unwrap();
+
+        let errs = validate_api_spec(&spec);
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("oauth2.scopes are not supported")),
+            "expected scopes-with-identity validation error, got: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn validate_oauth2_identity_with_audience_is_valid() {
+        let spec: ApiSpec = serde_yml::from_str(&access_token_auth_yaml(
+            r#"    method: oauth2
+    token_url: gcp_metadata_identity
+    audience: https://svc-xyz.a.run.app"#,
+        ))
+        .unwrap();
+
+        match spec.routing.auth() {
+            Some(AuthConfig::Oauth2 {
+                token_url,
+                audience,
+                ..
+            }) => {
+                assert_eq!(token_url, "gcp_metadata_identity");
+                assert_eq!(audience.as_deref(), Some("https://svc-xyz.a.run.app"));
+            }
+            other => panic!("expected oauth2 auth, got: {other:?}"),
+        }
+
+        let errs = validate_api_spec(&spec);
+        assert!(
+            !errs.iter().any(|e| e.contains("oauth2")),
+            "expected no oauth2 validation errors, got: {errs:?}"
         );
     }
 

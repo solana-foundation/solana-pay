@@ -30,10 +30,9 @@ recipients:
 session:
   cap_usdc: 10.0
   min_voucher_delta: 1
-  settlement_authority: delegated
+  voucher_signer: operator
   close_delay_ms: 15000
   settlement_interval_ms: 5000
-  modes: [push]
   splits:
     - recipient: gateway
       percent: 0.1

@@ -33,7 +33,7 @@ session:
   # Clients may request a lower cap; the server will not accept higher.
   cap_usdc: 10.0
   # The gateway meters successful responses and signs cumulative vouchers.
-  settlement_authority: delegated
+  voucher_signer: operator
   # Minimum voucher increment (base units = µUSDC).
   # Official Gemini token prices can be sub-µUSDC per token. We settle in
   # 0.000001 USDC quanta (1 µUSDC) once usage has accumulated enough value.
@@ -43,7 +43,6 @@ session:
   settlement_interval_ms: 5000
   # The agent payer opens the channel and reuses its authorization while the
   # delegated gateway operator signs metered vouchers.
-  modes: [push]
   splits:
     - recipient: platform
       percent: 0.1

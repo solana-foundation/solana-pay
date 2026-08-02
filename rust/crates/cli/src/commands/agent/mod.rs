@@ -977,7 +977,7 @@ fn discover_catalog_providers() -> Vec<DiscoveredProvider> {
         return Vec::new();
     };
     rt.block_on(async {
-        let mut resolved = match load_catalog_quietly() {
+        let mut resolved = match load_or_fetch_catalog().await {
             Ok(mut catalog) => {
                 let fqns = catalog_providers::picker_catalog_fqns(&catalog);
                 catalog_providers::resolve_catalog_providers(&mut catalog, &fqns).await
@@ -1049,9 +1049,19 @@ fn discover_catalog_providers() -> Vec<DiscoveredProvider> {
 /// anonymous 127.0.0.1 row on every `pay claude` launch. Provider selection is
 /// not a catalog-update command, so any non-empty on-disk snapshot is suitable;
 /// pinned OpenAPI sources are refreshed separately in the background.
-fn load_catalog_quietly() -> pay_core::Result<pay_core::skills::Catalog> {
+/// Cached catalog when one exists, else a fetch, else pinned providers only.
+///
+/// The fetch keeps the picker priced when no cache file exists at all (fresh
+/// machine, or a concurrent refresh pruned it): without it discovery would
+/// silently degrade to the built-in fallback providers, which carry no
+/// pricing metadata, and every hosted model would render "unpriced".
+/// `load_skills_for` writes the cache back and merges pins itself.
+async fn load_or_fetch_catalog() -> pay_core::Result<pay_core::skills::Catalog> {
     if let Ok(mut catalog) = pay_core::skills::load_cached_skills() {
         pay_core::skills::overlay::merge_pins_into(&mut catalog);
+        return Ok(catalog);
+    }
+    if let Ok(catalog) = pay_core::skills::load_skills_for(pay_core::ClientApp::Cli).await {
         return Ok(catalog);
     }
     let mut catalog = pay_core::skills::Catalog {
@@ -1287,7 +1297,11 @@ mod tests {
 
                 assert_eq!(providers.len(), 1);
                 assert_eq!(providers[0].slug(), "acme-inference");
-                assert_eq!(providers[0].models, ["acme-large", "acme-small"]);
+                assert_eq!(
+                    providers[0].models,
+                    ["acme-large"],
+                    "live models without a configured pricing variant must not be offered"
+                );
                 assert_eq!(
                     providers[0]
                         .pricing_hint_for_model(Some("acme-large"))

@@ -74,7 +74,7 @@ async fn session_channel_store()
                 pay_core::Error::Config(format!("failed to connect session Redis store: {error}"))
             })?;
         tracing::info!("using durable Redis channel store for MPP sessions");
-        return Ok((Arc::new(store), true));
+        Ok((Arc::new(store), true))
     }
 
     #[cfg(not(feature = "redis-session-store"))]
@@ -267,6 +267,28 @@ fn x402_currency_configs(
     configs
 }
 
+/// Session challenges and metered settlement convert USD prices into token
+/// base units by decimal scaling alone (`payment::price_unit_base_amount`),
+/// which is only sound when one whole token is worth exactly one USD. A
+/// non-pegged session currency (e.g. `SOL`) would advertise and settle a
+/// `$0.01` price as `0.01 SOL`, so refuse to boot instead of mispricing
+/// every voucher.
+fn ensure_session_currencies_usd_pegged(
+    currency_configs: &[(String, String, u8)],
+) -> pay_core::Result<()> {
+    for (symbol, mint, _decimals) in currency_configs {
+        if Stablecoin::parse_symbol(symbol).is_none() && Stablecoin::from_mint(mint).is_none() {
+            return Err(pay_core::Error::Config(format!(
+                "session currency `{symbol}` is not a recognized USD-pegged stablecoin: \
+                 session prices are USD amounts settled 1:1 in token base units, so a \
+                 non-pegged asset would be mispriced; use {}",
+                Stablecoin::SYMBOL_LIST
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn resolve_session_splits(
     api: &ApiSpec,
     session: &pay_types::metering::SessionSpec,
@@ -446,44 +468,6 @@ fn parse_payout_recipient(
         label,
         pubkey: recipient,
     })
-}
-
-async fn create_surfpool_payment_channel_payer(
-    rpc_url: &str,
-) -> pay_core::Result<Arc<dyn SolanaSigner>> {
-    use ed25519_dalek::SigningKey;
-    use pay_kit::mpp::solana_keychain::MemorySigner;
-
-    let sk = SigningKey::generate(&mut rand::rngs::OsRng);
-    let vk = sk.verifying_key();
-    let mut kp = [0u8; 64];
-    kp[..32].copy_from_slice(sk.as_bytes());
-    kp[32..].copy_from_slice(vk.as_bytes());
-    let signer = MemorySigner::from_bytes(&kp).map_err(|e| {
-        pay_core::Error::Config(format!(
-            "failed to create session channel payer signer: {e}"
-        ))
-    })?;
-    let pubkey = signer.pubkey().to_string();
-    pay_core::client::sandbox::fund_via_surfpool(rpc_url, &pubkey).await?;
-    Ok(Arc::new(signer) as Arc<dyn SolanaSigner>)
-}
-
-async fn ensure_surfpool_session_distribution_accounts(
-    rpc_url: &str,
-    splits: &[pay_kit::mpp::server::session::Split],
-) -> pay_core::Result<()> {
-    let treasury = pay_kit::mpp::program::payment_channels::treasury_owner().to_string();
-    pay_core::client::sandbox::set_surfpool_usdc_token_account(rpc_url, &treasury, 0).await?;
-    for split in splits {
-        pay_core::client::sandbox::set_surfpool_usdc_token_account(
-            rpc_url,
-            &split.recipient.to_string(),
-            0,
-        )
-        .await?;
-    }
-    Ok(())
 }
 
 fn add_payout_recipient_target(
@@ -978,113 +962,51 @@ impl StartCommand {
             )?;
             // ── Create one session MPP server per configured currency ──
             let session_mpps: Vec<Arc<SessionMpp>> = if let Some(ref sess) = api.session {
-                use pay_core::server::session::PullVoucherStrategy;
-                use pay_types::metering::{
-                    SessionPullVoucherStrategy as ConfigPullVoucherStrategy,
-                    SessionSettlementAuthority as ConfigSettlementAuthority,
-                };
-                use pay_kit::mpp::server::session::{
-                    SessionConfig, SettlementAuthority,
-                };
-                use pay_kit::mpp::{SessionMode, SessionPullVoucherStrategy};
+                use pay_kit::mpp::server::session::{SessionConfig, VoucherSigner};
+                use pay_types::metering::SessionVoucherSigner as ConfigVoucherSigner;
                 use std::str::FromStr;
+
+                ensure_session_currencies_usd_pegged(&currency_configs)?;
 
                 let session_secret = std::env::var("PAY_SESSION_SECRET")
                     .unwrap_or_else(|_| challenge_binding_secret.clone());
-                // Default to pull + clientVoucher (payment-channel) when `modes`
-                // is omitted — matches the canonical pay-kit `session()` adapter
-                // and the JS playground client. Explicit `modes:` is respected.
-                let modes_omitted = sess.modes.is_empty();
-                let requested_modes: Vec<SessionMode> = if modes_omitted {
-                    vec![SessionMode::Pull]
-                } else {
-                    sess.modes
-                        .iter()
-                        .map(|m| match m.as_str() {
-                            "pull" => SessionMode::Pull,
-                            _ => SessionMode::Push,
-                        })
-                        .collect()
-                };
-                let pull_voucher_strategy = match sess.pull_voucher_strategy {
-                    // Omitting `modes` opts into the pull default, so also enable
-                    // clientVoucher (otherwise pull gets stripped back to push).
-                    ConfigPullVoucherStrategy::Disabled if modes_omitted => {
-                        PullVoucherStrategy::ClientVoucher
-                    }
-                    ConfigPullVoucherStrategy::Disabled => PullVoucherStrategy::Disabled,
-                    ConfigPullVoucherStrategy::ClientVoucher => PullVoucherStrategy::ClientVoucher,
-                    ConfigPullVoucherStrategy::OperatedVoucher => {
-                        return Err(pay_core::Error::Config(
-                            "session.pull_voucher_strategy = operated_voucher is no longer \
-                             supported; use client_voucher or disabled"
-                                .to_string(),
-                        ));
-                    }
-                };
-                let mut modes = requested_modes.clone();
-                if pull_voucher_strategy == PullVoucherStrategy::Disabled {
-                    if requested_modes.contains(&SessionMode::Pull) {
-                        tracing::warn!(
-                            "pull mode requested but pull_voucher_strategy is disabled; advertising push only"
-                        );
-                    }
-                    modes.retain(|mode| mode != &SessionMode::Pull);
-                }
-                if modes.is_empty() {
-                    modes.push(SessionMode::Push);
-                }
-                let sdk_pull_voucher_strategy = if modes.contains(&SessionMode::Pull) {
-                    match pull_voucher_strategy {
-                        PullVoucherStrategy::Disabled => None,
-                        PullVoucherStrategy::ClientVoucher => {
-                            Some(SessionPullVoucherStrategy::ClientVoucher)
-                        }
-                    }
-                } else {
-                    None
-                };
                 let channel_program_id = std::env::var("PAY_PAYMENT_CHANNELS_PROGRAM_ID")
                     .or_else(|_| std::env::var("PAY_FIBER_PROGRAM_ID"))
                     .ok()
                     .and_then(|value| solana_pubkey::Pubkey::from_str(&value).ok())
                     .unwrap_or_else(pay_kit::mpp::program::payment_channels::default_program_id);
                 let session_splits = resolve_session_splits(&api, sess)?;
-                let client_voucher_pull = modes.contains(&SessionMode::Pull)
-                    && pull_voucher_strategy == PullVoucherStrategy::ClientVoucher;
-                let settlement_authority = match sess.settlement_authority {
-                    ConfigSettlementAuthority::ClientVoucher => {
-                        SettlementAuthority::ClientVoucher
-                    }
-                    ConfigSettlementAuthority::Delegated => SettlementAuthority::Delegated,
+                let voucher_signer = match sess.voucher_signer {
+                    ConfigVoucherSigner::Client => VoucherSigner::Client,
+                    ConfigVoucherSigner::Operator => VoucherSigner::Operator,
                 };
-                if settlement_authority == SettlementAuthority::Delegated
-                    && fee_payer_signer.is_none()
-                {
+                if voucher_signer == VoucherSigner::Operator && fee_payer_signer.is_none() {
                     return Err(pay_core::Error::Config(
-                        "delegated session settlement requires operator.fee_payer so the gateway can sign metered vouchers".to_string(),
+                        "operator-signed sessions require operator.fee_payer so the gateway can sign metered vouchers".to_string(),
                     ));
                 }
-                if client_voucher_pull
-                    && let Some(settlement_signer) = fee_payer_signer.as_ref()
-                    && recipient != settlement_signer.pubkey().to_string()
-                {
-                    return Err(pay_core::Error::Config(
-                        "pull/client_voucher sessions require the primary recipient to match the gateway settlement signer. Remove operator.recipient or set it to the configured signer pubkey.".to_string(),
-                    ));
+                if let Some(options) = sess.idle_timeout_options_seconds.as_deref() {
+                    pay_kit::mpp::validate_idle_timeout_options(options).map_err(|error| {
+                        pay_core::Error::Config(format!(
+                            "invalid session.idle_timeout_options_seconds: {error}"
+                        ))
+                    })?;
                 }
-                let session_channel_payer_signer = if client_voucher_pull && should_fund {
-                    Some(create_surfpool_payment_channel_payer(&rpc_url).await?)
+                // The negotiated idle timeout mirrors the lifecycle close
+                // delay; disabled auto-close advertises the spec maximum.
+                let idle_timeout_seconds = if sess.close_delay_ms == 0 {
+                    pay_kit::mpp::MAX_IDLE_TIMEOUT_SECONDS
                 } else {
-                    None
+                    u32::try_from(sess.close_delay_ms.div_ceil(1_000))
+                        .unwrap_or(pay_kit::mpp::MAX_IDLE_TIMEOUT_SECONDS)
+                        .clamp(1, pay_kit::mpp::MAX_IDLE_TIMEOUT_SECONDS)
                 };
                 let session_operator = fee_payer_signer
                     .as_ref()
-                    .or(session_channel_payer_signer.as_ref())
                     .map(|signer| signer.pubkey().to_string())
                     .unwrap_or_else(|| recipient.clone());
                 let (session_recipient, session_splits) =
-                    if settlement_authority == SettlementAuthority::Delegated {
+                    if voucher_signer == VoucherSigner::Operator {
                         delegated_session_channel_payout(
                             &recipient,
                             &session_operator,
@@ -1093,10 +1015,6 @@ impl StartCommand {
                     } else {
                         (recipient.clone(), session_splits)
                     };
-                if client_voucher_pull && should_fund {
-                    ensure_surfpool_session_distribution_accounts(&rpc_url, &session_splits)
-                        .await?;
-                }
 
                 let (session_channel_store, durable_session_store) =
                     session_channel_store().await?;
@@ -1111,15 +1029,21 @@ impl StartCommand {
                         currency: session_mpp_currency.clone(),
                         decimals: *session_decimals,
                         network: network.slug().to_string(),
-                        max_cap: cap_base,
+                        // Per-unit price; the gate overrides it per challenge
+                        // from the endpoint's resolved metering price.
+                        amount: 1,
+                        suggested_deposit: Some(cap_base),
+                        minimum_deposit: None,
                         min_voucher_delta: sess.min_voucher_delta,
-                        settlement_authority,
-                        modes: modes.clone(),
-                        pull_voucher_strategy: sdk_pull_voucher_strategy.clone(),
+                        voucher_signer,
+                        operator_signing_key: None,
+                        idle_timeout_options_seconds: sess.idle_timeout_options_seconds.clone(),
+                        idle_timeout_seconds,
                         grace_period_seconds:
                             pay_kit::mpp::program::payment_channels::DEFAULT_GRACE_PERIOD_SECONDS,
                         rpc_url: Some(rpc_url.clone()),
-                        program_id: Some(channel_program_id),
+                        channel_program: Some(channel_program_id),
+                        token_program: None,
                     };
 
                     let mut smpp = SessionMpp::new_with_channel_store(
@@ -1128,13 +1052,9 @@ impl StartCommand {
                         Arc::clone(&session_channel_store),
                     )
                         .with_realm(api.title.clone())
-                        .with_pull_voucher_strategy(pull_voucher_strategy)
                         .with_blockhash_cache(blockhash_cache.clone());
                     if let Some(operator_signer) = fee_payer_signer.clone() {
                         smpp = smpp.with_payment_channel_signer(operator_signer);
-                    }
-                    if let Some(channel_payer_signer) = session_channel_payer_signer.clone() {
-                        smpp = smpp.with_payment_channel_payer_signer(channel_payer_signer);
                     }
 
                     let smpp = Arc::new(smpp);
@@ -3062,8 +2982,9 @@ mod tests {
         surfpool_funding_targets, surfpool_prep_notice_body,
     };
     use super::{
-        build_pdb_config, default_bind, delegated_session_channel_payout, payout_recipient_pubkeys,
-        payout_recipient_targets, resolve_operator_currencies, session_lifecycle_reconciliation,
+        build_pdb_config, default_bind, delegated_session_channel_payout,
+        ensure_session_currencies_usd_pegged, payout_recipient_pubkeys, payout_recipient_targets,
+        resolve_operator_currencies, session_lifecycle_reconciliation,
         validate_browser_rpc_request, x402_currency_configs, x402_upto_beneficiary_pubkey,
         x402_upto_payout_for_recipient,
     };
@@ -3575,6 +3496,41 @@ endpoints:
             resolve_currency("USDG", "mainnet").0,
             pay_types::stablecoin_mints::USDG_MAINNET
         );
+    }
+
+    #[test]
+    fn session_currencies_require_usd_pegged_stablecoins() {
+        // Stablecoin symbols and recognized stablecoin mints pass.
+        let pegged: Vec<(String, String, u8)> = vec![
+            resolve_currency_config("USDC", "mainnet"),
+            resolve_currency_config("usdt", "mainnet"),
+            (
+                pay_types::stablecoin_mints::PYUSD_MAINNET.to_string(),
+                pay_types::stablecoin_mints::PYUSD_MAINNET.to_string(),
+                6,
+            ),
+        ];
+        assert!(ensure_session_currencies_usd_pegged(&pegged).is_ok());
+
+        // SOL resolves (9 decimals) for other schemes but must not open
+        // sessions: $0.01 would be advertised and settled as 0.01 SOL.
+        let sol = vec![resolve_currency_config("SOL", "mainnet")];
+        let err = ensure_session_currencies_usd_pegged(&sol).unwrap_err();
+        assert!(err.to_string().contains("not a recognized USD-pegged"));
+        assert!(err.to_string().contains("SOL"));
+
+        // Unrecognized raw mints fail closed rather than assume a peg.
+        let unknown = vec![(
+            "BonkMintAddress111111111111111111111111111".to_string(),
+            "BonkMintAddress111111111111111111111111111".to_string(),
+            6,
+        )];
+        assert!(ensure_session_currencies_usd_pegged(&unknown).is_err());
+    }
+
+    fn resolve_currency_config(symbol: &str, network: &str) -> (String, String, u8) {
+        let (mint, decimals) = resolve_currency(symbol, network);
+        (symbol.to_string(), mint, decimals)
     }
 
     #[test]

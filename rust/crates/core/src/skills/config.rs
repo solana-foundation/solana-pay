@@ -238,12 +238,20 @@ impl SkillsConfig {
         dir.join(format!("skills-{ts}-{hash}.json"))
     }
 
-    /// Remove every `skills-*.json` cache file except `keep`.
+    /// Remove `skills-*.json` cache files older than `keep`.
     ///
     /// Catalog files are timestamped, so even with an unchanged source hash
     /// each successful update writes a new file. Without this prune, repeat
     /// `pay skills update` calls would accumulate one stale catalog per run.
+    ///
+    /// Only files whose filename timestamp is strictly older than `keep`'s
+    /// are removed. Many pay processes (CLI, gateways, one MCP server per
+    /// agent session) refresh this cache independently; deleting everything
+    /// except our own write lets two racing refreshes delete each other's
+    /// file and leave no catalog at all, which downstream consumers read as
+    /// "catalog unavailable" long after both refreshes succeeded.
     pub fn clean_stale_caches(&self, keep: &std::path::Path) {
+        let keep_ts = cache_file_timestamp(keep);
         let dir = cache_dir();
         let Ok(entries) = std::fs::read_dir(&dir) else {
             return;
@@ -254,11 +262,25 @@ impl SkillsConfig {
                 continue;
             }
             let name = entry.file_name().to_string_lossy().to_string();
-            if name.starts_with("skills-") && name.ends_with(".json") {
+            if name.starts_with("skills-")
+                && name.ends_with(".json")
+                && cache_file_timestamp(&path) < keep_ts
+            {
                 let _ = std::fs::remove_file(&path);
             }
         }
     }
+}
+
+/// Unix timestamp embedded in a `skills-<ts>-<hash>.json` cache filename,
+/// or 0 when the name doesn't carry one (legacy files sort as oldest).
+fn cache_file_timestamp(path: &std::path::Path) -> u64 {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| name.strip_prefix("skills-"))
+        .and_then(|rest| rest.split('-').next())
+        .and_then(|ts| ts.parse().ok())
+        .unwrap_or(0)
 }
 
 /// Resolve a source shorthand to a URL.
@@ -482,5 +504,23 @@ mod tests {
     #[test]
     fn default_ttl_value() {
         assert_eq!(default_ttl(), 30);
+    }
+
+    #[test]
+    fn cache_file_timestamps_order_racing_refreshes() {
+        let older = std::path::Path::new("/tmp/skills-1785600000-aaaa1111.json");
+        let newer = std::path::Path::new("/tmp/skills-1785600042-bbbb2222.json");
+        assert_eq!(cache_file_timestamp(older), 1_785_600_000);
+        assert_eq!(cache_file_timestamp(newer), 1_785_600_042);
+        // A refresh only prunes strictly-older files, so two concurrent
+        // refreshes can never delete each other's write and leave zero
+        // catalogs behind.
+        assert!(cache_file_timestamp(older) < cache_file_timestamp(newer));
+        // Legacy names without a timestamp sort as oldest and are pruned
+        // by any timestamped write; an unparseable `keep` prunes nothing.
+        assert_eq!(
+            cache_file_timestamp(std::path::Path::new("/tmp/skills-cache.json")),
+            0
+        );
     }
 }

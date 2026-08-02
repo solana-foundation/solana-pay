@@ -404,12 +404,6 @@ async fn proxy(State(state): State<Arc<PayerState>>, req: Request) -> Response {
         return deliver(first, translated, session_authorization.take()).await;
     }
 
-    // The cached channel may have expired, closed, or exhausted its cap. Drop
-    // it before consuming the fresh challenge and opening a replacement.
-    if let Some(cached) = session_authorization.as_mut() {
-        **cached = None;
-    }
-
     // Buffer the 402 so it can be passed through untouched when payment
     // is impossible. 402 bodies are small (a JSON error envelope).
     let mut status = first.status();
@@ -433,17 +427,80 @@ async fn proxy(State(state): State<Arc<PayerState>>, req: Request) -> Response {
             .filter_map(|value| value.to_str().ok()),
     );
 
-    // A cached delegated session is represented by its idempotent `open`
-    // credential. Once the server seals that channel, the resulting 402 is a
-    // terminal-session error rather than a fresh challenge. Rediscovery must
-    // therefore happen without the stale credential before we can open a
-    // replacement channel.
+    let mut has_session_challenge = mpp_challenges.iter().any(|challenge| {
+        challenge.method.as_str() == "solana" && challenge.intent.as_str() == "session"
+    });
+
     if state.payment_protocol == PaymentProtocol::MppSession
         && used_cached_session
-        && !mpp_challenges.iter().any(|challenge| {
-            challenge.method.as_str() == "solana" && challenge.intent.as_str() == "session"
-        })
+        && !has_session_challenge
+        && retryable_cached_session_error(&resp_body)
     {
+        tracing::info!(%url, "payer proxy: retrying transient cached MPP session rejection");
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        let retried = match send_upstream(
+            &state,
+            &method,
+            &url,
+            &headers,
+            body.clone(),
+            cached_payment.as_ref(),
+        )
+        .await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                tracing::warn!(%url, %error, "payer proxy: cached MPP session retry failed");
+                return buffered_response(status, &resp_headers, resp_body);
+            }
+        };
+        if retried.status() != StatusCode::PAYMENT_REQUIRED {
+            return deliver(retried, translated, session_authorization.take()).await;
+        }
+        status = retried.status();
+        resp_headers = retried.headers().clone();
+        resp_body = match retried.bytes().await {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                tracing::warn!(%url, %error, "payer proxy: failed to read cached MPP session retry");
+                return (
+                    StatusCode::BAD_GATEWAY,
+                    format!("payer proxy: upstream error: {error}"),
+                )
+                    .into_response();
+            }
+        };
+        mpp_challenges = pay_core::mpp::parse_all(
+            resp_headers
+                .get_all(header::WWW_AUTHENTICATE)
+                .iter()
+                .filter_map(|value| value.to_str().ok()),
+        );
+        has_session_challenge = mpp_challenges.iter().any(|challenge| {
+            challenge.method.as_str() == "solana" && challenge.intent.as_str() == "session"
+        });
+    }
+
+    // A cached operator-signed session is represented by its reusable `use`
+    // credential. Only a definitive terminal error or a fresh session
+    // challenge proves that the cached channel should be replaced. Transient
+    // store contention must preserve it for the next request.
+    if state.payment_protocol == PaymentProtocol::MppSession
+        && used_cached_session
+        && !has_session_challenge
+        && !terminal_cached_session_error(&resp_body)
+    {
+        tracing::warn!(%url, "payer proxy: preserving cached MPP session after non-terminal 402");
+        return buffered_response(status, &resp_headers, resp_body);
+    }
+
+    if state.payment_protocol == PaymentProtocol::MppSession
+        && used_cached_session
+        && !has_session_challenge
+    {
+        if let Some(cached) = session_authorization.as_mut() {
+            **cached = None;
+        }
         tracing::info!(%url, "payer proxy: cached MPP session ended; requesting a fresh challenge");
         let refreshed = match send_upstream(&state, &method, &url, &headers, body.clone(), None)
             .await
@@ -486,6 +543,11 @@ async fn proxy(State(state): State<Arc<PayerState>>, req: Request) -> Response {
                 .iter()
                 .filter_map(|value| value.to_str().ok()),
         );
+    } else if state.payment_protocol == PaymentProtocol::MppSession
+        && used_cached_session
+        && let Some(cached) = session_authorization.as_mut()
+    {
+        **cached = None;
     }
 
     let charge_challenges: Vec<_> = mpp_challenges
@@ -559,32 +621,79 @@ async fn proxy(State(state): State<Arc<PayerState>>, req: Request) -> Response {
             return buffered_response(status, &resp_headers, resp_body);
         }
     };
-    if let (Some(cache), Some(authorization)) = (
-        session_authorization.as_mut(),
-        new_session_authorization.as_ref(),
-    ) {
-        **cache = Some(authorization.clone());
-    }
-
     tracing::info!(%url, "payer proxy: 402 paid — retrying once with payment credential");
     match send_upstream(&state, &method, &url, &headers, body, Some(&payment)).await {
         Ok(retry) => {
-            if retry.status() == StatusCode::PAYMENT_REQUIRED
-                && let Some(cache) = session_authorization.as_mut()
-            {
-                **cache = None;
+            // Only adopt the new credential once a request has actually gone
+            // through on it. Caching it before this point risks stranding a
+            // credential for a channel whose open transaction never landed
+            // (or whose response was lost) — a use of that credential then
+            // fails with a terminal-looking rejection (e.g. "unknown session
+            // channel") that never clears without a manual restart.
+            if retry.status() == StatusCode::PAYMENT_REQUIRED {
+                if let Some(cache) = session_authorization.as_mut() {
+                    **cache = None;
+                }
+            } else if let (Some(cache), Some(authorization)) = (
+                session_authorization.as_mut(),
+                new_session_authorization.as_ref(),
+            ) {
+                **cache = Some(authorization.clone());
             }
             deliver(retry, translated, session_authorization.take()).await
         }
         Err(e) => {
-            // The open credential is idempotent and the channel may already
-            // have been funded even though the response was lost. Preserve it
-            // across transport failures; only a definitive 402 rejection
-            // above proves that the cached session cannot be reused.
-            tracing::warn!(%url, error = %e, "payer proxy: paid retry failed — preserving the session and returning the original 402");
+            // A transport failure here means we don't know whether the paid
+            // request (and, for a first use, the channel open it carried)
+            // landed upstream. Leave the cache exactly as it was before this
+            // attempt — do not adopt the unconfirmed new credential — so the
+            // next request renegotiates instead of reusing a channel that
+            // may never have opened.
+            tracing::warn!(%url, error = %e, "payer proxy: paid retry failed — preserving the prior session and returning the original 402");
             buffered_response(status, &resp_headers, resp_body)
         }
     }
+}
+
+fn cached_session_error_text(body: &[u8]) -> String {
+    serde_json::from_slice::<serde_json::Value>(body)
+        .ok()
+        .and_then(|value| {
+            let error = value
+                .get("error")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            let message = value
+                .get("message")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            (!error.is_empty() || !message.is_empty()).then(|| format!("{error} {message}"))
+        })
+        .unwrap_or_else(|| String::from_utf8_lossy(body).into_owned())
+        .to_ascii_lowercase()
+}
+
+fn retryable_cached_session_error(body: &[u8]) -> bool {
+    let text = cached_session_error_text(body);
+    text.contains("concurrent channel update")
+        || text.contains("retry the request")
+        || text.contains("session_capacity_reserved")
+}
+
+fn terminal_cached_session_error(body: &[u8]) -> bool {
+    use pay_core::server::session::terminal_errors;
+    let text = cached_session_error_text(body);
+    text.contains("session_cap_exhausted")
+        || text.contains("session_close_pending")
+        || text.contains("already sealed")
+        || text.contains("close is pending")
+        || text.contains("cap has been exhausted")
+        || text.contains("exceeds available deposit")
+        || text.contains(terminal_errors::UNKNOWN_CHANNEL)
+        || text.contains(terminal_errors::CHALLENGE_ECHO_MISMATCH)
+        || text.contains(terminal_errors::OPERATOR_ONLY)
+        || text.contains(terminal_errors::PREDATES_PROOF_BINDING)
+        || text.contains(terminal_errors::PROOF_MISMATCH)
 }
 
 /// Hosted providers must challenge successful inference requests, but model
@@ -878,60 +987,61 @@ impl PaidHeaders {
     }
 }
 
-/// Open a delegated push session and return the authorization reused for all
-/// subsequent requests handled by this payer proxy.
+/// Open an operator-signed session and return the initial `open`
+/// authorization plus the reusable `use` credential cached for all subsequent
+/// requests handled by this payer proxy.
 fn build_session_authorization(
     state: &PayerState,
     challenge: &pay_core::mpp::Challenge,
 ) -> pay_core::Result<(PaidHeaders, String)> {
-    use pay_kit::mpp::{SessionMode, SessionRequest, SessionSettlementAuthority};
+    use pay_kit::mpp::{SessionRequest, SessionVoucherSigner};
 
     let request: SessionRequest = challenge
         .request
         .decode()
         .map_err(|error| pay_core::Error::Mpp(format!("invalid MPP session challenge: {error}")))?;
-    if request.settlement_authority != SessionSettlementAuthority::Delegated {
+    if request.method_details.voucher_signer != Some(SessionVoucherSigner::Operator) {
         return Err(pay_core::Error::Mpp(
-            "agent payer requires a delegated MPP session".to_string(),
+            "agent payer requires an operator-signed MPP session".to_string(),
         ));
     }
-    if !request.modes.is_empty() && !request.modes.contains(&SessionMode::Push) {
-        return Err(pay_core::Error::Mpp(
-            "agent payer requires MPP session push mode".to_string(),
-        ));
-    }
-    if let (Some(forced), Some(offered)) = (
-        state.network_override.as_deref(),
-        request.network.as_deref(),
-    ) && forced != offered
+    if let Some(forced) = state.network_override.as_deref()
+        && forced != request.method_details.network
     {
         return Err(pay_core::Error::Mpp(format!(
-            "MPP session network mismatch: payer requires `{forced}`, gateway offered `{offered}`"
+            "MPP session network mismatch: payer requires `{forced}`, gateway offered `{}`",
+            request.method_details.network
         )));
     }
 
-    let cap = request.cap.parse::<u64>().map_err(|_| {
-        pay_core::Error::Mpp(format!(
-            "MPP session challenge advertised a non-numeric cap: {}",
-            request.cap
-        ))
-    })?;
-    if cap == 0 {
-        return Err(pay_core::Error::Mpp(
-            "MPP session challenge advertised a zero cap".to_string(),
-        ));
-    }
-    let min_delta = request
-        .min_voucher_delta
+    let minimum = request
+        .minimum_deposit
         .as_deref()
-        .unwrap_or("1")
-        .parse::<u64>()
-        .map_err(|_| {
-            pay_core::Error::Mpp("MPP session challenge has invalid minVoucherDelta".to_string())
-        })?;
-    let deposit = min_delta.saturating_mul(1_000).max(1_000_000).min(cap);
+        .map(|value| {
+            value.parse::<u64>().map_err(|_| {
+                pay_core::Error::Mpp(format!(
+                    "MPP session challenge advertised a non-numeric minimumDeposit: {value}"
+                ))
+            })
+        })
+        .transpose()?
+        .unwrap_or(0);
+    let deposit = request
+        .suggested_deposit
+        .as_deref()
+        .map(|value| {
+            value.parse::<u64>().map_err(|_| {
+                pay_core::Error::Mpp(format!(
+                    "MPP session challenge advertised a non-numeric suggestedDeposit: {value}"
+                ))
+            })
+        })
+        .transpose()?
+        .unwrap_or(1_000_000)
+        .max(minimum)
+        .max(1);
     let sandbox = state.network_override.as_deref() == Some("localnet");
-    let (_handle, authorization) = pay_core::session::open_payment_channel_session_header(
+    let (handle, open_authorization) = pay_core::session::open_payment_channel_session_header(
         challenge,
         &request,
         state.store.as_ref(),
@@ -942,7 +1052,15 @@ fn build_session_authorization(
         sandbox,
     )?;
 
-    Ok((PaidHeaders::mpp(authorization.clone()), authorization))
+    // Subsequent requests authenticate with the reusable payer proof bound at
+    // open; the operator meters delivered service and signs the vouchers.
+    let use_authorization = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| pay_core::Error::Mpp(format!("Failed to build runtime: {error}")))?
+        .block_on(handle.use_header())?;
+
+    Ok((PaidHeaders::mpp(open_authorization), use_authorization))
 }
 
 /// Select a payable MPP challenge and build the `Authorization: Payment …`
@@ -1243,6 +1361,58 @@ mod tests {
     fn payer_proxy_bind_address_is_loopback_only() {
         assert!(PAYER_PROXY_BIND_IP.is_loopback());
         assert_eq!(PAYER_PROXY_BIND_IP, Ipv4Addr::LOCALHOST);
+    }
+
+    /// One case per real `session_failed` rejection the server can produce
+    /// for a stale cached credential (see `pay_core::server::session`'s
+    /// `verify_use_authentication` and `verify_challenge_echo`). Every one
+    /// of these is terminal — the exact same cached credential will fail
+    /// identically forever, so the proxy must discard it and renegotiate
+    /// rather than preserve-and-retry. Pinned against the server's own
+    /// error text so a rewording can't silently reopen the wedge.
+    #[test]
+    fn terminal_cached_session_error_recognizes_every_server_rejection() {
+        use pay_core::server::session::terminal_errors;
+
+        let session_failed_body = |message: &str| {
+            serde_json::to_vec(&serde_json::json!({
+                "error": "session_failed",
+                "message": message,
+                "retryable": true,
+            }))
+            .unwrap()
+        };
+
+        for message in [
+            &format!("{}: 6y6WeJ8H4o", terminal_errors::UNKNOWN_CHANNEL),
+            terminal_errors::CHALLENGE_ECHO_MISMATCH,
+            terminal_errors::OPERATOR_ONLY,
+            &format!(
+                "session channel {}; open a new session",
+                terminal_errors::PREDATES_PROOF_BINDING
+            ),
+            &format!("use authentication {}", terminal_errors::PROOF_MISMATCH),
+        ] {
+            let body = session_failed_body(message);
+            assert!(
+                terminal_cached_session_error(&body),
+                "expected terminal classification for: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn terminal_cached_session_error_does_not_misclassify_a_transient_store_error() {
+        let body = serde_json::to_vec(&serde_json::json!({
+            "error": "session_failed",
+            "message": "failed to read session channel abc123: store timeout",
+            "retryable": true,
+        }))
+        .unwrap();
+        assert!(
+            !terminal_cached_session_error(&body),
+            "a store read hiccup must stay retryable, not be treated as terminal"
+        );
     }
 
     /// A canned MPP charge challenge that signs fully offline: the
@@ -1981,7 +2151,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn session_open_credential_survives_a_paid_retry_transport_error() {
+    async fn session_open_credential_does_not_survive_a_paid_retry_transport_error() {
         fn open_test_session(
             _state: &PayerState,
             _challenge: &pay_core::mpp::Challenge,
@@ -1991,8 +2161,9 @@ mod tests {
         }
 
         // Serve exactly the challenge response, then stop listening before the
-        // paid retry. This models a connection failure after the open may
-        // already have funded its channel.
+        // paid retry. This models a connection failure after the open may or
+        // may not have landed upstream — genuinely ambiguous, since nothing
+        // confirms whether the retry was even received.
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let challenge = session_challenge_header();
@@ -2041,8 +2212,11 @@ mod tests {
         assert_eq!(response.status(), StatusCode::PAYMENT_REQUIRED);
         assert_eq!(
             state.session_authorization.lock().await.as_deref(),
-            Some("Payment durable-open"),
-            "an ambiguous transport failure must retain the idempotent open credential"
+            None,
+            "an unconfirmed open credential must not be cached — adopting it before \
+             a paid retry proves it landed risks stranding a credential for a \
+             channel that never opened; the next request must renegotiate instead \
+             of trusting a credential no response ever confirmed"
         );
     }
 
@@ -2240,6 +2414,97 @@ mod tests {
                 Some("Payment test-session".to_string()),
             ],
             "a terminal cached session must be followed by unauthenticated challenge discovery",
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn retryable_cached_session_error_reuses_channel() {
+        fn open_test_session(
+            _state: &PayerState,
+            _challenge: &pay_core::mpp::Challenge,
+        ) -> pay_core::Result<(PaidHeaders, String)> {
+            let authorization = "Payment retryable-session".to_string();
+            Ok((PaidHeaders::mpp(authorization.clone()), authorization))
+        }
+
+        let seen = Arc::new(Mutex::new(Vec::<Option<String>>::new()));
+        let record = seen.clone();
+        let app = Router::new().fallback(any(move |req: Request| {
+            let record = record.clone();
+            async move {
+                let authorization = req
+                    .headers()
+                    .get(header::AUTHORIZATION)
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_string);
+                let _ = axum::body::to_bytes(req.into_body(), MAX_BODY_BYTES).await;
+                let mut seen = record.lock().unwrap();
+                seen.push(authorization.clone());
+                match seen.len() {
+                    1 => Response::builder()
+                        .status(StatusCode::PAYMENT_REQUIRED)
+                        .header(header::WWW_AUTHENTICATE, session_challenge_header())
+                        .body(Body::from(r#"{"error":"payment required"}"#))
+                        .unwrap(),
+                    2 | 4 => (StatusCode::OK, "session paid").into_response(),
+                    3 => Response::builder()
+                        .status(StatusCode::PAYMENT_REQUIRED)
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(
+                            r#"{"error":"session_failed","message":"Store error: Concurrent channel update; retry the request"}"#,
+                        ))
+                        .unwrap(),
+                    call => panic!("unexpected upstream call {call}"),
+                }
+            }
+        }));
+        let upstream = spawn_server(app).await;
+        let store: Arc<dyn AccountsStore> = Arc::new(MemoryAccountsStore::new());
+        let state = Arc::new(
+            PayerState::new(
+                PayerUpstream {
+                    base_url: upstream,
+                    host_header: None,
+                    dialect: Dialect::Anthropic,
+                    chat_path: "v1/chat/completions".to_string(),
+                    responses_path: "v1/responses".to_string(),
+                    require_payment: true,
+                    payment_protocol: PaymentProtocol::MppSession,
+                },
+                store,
+                None,
+                None,
+            )
+            .unwrap()
+            .with_session_opener(open_test_session),
+        );
+        let payer = spawn_server(router(state.clone())).await;
+
+        let client = reqwest::Client::new();
+        for prompt in ["one", "two"] {
+            let response = client
+                .post(format!("{payer}/v1/messages"))
+                .body(prompt)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![
+                None,
+                Some("Payment retryable-session".to_string()),
+                Some("Payment retryable-session".to_string()),
+                Some("Payment retryable-session".to_string()),
+            ],
+            "a retryable store conflict must retry the same channel without rediscovery",
+        );
+        assert_eq!(
+            state.session_authorization.lock().await.as_deref(),
+            Some("Payment retryable-session"),
+            "a transient 402 must preserve the cached session"
         );
     }
 

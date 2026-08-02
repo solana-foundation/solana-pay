@@ -8,10 +8,11 @@
 //!
 //! ```text
 //! 1. Server returns 402 with session challenge (intent="session")
-//! 2. Client creates a payment channel on-chain → gets channel_id + tx_sig
-//! 3. Client calls SessionHandle::new() and sends open_header() on first request
-//! 4. For each subsequent request: voucher_header(cost_per_request)
-//! 5. When done: close_header() triggers on-chain settlement
+//! 2. Client builds a challenge-bound open transaction and sends the `open`
+//!    action; the server verifies, broadcasts, and confirms it
+//! 3. Client-signed channels send voucher_header(cost) per request;
+//!    operator-signed channels send use_header() and the operator meters
+//! 4. When done: close_header() triggers on-chain settlement
 //! ```
 
 use std::sync::Arc;
@@ -19,8 +20,9 @@ use std::sync::Arc;
 use pay_kit::mpp::client::session::ActiveSession;
 use pay_kit::mpp::solana_keychain::SolanaSigner;
 use pay_kit::mpp::{
-    PaymentChallenge, PaymentCredential, SessionAction, SessionMode, SessionRequest,
-    format_authorization, parse_www_authenticate,
+    ClosePayload, PaymentChallenge, PaymentCredential, SessionAction, SessionAuthentication,
+    SessionAuthenticationType, SessionRequest, SessionVoucherSigner, SignedVoucher, UsePayload,
+    VoucherData, VoucherSignatureType, format_authorization, parse_www_authenticate,
 };
 use solana_pubkey::Pubkey;
 use tokio::sync::Mutex;
@@ -32,8 +34,8 @@ use crate::{Error, Result};
 pub use pay_kit::mpp::client::session::ActiveSession as RawSession;
 
 /// A live session: wraps an [`ActiveSession`] and the original challenge so
-/// voucher authorization headers can be produced without re-parsing the
-/// challenge on each call.
+/// authorization headers can be produced without re-parsing the challenge on
+/// each call.
 ///
 /// `SessionHandle` is `Clone` and `Send + Sync` — safe to share across async
 /// tasks (e.g., a middleware that reuses the same channel for all in-flight
@@ -43,9 +45,13 @@ pub struct SessionHandle {
     inner: Arc<Mutex<ActiveSession>>,
     /// Original challenge — echoed back in every `PaymentCredential`.
     challenge: PaymentChallenge,
-    /// Delegated sessions bind the operator, rather than the local ephemeral
-    /// voucher key, as the channel's on-chain authorized signer.
-    authorized_signer_override: Option<Pubkey>,
+    /// Reusable payer proof bound at open. Present for operator-signed
+    /// channels, where it authenticates `use` and `close` actions.
+    authentication: Option<SessionAuthentication>,
+    /// Client-mode ephemeral voucher key. Kept so `close_header` can sign an
+    /// equal-watermark voucher (close authentication without advancing
+    /// settlement) — [`ActiveSession`] only signs strictly increasing ones.
+    voucher_key: Option<ed25519_dalek::SigningKey>,
 }
 
 impl SessionHandle {
@@ -73,35 +79,37 @@ impl SessionHandle {
         signer: Box<dyn SolanaSigner>,
         challenge: PaymentChallenge,
     ) -> Self {
+        Self::from_active(ActiveSession::new(channel_id, signer), challenge)
+    }
+
+    /// Wrap an existing [`ActiveSession`] (e.g. one produced by the PayKit
+    /// session opener).
+    pub fn from_active(session: ActiveSession, challenge: PaymentChallenge) -> Self {
         Self {
-            inner: Arc::new(Mutex::new(ActiveSession::new(channel_id, signer))),
+            inner: Arc::new(Mutex::new(session)),
             challenge,
-            authorized_signer_override: None,
+            authentication: None,
+            voucher_key: None,
         }
     }
 
-    fn with_authorized_signer(mut self, authorized_signer: Pubkey) -> Self {
-        self.authorized_signer_override = Some(authorized_signer);
+    /// Attach the reusable payer proof bound at open (operator-signed mode).
+    pub fn with_authentication(mut self, authentication: SessionAuthentication) -> Self {
+        self.authentication = Some(authentication);
         self
     }
 
-    /// Build an `Authorization` header for the `open` action.
-    ///
-    /// Send this on the **first** request after the on-chain open transaction
-    /// has been confirmed.
-    ///
-    /// * `deposit` — amount locked on-chain (base units, e.g. µUSDC)
-    /// * `open_tx_signature` — base58 Solana transaction signature
-    pub async fn open_header(&self, deposit: u64, open_tx_signature: &str) -> Result<String> {
-        let session = self.inner.lock().await;
-        let action = session.open_action(deposit, open_tx_signature);
-        build_header(&self.challenge, &action)
+    /// Retain the client-mode ephemeral voucher key so `close_header` can
+    /// authenticate a close without advancing settlement.
+    pub fn with_voucher_key(mut self, key: ed25519_dalek::SigningKey) -> Self {
+        self.voucher_key = Some(key);
+        self
     }
 
     /// Build an `Authorization` header carrying a voucher for `amount` base units.
     ///
     /// Increments the cumulative watermark by `amount`. Call this before every
-    /// metered API request (after the initial open).
+    /// metered API request on a client-signed channel.
     pub async fn voucher_header(&self, amount: u64) -> Result<String> {
         let mut session = self.inner.lock().await;
         let action = session
@@ -111,25 +119,82 @@ impl SessionHandle {
         build_header(&self.challenge, &action)
     }
 
+    /// Build an `Authorization` header for a metered request on an
+    /// operator-signed channel, presenting the reusable payer proof.
+    pub async fn use_header(&self) -> Result<String> {
+        let authentication = self.authentication.clone().ok_or_else(|| {
+            Error::Mpp("use requires the payer proof bound at open (operator mode)".to_string())
+        })?;
+        let session = self.inner.lock().await;
+        let action = SessionAction::Use(UsePayload {
+            channel_id: session.channel_id_str(),
+            authentication,
+        });
+        build_header(&self.challenge, &action)
+    }
+
     /// Build an `Authorization` header for cooperative channel close.
     ///
-    /// `final_increment` optionally adds a last voucher for any outstanding
-    /// balance before close. Pass `None` if the channel is already fully
-    /// settled.
+    /// Operator-signed channels authenticate with the bound payer proof and
+    /// never carry a voucher. Client-signed channels must always authenticate
+    /// with a final voucher: `final_increment` adds any outstanding balance,
+    /// while `None` (or zero) re-signs the current watermark, which
+    /// authenticates the close without advancing settlement.
     pub async fn close_header(&self, final_increment: Option<u64>) -> Result<String> {
         let mut session = self.inner.lock().await;
-        let action = session
-            .close_action(final_increment)
-            .await
-            .map_err(|e| Error::Mpp(format!("Failed to build close action: {e}")))?;
+        if let Some(authentication) = self.authentication.clone() {
+            let action = SessionAction::Close(ClosePayload {
+                channel_id: session.channel_id_str(),
+                authentication: Some(authentication),
+                voucher: None,
+            });
+            return build_header(&self.challenge, &action);
+        }
+        let action = match final_increment {
+            Some(increment) if increment > 0 => session
+                .close_action(Some(increment))
+                .await
+                .map_err(|e| Error::Mpp(format!("Failed to build close action: {e}")))?,
+            _ => SessionAction::Close(ClosePayload {
+                channel_id: session.channel_id_str(),
+                authentication: None,
+                voucher: Some(self.watermark_voucher(&session)?),
+            }),
+        };
         build_header(&self.challenge, &action)
+    }
+
+    /// Sign a voucher at the session's current cumulative watermark.
+    fn watermark_voucher(&self, session: &ActiveSession) -> Result<SignedVoucher> {
+        use ed25519_dalek::Signer;
+
+        let key = self.voucher_key.as_ref().ok_or_else(|| {
+            Error::Mpp(
+                "close without a final increment requires the session voucher key".to_string(),
+            )
+        })?;
+        let data = VoucherData {
+            channel_id: session.channel_id_str(),
+            cumulative_amount: session.cumulative.to_string(),
+            expires_at: Some(pay_kit::mpp::DEFAULT_SESSION_EXPIRES_AT),
+        };
+        let message = data
+            .message_bytes()
+            .map_err(|e| Error::Mpp(format!("Failed to encode close voucher: {e}")))?;
+        let signature = bs58::encode(key.sign(&message).to_bytes()).into_string();
+        Ok(SignedVoucher {
+            data,
+            signer: session.authorized_signer(),
+            signature,
+            signature_type: VoucherSignatureType::Ed25519,
+        })
     }
 
     /// Build an `Authorization` header for a payment-channel `open` action.
     ///
-    /// `open_slot` is the channel's on-chain open slot — a channel-PDA seed
-    /// since the epoch-addressed program update — and must match the slot the
-    /// open transaction was built for (the challenge's `recentSlot`).
+    /// `open_slot` must come from the challenge's `recentSlot` and
+    /// `transaction` must be the base64 open transaction built against the
+    /// challenge's `recentBlockhash` — the server rejects anything else.
     #[allow(clippy::too_many_arguments)]
     pub async fn open_payment_channel_header(
         &self,
@@ -142,38 +207,8 @@ impl SessionHandle {
         open_slot: u64,
         transaction: String,
     ) -> Result<String> {
-        self.open_payment_channel_header_with_mode(
-            SessionMode::Push,
-            deposit,
-            payer,
-            payee,
-            mint,
-            salt,
-            grace_period,
-            open_slot,
-            transaction,
-        )
-        .await
-    }
-
-    /// Build an `Authorization` header for a payment-channel `open` action
-    /// using an explicit submission mode.
-    #[allow(clippy::too_many_arguments)]
-    pub async fn open_payment_channel_header_with_mode(
-        &self,
-        mode: SessionMode,
-        deposit: u64,
-        payer: &str,
-        payee: &str,
-        mint: &str,
-        salt: u64,
-        grace_period: u32,
-        open_slot: u64,
-        transaction: String,
-    ) -> Result<String> {
         let session = self.inner.lock().await;
-        let SessionAction::Open(payload) = session.open_payment_channel_action_with_mode(
-            mode,
+        let SessionAction::Open(mut payload) = session.open_payment_channel_action(
             deposit,
             payer,
             payee,
@@ -181,25 +216,22 @@ impl SessionHandle {
             salt,
             grace_period,
             open_slot,
-            "pending",
+            &transaction,
         ) else {
             unreachable!("open_payment_channel_action always returns SessionAction::Open")
         };
-        let mut payload = payload.with_transaction(transaction);
-        if let Some(authorized_signer) = self.authorized_signer_override {
-            payload.authorized_signer = authorized_signer.to_string();
-        }
+        payload.authentication = self.authentication.clone();
         build_header(&self.challenge, &SessionAction::Open(payload))
     }
 
     /// Build an `Authorization` header for a top-up after adding more funds
     /// on-chain.
     ///
-    /// * `new_deposit` — new total deposit after the top-up (base units)
-    /// * `topup_tx_signature` — base58 Solana transaction signature
-    pub async fn topup_header(&self, new_deposit: u64, topup_tx_signature: &str) -> Result<String> {
+    /// * `additional_amount` — amount added to the deposit (base units)
+    /// * `transaction` — base64 signed top-up transaction
+    pub async fn topup_header(&self, additional_amount: u64, transaction: &str) -> Result<String> {
         let session = self.inner.lock().await;
-        let action = session.topup_action(new_deposit, topup_tx_signature);
+        let action = session.topup_action(additional_amount, transaction);
         build_header(&self.challenge, &action)
     }
 
@@ -219,106 +251,38 @@ impl SessionHandle {
     }
 }
 
-// ── One-shot session pay ──────────────────────────────────────────────────────
+// ── Session open ─────────────────────────────────────────────────────────────
 
-/// Make a single API call through a session-gated endpoint.
+/// Open a payment-channel session from a 402 challenge.
 ///
-/// Creates an ephemeral keypair, opens a session with the given `deposit`
-/// (base units), sends the `open` action as the Authorization header, and
-/// returns the `Authorization` header value to use for the retry.
-///
-/// The server currently trusts the deposit without on-chain verification,
-/// so this works without a real payment channel for development/testing.
-pub fn open_session_header(
-    challenge: &PaymentChallenge,
-    deposit: u64,
-) -> Result<(SessionHandle, String)> {
-    use ed25519_dalek::SigningKey;
-    use pay_kit::mpp::solana_keychain::MemorySigner;
-    use solana_pubkey::Pubkey;
-
-    // Generate a fresh ephemeral session keypair.
-    let sk = SigningKey::generate(&mut rand::thread_rng());
-    let vk = sk.verifying_key();
-    let mut kp = [0u8; 64];
-    kp[..32].copy_from_slice(sk.as_bytes());
-    kp[32..].copy_from_slice(vk.as_bytes());
-    let signer: Box<dyn pay_kit::mpp::solana_keychain::SolanaSigner> =
-        Box::new(MemorySigner::from_bytes(&kp).map_err(|e| Error::Mpp(e.to_string()))?);
-
-    // Random channel ID — server stores it keyed by this string.
-    let channel_id = Pubkey::new_unique();
-
-    let handle = SessionHandle::new(channel_id, signer, challenge.clone());
-
-    // Build the open header (fake tx sig — server trusts it for now).
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|e| Error::Mpp(format!("Failed to build runtime: {e}")))?;
-    let auth_header = rt.block_on(handle.open_header(deposit, "demo_open_tx"))?;
-
-    Ok((handle, auth_header))
-}
-
-/// Open a payment-channel push session with a payer-signed transaction.
-///
-/// The transaction is signed by the payer and fee-payer/cosigned by the server
-/// when it processes the `open` action.
+/// Builds the open transaction against the challenge's `recentBlockhash` and
+/// `recentSlot`, prompts for spend authorization, and returns the handle plus
+/// the `Authorization` header for the retry. For operator-signed challenges
+/// (`voucherSigner: "operator"`) the payer also signs the reusable session
+/// proof bound to the opening challenge and derived channel.
 #[allow(clippy::too_many_arguments)]
 pub fn open_payment_channel_session_header(
     challenge: &PaymentChallenge,
-    request: &pay_kit::mpp::SessionRequest,
+    request: &SessionRequest,
     store: &dyn crate::accounts::AccountsStore,
     network_override: Option<&str>,
     account_override: Option<&str>,
     deposit: u64,
-    resource_url: &str,
-    sandbox: bool,
-) -> Result<(SessionHandle, String)> {
-    open_payment_channel_session_header_with_mode(
-        challenge,
-        request,
-        store,
-        network_override,
-        account_override,
-        deposit,
-        pay_kit::mpp::SessionMode::Push,
-        resource_url,
-        sandbox,
-    )
-}
-
-/// Open a payment-channel session in `submission_mode`.
-#[allow(clippy::too_many_arguments)]
-pub fn open_payment_channel_session_header_with_mode(
-    challenge: &PaymentChallenge,
-    request: &pay_kit::mpp::SessionRequest,
-    store: &dyn crate::accounts::AccountsStore,
-    network_override: Option<&str>,
-    account_override: Option<&str>,
-    deposit: u64,
-    submission_mode: pay_kit::mpp::SessionMode,
     resource_url: &str,
     sandbox: bool,
 ) -> Result<(SessionHandle, String)> {
     use pay_kit::mpp::client::{
-        BuildOpenPaymentChannelTransactionParams, DerivePaymentChannelOpenParams,
-        PaymentChannelOpenOptions, build_open_payment_channel_transaction,
+        DerivePaymentChannelOpenParams, PaymentChannelOpenOptions,
+        PaymentChannelSessionOpenOptions, create_payment_channel_session_opener,
         derive_payment_channel_open,
     };
     use pay_kit::mpp::protocol::solana::default_rpc_url;
     use pay_kit::mpp::solana_keychain::MemorySigner;
-    use solana_hash::Hash;
-    use solana_pubkey::Pubkey;
-    use std::str::FromStr;
 
-    let network = network_override.map(str::to_string).unwrap_or_else(|| {
-        request
-            .network
-            .clone()
-            .unwrap_or_else(|| "mainnet".to_string())
-    });
+    let details = &request.method_details;
+    let network = network_override
+        .map(str::to_string)
+        .unwrap_or_else(|| details.network.clone());
     canonical_session_origin(resource_url)?;
     let prompt_context = crate::client::prompt::payment_prompt_context(None, &[Some(resource_url)]);
     let limit = session_spend_limit(deposit, request);
@@ -334,19 +298,6 @@ pub fn open_payment_channel_session_header_with_mode(
         &intent,
     )?;
     let payer = signer.pubkey();
-    let rpc_url =
-        std::env::var("PAY_RPC_URL").unwrap_or_else(|_| default_rpc_url(&network).to_string());
-
-    let fee_payer = Pubkey::from_str(&request.operator)
-        .map_err(|_| Error::Mpp(format!("invalid operator pubkey: {}", request.operator)))?;
-    let salt = rand::random::<u64>();
-    let grace_period = 900u32;
-    let open_options = PaymentChannelOpenOptions {
-        deposit: Some(deposit),
-        grace_period: Some(grace_period),
-        salt: Some(salt),
-        ..PaymentChannelOpenOptions::default()
-    };
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -355,22 +306,16 @@ pub fn open_payment_channel_session_header_with_mode(
 
     if sandbox && ephemeral_notice.is_some() {
         let pubkey = payer.to_string();
-        let rpc = rpc_url.clone();
+        let rpc =
+            std::env::var("PAY_RPC_URL").unwrap_or_else(|_| default_rpc_url(&network).to_string());
         if let Err(e) = rt.block_on(crate::client::sandbox::fund_via_surfpool(&rpc, &pubkey)) {
             tracing::warn!(error = %e, "Surfpool auto-fund failed — USDC balance may be 0");
         }
     }
 
-    let recent_blockhash = if let Some(blockhash) = request.recent_blockhash.as_deref() {
-        Hash::from_str(blockhash)
-            .map_err(|e| Error::Mpp(format!("invalid recentBlockhash in challenge: {e}")))?
-    } else {
-        use pay_kit::mpp::solana_rpc_client::rpc_client::RpcClient;
-        RpcClient::new(rpc_url.clone())
-            .get_latest_blockhash()
-            .map_err(|e| Error::Mpp(format!("failed to get recent blockhash: {e}")))?
-    };
-
+    // Fresh ephemeral session keypair — the voucher signer for client-signed
+    // channels; unused for signing in operator mode but still generated so the
+    // handle can be constructed uniformly.
     let sk = ed25519_dalek::SigningKey::generate(&mut rand::thread_rng());
     let vk = sk.verifying_key();
     let mut kp_bytes = [0u8; 64];
@@ -378,16 +323,37 @@ pub fn open_payment_channel_session_header_with_mode(
     kp_bytes[32..].copy_from_slice(vk.as_bytes());
     let session_signer: Box<dyn pay_kit::mpp::solana_keychain::SolanaSigner> =
         Box::new(MemorySigner::from_bytes(&kp_bytes).map_err(|e| Error::Mpp(e.to_string()))?);
-    let authorized_signer = match request.settlement_authority {
-        pay_kit::mpp::SessionSettlementAuthority::ClientVoucher => session_signer.pubkey(),
-        pay_kit::mpp::SessionSettlementAuthority::Delegated => fee_payer,
+
+    let voucher_signer = details
+        .voucher_signer
+        .unwrap_or(SessionVoucherSigner::Client);
+    let authorized_signer = match voucher_signer {
+        SessionVoucherSigner::Client => session_signer.pubkey(),
+        SessionVoucherSigner::Operator => {
+            let operator = details.operator.as_deref().ok_or_else(|| {
+                Error::Mpp("operator-signed session challenge is missing operator".to_string())
+            })?;
+            std::str::FromStr::from_str(operator)
+                .map_err(|_| Error::Mpp(format!("invalid session operator: {operator}")))?
+        }
         _ => {
             return Err(Error::Mpp(
-                "unsupported MPP session settlement authority".to_string(),
+                "unsupported MPP session voucher signer".to_string(),
             ));
         }
     };
 
+    let salt = rand::random::<u64>();
+    let open_options = PaymentChannelOpenOptions {
+        deposit: Some(deposit),
+        salt: Some(salt),
+        ..PaymentChannelOpenOptions::default()
+    };
+
+    // Derive the channel address up front: the operator-mode proof signs over
+    // (challengeId, channelId) and must exist before the opener builds the
+    // payload. The opener below re-derives the same channel from the same
+    // salt/deposit/challenge inputs.
     let open = derive_payment_channel_open(DerivePaymentChannelOpenParams {
         request,
         payer,
@@ -395,45 +361,55 @@ pub fn open_payment_channel_session_header_with_mode(
         options: open_options.clone(),
     })
     .map_err(|e| Error::Mpp(format!("derive_payment_channel_open: {e}")))?;
-    let payee = open.payee;
-    let mint = open.mint;
 
-    let open_tx = rt
-        .block_on(build_open_payment_channel_transaction(
-            BuildOpenPaymentChannelTransactionParams {
-                request,
-                signer: &signer,
-                authorized_signer,
-                fee_payer: Some(fee_payer),
-                recent_blockhash,
-                options: open_options,
+    let authentication = if voucher_signer == SessionVoucherSigner::Operator {
+        let mut proof = SessionAuthentication {
+            kind: SessionAuthenticationType::Proof,
+            challenge_id: challenge.id.clone(),
+            payer: payer.to_string(),
+            signature: String::new(),
+        };
+        let message = proof
+            .message_bytes(&open.channel_id.to_string())
+            .map_err(|e| Error::Mpp(format!("failed to encode session proof: {e}")))?;
+        let signature = rt
+            .block_on(signer.sign_message(&message))
+            .map_err(|e| Error::Mpp(format!("failed to sign session proof: {e}")))?;
+        proof.signature = bs58::encode(signature.as_ref()).into_string();
+        Some(proof)
+    } else {
+        None
+    };
+
+    let opened = rt
+        .block_on(create_payment_channel_session_opener(
+            request,
+            &signer,
+            session_signer,
+            None,
+            PaymentChannelSessionOpenOptions {
+                open: open_options,
+                cumulative: None,
+                expires_at: None,
+                authentication: authentication.clone(),
+                idle_timeout_seconds: None,
             },
         ))
-        .map_err(|e| Error::Mpp(format!("build_open_payment_channel_transaction: {e}")))?;
+        .map_err(|e| Error::Mpp(format!("create_payment_channel_session_opener: {e}")))?;
+    debug_assert_eq!(opened.open.channel_id, open.channel_id);
 
-    let handle = SessionHandle::new(open_tx.channel_id, session_signer, challenge.clone())
-        .with_authorized_signer(authorized_signer);
-    let auth_header = rt.block_on(handle.open_payment_channel_header_with_mode(
-        submission_mode.clone(),
-        deposit,
-        &payer.to_string(),
-        &payee.to_string(),
-        &mint.to_string(),
-        salt,
-        grace_period,
-        // The open slot is a channel-PDA seed since the epoch-addressed
-        // program update; use the same slot the open transaction was derived
-        // for (challenge `recentSlot`, resolved inside
-        // `derive_payment_channel_open`) so the server re-derives the same PDA.
-        open.open_slot,
-        open_tx.transaction,
-    ))?;
+    let auth_header = build_header(challenge, &opened.action)?;
+    let mut handle = SessionHandle::from_active(opened.session, challenge.clone());
+    handle = match authentication {
+        Some(authentication) => handle.with_authentication(authentication),
+        None => handle.with_voucher_key(sk),
+    };
 
     tracing::debug!(
         payer = %payer,
-        channel = %open_tx.channel_id,
+        channel = %open.channel_id,
         deposit,
-        mode = ?submission_mode,
+        voucher_signer = ?voucher_signer,
         "payment-channel session authorization header ready"
     );
 
@@ -510,31 +486,40 @@ fn build_header(challenge: &PaymentChallenge, action: &SessionAction) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pay_kit::mpp::{
-        Base64UrlJson, SessionMode, SessionPullVoucherStrategy, SessionSplit, parse_authorization,
-    };
+    use pay_kit::mpp::{Base64UrlJson, SessionMethodDetails, SessionSplit, parse_authorization};
 
     fn test_request() -> SessionRequest {
         SessionRequest {
-            cap: "1000000".to_string(),
+            amount: "25".to_string(),
             currency: solana_pubkey::Pubkey::new_unique().to_string(),
-            decimals: Some(6),
-            network: Some("localnet".to_string()),
-            operator: solana_pubkey::Pubkey::new_unique().to_string(),
             recipient: solana_pubkey::Pubkey::new_unique().to_string(),
-            splits: vec![SessionSplit {
-                recipient: solana_pubkey::Pubkey::new_unique().to_string(),
-                bps: 100,
-            }],
-            program_id: Some(solana_pubkey::Pubkey::new_unique().to_string()),
             description: Some("test session".to_string()),
             external_id: Some("ext-123".to_string()),
-            min_voucher_delta: Some("25".to_string()),
-            settlement_authority: pay_kit::mpp::SessionSettlementAuthority::ClientVoucher,
-            modes: vec![SessionMode::Push, SessionMode::Pull],
-            pull_voucher_strategy: Some(SessionPullVoucherStrategy::ClientVoucher),
-            recent_blockhash: None,
-            recent_slot: None,
+            minimum_deposit: Some("100".to_string()),
+            suggested_deposit: Some("1000000".to_string()),
+            unit_type: Some("request".to_string()),
+            method_details: SessionMethodDetails {
+                network: "localnet".to_string(),
+                channel_program: solana_pubkey::Pubkey::new_unique().to_string(),
+                channel_id: None,
+                recent_blockhash: Some(solana_hash::Hash::new_unique().to_string()),
+                recent_slot: Some(314),
+                decimals: Some(6),
+                token_program: None,
+                fee_payer: None,
+                fee_payer_key: None,
+                voucher_signer: Some(SessionVoucherSigner::Client),
+                operator: None,
+                min_voucher_delta: Some("25".to_string()),
+                ttl_seconds: None,
+                idle_timeout_options_seconds: None,
+                idle_timeout_seconds: None,
+                grace_period_seconds: Some(900),
+                distribution_splits: vec![SessionSplit {
+                    recipient: solana_pubkey::Pubkey::new_unique().to_string(),
+                    share_bps: 100,
+                }],
+            },
         }
     }
 
@@ -549,7 +534,7 @@ mod tests {
         )
     }
 
-    fn test_signer() -> Box<dyn SolanaSigner> {
+    fn test_keypair() -> (ed25519_dalek::SigningKey, Box<dyn SolanaSigner>) {
         use ed25519_dalek::SigningKey;
         use pay_kit::mpp::solana_keychain::MemorySigner;
 
@@ -558,7 +543,11 @@ mod tests {
         let mut kp = [0u8; 64];
         kp[..32].copy_from_slice(sk.as_bytes());
         kp[32..].copy_from_slice(vk.as_bytes());
-        Box::new(MemorySigner::from_bytes(&kp).unwrap())
+        (sk.clone(), Box::new(MemorySigner::from_bytes(&kp).unwrap()))
+    }
+
+    fn test_signer() -> Box<dyn SolanaSigner> {
+        test_keypair().1
     }
 
     fn parse_action(header: &str) -> SessionAction {
@@ -575,7 +564,7 @@ mod tests {
             panic!("expected a session challenge");
         };
         assert_eq!(parsed_challenge.intent.as_str(), "session");
-        assert_eq!(request.cap, "1000000");
+        assert_eq!(request.suggested_deposit.as_deref(), Some("1000000"));
 
         let non_session = test_challenge("charge").to_header().unwrap();
         assert!(SessionHandle::parse_challenge(&non_session).is_none());
@@ -612,28 +601,14 @@ mod tests {
     fn spend_limit_displays_usd_amount() {
         let mut request = test_request();
         request.currency = "USDC".to_string();
-        request.decimals = Some(6);
         let limit = session_spend_limit(1_000_000, &request);
-        assert_eq!(limit.display, "$1.00");
-        assert_eq!(limit.usd_amount.as_deref(), Some("$1.00"));
-    }
-
-    #[test]
-    fn spend_limit_uses_canonical_stablecoin_decimals() {
-        let mut request = test_request();
-        request.currency = "USDC".to_string();
-        request.decimals = Some(18);
-
-        let limit = session_spend_limit(1_000_000, &request);
-
         assert_eq!(limit.display, "$1.00");
         assert_eq!(limit.usd_amount.as_deref(), Some("$1.00"));
     }
 
     #[test]
     fn spend_limit_does_not_trust_unknown_asset_decimals() {
-        let mut request = test_request();
-        request.decimals = Some(u8::MAX);
+        let request = test_request();
 
         let limit = session_spend_limit(1_000_000, &request);
 
@@ -649,15 +624,32 @@ mod tests {
         let channel_id = Pubkey::new_unique();
         let channel_id_str = channel_id.to_string();
         let challenge = test_challenge("session");
-        let handle = SessionHandle::new(channel_id, test_signer(), challenge.clone());
+        let (voucher_key, signer) = test_keypair();
+        let handle =
+            SessionHandle::new(channel_id, signer, challenge.clone()).with_voucher_key(voucher_key);
 
-        let open = parse_action(&handle.open_header(1_000_000, "open_sig").await.unwrap());
+        let open = parse_action(
+            &handle
+                .open_payment_channel_header(
+                    1_000_000,
+                    &Pubkey::new_unique().to_string(),
+                    &Pubkey::new_unique().to_string(),
+                    &Pubkey::new_unique().to_string(),
+                    7,
+                    900,
+                    314,
+                    "AQAB".to_string(),
+                )
+                .await
+                .unwrap(),
+        );
         match open {
             SessionAction::Open(payload) => {
-                assert_eq!(payload.mode, SessionMode::Push);
-                assert_eq!(payload.channel_id.as_deref(), Some(channel_id_str.as_str()));
-                assert_eq!(payload.deposit.as_deref(), Some("1000000"));
-                assert_eq!(payload.signature, "open_sig");
+                assert_eq!(payload.channel_id, channel_id_str);
+                assert_eq!(payload.deposit_amount, "1000000");
+                assert_eq!(payload.open_slot, 314);
+                assert_eq!(payload.transaction, "AQAB");
+                assert!(payload.authentication.is_none());
             }
             _ => panic!("expected open action"),
         }
@@ -666,7 +658,7 @@ mod tests {
         match voucher {
             SessionAction::Voucher(payload) => {
                 assert_eq!(payload.voucher.data.channel_id, channel_id_str);
-                assert_eq!(payload.voucher.data.cumulative, "125");
+                assert_eq!(payload.voucher.data.cumulative_amount, "125");
             }
             _ => panic!("expected voucher action"),
         }
@@ -674,12 +666,12 @@ mod tests {
         assert_eq!(handle.channel_id().await, channel_id.to_string());
         assert_eq!(handle.challenge().intent, challenge.intent);
 
-        let topup = parse_action(&handle.topup_header(2_000_000, "topup_sig").await.unwrap());
+        let topup = parse_action(&handle.topup_header(2_000_000, "AQAB").await.unwrap());
         match topup {
             SessionAction::TopUp(payload) => {
                 assert_eq!(payload.channel_id, channel_id.to_string());
-                assert_eq!(payload.new_deposit, "2000000");
-                assert_eq!(payload.signature, "topup_sig");
+                assert_eq!(payload.additional_amount, "2000000");
+                assert_eq!(payload.transaction, "AQAB");
             }
             _ => panic!("expected topup action"),
         }
@@ -688,56 +680,53 @@ mod tests {
         match close {
             SessionAction::Close(payload) => {
                 let voucher = payload.voucher.expect("final voucher");
-                assert_eq!(voucher.data.cumulative, "150");
+                assert_eq!(voucher.data.cumulative_amount, "150");
             }
             _ => panic!("expected close action"),
         }
     }
 
     #[tokio::test]
-    async fn delegated_open_uses_operator_as_authorized_signer() {
-        let operator = Pubkey::new_unique();
-        let handle = SessionHandle::new(
-            Pubkey::new_unique(),
-            test_signer(),
-            test_challenge("session"),
-        )
-        .with_authorized_signer(operator);
-        let header = handle
-            .open_payment_channel_header_with_mode(
-                SessionMode::Push,
-                1_000_000,
-                &Pubkey::new_unique().to_string(),
-                &Pubkey::new_unique().to_string(),
-                &Pubkey::new_unique().to_string(),
-                7,
-                900,
-                42,
-                "transaction".to_string(),
-            )
-            .await
-            .unwrap();
+    async fn client_close_without_increment_signs_watermark_voucher() {
+        let channel_id = Pubkey::new_unique();
+        let challenge = test_challenge("session");
+        let (voucher_key, signer) = test_keypair();
+        let handle =
+            SessionHandle::new(channel_id, signer, challenge).with_voucher_key(voucher_key);
+        handle.voucher_header(100).await.unwrap();
 
-        let SessionAction::Open(payload) = parse_action(&header) else {
-            panic!("expected open action");
+        let close = parse_action(&handle.close_header(None).await.unwrap());
+        let SessionAction::Close(payload) = close else {
+            panic!("expected close action");
         };
-        assert_eq!(payload.authorized_signer, operator.to_string());
+        assert!(payload.authentication.is_none());
+        let voucher = payload.voucher.expect("watermark voucher");
+        assert_eq!(voucher.data.cumulative_amount, "100");
     }
 
-    #[test]
-    fn open_session_header_returns_parseable_header() {
+    #[tokio::test]
+    async fn operator_session_uses_bound_proof_for_use_and_close() {
+        let channel_id = Pubkey::new_unique();
         let challenge = test_challenge("session");
-        let (handle, header) = open_session_header(&challenge, 1_000_000).unwrap();
-        let action = parse_action(&header);
-        match action {
-            SessionAction::Open(payload) => {
-                assert_eq!(payload.mode, SessionMode::Push);
-                assert_eq!(payload.deposit.as_deref(), Some("1000000"));
-            }
-            _ => panic!("expected open action"),
-        }
-        let parsed = SessionHandle::parse_challenge(&challenge.to_header().unwrap()).unwrap();
-        assert_eq!(parsed.0.intent, handle.challenge().intent);
+        let payer = ed25519_dalek::SigningKey::generate(&mut rand::thread_rng());
+        let proof =
+            SessionAuthentication::sign(challenge.id.clone(), &channel_id.to_string(), &payer)
+                .unwrap();
+        let handle = SessionHandle::new(channel_id, test_signer(), challenge)
+            .with_authentication(proof.clone());
+
+        let SessionAction::Use(payload) = parse_action(&handle.use_header().await.unwrap()) else {
+            panic!("expected use action");
+        };
+        assert_eq!(payload.channel_id, channel_id.to_string());
+        assert_eq!(payload.authentication, proof);
+
+        let SessionAction::Close(payload) = parse_action(&handle.close_header(None).await.unwrap())
+        else {
+            panic!("expected close action");
+        };
+        assert!(payload.voucher.is_none());
+        assert_eq!(payload.authentication, Some(proof));
     }
 
     #[test]
@@ -751,7 +740,7 @@ mod tests {
         let action = parse_action(&sync);
         match action {
             SessionAction::Voucher(payload) => {
-                assert_eq!(payload.voucher.data.cumulative, "42");
+                assert_eq!(payload.voucher.data.cumulative_amount, "42");
             }
             _ => panic!("expected voucher action"),
         }
