@@ -830,6 +830,7 @@ pub enum SessionVoucherSigner {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct SessionSpec {
     /// Default channel cap offered to clients (USDC, human-readable).
     /// Clients may request a lower cap; the server will not exceed this.
@@ -2588,6 +2589,20 @@ mod tests {
         let session: SessionSpec =
             serde_json::from_str(r#"{"cap_usdc":10.0,"voucher_signer":"operator"}"#).unwrap();
         assert_eq!(session.voucher_signer, SessionVoucherSigner::Operator);
+    }
+
+    #[test]
+    fn session_spec_rejects_unknown_fields() {
+        // A legacy/renamed key (e.g. a since-removed `settlement_authority`)
+        // must be a hard parse error, not a silent no-op that leaves
+        // `voucher_signer` defaulted to `client`.
+        let result: Result<SessionSpec, _> = serde_json::from_str(
+            r#"{"cap_usdc":10.0,"settlement_authority":"delegated"}"#,
+        );
+        assert!(
+            result.is_err(),
+            "unknown field must be rejected, not silently ignored"
+        );
     }
 
     #[test]

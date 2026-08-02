@@ -62,15 +62,12 @@ recipients:
 # settles and closes the channel.
 #
 # The canonical pay-kit `session()` adapter (and the JS playground client) opens
-# a payment-channel session in pull + clientVoucher mode — the client signs each
-# voucher, the operator only fee-pays/settles. Advertise that so the playground's
-# payment-channel session opener has the challenge it requires (a push-only
-# challenge makes it fail with "requires a pull-mode session challenge").
+# a payment-channel session with the client signing each voucher — the
+# operator only fee-pays/settles. `voucher_signer` defaults to `client`, which
+# matches that, so it's left unset here.
 session:
   cap_usdc: 1.0
   close_delay_ms: 2000
-  modes: [pull]
-  pull_voucher_strategy: client_voucher
   # Settlement split: the platform takes 30% of the settled session total at
   # idle-close, the seller (operator) nets the remaining 70%. Session splits are
   # percentage-only (the channel settles a single cumulative amount).
