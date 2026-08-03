@@ -1,0 +1,86 @@
+# pay-api configuration
+#
+# Field-level overrides via env vars use the `PAY_API_` prefix and `__` as a
+# nesting separator. Examples:
+#   PAY_API_PORT=8080
+#   PAY_API_RPC_TIMEOUT_MS=2500
+#   PAY_API_NETWORKS__MAINNET__RPC_URL=https://my-rpc-host
+#   PAY_API_NETWORKS__SANDBOX__RPC_URL=http://127.0.0.1:8899
+# MoonPay onramp overrides use the same names as the public web UI:
+#   MOONPAY_PUBLISHABLE_API_KEY=pk_live_...
+#   MOONPAY_ONRAMP_CURRENCY_CODE=usdc_sol
+#   MOONPAY_ONRAMP_BASE_CURRENCY_AMOUNT=20
+# /v1/send uses the shared MPP challenge secret and GCP KMS fee payer signer:
+#   PAY_MPP_CHALLENGE_SECRET=...
+#   PAY_API_SEND__ENABLED=true
+#   PAY_API_SEND__FEE_PAYER__KEY_NAME=projects/.../cryptoKeyVersions/1
+#   PAY_API_SEND__FEE_PAYER__PUBKEY=...
+# Cloud Run's `PORT` env var is also respected.
+
+port: 8080
+rpc_timeout_ms: 3000
+
+# Supported networks. The map keys must match `Network` variants
+# (mainnet | sandbox). Add a new entry to enable a new network — no code change.
+networks:
+  mainnet:
+    rpc_url: https://api.mainnet-beta.solana.com
+  sandbox:
+    rpc_url: https://402.surfnet.dev:8899
+
+# Stablecoins reported by /v1/balance/stablecoins. Order here is the order in
+# the response. token_program: spl_token | token_2022.
+stablecoins:
+  - symbol: USDC
+    mint: EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v
+    token_program: spl_token
+    decimals: 6
+  - symbol: PYUSD
+    mint: 2b1kV6DkPAnxd5ixfnxCpjxmKwqjjaYmCZfHsFu24GXo
+    token_program: token_2022
+    decimals: 6
+  - symbol: CASH
+    mint: CASHx9KJUStyftLFWGvEVf59SGeG9sh5FfcnZMVPCASH
+    token_program: token_2022
+    decimals: 6
+  - symbol: USDT
+    mint: Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB
+    token_program: spl_token
+    decimals: 6
+  - symbol: USDPT
+    mint: HVWf8JmLoHs99Lw8Psf3fyqAtA4crWxCPkrmSdNjhNH3
+    token_program: token_2022
+    decimals: 6
+  - symbol: USDG
+    mint: 2u1tszSeqZ3qBWF3uNGPFc8TzMk2tdiwknnRMWGWjGWH
+    token_program: token_2022
+    decimals: 6
+
+moonpay:
+  onramp_currency_code: usdc_sol
+  onramp_base_currency_amount: "20"
+
+send:
+  enabled: false
+  realm: pay-api send
+  # Wrapped SOL mint queried through Helius DAS getAsset for SOL/USD pricing.
+  sol_price_asset: So11111111111111111111111111111111111111112
+  # Fee-payer SOL cost estimate reimbursed as an extra stablecoin split.
+  estimated_fee_lamports: 10000
+  fee_payer:
+    key_name:
+    pubkey:
+  fee_refund_split:
+    label: Fee payer refund
+    memo: fee-payer-refund
+
+# Activation-campaign redemption. Reuses `send.fee_payer.*` as the hot
+# wallet that signs Transfer + Memo. Dedup skips automatically when
+# `helius_api_key` is empty — useful for sandbox testing against
+# `402.surfnet.dev` (Helius enhanced-transactions is mainnet-only).
+redemption:
+  enabled: true
+  currency: USDC
+  amount: 5000000          # $5 legacy flat-list fallback; campaigns override it
+  network: sandbox         # → networks.sandbox.rpc_url
+  helius_api_key: ""       # empty → dedup disabled; warning logged on each call

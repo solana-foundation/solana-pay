@@ -1,0 +1,50 @@
+[package]
+name = "pay-worker"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "close-channels"
+path = "src/bin/close_channels.rs"
+
+[[bin]]
+name = "settle-sessions"
+path = "src/bin/settle_sessions.rs"
+
+[dependencies]
+# Reuse pay-api's core (RPC client, Channel decode helpers, ATA derivation,
+# stablecoin/token-program resolution). Keeps one implementation of the
+# Solana JSON-RPC plumbing and the on-chain account shapes.
+pay-api-core = { path = "../pay-api-core" }
+
+base64 = "0.22"
+axum = { workspace = true }
+bs58 = "0.5"
+figment = { workspace = true, features = ["yaml"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = "0.10"
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "signal", "time"] }
+tokio-util = "0.7"
+tracing = { workspace = true }
+tracing-opentelemetry = { workspace = true }
+tracing-subscriber = { workspace = true }
+opentelemetry = { workspace = true }
+opentelemetry-otlp = { workspace = true }
+opentelemetry-semantic-conventions = { workspace = true }
+opentelemetry_sdk = { workspace = true }
+redis = { version = "0.32", features = ["aio", "tokio-comp", "connection-manager"] }
+
+# Same PayKit revision as pay-api and the pay proxy (workspace-pinned) — all
+# three speak the same durable Redis channel namespace and wire schema.
+pay-kit = { workspace = true, features = ["gcp_kms", "worker", "redis-store"] }
+solana-pubkey = { workspace = true }
+solana-signature = { workspace = true }
+solana-transaction = { workspace = true }
+solana-message = { workspace = true }
+solana-instruction = { workspace = true }
+solana-address = { version = "2", features = ["borsh", "curve25519"] }
+bincode = { workspace = true }
+spl-token-2022-interface = "2.1.0"

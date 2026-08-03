@@ -1,0 +1,32 @@
+# close-channels job configuration.
+#
+# Load order (later overrides earlier):
+#   1. this file
+#   2. JOBS_* env vars (with `__` for nesting), e.g.
+#      JOBS_NETWORKS__MAINNET__RPC_URL, JOBS_SEND__FEE_PAYER__KEY_NAME
+#   3. the top-level RPC_URL env var (applied to the mainnet network),
+#      matching the agent-gateway / pay-api convention.
+#
+# The fee-payer key uses the SAME env keys as pay-api so a single Doppler
+# config works for both:
+#   PAY_API_SEND__FEE_PAYER__KEY_NAME  (GCP KMS key resource name)
+#   PAY_API_SEND__FEE_PAYER__PUBKEY    (base58 pubkey of that key)
+# or the local escape hatch LOCAL_FEE_PAYER_PRIVATE_KEY.
+
+networks:
+  mainnet:
+    # Public mainnet RPC placeholder. In prod set RPC_URL (Helius) instead.
+    rpc_url: "https://api.mainnet-beta.solana.com"
+  sandbox:
+    rpc_url: "https://402.surfnet.dev"
+
+# Owner of the treasury ATA the payment-channels program pays protocol fees to.
+# Mainnet value baked into the deployed program. Overridable per-network via
+# JOBS_TREASURY_OWNER for non-mainnet deployments.
+treasury_owner: "Cs2zdfUNonRdRGsiZUQQLdTxzxVvJZmgiX2mpLYKuEqP"
+
+# Per-RPC-call timeout (ms).
+rpc_timeout_ms: 15000
+
+# Max wall-clock seconds to wait for a broadcast tx to reach `confirmed`.
+confirm_timeout_seconds: 60
