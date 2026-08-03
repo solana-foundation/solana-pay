@@ -221,7 +221,7 @@ pub struct RedemptionConfig {
 
     /// Helius enhanced-transactions API key. Required while enabled.
     #[serde(default)]
-    pub helius_api_key: String,
+    pub solana_rpc_api_key: String,
 
     /// Helius base URL — change for staging / on-prem.
     #[serde(default = "default_helius_base")]
@@ -275,7 +275,7 @@ impl Default for RedemptionConfig {
             currency: default_redemption_currency(),
             amount: default_redemption_amount(),
             network: default_redemption_network(),
-            helius_api_key: String::new(),
+            solana_rpc_api_key: String::new(),
             helius_base: default_helius_base(),
             max_scan_pages: None,
             codes: Vec::new(),
@@ -382,9 +382,10 @@ fn validate_campaign_id(id: &str) -> Result<(), String> {
 }
 
 fn validate_redemption_config(redemption: &RedemptionConfig) -> Result<(), String> {
-    if redemption.helius_api_key.trim().is_empty() {
+    if redemption.solana_rpc_api_key.trim().is_empty() {
         return Err(
-            "redemption.helius_api_key is required when redemption.enabled is true; ".to_string(),
+            "redemption.solana_rpc_api_key is required when redemption.enabled is true; "
+                .to_string(),
         );
     }
     if redemption.codes.is_empty()
@@ -453,7 +454,7 @@ fn validate_redemption_config(redemption: &RedemptionConfig) -> Result<(), Strin
 }
 
 /// Pull `api-key=` out of a Helius-style RPC URL.
-fn extract_helius_api_key(rpc_url: &str) -> Option<String> {
+fn extract_solana_rpc_api_key(rpc_url: &str) -> Option<String> {
     let parsed = Url::parse(rpc_url).ok()?;
     parsed
         .query_pairs()
@@ -568,7 +569,7 @@ impl Config {
         }
     }
 
-    /// Resolve `redemption.helius_api_key` from the environment.
+    /// Resolve `redemption.solana_rpc_api_key` from the environment.
     ///
     /// Sources, first match wins:
     ///   1. `HELIUS_API_KEY` (explicit, mirrors the MoonPay convention).
@@ -577,22 +578,22 @@ impl Config {
     ///      `gateway-402/prd`), so the dedup endpoint can piggyback on
     ///      the same secret without a separate doppler entry.
     fn apply_redemption_env(&mut self) -> Result<(), ConfigError> {
-        if self.redemption.helius_api_key.is_empty()
+        if self.redemption.solana_rpc_api_key.is_empty()
             && let Ok(key) = std::env::var("HELIUS_API_KEY")
         {
             let key = key.trim();
             if !key.is_empty() {
-                self.redemption.helius_api_key = key.to_string();
+                self.redemption.solana_rpc_api_key = key.to_string();
             }
         }
-        if self.redemption.helius_api_key.is_empty()
+        if self.redemption.solana_rpc_api_key.is_empty()
             && let Some(rpc_url) = self
                 .networks
                 .get(&Network::Mainnet)
                 .map(|n| n.rpc_url.as_str())
-            && let Some(key) = extract_helius_api_key(rpc_url)
+            && let Some(key) = extract_solana_rpc_api_key(rpc_url)
         {
-            self.redemption.helius_api_key = key;
+            self.redemption.solana_rpc_api_key = key;
         }
 
         // `REDEMPTION_CODES` is stored in Doppler so redemption
@@ -919,7 +920,7 @@ mod tests {
     #[test]
     fn rejects_duplicate_codes_across_campaigns() {
         let redemption = RedemptionConfig {
-            helius_api_key: "test-key".to_string(),
+            solana_rpc_api_key: "test-key".to_string(),
             campaigns: vec![
                 RedemptionCampaignConfig {
                     id: "anthropic-tokyo-Q2-2026".to_string(),
@@ -951,6 +952,6 @@ mod tests {
 
         let error = validate_redemption_config(&redemption)
             .expect_err("enabled redemption requires durable deduplication");
-        assert!(error.contains("redemption.helius_api_key is required"));
+        assert!(error.contains("redemption.solana_rpc_api_key is required"));
     }
 }

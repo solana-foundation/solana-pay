@@ -235,8 +235,8 @@ async fn find_prior_burn(
     // forks like Surfnet), skip the burn scan and let the transfer
     // proceed. Production deployments always have a key configured;
     // this just unblocks end-to-end testing against `402.surfnet.dev`.
-    if cfg.helius_api_key.is_empty() {
-        warn!("redemption.helius_api_key is empty — skipping dedup scan (sandbox mode)");
+    if cfg.solana_rpc_api_key.is_empty() {
+        warn!("redemption.solana_rpc_api_key is empty — skipping dedup scan (sandbox mode)");
         return Ok(None);
     }
 
@@ -254,7 +254,7 @@ async fn find_prior_burn(
         .expect("static URL parses");
         {
             let mut q = url.query_pairs_mut();
-            q.append_pair("api-key", &cfg.helius_api_key);
+            q.append_pair("api-key", &cfg.solana_rpc_api_key);
             // No `type=` filter: Helius's heuristic classifier can mark a
             // multi-instruction tx (idempotent-ATA-create + TransferChecked
             // + memo) as something other than `TRANSFER`, which would
@@ -413,7 +413,7 @@ pub struct RedemptionState {
     pub token_program: Pubkey,
     pub decimals: u8,
     pub network: Network,
-    pub helius_api_key: String,
+    pub solana_rpc_api_key: String,
     pub helius_base: String,
     pub max_scan_pages: usize,
     /// Active code → campaign grant, loaded from `REDEMPTION_CODES`
@@ -500,7 +500,7 @@ impl RedemptionState {
             token_program,
             decimals: STABLECOIN_DECIMALS,
             network: cfg.network,
-            helius_api_key: cfg.helius_api_key.clone(),
+            solana_rpc_api_key: cfg.solana_rpc_api_key.clone(),
             helius_base: cfg.helius_base.clone(),
             max_scan_pages: cfg.max_scan_pages.unwrap_or(DEFAULT_MAX_SCAN_PAGES),
             grants,
