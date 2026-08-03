@@ -116,9 +116,9 @@ pub async fn run(params: Params) -> Result<CallToolResult, rmcp::ErrorData> {
         }
     };
 
-    Ok(CallToolResult::success(vec![rmcp::model::Content::text(
-        json,
-    )]))
+    Ok(CallToolResult::success(vec![
+        rmcp::model::ContentBlock::text(json),
+    ]))
 }
 
 fn build_response(

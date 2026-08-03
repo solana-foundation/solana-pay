@@ -162,8 +162,8 @@ pub async fn run(params: Params) -> Result<CallToolResult, rmcp::ErrorData> {
     let image = general_purpose::STANDARD.encode(&png);
 
     Ok(CallToolResult::success(vec![
-        rmcp::model::Content::text(json),
-        rmcp::model::Content::image(image, "image/png"),
+        rmcp::model::ContentBlock::text(json),
+        rmcp::model::ContentBlock::image(image, "image/png"),
     ]))
 }
 
@@ -358,7 +358,7 @@ mod tests {
 
     #[test]
     fn standard_image_content_shape_stays_host_compatible() {
-        let content = rmcp::model::Content::image("abc123", "image/png");
+        let content = rmcp::model::ContentBlock::image("abc123", "image/png");
         let value = serde_json::to_value(&content).expect("serialize content");
 
         assert_eq!(value["type"], "image");

@@ -14,13 +14,11 @@
 //! the MCP client anyway.
 //!
 //! The [`AuthGate`] trait is synchronous, but rmcp's elicitation call is
-//! `async`. We bridge with [`tokio::task::block_in_place`] + the current
-//! [`tokio::runtime::Handle`] — the entire pay-mcp server runs on a
-//! multi-threaded Tokio runtime, so the calling thread can yield to the
-//! runtime while we wait on the elicitation round-trip. This is the same
-//! shape that platform gates already use (Touch ID is also a blocking
-//! "wait for a human" call from Rust's view; the difference is purely
-//! plumbing).
+//! `async`. Payment work runs on a blocking thread and sends approval requests
+//! through a broker polled by the original tool-handler task. That preserves
+//! MCP 2026-07-28 request association (SEP-2260) while the blocking signer
+//! waits just like a native Touch ID prompt. The direct peer backend remains
+//! for older MCP sessions and compatibility tests.
 //!
 //! All failure modes map to [`pay_keystore::Error::AuthDenied`]: declined
 //! responses, cancelled responses, transport errors, and timeouts. The
@@ -30,11 +28,9 @@ use std::time::Duration;
 
 use pay_keystore::{AuthGate, AuthIntent, Error as KeystoreError};
 use rmcp::Peer;
-use rmcp::model::{
-    CreateElicitationRequestParam, CreateElicitationResult, ElicitationAction, ElicitationSchema,
-};
+use rmcp::model::{ElicitRequestParams, ElicitResult, ElicitationAction, ElicitationSchema};
 use rmcp::service::RoleServer;
-use tokio::runtime::Handle;
+use tokio::sync::mpsc;
 
 /// Outer deadline for a single elicitation round-trip, including the
 /// human's response time. Matches Hermes' gateway approval default so
@@ -75,46 +71,69 @@ pub async fn confirm_file_upload(
         }
         ElicitationAction::Decline => Err("The user declined to send the local file.".to_string()),
         ElicitationAction::Cancel => Err("The user cancelled sending the local file.".to_string()),
+        _ => Err("The MCP client returned an unsupported approval action.".to_string()),
     }
 }
 
 /// `AuthGate` that asks the connected MCP client for approval via
 /// `elicitation/create` instead of a platform biometric prompt.
 pub struct ElicitationAuth {
-    peer: Peer<RoleServer>,
+    backend: ElicitationBackend,
+}
+
+enum ElicitationBackend {
+    Direct(Peer<RoleServer>),
+    Broker(mpsc::UnboundedSender<BrokerRequest>),
+}
+
+pub(crate) struct BrokerRequest {
+    params: ElicitRequestParams,
+    reply: std::sync::mpsc::SyncSender<Result<ElicitResult, rmcp::ServiceError>>,
 }
 
 impl ElicitationAuth {
-    /// Construct a new gate bound to the active MCP session's peer.
+    /// Construct a direct gate for MCP sessions older than 2026-07-28.
     ///
-    /// The peer is cheap to clone — it holds an inner `Arc` — so callers
-    /// usually take a clone out of the rmcp tool-call context and hand it
-    /// here per signing operation.
+    /// MCP 2026-07-28 requires request association; Pay's tool handler uses
+    /// the internal broker backend for those sessions.
     pub fn new(peer: Peer<RoleServer>) -> Self {
-        Self { peer }
+        Self {
+            backend: ElicitationBackend::Direct(peer),
+        }
+    }
+
+    pub(crate) fn via_broker(sender: mpsc::UnboundedSender<BrokerRequest>) -> Self {
+        Self {
+            backend: ElicitationBackend::Broker(sender),
+        }
     }
 }
 
 impl AuthGate for ElicitationAuth {
     fn authenticate(&self, intent: &AuthIntent) -> Result<(), KeystoreError> {
         let params = build_request(intent);
-        let peer = self.peer.clone();
-
-        // Bridge sync → async. `block_in_place` permits blocking on the
-        // current multi-threaded runtime worker without starving other
-        // tasks; `Handle::current().block_on` drives the elicitation
-        // future to completion. Equivalent to how the macOS Touch ID
-        // gate blocks the calling thread on `LAContext.evaluatePolicy`.
-        let outcome: Result<CreateElicitationResult, rmcp::ServiceError> =
-            tokio::task::block_in_place(|| {
-                Handle::current().block_on(async move {
-                    tokio::time::timeout(ELICITATION_TIMEOUT, peer.create_elicitation(params))
-                        .await
-                        .map_err(|_| rmcp::ServiceError::Timeout {
-                            timeout: ELICITATION_TIMEOUT,
-                        })?
+        let outcome = match &self.backend {
+            ElicitationBackend::Direct(peer) => {
+                let peer = peer.clone();
+                tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current().block_on(request_elicitation(&peer, params))
                 })
-            });
+            }
+            ElicitationBackend::Broker(sender) => {
+                let (reply, response) = std::sync::mpsc::sync_channel(1);
+                if sender.send(BrokerRequest { params, reply }).is_err() {
+                    Err(rmcp::ServiceError::TransportClosed)
+                } else {
+                    response
+                        .recv_timeout(ELICITATION_TIMEOUT)
+                        .unwrap_or_else(|_| {
+                            Err(rmcp::ServiceError::Timeout {
+                                timeout: ELICITATION_TIMEOUT,
+                            })
+                        })
+                }
+            }
+        };
 
         interpret_elicitation_outcome(outcome)
     }
@@ -124,6 +143,44 @@ impl AuthGate for ElicitationAuth {
         // transport failure as AuthDenied anyway, and is_available() is
         // called from contexts where blocking is undesirable.
         true
+    }
+}
+
+async fn request_elicitation(
+    peer: &Peer<RoleServer>,
+    params: ElicitRequestParams,
+) -> Result<ElicitResult, rmcp::ServiceError> {
+    tokio::time::timeout(ELICITATION_TIMEOUT, peer.create_elicitation(params))
+        .await
+        .map_err(|_| rmcp::ServiceError::Timeout {
+            timeout: ELICITATION_TIMEOUT,
+        })?
+}
+
+/// Run blocking payment work while servicing its approval requests on the
+/// originating MCP task. MCP 2026-07-28 requires this association (SEP-2260),
+/// so the blocking signer never calls the peer directly.
+pub(crate) async fn spawn_blocking_with_elicitation<T, F>(
+    peer: &Peer<RoleServer>,
+    operation: F,
+) -> Result<T, tokio::task::JoinError>
+where
+    T: Send + 'static,
+    F: FnOnce(mpsc::UnboundedSender<BrokerRequest>) -> T + Send + 'static,
+{
+    let (sender, mut requests) = mpsc::unbounded_channel();
+    let mut operation = tokio::task::spawn_blocking(move || operation(sender));
+    loop {
+        tokio::select! {
+            result = &mut operation => return result,
+            request = requests.recv() => {
+                let Some(request) = request else {
+                    return operation.await;
+                };
+                let result = request_elicitation(peer, request.params).await;
+                let _ = request.reply.send(result);
+            }
+        }
     }
 }
 
@@ -142,7 +199,7 @@ impl AuthGate for ElicitationAuth {
 /// with a negative answer), but a buggy or hostile client might — and we'd
 /// rather deny than admit on conflicting input.
 fn interpret_elicitation_outcome(
-    outcome: Result<CreateElicitationResult, rmcp::ServiceError>,
+    outcome: Result<ElicitResult, rmcp::ServiceError>,
 ) -> Result<(), KeystoreError> {
     match outcome {
         Ok(res) => match res.action {
@@ -167,6 +224,9 @@ fn interpret_elicitation_outcome(
             ElicitationAction::Cancel => Err(KeystoreError::AuthDenied(
                 "user cancelled the request via the MCP client".to_string(),
             )),
+            _ => Err(KeystoreError::AuthDenied(
+                "MCP client returned an unsupported elicitation action".to_string(),
+            )),
         },
         Err(err) => Err(KeystoreError::AuthDenied(format!(
             "elicitation transport failed: {err}"
@@ -181,7 +241,7 @@ fn interpret_elicitation_outcome(
 ///   so clients that render forms can present a confirmation UI; clients
 ///   that fall back to yes/no still get the message text.
 /// - **Per-call only**: no server-side state binds approvals across calls.
-fn build_request(intent: &AuthIntent) -> CreateElicitationRequestParam {
+fn build_request(intent: &AuthIntent) -> ElicitRequestParams {
     // Builder validates required fields against declared properties.
     // The combination below is statically sound; `expect` would only
     // fire if rmcp's validation contract changes in a future release.
@@ -190,7 +250,8 @@ fn build_request(intent: &AuthIntent) -> CreateElicitationRequestParam {
         .build()
         .expect("required_bool registers `approved` in properties");
 
-    CreateElicitationRequestParam {
+    ElicitRequestParams::FormElicitationParams {
+        meta: None,
         message: intent.message().to_string(),
         requested_schema: schema,
     }
@@ -201,12 +262,13 @@ fn build_file_upload_request(
     bytes: u64,
     method: &str,
     destination: &str,
-) -> CreateElicitationRequestParam {
+) -> ElicitRequestParams {
     let schema = ElicitationSchema::builder()
         .required_bool("approved")
         .build()
         .expect("required_bool registers `approved` in properties");
-    CreateElicitationRequestParam {
+    ElicitRequestParams::FormElicitationParams {
+        meta: None,
         message: format!(
             "Allow Pay to read and send `{path}` ({bytes} bytes) in an HTTP {method} request to {destination}? The file is read once after approval; the exact snapshot may be reused only to retry this same request after a 402 payment challenge."
         ),
@@ -218,19 +280,29 @@ fn build_file_upload_request(
 mod tests {
     use super::*;
 
+    fn form(request: &ElicitRequestParams) -> (&str, &ElicitationSchema) {
+        match request {
+            ElicitRequestParams::FormElicitationParams {
+                message,
+                requested_schema,
+                ..
+            } => (message, requested_schema),
+            _ => panic!("expected form elicitation"),
+        }
+    }
+
     #[test]
     fn build_request_carries_intent_message() {
         let intent = AuthIntent::authorize_payment("$0.50", "accessing API api.example.com");
         let req = build_request(&intent);
+        let (message, _) = form(&req);
         assert!(
-            req.message.contains("$0.50"),
-            "message should include amount: {:?}",
-            req.message,
+            message.contains("$0.50"),
+            "message should include amount: {message:?}",
         );
         assert!(
-            req.message.contains("api.example.com"),
-            "message should include operator: {:?}",
-            req.message,
+            message.contains("api.example.com"),
+            "message should include operator: {message:?}",
         );
     }
 
@@ -238,9 +310,10 @@ mod tests {
     fn build_request_includes_approved_boolean_field() {
         let intent = AuthIntent::default_payment();
         let req = build_request(&intent);
+        let (_, schema) = form(&req);
         // The schema must include an `approved` property so even
         // form-rendering clients have a concrete confirmation field.
-        let json = serde_json::to_value(&req.requested_schema).expect("schema should serialize");
+        let json = serde_json::to_value(schema).expect("schema should serialize");
         let props = json.get("properties").expect("schema has properties");
         assert!(
             props.get("approved").is_some(),
@@ -256,17 +329,19 @@ mod tests {
             "POST",
             "https://api.example.com/upload",
         );
-        assert!(req.message.contains("/workspace/photo.png"));
-        assert!(req.message.contains("1024 bytes"));
-        assert!(req.message.contains("POST"));
-        assert!(req.message.contains("https://api.example.com/upload"));
+        let (message, _) = form(&req);
+        assert!(message.contains("/workspace/photo.png"));
+        assert!(message.contains("1024 bytes"));
+        assert!(message.contains("POST"));
+        assert!(message.contains("https://api.example.com/upload"));
     }
 
-    fn result(
-        action: ElicitationAction,
-        content: Option<serde_json::Value>,
-    ) -> CreateElicitationResult {
-        CreateElicitationResult { action, content }
+    fn result(action: ElicitationAction, content: Option<serde_json::Value>) -> ElicitResult {
+        let result = ElicitResult::new(action);
+        match content {
+            Some(content) => result.with_content(content),
+            None => result,
+        }
     }
 
     #[test]
@@ -320,5 +395,22 @@ mod tests {
             timeout: Duration::from_secs(1),
         }));
         assert!(matches!(out, Err(KeystoreError::AuthDenied(_))));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn broker_bridges_blocking_auth_to_async_approval() {
+        let (sender, mut requests) = mpsc::unbounded_channel();
+        let auth = ElicitationAuth::via_broker(sender);
+        let intent = AuthIntent::authorize_payment("$0.01", "broker test");
+        let operation = tokio::task::spawn_blocking(move || auth.authenticate(&intent));
+
+        let request = requests.recv().await.expect("broker request");
+        request
+            .reply
+            .send(Ok(ElicitResult::new(ElicitationAction::Accept)
+                .with_content(serde_json::json!({ "approved": true }))))
+            .unwrap();
+
+        assert!(operation.await.unwrap().is_ok());
     }
 }

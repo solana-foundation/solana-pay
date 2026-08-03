@@ -41,11 +41,8 @@ struct SearchCatalogResponse {
     selection_guidance: Vec<String>,
     call_plan_fields: Vec<String>,
     next_step: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    capability_request: Option<serde_json::Value>,
     /// Internal gate for the capability-request offer (see
-    /// `pay_core::skills::is_catalog_miss`) — not part of the wire response;
-    /// the offer's outcome is reported via `capability_request`/`next_step`.
+    /// `pay_core::skills::is_catalog_miss`) — not part of the wire response.
     #[serde(skip)]
     catalog_miss: bool,
 }
@@ -94,14 +91,20 @@ fn default_max_results() -> usize {
     5
 }
 
-pub async fn run(
-    params: Params,
-    peer: rmcp::Peer<rmcp::service::RoleServer>,
-    progress_token: Option<rmcp::model::ProgressToken>,
-) -> Result<CallToolResult, rmcp::ErrorData> {
+pub async fn run(params: Params) -> Result<CallToolResult, rmcp::ErrorData> {
+    run_with_miss(params).await.map(|(result, _miss)| result)
+}
+
+/// Return the visible search result plus the measured catalog-miss gate so
+/// the MCP handler can start the same MRTR call without relying on the model
+/// to notice a prose `next_step` and invoke a second tool.
+pub async fn run_with_miss(params: Params) -> Result<(CallToolResult, bool), rmcp::ErrorData> {
     let query = params.query.trim().to_string();
     if query.is_empty() {
-        return Ok(super::tool_error("`query` must describe the user's task"));
+        return Ok((
+            super::tool_error("`query` must describe the user's task"),
+            false,
+        ));
     }
 
     let cache_bust = params.cache_bust;
@@ -116,12 +119,12 @@ pub async fn run(
     };
     let catalog = match catalog_result {
         Ok(catalog) => catalog,
-        Err(message) => return Ok(super::tool_error(message)),
+        Err(message) => return Ok((super::tool_error(message), false)),
     };
 
     let max_results = params.max_results.clamp(1, 10);
     let category = params.category.clone();
-    let mut response = build_search_catalog_response(
+    let response = build_search_catalog_response(
         catalog,
         query.clone(),
         category,
@@ -130,69 +133,21 @@ pub async fn run(
     )
     .await;
 
-    // Offer gate: a hard miss, or a specific query with only weak keyword
-    // noise (an is_empty() gate never fired — term-overlap noise once scored
-    // an air-quality API at 96 on "solana priority fee forecasts" — while a
-    // bare no-strong gate fires on over half of ordinary fuzzy searches).
-    // For weak-only vague queries the next_step hint below routes the model
-    // to `request_capability` instead of prompting the user directly.
-    if response.catalog_miss
-        && let Some(capability_request) =
-            offer_capability_request(&peer, progress_token, &query).await
-    {
-        response.next_step = next_step_for_capability_request(&capability_request);
-        response.capability_request = Some(capability_request);
-    }
-
     let json = match serde_json::to_string_pretty(&response) {
         Ok(json) => json,
         Err(err) => {
-            return Ok(super::tool_error(format!(
-                "Failed to serialize response: {err}"
-            )));
+            return Ok((
+                super::tool_error(format!("Failed to serialize response: {err}")),
+                false,
+            ));
         }
     };
 
-    Ok(CallToolResult::success(vec![rmcp::model::Content::text(
-        json,
-    )]))
-}
-
-/// On a catalog miss, run the same single-prompt build-request flow
-/// `request_capability` uses — the elicitation itself is the consent gate.
-/// Returns `None` when the elicitation round-trip fails (commonly a client
-/// with no elicitation support) so callers fall back to the plain text hint
-/// in [`next_step_for_candidates`] instead of erroring the whole search.
-async fn offer_capability_request(
-    peer: &rmcp::Peer<rmcp::service::RoleServer>,
-    progress_token: Option<rmcp::model::ProgressToken>,
-    query: &str,
-) -> Option<serde_json::Value> {
-    use super::request_capability::{CapabilityRequestError, CapabilityRequestOutcome};
-    match super::request_capability::run_capability_request(peer, progress_token, query).await {
-        Ok(CapabilityRequestOutcome::Submitted(value)) => Some(value),
-        Ok(CapabilityRequestOutcome::Declined) => Some(serde_json::json!({
-            "status": "declined",
-            "message": "The user declined to request this capability.",
-        })),
-        Err(CapabilityRequestError::Elicitation(_)) => None,
-        Err(CapabilityRequestError::Other(message)) => {
-            Some(serde_json::json!({ "status": "failed", "error": message }))
-        }
-    }
-}
-
-fn next_step_for_capability_request(value: &serde_json::Value) -> String {
-    if let Some(next_step) = value.get("next_step").and_then(|v| v.as_str()) {
-        return next_step.to_string();
-    }
-
-    match value.get("status").and_then(|v| v.as_str()) {
-        Some("declined") => {
-            "The user declined a capability request for this query; ask before using a non-Pay fallback.".to_string()
-        }
-        _ => "The capability request could not be completed; show the user the error before retrying.".to_string(),
-    }
+    let catalog_miss = response.catalog_miss;
+    Ok((
+        CallToolResult::success(vec![rmcp::model::ContentBlock::text(json)]),
+        catalog_miss,
+    ))
 }
 
 async fn build_search_catalog_response(
@@ -265,7 +220,6 @@ async fn build_search_catalog_response(
         selection_guidance: selection_guidance(),
         call_plan_fields: call_plan_fields(),
         next_step,
-        capability_request: None,
         catalog_miss,
     }
 }
@@ -526,29 +480,6 @@ mod tests {
         assert!(response.candidates.iter().any(|c| c.strong));
         assert!(!response.catalog_miss);
         assert!(!response.next_step.contains("request_capability"));
-    }
-
-    #[test]
-    fn next_step_for_capability_request_prefers_inner_next_step() {
-        let value = serde_json::json!({
-            "next_step": "A studio returned a quote. Present price, timeline, and terms to the user before accepting; do not fund automatically.",
-        });
-        assert_eq!(
-            next_step_for_capability_request(&value),
-            "A studio returned a quote. Present price, timeline, and terms to the user before accepting; do not fund automatically."
-        );
-    }
-
-    #[test]
-    fn next_step_for_capability_request_handles_declined_status() {
-        let value = serde_json::json!({ "status": "declined" });
-        assert!(next_step_for_capability_request(&value).contains("declined"));
-    }
-
-    #[test]
-    fn next_step_for_capability_request_handles_failed_status() {
-        let value = serde_json::json!({ "status": "failed", "error": "boom" });
-        assert!(next_step_for_capability_request(&value).contains("could not be completed"));
     }
 
     #[tokio::test]

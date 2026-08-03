@@ -1,6 +1,8 @@
+#![allow(deprecated)] // MCP roots remain required for local-file authorization.
+
 use base64::{Engine, engine::general_purpose};
 use pay_core::client::fetch::{RedirectPolicy, RequestBody};
-use rmcp::model::{CallToolResult, Content, RawResource, Root};
+use rmcp::model::{CallToolResult, ContentBlock, Resource, Root};
 use rmcp::schemars;
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -181,14 +183,14 @@ pub async fn run(
         RedirectPolicy::Follow
     };
 
-    let response = tokio::task::spawn_blocking(move || {
+    let response = crate::auth::spawn_blocking_with_elicitation(&peer, move |elicitation| {
         do_paid_fetch(
             &method,
             &url,
             &headers,
             body.as_ref(),
             redirect_policy,
-            Some(peer),
+            Some(elicitation),
         )
     })
     .await
@@ -438,22 +440,22 @@ fn body_to_mcp_content(
     body: Vec<u8>,
     content_type: Option<&str>,
     empty_message: &str,
-) -> Vec<Content> {
+) -> Vec<ContentBlock> {
     if body.is_empty() {
-        return vec![Content::text(empty_message.to_string())];
+        return vec![ContentBlock::text(empty_message.to_string())];
     }
 
     let mime = mime_from_content_type(content_type);
 
     if mime.starts_with("image/") {
         let encoded = general_purpose::STANDARD.encode(&body);
-        return vec![Content::image(encoded, mime)];
+        return vec![ContentBlock::image(encoded, mime)];
     }
 
     if is_binary_content_type(&mime) {
         return match write_body_to_tempfile(&body, &mime) {
             Ok(path) => {
-                let note = Content::text(format!(
+                let note = ContentBlock::text(format!(
                     "Binary response ({} bytes, {mime}) written to {path}",
                     body.len()
                 ));
@@ -468,7 +470,7 @@ fn body_to_mcp_content(
                     vec![note]
                 }
             }
-            Err(err) => vec![Content::text(format!(
+            Err(err) => vec![ContentBlock::text(format!(
                 "Binary response ({} bytes, {mime}) — failed to spill to tempfile: {err}",
                 body.len()
             ))],
@@ -559,7 +561,7 @@ struct ExtractedMedia {
 /// JSON with a `<mime, N bytes → /path>` placeholder. Images are additionally
 /// surfaced as `Content::image` so the model can see them. Whatever text
 /// remains is size-capped by [`text_content_capped`].
-fn text_body_to_content(text: String) -> Vec<Content> {
+fn text_body_to_content(text: String) -> Vec<ContentBlock> {
     if let Ok(mut value) = serde_json::from_str::<Value>(&text) {
         let mut extracted = Vec::new();
         extract_media_from_json(&mut value, &mut extracted);
@@ -585,9 +587,12 @@ fn text_body_to_content(text: String) -> Vec<Content> {
 ///   for handing a client a file by reference — clients that support these
 ///   types can open/play them, and we avoid inlining multi-megabyte base64
 ///   that would flood the context.
-fn media_as_content_block(media: &ExtractedMedia) -> Option<Content> {
+fn media_as_content_block(media: &ExtractedMedia) -> Option<ContentBlock> {
     if media.mime.starts_with("image/") {
-        return Some(Content::image(media.encoded.clone(), media.mime.clone()));
+        return Some(ContentBlock::image(
+            media.encoded.clone(),
+            media.mime.clone(),
+        ));
     }
     if media.mime.starts_with("audio/")
         || media.mime.starts_with("video/")
@@ -603,34 +608,34 @@ fn media_as_content_block(media: &ExtractedMedia) -> Option<Content> {
 }
 
 /// Build a `resource_link` content block referencing a media file on disk.
-fn resource_link_for_file(path: &str, mime: &str, bytes: usize) -> Content {
+fn resource_link_for_file(path: &str, mime: &str, bytes: usize) -> ContentBlock {
     let name = path
         .rsplit(['/', '\\'])
         .next()
         .filter(|s| !s.is_empty())
         .unwrap_or(path)
         .to_string();
-    let mut resource = RawResource::new(format!("file://{path}"), name);
-    resource.mime_type = Some(mime.to_string());
-    resource.size = u32::try_from(bytes).ok();
-    Content::resource_link(resource)
+    let resource = Resource::new(format!("file://{path}"), name)
+        .with_mime_type(mime)
+        .with_size(bytes as u64);
+    ContentBlock::resource_link(resource)
 }
 
 /// Return the text as inline `Content::text`, or — when it exceeds
 /// [`MAX_TEXT_INLINE_BYTES`] — spill the full body to a tempfile and return a
 /// short preview plus the path, so a huge response can't flood the context.
-fn text_content_capped(text: String) -> Content {
+fn text_content_capped(text: String) -> ContentBlock {
     if text.len() <= MAX_TEXT_INLINE_BYTES {
-        return Content::text(text);
+        return ContentBlock::text(text);
     }
     let preview: String = text.chars().take(TEXT_PREVIEW_BYTES).collect();
     match write_body_to_tempfile(text.as_bytes(), "text/plain") {
-        Ok(path) => Content::text(format!(
+        Ok(path) => ContentBlock::text(format!(
             "Large text response ({} bytes) written to {path}. First {} chars:\n{preview}",
             text.len(),
             preview.len()
         )),
-        Err(err) => Content::text(format!(
+        Err(err) => ContentBlock::text(format!(
             "Large text response ({} bytes) — failed to spill to tempfile: {err}. First {} chars:\n{preview}",
             text.len(),
             preview.len()
@@ -827,7 +832,7 @@ fn do_paid_fetch(
     extra_headers: &[(String, String)],
     body: Option<&RequestBody>,
     redirect_policy: RedirectPolicy,
-    peer: Option<rmcp::Peer<rmcp::service::RoleServer>>,
+    elicitation: Option<tokio::sync::mpsc::UnboundedSender<crate::auth::BrokerRequest>>,
 ) -> Result<PaidFetchResult, pay_core::Error> {
     use pay_core::client::runner::RunOutcome;
 
@@ -845,7 +850,7 @@ fn do_paid_fetch(
     };
 
     // Build a fresh elicitation-backed AuthGate per signing operation when
-    // we have a peer AND no local biometric is available. A local Touch ID /
+    // we have a request broker AND no local biometric is available. A local Touch ID /
     // Windows Hello / polkit prompt is faster and more familiar than a
     // round-trip through the MCP client UI, so we prefer it whenever the
     // platform offers it. `PAY_FORCE_ELICITATION=1` opts back into the
@@ -854,9 +859,10 @@ fn do_paid_fetch(
     //
     // When None (e.g. unit tests, or biometrics-available path), each
     // `_with_override` call gets `None` and falls back to the platform
-    // default gate. The peer is cheap to clone (it wraps an Arc).
+    // default gate. The broker keeps server-to-client requests associated
+    // with the originating tools/call under MCP 2026-07-28 (SEP-2260).
     let make_auth_override = || -> pay_core::signer::AuthOverride {
-        let peer = peer.as_ref()?;
+        let elicitation = elicitation.as_ref()?;
         let force = std::env::var("PAY_FORCE_ELICITATION")
             .ok()
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
@@ -864,7 +870,10 @@ fn do_paid_fetch(
         if !force && pay_keystore::Keystore::any_biometric_available() {
             return None;
         }
-        Some(Box::new(crate::ElicitationAuth::new(peer.clone())) as Box<dyn pay_keystore::AuthGate>)
+        Some(
+            Box::new(crate::ElicitationAuth::via_broker(elicitation.clone()))
+                as Box<dyn pay_keystore::AuthGate>,
+        )
     };
 
     let store = pay_core::accounts::FileAccountsStore::default_path();
@@ -1303,12 +1312,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("photo.png");
         std::fs::write(&path, b"image bytes").unwrap();
-        let root = Root {
-            uri: reqwest::Url::from_directory_path(dir.path())
+        let root = Root::new(
+            reqwest::Url::from_directory_path(dir.path())
                 .unwrap()
                 .to_string(),
-            name: Some("workspace".to_string()),
-        };
+        )
+        .with_name("workspace");
 
         let file = resolve_body_file_path("photo.png", &[root]).unwrap();
         assert_eq!(file.path, std::fs::canonicalize(path).unwrap());
@@ -1320,12 +1329,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("payload.json");
         std::fs::write(&path, br#"{"approved":true}"#).unwrap();
-        let root = Root {
-            uri: reqwest::Url::from_directory_path(dir.path())
+        let root = Root::new(
+            reqwest::Url::from_directory_path(dir.path())
                 .unwrap()
                 .to_string(),
-            name: Some("workspace".to_string()),
-        };
+        )
+        .with_name("workspace");
 
         let file = resolve_body_file_path("payload.json", &[root]).unwrap();
         std::fs::write(&path, b"changed").unwrap();
@@ -1346,12 +1355,12 @@ mod tests {
         std::fs::create_dir(&outside).unwrap();
         std::fs::write(root_path.join("payload"), b"approved").unwrap();
         std::fs::write(outside.join("payload"), b"outside!").unwrap();
-        let root = Root {
-            uri: reqwest::Url::from_directory_path(&root_path)
+        let root = Root::new(
+            reqwest::Url::from_directory_path(&root_path)
                 .unwrap()
                 .to_string(),
-            name: Some("workspace".to_string()),
-        };
+        )
+        .with_name("workspace");
 
         let file = resolve_body_file_path("payload", &[root]).unwrap();
         std::fs::rename(&root_path, &moved_root).unwrap();
@@ -1364,12 +1373,11 @@ mod tests {
     fn rejects_file_outside_declared_roots() {
         let allowed = tempfile::tempdir().unwrap();
         let outside = tempfile::NamedTempFile::new().unwrap();
-        let root = Root {
-            uri: reqwest::Url::from_directory_path(allowed.path())
+        let root = Root::new(
+            reqwest::Url::from_directory_path(allowed.path())
                 .unwrap()
                 .to_string(),
-            name: None,
-        };
+        );
 
         let error = resolve_body_file_path(outside.path().to_str().unwrap(), &[root]).unwrap_err();
         assert!(error.contains("outside the MCP client's declared filesystem roots"));
@@ -1380,18 +1388,16 @@ mod tests {
         let first = tempfile::tempdir().unwrap();
         let second = tempfile::tempdir().unwrap();
         let roots = [
-            Root {
-                uri: reqwest::Url::from_directory_path(first.path())
+            Root::new(
+                reqwest::Url::from_directory_path(first.path())
                     .unwrap()
                     .to_string(),
-                name: None,
-            },
-            Root {
-                uri: reqwest::Url::from_directory_path(second.path())
+            ),
+            Root::new(
+                reqwest::Url::from_directory_path(second.path())
                     .unwrap()
                     .to_string(),
-                name: None,
-            },
+            ),
         ];
 
         let error = resolve_body_file_path("photo.png", &roots).unwrap_err();
@@ -1881,7 +1887,7 @@ mod tests {
             .find_map(|c| c.as_resource_link())
             .expect("resource_link");
         assert_eq!(link.mime_type.as_deref(), Some("application/pdf"));
-        assert_eq!(link.size, Some(body.len() as u32));
+        assert_eq!(link.size, Some(body.len() as u64));
         let _ = std::fs::remove_file(path);
     }
 

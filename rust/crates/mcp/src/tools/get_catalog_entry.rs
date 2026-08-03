@@ -100,9 +100,9 @@ pub async fn run(params: Params) -> Result<CallToolResult, rmcp::ErrorData> {
         }
     };
 
-    Ok(CallToolResult::success(vec![rmcp::model::Content::text(
-        json,
-    )]))
+    Ok(CallToolResult::success(vec![
+        rmcp::model::ContentBlock::text(json),
+    ]))
 }
 
 fn endpoint_entry_for(base_url: &str, ep: &pay_core::skills::Endpoint) -> EndpointEntry {

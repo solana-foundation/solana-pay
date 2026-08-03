@@ -105,9 +105,9 @@ pub async fn run(params: Params) -> Result<CallToolResult, rmcp::ErrorData> {
             if is_error {
                 Ok(super::tool_error(response))
             } else {
-                Ok(CallToolResult::success(vec![rmcp::model::Content::text(
-                    response,
-                )]))
+                Ok(CallToolResult::success(vec![
+                    rmcp::model::ContentBlock::text(response),
+                ]))
             }
         }
         Err(errors) => {

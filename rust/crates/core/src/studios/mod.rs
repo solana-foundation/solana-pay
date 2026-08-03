@@ -4,9 +4,10 @@
 //! overrides the shipped default so a local `scarced` dev instance can stand
 //! in for the production endpoint during development.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::{ClientApp, Error, Result};
@@ -50,29 +51,39 @@ impl Default for StudioRegistry {
 impl StudioRegistry {
     pub fn load() -> Result<Self> {
         let path = config_path();
-        if !path.exists()
-            || std::fs::read_to_string(&path)
-                .map(|raw| raw.trim().is_empty())
-                .unwrap_or(true)
-        {
+        Self::load_from_path(&path)
+    }
+
+    fn load_from_path(path: &Path) -> Result<Self> {
+        if !path.exists() {
             let cfg = Self::default();
-            let _ = cfg.save(); // persist so the user can see/edit it
+            cfg.save_to_path(path)?; // persist so the user can see/edit it
             return Ok(cfg);
         }
-        let raw = std::fs::read_to_string(&path)
+        let raw = std::fs::read_to_string(path)
             .map_err(|e| Error::Config(format!("read {}: {e}", path.display())))?;
+        if raw.trim().is_empty() {
+            return Err(Error::Config(format!(
+                "{} is empty; add at least one studio or remove the file to restore the default",
+                path.display()
+            )));
+        }
         serde_yml::from_str(&raw)
             .map_err(|e| Error::Config(format!("parse {}: {e}", path.display())))
     }
 
     pub fn save(&self) -> Result<()> {
         let path = config_path();
+        self.save_to_path(&path)
+    }
+
+    fn save_to_path(&self, path: &Path) -> Result<()> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| Error::Config(format!("mkdir: {e}")))?;
         }
         let yaml =
             serde_yml::to_string(self).map_err(|e| Error::Config(format!("serialize: {e}")))?;
-        std::fs::write(&path, yaml)
+        std::fs::write(path, yaml)
             .map_err(|e| Error::Config(format!("write {}: {e}", path.display())))
     }
 }
@@ -105,12 +116,132 @@ pub struct NewCapabilityRequest {
     /// Buyer identity, Solana side — the local Pay wallet's pubkey.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub buyer_solana_pubkey: Option<String>,
+    /// Quote-ready specification assembled and validated by the buyer-side
+    /// MRTR refinement loop. Studios receive this instead of doing unpaid
+    /// discovery work themselves.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub brief: Option<CapabilityBrief>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct BudgetAmount {
     pub amount: u64,
     pub mint: String,
+}
+
+/// Quote-sizing specification mirrored from scarce-studio's public RFQ schema.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CapabilityBrief {
+    pub example_exchange: ExampleExchange,
+    pub freshness: Freshness,
+    #[serde(default)]
+    pub upstream_dependencies: Vec<UpstreamDependency>,
+    pub volume: VolumeBand,
+    pub compute_class: ComputeClass,
+    pub state: StateRequirement,
+    pub interface: InterfaceKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ExampleExchange {
+    pub request: serde_json::Value,
+    pub response: serde_json::Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Freshness {
+    Realtime,
+    Cached { ttl_seconds: u64 },
+    Scheduled { cron: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct UpstreamDependency {
+    pub name: String,
+    #[serde(default)]
+    pub est_cost_per_call: Option<BudgetAmount>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct VolumeBand {
+    pub calls_per_month: u64,
+    pub avg_request_bytes: u64,
+    pub avg_response_bytes: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ComputeClass {
+    Proxy,
+    Cpu,
+    Gpu,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum StateRequirement {
+    None,
+    Cache,
+    Durable { gib: u64 },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum InterfaceKind {
+    RequestResponse,
+    WebhookPush,
+    Dataset,
+}
+
+impl CapabilityBrief {
+    /// Collect every actionable semantic error so the refinement model can
+    /// correct the brief in one MRTR round.
+    pub fn validation_errors(&self) -> Vec<String> {
+        let mut errors = Vec::new();
+        match &self.freshness {
+            Freshness::Cached { ttl_seconds } if *ttl_seconds == 0 => {
+                errors.push("brief.freshness.ttl_seconds must be at least 1".to_string());
+            }
+            Freshness::Scheduled { cron } if cron.trim().is_empty() => {
+                errors.push("brief.freshness.cron must be a non-empty cron expression".to_string());
+            }
+            _ => {}
+        }
+        for (index, dependency) in self.upstream_dependencies.iter().enumerate() {
+            if dependency.name.trim().is_empty() {
+                errors.push(format!(
+                    "brief.upstream_dependencies[{index}].name must be non-empty"
+                ));
+            }
+            if let Some(cost) = &dependency.est_cost_per_call {
+                if cost.amount == 0 {
+                    errors.push(format!(
+                        "brief.upstream_dependencies[{index}].est_cost_per_call.amount must be greater than zero"
+                    ));
+                }
+                if cost.mint.trim().is_empty() {
+                    errors.push(format!(
+                        "brief.upstream_dependencies[{index}].est_cost_per_call.mint must be non-empty"
+                    ));
+                }
+            }
+        }
+        if self.volume.calls_per_month == 0 {
+            errors.push("brief.volume.calls_per_month must be at least 1".to_string());
+        }
+        if let StateRequirement::Durable { gib } = self.state
+            && gib == 0
+        {
+            errors.push("brief.state.gib must be at least 1".to_string());
+        }
+        errors
+    }
 }
 
 /// Outcome of POSTing a capability-request RFQ to one studio.
@@ -230,6 +361,25 @@ mod tests {
     }
 
     #[test]
+    fn unreadable_registry_fails_closed_instead_of_using_default() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("studios.yaml");
+        std::fs::create_dir(&path).unwrap();
+        let error = StudioRegistry::load_from_path(&path).unwrap_err();
+        assert!(error.to_string().contains("read"));
+    }
+
+    #[test]
+    fn empty_registry_file_is_actionable_error() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("studios.yaml");
+        std::fs::write(&path, "  \n").unwrap();
+        let error = StudioRegistry::load_from_path(&path).unwrap_err();
+        assert!(error.to_string().contains("is empty"));
+        assert!(error.to_string().contains("remove the file"));
+    }
+
+    #[test]
     fn new_capability_request_omits_absent_optional_fields() {
         let request = NewCapabilityRequest {
             query: "solana priority fee forecast api".to_string(),
@@ -239,6 +389,7 @@ mod tests {
             budget_ceiling: None,
             buyer_npub: None,
             buyer_solana_pubkey: Some("4Nd1mBQtrMJVYVfKf2PJy9NZUZdTAsp7D4xWLs4gDB4T".to_string()),
+            brief: None,
         };
         let json = serde_json::to_value(&request).unwrap();
         let obj = json.as_object().unwrap();
@@ -272,6 +423,7 @@ mod tests {
                 "npub1cscv4empnwmfyurd6utlwmq3h3dzpesjyhtttt6rk69hndk9w0nqr65xpy".to_string(),
             ),
             buyer_solana_pubkey: None,
+            brief: None,
         };
         let json = serde_json::to_value(&request).unwrap();
         assert_eq!(

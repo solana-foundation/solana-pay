@@ -2,15 +2,21 @@
 //!
 //! Each tool's logic and params live in `tools/<name>.rs`.
 
+use rmcp::handler::server::tool::ToolCallContext;
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{CallToolResult, ProtocolVersion, ServerCapabilities, ServerInfo};
-use rmcp::{ServerHandler, tool, tool_handler, tool_router};
+use rmcp::model::{
+    CallToolRequestParams, CallToolResponse, CallToolResult, ListToolsResult,
+    PaginatedRequestParams, ProtocolVersion, ServerCapabilities, ServerInfo, Tool,
+};
+use rmcp::service::{RequestContext, RoleServer};
+use rmcp::{ServerHandler, tool, tool_router};
 
 use crate::tools;
 
 pub struct PayMcp {
     #[allow(dead_code)]
     tool_router: rmcp::handler::server::router::tool::ToolRouter<Self>,
+    capability_mrtr: tools::request_capability::MrtrState,
 }
 
 impl Default for PayMcp {
@@ -24,6 +30,7 @@ impl PayMcp {
     pub fn new() -> Self {
         Self {
             tool_router: Self::tool_router(),
+            capability_mrtr: tools::request_capability::MrtrState::default(),
         }
     }
 
@@ -77,24 +84,20 @@ fields, and the next provider-selection step. Select an endpoint only when it
 clearly matches the task; otherwise inspect one likely provider with
 `get_catalog_entry` or ask the user.
 
-On a real miss (no candidate clearly fits — weak keyword matches may still be
-listed), this tool itself asks the user — one prompt, accept-to-send — whether
-to have the studio registry build the capability, and on accept runs the same
-submission flow as `request_capability` before returning. When the response
-contains a `capability_request`, the user has already been asked — do not ask
-again in chat and do not call `request_capability` for the same query.
-Otherwise follow the response's `next_step`: it says when to call
-`request_capability` directly (call it without pre-asking in chat — its own
-prompt is the consent step).
+On a measured miss (no candidate clearly fits — weak keyword matches may still
+be listed), this same tool call enters a resumable MRTR flow: one user prompt,
+then local-model refinement with read-only catalog research, strict validation,
+and quote-ready studio submission. Do not pre-ask in chat and do not call
+`request_capability` afterward for the same query. If the MCP client cannot run
+MRTR, the ordinary search result explains the unsupported flow and nothing is
+sent to a studio.
 "#
     )]
     async fn search_catalog(
         &self,
         Parameters(params): Parameters<tools::search_catalog::Params>,
-        peer: rmcp::Peer<rmcp::service::RoleServer>,
-        meta: rmcp::model::Meta,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        tools::search_catalog::run(params, peer, meta.get_progress_token()).await
+        tools::search_catalog::run(params).await
     }
 
     #[tool(description = r#"List all available Pay APIs/skills.
@@ -198,44 +201,118 @@ For detailed authoring guidance, use the Pay skill reference
     #[tool(
         description = r#"Ask the studio registry to build a capability Pay doesn't have yet.
 
-`search_catalog` offers this automatically on a clear miss — when its
-response already contains a `capability_request`, the user has been asked;
-do not call this again for the same query. In every other uncovered case,
-call it directly: search returned only weak keyword matches that don't
-actually do the user's task, `list_catalog` showed nothing fitting, or the
-user asks to have something built. NEVER pre-ask for permission in chat —
-the tool's single accept-to-send prompt (two optional free-form questions:
-what to build, what they'd use today) IS the consent step, so a chat-level
-ask is a duplicate; calling on a suspected miss is safe because declining
-costs nothing and submits nothing. When you talk about it, frame it as
-what it is: the user found unmet demand, a studio builds and deploys the
-API, and the user publishes and monetizes it — an agentic business
-opportunity, not paperwork. On accept the answers are structured into a
-brief and the request is attributed to the user's Pay wallet, submitted to
-every registered studio, and reported back as either a quote or pending.
-This never spends funds; accepting and funding a quote is a separate step.
+`search_catalog` starts this automatically on a measured miss; do not call it
+again for the same query. In every other uncovered case, call it directly:
+search returned weak matches that do not perform the task, `list_catalog`
+showed nothing fitting, or the user asks to have something built. NEVER pre-ask
+for permission in chat. This one resumable MCP call owns the consent prompt,
+local-model research with read-only Pay catalog tools, strict quote-ready brief
+validation, and studio submission. There is no second tool call for the model
+to remember. Calling on a suspected miss is safe because declining costs
+nothing and submits nothing; invalid or incomplete refinement fails closed.
+Frame the offer as unmet demand the user can own and monetize, not paperwork.
+The request is attributed to the user's Pay wallet and reported as quoted,
+pending, or failed. This never spends funds; accepting and funding a quote is
+a separate step. Requires MCP 2026-07-28 MRTR, form elicitation, and
+sampling-with-tools.
 "#
     )]
     async fn request_capability(
         &self,
-        Parameters(params): Parameters<tools::request_capability::Params>,
-        peer: rmcp::Peer<rmcp::service::RoleServer>,
-        meta: rmcp::model::Meta,
+        Parameters(_params): Parameters<tools::request_capability::Params>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        tools::request_capability::run(params, peer, meta.get_progress_token()).await
+        Ok(tools::tool_error(
+            "request_capability requires MCP 2026-07-28 multi-round-trip request support",
+        ))
     }
 }
 
-#[tool_handler]
 impl ServerHandler for PayMcp {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo {
-            protocol_version: ProtocolVersion::V_2025_06_18,
-            capabilities: ServerCapabilities::builder().enable_tools().build(),
-            server_info: rmcp::model::Implementation::from_build_env(),
-            instructions: Some(pay_core::instructions::INSTRUCTIONS.to_string()),
-        }
+        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+            .with_protocol_version(ProtocolVersion::V_2026_07_28)
+            .with_instructions(pay_core::instructions::INSTRUCTIONS)
     }
+
+    async fn call_tool(
+        &self,
+        request: CallToolRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResponse, rmcp::ErrorData> {
+        let capability_flow = request.name == "request_capability"
+            || (request.name == "search_catalog" && request.request_state.is_some());
+        if capability_flow {
+            let supported = supports_capability_mrtr(&context);
+            if !supported {
+                return Ok(tools::tool_error(
+                    "request_capability requires MCP 2026-07-28 with form elicitation and sampling-with-tools. Nothing was sent to a studio.",
+                )
+                .into());
+            }
+            return tools::request_capability::run_mrtr(
+                request,
+                context.peer,
+                &self.capability_mrtr,
+            )
+            .await;
+        }
+
+        if request.name == "search_catalog" {
+            let params = match serde_json::from_value::<tools::search_catalog::Params>(
+                serde_json::Value::Object(request.arguments.clone().unwrap_or_default()),
+            ) {
+                Ok(params) => params,
+                Err(error) => {
+                    return Ok(tools::tool_error(format!(
+                        "Invalid search_catalog parameters: {error}"
+                    ))
+                    .into());
+                }
+            };
+            let (result, miss) = tools::search_catalog::run_with_miss(params).await?;
+            if !miss {
+                return Ok(result.into());
+            }
+            let supported = supports_capability_mrtr(&context);
+            if !supported {
+                return Ok(result.into());
+            }
+            return tools::request_capability::run_mrtr(
+                request,
+                context.peer,
+                &self.capability_mrtr,
+            )
+            .await;
+        }
+
+        self.tool_router
+            .call(ToolCallContext::new(self, request, context))
+            .await
+    }
+
+    async fn list_tools(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ListToolsResult, rmcp::ErrorData> {
+        Ok(ListToolsResult::with_all_items(self.tool_router.list_all()))
+    }
+
+    fn get_tool(&self, name: &str) -> Option<Tool> {
+        self.tool_router.get(name).cloned()
+    }
+}
+
+fn supports_capability_mrtr(context: &RequestContext<RoleServer>) -> bool {
+    context.protocol_version() == Some(ProtocolVersion::V_2026_07_28)
+        && context.client_capabilities().is_some_and(|capabilities| {
+            capabilities
+                .elicitation
+                .is_some_and(|elicitation| elicitation.form.is_some())
+                && capabilities
+                    .sampling
+                    .is_some_and(|sampling| sampling.tools.is_some())
+        })
 }
 
 #[cfg(test)]
@@ -261,7 +338,7 @@ mod tests {
     fn server_info_protocol_version() {
         let mcp = PayMcp::new();
         let info = mcp.get_info();
-        assert_eq!(info.protocol_version, ProtocolVersion::V_2025_06_18);
+        assert_eq!(info.protocol_version, ProtocolVersion::V_2026_07_28);
     }
 
     #[test]
