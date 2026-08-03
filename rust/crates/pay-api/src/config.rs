@@ -382,6 +382,11 @@ fn validate_campaign_id(id: &str) -> Result<(), String> {
 }
 
 fn validate_redemption_config(redemption: &RedemptionConfig) -> Result<(), String> {
+    if redemption.helius_api_key.trim().is_empty() {
+        return Err(
+            "redemption.helius_api_key is required when redemption.enabled is true; ".to_string(),
+        );
+    }
     if redemption.codes.is_empty()
         && !redemption
             .campaigns
@@ -914,6 +919,7 @@ mod tests {
     #[test]
     fn rejects_duplicate_codes_across_campaigns() {
         let redemption = RedemptionConfig {
+            helius_api_key: "test-key".to_string(),
             campaigns: vec![
                 RedemptionCampaignConfig {
                     id: "anthropic-tokyo-Q2-2026".to_string(),
@@ -934,5 +940,17 @@ mod tests {
         let error = validate_redemption_config(&redemption)
             .expect_err("the same code cannot belong to two campaigns");
         assert!(error.contains("duplicate redemption code across campaigns"));
+    }
+
+    #[test]
+    fn rejects_redemption_without_helius_deduplication() {
+        let redemption = RedemptionConfig {
+            codes: vec!["CODE123".to_string()],
+            ..RedemptionConfig::default()
+        };
+
+        let error = validate_redemption_config(&redemption)
+            .expect_err("enabled redemption requires durable deduplication");
+        assert!(error.contains("redemption.helius_api_key is required"));
     }
 }

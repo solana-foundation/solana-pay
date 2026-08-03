@@ -75,12 +75,11 @@ send:
     memo: fee-payer-refund
 
 # Activation-campaign redemption. Reuses `send.fee_payer.*` as the hot
-# wallet that signs Transfer + Memo. Dedup skips automatically when
-# `helius_api_key` is empty — useful for sandbox testing against
-# `402.surfnet.dev` (Helius enhanced-transactions is mainnet-only).
+# wallet that signs Transfer + Memo. A Helius API key is required for
+# durable redemption deduplication across API instances and restarts.
 redemption:
   enabled: true
   currency: USDC
   amount: 5000000          # $5 legacy flat-list fallback; campaigns override it
   network: sandbox         # → networks.sandbox.rpc_url
-  helius_api_key: ""       # empty → dedup disabled; warning logged on each call
+  helius_api_key: ""       # required when redemption is enabled
