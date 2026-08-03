@@ -342,18 +342,17 @@ async fn run_mrtr_for_wallet(
                 }
             };
 
-            if !consume_once(state, &flow.id) {
-                return Ok(tool_error(
-                    "This capability refinement was already submitted or attempted; start a new request instead of replaying it.",
-                )
-                .into());
-            }
+            let registry =
+                match prepare_submission_registry(state, &flow.id, StudioRegistry::load()) {
+                    Ok(registry) => registry,
+                    Err(error) => return Ok(error.into()),
+                };
             let Some(peer) = peer else {
                 return Ok(
                     tool_error("MRTR test flow reached studio submission without a peer").into(),
                 );
             };
-            submit_refined(flow, refined, peer, progress_token).await
+            submit_refined(flow, refined, registry, peer, progress_token).await
         }
     }
 }
@@ -594,6 +593,26 @@ fn consume_once(state: &MrtrState, id: &str) -> bool {
         .insert(id.to_string())
 }
 
+fn prepare_submission_registry(
+    state: &MrtrState,
+    flow_id: &str,
+    registry: pay_core::Result<StudioRegistry>,
+) -> std::result::Result<StudioRegistry, CallToolResult> {
+    let registry =
+        registry.map_err(|error| tool_error(format!("Failed to load studio registry: {error}")))?;
+    if registry.studios.is_empty() {
+        return Err(tool_error(
+            "No studios are registered in ~/.config/pay/studios.yaml.",
+        ));
+    }
+    if !consume_once(state, flow_id) {
+        return Err(tool_error(
+            "This capability refinement was already submitted or attempted; start a new request instead of replaying it.",
+        ));
+    }
+    Ok(registry)
+}
+
 fn round_limit_error() -> CallToolResult {
     tool_error(format!(
         "Local capability refinement did not produce a valid brief within {MAX_REFINEMENT_ROUNDS} rounds. Nothing was sent to a studio."
@@ -607,6 +626,7 @@ fn tool_error(message: impl Into<String>) -> CallToolResult {
 async fn submit_refined(
     flow: FlowState,
     refined: RefinedCapability,
+    registry: StudioRegistry,
     peer: Peer<RoleServer>,
     progress_token: Option<ProgressToken>,
 ) -> Result<CallToolResponse, rmcp::ErrorData> {
@@ -620,16 +640,6 @@ async fn submit_refined(
         buyer_solana_pubkey: Some(flow.buyer_solana_pubkey),
         brief: Some(refined.brief.clone()),
     };
-    let registry = match StudioRegistry::load() {
-        Ok(registry) => registry,
-        Err(error) => {
-            return Ok(tool_error(format!("Failed to load studio registry: {error}")).into());
-        }
-    };
-    if registry.studios.is_empty() {
-        return Ok(tool_error("No studios are registered in ~/.config/pay/studios.yaml.").into());
-    }
-
     let status = Status::new(peer, progress_token);
     let submissions = match with_rotating_status(
         &status,
@@ -1009,6 +1019,27 @@ mod tests {
         );
         assert!(consume_once(&state, "one"));
         assert!(!consume_once(&state, "one"));
+    }
+
+    #[test]
+    fn registry_validation_precedes_submission_replay_consumption() {
+        let state = MrtrState::default();
+
+        let malformed = prepare_submission_registry(
+            &state,
+            "one",
+            Err(pay_core::Error::Config("malformed registry".to_string())),
+        );
+        assert!(malformed.is_err());
+        assert!(state.consumed.lock().unwrap().is_empty());
+
+        let empty =
+            prepare_submission_registry(&state, "one", Ok(StudioRegistry { studios: vec![] }));
+        assert!(empty.is_err());
+        assert!(state.consumed.lock().unwrap().is_empty());
+
+        assert!(prepare_submission_registry(&state, "one", Ok(StudioRegistry::default())).is_ok());
+        assert!(prepare_submission_registry(&state, "one", Ok(StudioRegistry::default())).is_err());
     }
 
     #[test]
