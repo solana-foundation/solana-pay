@@ -17,6 +17,7 @@ pub struct PayMcp {
     #[allow(dead_code)]
     tool_router: rmcp::handler::server::router::tool::ToolRouter<Self>,
     capability_mrtr: tools::request_capability::MrtrState,
+    payment_sessions: pay_core::session_manager::SessionManager,
 }
 
 impl Default for PayMcp {
@@ -31,6 +32,7 @@ impl PayMcp {
         Self {
             tool_router: Self::tool_router(),
             capability_mrtr: tools::request_capability::MrtrState::default(),
+            payment_sessions: pay_core::session_manager::SessionManager::default(),
         }
     }
 
@@ -67,7 +69,7 @@ and does not submit the request or payment.
         Parameters(params): Parameters<tools::curl::Params>,
         peer: rmcp::Peer<rmcp::service::RoleServer>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        tools::curl::run(params, peer).await
+        tools::curl::run(params, peer, self.payment_sessions.clone()).await
     }
 
     #[tool(

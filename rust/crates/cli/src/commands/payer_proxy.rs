@@ -126,7 +126,7 @@ struct PayerState {
     /// Cached delegated-session authorization. Holding the mutex serializes
     /// requests because the server reserves a session's remaining capacity
     /// while it meters a response.
-    session_authorization: Arc<tokio::sync::Mutex<Option<String>>>,
+    session_authorization: pay_core::session_manager::SessionSlot,
     session_opener: SessionOpener,
     client: reqwest::Client,
     store: Arc<dyn AccountsStore>,
@@ -180,7 +180,7 @@ impl PayerState {
             responses_path: upstream.responses_path.trim_start_matches('/').to_string(),
             require_payment: upstream.require_payment,
             payment_protocol: upstream.payment_protocol,
-            session_authorization: Arc::new(tokio::sync::Mutex::new(None)),
+            session_authorization: pay_core::session_manager::SessionSlot::default(),
             session_opener: build_session_authorization,
             client,
             store,
@@ -356,14 +356,14 @@ async fn proxy(State(state): State<Arc<PayerState>>, req: Request) -> Response {
     // process. Keep the guard until the gateway has accepted and metered this
     // response so two concurrent calls cannot reserve the same channel cap.
     let mut session_authorization = if state.payment_protocol == PaymentProtocol::MppSession {
-        Some(state.session_authorization.clone().lock_owned().await)
+        Some(state.session_authorization.acquire().await)
     } else {
         None
     };
     let cached_payment = session_authorization
-        .as_deref()
-        .and_then(Option::as_ref)
-        .cloned()
+        .as_ref()
+        .and_then(pay_core::session_manager::SessionLease::authorization)
+        .map(str::to_string)
         .map(PaidHeaders::mpp);
     let used_cached_session = cached_payment.is_some();
 
@@ -499,7 +499,7 @@ async fn proxy(State(state): State<Arc<PayerState>>, req: Request) -> Response {
         && !has_session_challenge
     {
         if let Some(cached) = session_authorization.as_mut() {
-            **cached = None;
+            cached.clear();
         }
         tracing::info!(%url, "payer proxy: cached MPP session ended; requesting a fresh challenge");
         let refreshed = match send_upstream(&state, &method, &url, &headers, body.clone(), None)
@@ -547,7 +547,7 @@ async fn proxy(State(state): State<Arc<PayerState>>, req: Request) -> Response {
         && used_cached_session
         && let Some(cached) = session_authorization.as_mut()
     {
-        **cached = None;
+        cached.clear();
     }
 
     let charge_challenges: Vec<_> = mpp_challenges
@@ -632,13 +632,13 @@ async fn proxy(State(state): State<Arc<PayerState>>, req: Request) -> Response {
             // channel") that never clears without a manual restart.
             if retry.status() == StatusCode::PAYMENT_REQUIRED {
                 if let Some(cache) = session_authorization.as_mut() {
-                    **cache = None;
+                    cache.clear();
                 }
             } else if let (Some(cache), Some(authorization)) = (
                 session_authorization.as_mut(),
                 new_session_authorization.as_ref(),
             ) {
-                **cache = Some(authorization.clone());
+                cache.adopt(authorization.clone());
             }
             deliver(retry, translated, session_authorization.take()).await
         }
@@ -843,7 +843,7 @@ fn translate_request(
 /// Hand an upstream response back to Claude Code: translated (SSE or
 /// buffered JSON) when the request was translated and succeeded,
 /// streamed passthrough otherwise.
-type SessionAuthorizationGuard = tokio::sync::OwnedMutexGuard<Option<String>>;
+type SessionAuthorizationGuard = pay_core::session_manager::SessionLease;
 
 async fn deliver(
     resp: reqwest::Response,
@@ -994,73 +994,20 @@ fn build_session_authorization(
     state: &PayerState,
     challenge: &pay_core::mpp::Challenge,
 ) -> pay_core::Result<(PaidHeaders, String)> {
-    use pay_kit::mpp::{SessionRequest, SessionVoucherSigner};
-
-    let request: SessionRequest = challenge
-        .request
-        .decode()
-        .map_err(|error| pay_core::Error::Mpp(format!("invalid MPP session challenge: {error}")))?;
-    if request.method_details.voucher_signer != Some(SessionVoucherSigner::Operator) {
-        return Err(pay_core::Error::Mpp(
-            "agent payer requires an operator-signed MPP session".to_string(),
-        ));
-    }
-    if let Some(forced) = state.network_override.as_deref()
-        && forced != request.method_details.network
-    {
-        return Err(pay_core::Error::Mpp(format!(
-            "MPP session network mismatch: payer requires `{forced}`, gateway offered `{}`",
-            request.method_details.network
-        )));
-    }
-
-    let minimum = request
-        .minimum_deposit
-        .as_deref()
-        .map(|value| {
-            value.parse::<u64>().map_err(|_| {
-                pay_core::Error::Mpp(format!(
-                    "MPP session challenge advertised a non-numeric minimumDeposit: {value}"
-                ))
-            })
-        })
-        .transpose()?
-        .unwrap_or(0);
-    let deposit = request
-        .suggested_deposit
-        .as_deref()
-        .map(|value| {
-            value.parse::<u64>().map_err(|_| {
-                pay_core::Error::Mpp(format!(
-                    "MPP session challenge advertised a non-numeric suggestedDeposit: {value}"
-                ))
-            })
-        })
-        .transpose()?
-        .unwrap_or(1_000_000)
-        .max(minimum)
-        .max(1);
     let sandbox = state.network_override.as_deref() == Some("localnet");
-    let (handle, open_authorization) = pay_core::session::open_payment_channel_session_header(
+    let prepared = pay_core::session_manager::prepare_operator_session_with_override(
         challenge,
-        &request,
         state.store.as_ref(),
         state.network_override.as_deref(),
         state.account_override.as_deref(),
-        deposit,
         &state.authorization_url,
         sandbox,
+        None,
     )?;
-
-    // Subsequent requests authenticate with the reusable payer proof bound at
-    // open; the operator meters delivered service and signs the vouchers.
-    let use_authorization = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|error| pay_core::Error::Mpp(format!("Failed to build runtime: {error}")))?
-        .block_on(handle.use_header())?;
-
-    Ok((PaidHeaders::mpp(open_authorization), use_authorization))
+    Ok((
+        PaidHeaders::mpp(prepared.open_authorization),
+        prepared.use_authorization,
+    ))
 }
 
 /// Select a payable MPP challenge and build the `Authorization: Payment …`
@@ -2211,7 +2158,7 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::PAYMENT_REQUIRED);
         assert_eq!(
-            state.session_authorization.lock().await.as_deref(),
+            state.session_authorization.acquire().await.authorization(),
             None,
             "an unconfirmed open credential must not be cached — adopting it before \
              a paid retry proves it landed risks stranding a credential for a \
@@ -2502,7 +2449,7 @@ mod tests {
             "a retryable store conflict must retry the same channel without rediscovery",
         );
         assert_eq!(
-            state.session_authorization.lock().await.as_deref(),
+            state.session_authorization.acquire().await.authorization(),
             Some("Payment retryable-session"),
             "a transient 402 must preserve the cached session"
         );

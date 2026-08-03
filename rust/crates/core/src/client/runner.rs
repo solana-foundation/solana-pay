@@ -47,9 +47,14 @@ pub enum RunOutcome {
         resource_url: String,
     },
     /// The server returned 402 with an MPP session challenge (intent="session").
-    /// Session payments require a stateful client with a Fiber channel.
+    /// Reusable session clients open a Solana payment channel, then cache its
+    /// authorization for later requests.
     SessionChallenge {
         challenge: Box<mpp::Challenge>,
+        /// x402 alternatives advertised beside the session, retained so a
+        /// client can fall back when it cannot reuse this session shape.
+        x402_alternative: Option<Box<x402::Challenge>>,
+        x402_upto_accepts: Vec<pay_kit::x402::upto::UptoRequirements>,
         advertised_challenges: DecodedPaymentChallenges,
         resource_url: String,
     },
@@ -678,6 +683,12 @@ pub(crate) fn classify_402_with_preference(
     });
     let mpp_challenges = mpp::parse_headers(headers);
     let x402_siwx_challenge = x402::parse_siwx_auth(headers, body);
+    let x402_upto_accepts = x402::parse_upto_accepts(headers, body);
+    let x402_alternative = if x402_upto_accepts.is_empty() {
+        x402_challenge.clone().map(Box::new)
+    } else {
+        None
+    };
 
     // x402::parse (from pay_kit::x402) only returns Some when a Solana-
     // compatible `accepts` entry exists — it's already a Solana filter.
@@ -698,6 +709,8 @@ pub(crate) fn classify_402_with_preference(
             );
             return RunOutcome::SessionChallenge {
                 challenge: Box::new(challenge.clone()),
+                x402_alternative,
+                x402_upto_accepts,
                 advertised_challenges,
                 resource_url: resource_url.to_string(),
             };
@@ -746,12 +759,6 @@ pub(crate) fn classify_402_with_preference(
         // real `upto` is present prefer that reading and drop the (bogus) exact
         // alternative — otherwise the selector could pick an `exact` the server
         // never advertised and the payment would be rejected.
-        let x402_upto_accepts = x402::parse_upto_accepts(headers, body);
-        let x402_alternative = if x402_upto_accepts.is_empty() {
-            x402_challenge.clone().map(Box::new)
-        } else {
-            None
-        };
         return RunOutcome::MppChallenge {
             challenge: Box::new(challenge),
             alternatives: charge_challenges,
@@ -1940,7 +1947,12 @@ HTTP request sent, awaiting response...
             "https://example.com/resource",
             ProtocolPreference::Auto,
         );
-        assert!(matches!(outcome, RunOutcome::SessionChallenge { .. }));
+        match outcome {
+            RunOutcome::SessionChallenge {
+                x402_alternative, ..
+            } => assert!(x402_alternative.is_some()),
+            other => panic!("expected session challenge, got {other:?}"),
+        }
     }
 
     #[test]
