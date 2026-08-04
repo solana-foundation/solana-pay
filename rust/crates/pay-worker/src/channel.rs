@@ -43,6 +43,11 @@ pub const CHANNEL_ACCOUNT_SIZE: usize = 256;
 /// grace_period(4) + open_slot(8)`.
 const OPEN_HEADER_LEN: usize = 29;
 
+/// A distribution must fit in a Solana transaction together with the fixed
+/// channel accounts. Keep malformed preimages from requesting an unbounded
+/// allocation and reject plans that cannot be represented safely.
+const MAX_DISTRIBUTION_RECIPIENTS: usize = 64;
+
 /// Resolve the token program that owns `mint` (SPL Token vs Token-2022) by
 /// reading the mint account's owner. Falls back to SPL Token if unknown.
 pub async fn resolve_token_program(
@@ -275,6 +280,25 @@ fn decode_recipients(preimage: &[u8]) -> Result<Vec<DistributionEntry>, JobError
         return Err(JobError::OpenIxDecode("preimage shorter than count".into()));
     }
     let count = u32::from_le_bytes([preimage[0], preimage[1], preimage[2], preimage[3]]) as usize;
+    if count > MAX_DISTRIBUTION_RECIPIENTS {
+        return Err(JobError::OpenIxDecode(format!(
+            "distribution has {count} recipients; maximum is {MAX_DISTRIBUTION_RECIPIENTS}"
+        )));
+    }
+    let payload_len = preimage.len() - 4;
+    let expected_payload_len = count
+        .checked_mul(34)
+        .ok_or_else(|| JobError::OpenIxDecode("recipient payload length overflow".into()))?;
+    if payload_len < expected_payload_len {
+        return Err(JobError::OpenIxDecode(
+            "preimage truncated mid-entry".into(),
+        ));
+    }
+    if payload_len > expected_payload_len {
+        return Err(JobError::OpenIxDecode(
+            "preimage has trailing recipient data".into(),
+        ));
+    }
     let mut out = Vec::with_capacity(count);
     let mut off = 4;
     for _ in 0..count {
@@ -470,6 +494,11 @@ mod tests {
         preimage.extend_from_slice(&1u32.to_le_bytes());
         preimage.extend_from_slice(&[1u8; 10]); // too short for a 34-byte entry
         assert!(decode_recipients(&preimage).is_err());
+    }
+
+    #[test]
+    fn decode_recipients_rejects_unbounded_count_before_allocating() {
+        assert!(decode_recipients(&u32::MAX.to_le_bytes()).is_err());
     }
 
     #[test]
