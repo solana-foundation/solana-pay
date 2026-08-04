@@ -69,7 +69,7 @@ pub async fn build_receipt(
 ) -> Result<Receipt> {
     let mut receipt = build_receipt_skeleton(signature, network, rpc_value, stablecoins)?;
     let mints = collect_mints(&receipt);
-    let metadata = resolve_mints(rpc, rpc_url, network, stablecoins, &mints).await;
+    let mut metadata = resolve_mints(rpc, rpc_url, network, stablecoins, &mints).await;
     apply_metadata(&mut receipt, &metadata);
 
     if let Some(ref mut session) = receipt.session {
@@ -102,6 +102,10 @@ pub async fn build_receipt(
         if !candidates.is_empty()
             && let Ok(Some(state)) = fetch_recurring_delegation(rpc, rpc_url, &candidates).await
         {
+            let mint = state.mint.to_string();
+            if !metadata.contains_key(&mint) {
+                metadata.extend(resolve_mints(rpc, rpc_url, network, stablecoins, &[mint]).await);
+            }
             attach_recurring_delegation_state(&mut receipt, &state);
         }
         if let Some(ref mut subscription) = receipt.subscription {
@@ -1905,6 +1909,7 @@ fn ui_amount_from_raw(raw: u128, decimals: u8) -> f64 {
 mod tests {
     use super::*;
     use serde_json::json;
+    use solana_pubkey::Pubkey;
 
     fn parse(value: Value) -> Receipt {
         build_receipt_skeleton(
@@ -1914,6 +1919,58 @@ mod tests {
             &[],
         )
         .expect("receipt builds")
+    }
+
+    #[test]
+    fn recurring_state_amount_uses_mint_decimals() {
+        let mint = Pubkey::new_unique();
+        let mut subscription = ReceiptSubscription {
+            action: "cancel".to_string(),
+            status: SubscriptionStatus::Cancelled,
+            subscriber: None,
+            recipient: None,
+            plan: None,
+            subscription_id: None,
+            period_amount: None,
+            period_hours: None,
+            period_label: None,
+            period_start_ts: None,
+            period_end_ts: None,
+            expires_at_ts: None,
+            events: Vec::new(),
+        };
+        let state = crate::subscription_state::RecurringDelegationState {
+            address: Pubkey::new_unique().to_string(),
+            subscriber: Pubkey::new_unique(),
+            puller: Pubkey::new_unique(),
+            mint,
+            current_period_start_ts: 0,
+            period_length_s: 0,
+            expiry_ts: 0,
+            amount_per_period: 5_000_000,
+        };
+        let mut receipt = parse(json!({
+            "slot": 1,
+            "meta": {"err": null, "fee": 0, "innerInstructions": []},
+            "transaction": {"message": {"accountKeys": ["payer"], "instructions": []}}
+        }));
+        receipt.subscription = Some(subscription.clone());
+        attach_recurring_delegation_state(&mut receipt, &state);
+        subscription = receipt.subscription.take().unwrap();
+
+        let metadata = HashMap::from([(
+            mint.to_string(),
+            TokenMetadata {
+                symbol: Some("USDC".to_string()),
+                decimals: Some(6),
+                ..TokenMetadata::default()
+            },
+        )]);
+        attach_subscription_metadata(&mut subscription, &metadata);
+
+        let amount = subscription.period_amount.unwrap();
+        assert_eq!(amount.decimals, 6);
+        assert_eq!(amount.ui_amount, 5.0);
     }
 
     #[test]

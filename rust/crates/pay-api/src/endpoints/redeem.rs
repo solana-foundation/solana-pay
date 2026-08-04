@@ -1,20 +1,19 @@
 //! `POST /v1/redeem`
 //!
 //! Activation-campaign redemption. Takes a code + destination, looks up
-//! the gateway hot wallet's recent transactions via Helius to make sure
-//! the code hasn't been burned yet, then builds + signs + broadcasts a
-//! transaction that pays the code's campaign amount of the configured token
-//! to the destination and stamps `pay-redeem:<code>` as a memo so the
-//! next request can detect this one.
+//! the gateway hot wallet's recent transactions via Helius, atomically claims
+//! the code in Redis, then builds + signs + broadcasts a transaction that pays
+//! the code's campaign amount of the configured token to the destination and
+//! stamps `pay-redeem:<code>` as a memo.
 //!
 //! The fee payer / hot wallet is `state.send.fee_payer` — the same
 //! GCP-KMS-backed signer the `/v1/send` endpoint uses. The redemption
-//! endpoint only needs the mint, amount, decimals, network, and a
-//! Helius API key on top of that.
+//! endpoint additionally needs the mint, amount, network, Helius API key,
+//! and Redis claim store.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::str::FromStr;
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{Arc, LazyLock};
 
 use axum::Json;
 use axum::extract::State;
@@ -114,18 +113,6 @@ pub async fn handler(
     };
     let hot_wallet = signer.pubkey();
 
-    // Close the TOCTOU window between the Helius scan and broadcast by
-    // marking the code as in-flight. A concurrent request carrying the
-    // same code sees the lock and returns 409 immediately. Released on
-    // every exit path via RAII (Drop on `_in_flight`). Single-instance
-    // only — a multi-instance deployment would need an external lock.
-    let _in_flight = match InFlightGuard::acquire(&cfg.in_flight, &req.code) {
-        Ok(g) => g,
-        Err(_) => {
-            return err_resp(StatusCode::CONFLICT, "code redemption already in progress");
-        }
-    };
-
     // 1. Dedup scan.
     match find_prior_burn(&hot_wallet, &req.code, cfg).await {
         Ok(Some(sig)) => {
@@ -136,16 +123,32 @@ pub async fn handler(
             );
         }
         Ok(None) => {}
-        Err(e) => {
+        Err(DedupScanError::Request(e)) => {
             // Strip the request URL before logging — it carries the
             // Helius `api-key=` query param and `reqwest::Error`'s
             // Display impl prints it verbatim.
             warn!(error = %e.without_url(), "Helius dedup scan failed");
             return err_resp(StatusCode::BAD_GATEWAY, "redemption dedup check failed");
         }
+        Err(error) => {
+            warn!(%error, "redemption dedup scan failed closed");
+            return err_resp(StatusCode::BAD_GATEWAY, "redemption dedup check failed");
+        }
     }
 
-    // 2. Build the unsigned tx.
+    // 2. Atomically claim the code in durable storage. The claim is never
+    // deleted: a crash or ambiguous broadcast remains fail-closed and can be
+    // reconciled from the stored destination plus the on-chain memo.
+    match acquire_redemption_claim(cfg, &req.code, &destination_pk).await {
+        Ok(true) => {}
+        Ok(false) => return err_resp(StatusCode::CONFLICT, "code already redeemed or claimed"),
+        Err(error) => {
+            warn!(%error, "redemption claim store unavailable");
+            return err_resp(StatusCode::BAD_GATEWAY, "redemption claim failed");
+        }
+    }
+
+    // 3. Build the unsigned tx.
     let rpc_url = match state.rpc_url_for(cfg.network) {
         Ok(url) => url.to_string(),
         Err(e) => return err_resp(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
@@ -171,11 +174,17 @@ pub async fn handler(
         Err(msg) => return err_resp(StatusCode::INTERNAL_SERVER_ERROR, &msg),
     };
 
-    // 3. Sign + broadcast.
+    // 4. Sign + broadcast.
     let signature = match sign_and_broadcast(unsigned, signer, &state, &rpc_url).await {
         Ok(sig) => sig,
         Err(msg) => return err_resp(StatusCode::INTERNAL_SERVER_ERROR, &msg),
     };
+
+    if let Err(error) = record_redemption_signature(cfg, &req.code, &signature).await {
+        // The durable claim already prevents another payout. Keep serving the
+        // successful signature and let operators reconcile the stale status.
+        warn!(%error, %signature, "failed to update redemption claim status");
+    }
 
     info!(
         campaign = %grant.campaign_id,
@@ -222,6 +231,16 @@ struct HeliusIx {
     data: String,
 }
 
+#[derive(Debug, thiserror::Error)]
+enum DedupScanError {
+    #[error("Helius request failed")]
+    Request(#[from] reqwest::Error),
+    #[error("Helius history scan exhausted its page cap")]
+    PageCap,
+    #[error("redemption dedup is not configured")]
+    NotConfigured,
+}
+
 /// Walk the hot wallet's Helius "transactions for address" history
 /// looking for any prior tx whose memo program ix decodes to
 /// `pay-redeem:<code>`. Returns the matching signature when found.
@@ -229,15 +248,9 @@ async fn find_prior_burn(
     hot_wallet: &Pubkey,
     code: &str,
     cfg: &RedemptionState,
-) -> Result<Option<String>, reqwest::Error> {
-    // Sandbox / local-testing escape hatch: when no Helius key is set
-    // (Helius enhanced transactions is mainnet-only, so it can't see
-    // forks like Surfnet), skip the burn scan and let the transfer
-    // proceed. Production deployments always have a key configured;
-    // this just unblocks end-to-end testing against `402.surfnet.dev`.
+) -> Result<Option<String>, DedupScanError> {
     if cfg.solana_rpc_api_key.is_empty() {
-        warn!("redemption.solana_rpc_api_key is empty — skipping dedup scan (sandbox mode)");
-        return Ok(None);
+        return Err(DedupScanError::NotConfigured);
     }
 
     let http = &cfg.http_client;
@@ -292,14 +305,47 @@ async fn find_prior_burn(
         }
         cursor = txs.last().map(|t| t.signature.clone());
         if page + 1 == cfg.max_scan_pages {
-            warn!(
-                code = code,
-                max_scan_pages = cfg.max_scan_pages,
-                "redeem scan hit page cap without exhausting hot-wallet history"
-            );
+            return Err(DedupScanError::PageCap);
         }
     }
-    Ok(None)
+    Err(DedupScanError::PageCap)
+}
+
+fn redemption_claim_key(code: &str) -> String {
+    format!(
+        "pay-api:redemption:{}",
+        blake3::hash(code.as_bytes()).to_hex()
+    )
+}
+
+async fn acquire_redemption_claim(
+    cfg: &RedemptionState,
+    code: &str,
+    destination: &Pubkey,
+) -> Result<bool, redis::RedisError> {
+    let mut connection = cfg.claim_store.get_connection_manager().await?;
+    let acquired: Option<String> = redis::cmd("SET")
+        .arg(redemption_claim_key(code))
+        .arg(format!("claimed:{destination}"))
+        .arg("NX")
+        .query_async(&mut connection)
+        .await?;
+    Ok(acquired.is_some())
+}
+
+async fn record_redemption_signature(
+    cfg: &RedemptionState,
+    code: &str,
+    signature: &Signature,
+) -> Result<(), redis::RedisError> {
+    let mut connection = cfg.claim_store.get_connection_manager().await?;
+    let _: Option<String> = redis::cmd("SET")
+        .arg(redemption_claim_key(code))
+        .arg(format!("broadcast:{signature}"))
+        .arg("XX")
+        .query_async(&mut connection)
+        .await?;
+    Ok(())
 }
 
 // ── Transaction construction ──────────────────────────────────────────────
@@ -422,11 +468,8 @@ pub struct RedemptionState {
     /// Pooled HTTP client for the Helius dedup scan. Shared across all
     /// `/v1/redeem` requests so connections / TLS handshakes are reused.
     pub http_client: reqwest::Client,
-    /// Set of codes currently mid-redemption on this instance. The
-    /// handler inserts before the Helius scan and removes on every
-    /// exit path; a concurrent request finding the code present
-    /// returns 409.
-    pub in_flight: Arc<Mutex<HashSet<String>>>,
+    /// Durable atomic claim store shared by every API replica.
+    pub claim_store: redis::Client,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -493,6 +536,9 @@ impl RedemptionState {
             .pool_idle_timeout(std::time::Duration::from_secs(30))
             .build()
             .expect("reqwest::Client builds with default tls");
+        let claim_store = redis::Client::open(cfg.claim_store_url.as_str()).map_err(|error| {
+            Error::SendNotConfigured(format!("invalid redemption.claim_store_url: {error}"))
+        })?;
 
         Ok(Self {
             enabled: cfg.enabled,
@@ -505,39 +551,8 @@ impl RedemptionState {
             max_scan_pages: cfg.max_scan_pages.unwrap_or(DEFAULT_MAX_SCAN_PAGES),
             grants,
             http_client,
-            in_flight: Arc::new(Mutex::new(HashSet::new())),
+            claim_store,
         })
-    }
-}
-
-// ── In-flight guard ───────────────────────────────────────────────────────
-
-/// RAII guard that releases the in-flight slot for a code on Drop.
-/// `acquire` returns `Err(())` if the code is already in flight on this
-/// instance, which the handler converts to 409.
-struct InFlightGuard {
-    set: Arc<Mutex<HashSet<String>>>,
-    code: String,
-}
-
-impl InFlightGuard {
-    fn acquire(set: &Arc<Mutex<HashSet<String>>>, code: &str) -> Result<Self, ()> {
-        let mut guard = set.lock().expect("in_flight mutex poisoned");
-        if !guard.insert(code.to_string()) {
-            return Err(());
-        }
-        Ok(Self {
-            set: set.clone(),
-            code: code.to_string(),
-        })
-    }
-}
-
-impl Drop for InFlightGuard {
-    fn drop(&mut self) {
-        if let Ok(mut guard) = self.set.lock() {
-            guard.remove(&self.code);
-        }
     }
 }
 
@@ -587,7 +602,7 @@ fn err_resp_with_extra(status: StatusCode, message: &str, extra: serde_json::Val
 
 #[cfg(test)]
 mod tests {
-    use super::{RedemptionGrant, RedemptionState};
+    use super::{RedemptionGrant, RedemptionState, redemption_claim_key};
     use crate::config::{RedemptionCampaignConfig, RedemptionConfig};
 
     #[test]
@@ -595,6 +610,7 @@ mod tests {
         let cfg = RedemptionConfig {
             enabled: true,
             amount: 5_000_000,
+            claim_store_url: "redis://127.0.0.1/".to_string(),
             codes: vec!["LEGACY123".to_string()],
             campaigns: vec![
                 RedemptionCampaignConfig {
@@ -643,5 +659,13 @@ mod tests {
             })
         );
         assert!(!state.grants.contains_key("OFFLINE1"));
+    }
+
+    #[test]
+    fn redemption_claim_keys_do_not_expose_codes() {
+        let key = redemption_claim_key("SECRET-CODE-123");
+        assert!(key.starts_with("pay-api:redemption:"));
+        assert!(!key.contains("SECRET-CODE-123"));
+        assert_eq!(key, redemption_claim_key("SECRET-CODE-123"));
     }
 }

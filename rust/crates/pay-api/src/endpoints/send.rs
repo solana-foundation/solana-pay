@@ -752,6 +752,10 @@ fn validate_paid_send_request(
         return Err(Error::InvalidPaymentCredential);
     }
 
+    if (method_details.confidential == Some(true)) != resolved.confidential {
+        return Err(Error::InvalidPaymentCredential);
+    }
+
     // Confidential charges are gateway-paid, absorb the SOL fee, and carry no
     // splits: the recipient is the primary and receives exactly the requested
     // amount. Reconciliation is by signature, so the memo is logical only.
@@ -1439,6 +1443,25 @@ mod tests {
         )
         .unwrap();
         validate_paid_send_request(&request, &resolved).expect("confidential charge validates");
+    }
+
+    #[test]
+    fn validate_paid_send_request_rejects_confidential_mode_mismatch() {
+        let confidential = confidential_resolved();
+        let amounts = compute_send_amounts(confidential.requested_amount_raw, 0, false).unwrap();
+        let request = build_charge_request(
+            &confidential,
+            &amounts,
+            0,
+            SendChallengeLayout::ExistingRecipientAta,
+            &FeeRefundSplitConfig::default(),
+            None,
+        )
+        .unwrap();
+
+        let mut plain = confidential;
+        plain.confidential = false;
+        assert!(validate_paid_send_request(&request, &plain).is_err());
     }
 
     #[test]

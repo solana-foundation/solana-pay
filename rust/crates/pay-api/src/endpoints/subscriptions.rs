@@ -389,14 +389,17 @@ fn resolve_cancel_request(
 /// rejected.
 fn parse_cancel_tx(tx_b64: &str, expected_fee_payer: &str) -> Result<ParsedCancelTx, Error> {
     use base64::Engine;
+    use solana_sanitize::Sanitize;
     let raw = base64::engine::general_purpose::STANDARD
         .decode(tx_b64.trim())
         .map_err(|_| Error::InvalidPaymentCredential)?;
     let tx: Transaction =
         bincode::deserialize(&raw).map_err(|_| Error::InvalidPaymentCredential)?;
+    tx.sanitize().map_err(|_| Error::InvalidPaymentCredential)?;
 
     let keys = &tx.message.account_keys;
-    if keys.is_empty() {
+    let required_signatures = tx.message.header.num_required_signatures as usize;
+    if keys.is_empty() || required_signatures == 0 || tx.signatures.len() != required_signatures {
         return Err(Error::InvalidPaymentCredential);
     }
 
@@ -793,6 +796,20 @@ mod tests {
         );
         // Submitting an imposter pubkey as the expected fee payer must fail.
         assert!(parse_cancel_tx(&encode_tx(&tx), &imposter.to_string()).is_err());
+    }
+
+    #[test]
+    fn parse_cancel_tx_rejects_missing_signature_slots() {
+        let fee_payer = Pubkey::new_unique();
+        let mut tx = build_cancel_tx(
+            fee_payer,
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+        );
+        tx.signatures.clear();
+
+        assert!(parse_cancel_tx(&encode_tx(&tx), &fee_payer.to_string()).is_err());
     }
 
     #[test]

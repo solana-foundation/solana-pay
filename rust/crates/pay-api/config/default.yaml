@@ -75,11 +75,12 @@ send:
     memo: fee-payer-refund
 
 # Activation-campaign redemption. Reuses `send.fee_payer.*` as the hot
-# wallet that signs Transfer + Memo. A Helius API key is required for
-# durable redemption deduplication across API instances and restarts.
+# wallet that signs Transfer + Memo. Redis provides the atomic durable claim;
+# Helius detects redemptions made before the claim store was introduced.
 redemption:
-  enabled: true
+  enabled: false
   currency: USDC
   amount: 5000000          # $5 legacy flat-list fallback; campaigns override it
-  network: sandbox         # → networks.sandbox.rpc_url
+  network: mainnet         # Helius transaction history is mainnet-only
   solana_rpc_api_key: ""   # required when redemption is enabled
+  claim_store_url: ""      # Redis; PAY_SESSION_REDIS_URL is also accepted

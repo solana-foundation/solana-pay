@@ -23,6 +23,7 @@ serde_json = { workspace = true }
 pay-kit = { workspace = true, features = ["gcp_kms", "worker"] }
 solana-pubkey = { workspace = true }
 solana-keypair = { workspace = true }
+solana-sanitize = { workspace = true }
 solana-signature = { workspace = true }
 solana-transaction = { workspace = true }
 solana-message = { workspace = true }
@@ -33,6 +34,8 @@ spl-token-2022-interface = "2.1.0"
 base64 = "0.22"
 bincode = { workspace = true }
 bs58 = "0.5"
+blake3 = { workspace = true }
+redis = { version = "0.32", features = ["aio", "tokio-comp", "connection-manager"] }
 reqwest = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal", "time", "net"] }

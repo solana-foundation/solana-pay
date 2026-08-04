@@ -46,7 +46,6 @@ struct PlannedStep {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum StepKind {
-    SettleAndSeal,
     RequestClose,
     Seal,
     Distribute,
@@ -56,7 +55,6 @@ enum StepKind {
 impl StepKind {
     const fn label(self) -> &'static str {
         match self {
-            Self::SettleAndSeal => "settle_and_seal",
             Self::RequestClose => "request_close",
             Self::Seal => "seal",
             Self::Distribute => "distribute",
@@ -294,10 +292,9 @@ async fn process_channel(
 
 /// Run the adaptive state machine and return the ordered instruction steps.
 ///
-/// A "step" is one transaction. We keep `settle_and_seal` + `distribute`
-/// and `seal` + `distribute` as SEPARATE transactions so the second only
-/// applies to state the first produced — and so a dry-run can log each with
-/// its own derived accounts.
+/// A "step" is one transaction. We keep `seal` + `distribute` as separate
+/// transactions so the second only applies to state the first produced — and
+/// so a dry-run can log each with its own derived accounts.
 async fn plan_steps(
     rpc: &RpcClient,
     rpc_url: &str,
@@ -318,16 +315,10 @@ async fn plan_steps(
     match decoded.channel.status {
         STATUS_OPEN => {
             if me == payee {
-                steps.push(PlannedStep {
-                    kind: StepKind::SettleAndSeal,
-                    instructions: vec![channel::build_settle_and_seal_ix(&address, &payee)],
-                    effect: "settle (has_voucher=0) and seal the channel".into(),
-                });
-                // After seal, distribute performs the payouts + tombstone.
-                let dist =
-                    build_distribute_step(rpc, rpc_url, decoded, treasury_owner, &token_program)
-                        .await?;
-                steps.push(dist);
+                warn!(
+                    channel = %address,
+                    "refusing to seal an open payee channel without Redis voucher state; use settle-sessions"
+                );
             } else if me == payer {
                 steps.push(PlannedStep {
                     kind: StepKind::RequestClose,

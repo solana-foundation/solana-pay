@@ -26,6 +26,25 @@ pub async fn build_fee_payer_signer(
         let key = key.trim();
         if !key.is_empty() {
             let signer = Signer::from_memory(key).map_err(|_| JobError::FeePayerSigner)?;
+            let expected_pubkey = fee_payer
+                .pubkey
+                .as_deref()
+                .filter(|pubkey| !pubkey.trim().is_empty())
+                .ok_or_else(|| {
+                    JobError::Config(
+                        "fee-payer pubkey is required when LOCAL_FEE_PAYER_PRIVATE_KEY is set"
+                            .into(),
+                    )
+                })?;
+            if signer.pubkey().to_string() != expected_pubkey {
+                tracing::warn!(
+                    expected_pubkey,
+                    actual_pubkey = %signer.pubkey(),
+                    "rejecting local fee-payer key with unexpected pubkey"
+                );
+                return Err(JobError::FeePayerSigner);
+            }
+            tracing::warn!(pubkey = %signer.pubkey(), "using local fee-payer private key");
             return Ok(Arc::new(signer));
         }
     }

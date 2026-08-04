@@ -36,6 +36,20 @@ pub async fn build_fee_payer_signer(
         let key = key.trim();
         if !key.is_empty() {
             let signer = Signer::from_memory(key).map_err(|_| Error::FeePayerSigner)?;
+            let expected_pubkey = fee_payer
+                .pubkey
+                .as_deref()
+                .filter(|pubkey| !pubkey.trim().is_empty())
+                .ok_or(Error::FeePayerSigner)?;
+            if signer.pubkey().to_string() != expected_pubkey {
+                tracing::warn!(
+                    expected_pubkey,
+                    actual_pubkey = %signer.pubkey(),
+                    "rejecting local fee-payer key with unexpected pubkey"
+                );
+                return Err(Error::FeePayerSigner);
+            }
+            tracing::warn!(pubkey = %signer.pubkey(), "using local fee-payer private key");
             return Ok(Arc::new(signer));
         }
     }

@@ -949,7 +949,7 @@ async fn reconcile_channel(
             escrow_active,
         });
     };
-    if expires_at <= now {
+    if expires_at != 0 && expires_at <= now {
         warn!(
             channel_id = %state.channel_id,
             expires_at,
@@ -1182,7 +1182,7 @@ fn close_voucher(
     let expires_at = state
         .highest_voucher_expires_at
         .ok_or_else(|| JobError::TxBuild("latest unsettled voucher has no expiry".into()))?;
-    if expires_at <= now {
+    if expires_at != 0 && expires_at <= now {
         return Err(JobError::TxBuild(format!(
             "latest unsettled voucher for {} expired at {expires_at}",
             state.channel_id
@@ -1520,5 +1520,12 @@ mod tests {
         assert_eq!(expires_at, 0);
 
         assert!(close_voucher(&state, 50, &signer, 500).is_err());
+
+        state.highest_voucher_expires_at = Some(0);
+        let (signature, cumulative, expires_at) =
+            close_voucher(&state, 50, &signer, i64::MAX).unwrap();
+        assert_eq!(signature, Some([7_u8; 64]));
+        assert_eq!(cumulative, 75);
+        assert_eq!(expires_at, 0);
     }
 }

@@ -231,6 +231,11 @@ pub struct RedemptionConfig {
     #[serde(default)]
     pub max_scan_pages: Option<usize>,
 
+    /// Redis URL for durable, atomic redemption claims. Required while
+    /// redemption is enabled so claims survive replicas and restarts.
+    #[serde(default)]
+    pub claim_store_url: String,
+
     /// Legacy flat redemption-code whitelist. Kept during the migration
     /// to versioned campaigns so an older Doppler value remains usable.
     #[serde(default)]
@@ -278,6 +283,7 @@ impl Default for RedemptionConfig {
             solana_rpc_api_key: String::new(),
             helius_base: default_helius_base(),
             max_scan_pages: None,
+            claim_store_url: String::new(),
             codes: Vec::new(),
             campaigns: Vec::new(),
         }
@@ -382,11 +388,24 @@ fn validate_campaign_id(id: &str) -> Result<(), String> {
 }
 
 fn validate_redemption_config(redemption: &RedemptionConfig) -> Result<(), String> {
+    if redemption.network != Network::Mainnet {
+        return Err(
+            "redemption.network must be mainnet because the Helius history scan is mainnet-only"
+                .into(),
+        );
+    }
     if redemption.solana_rpc_api_key.trim().is_empty() {
         return Err(
-            "redemption.solana_rpc_api_key is required when redemption.enabled is true; "
-                .to_string(),
+            "redemption.solana_rpc_api_key is required when redemption.enabled is true".to_string(),
         );
+    }
+    if redemption.claim_store_url.trim().is_empty() {
+        return Err(
+            "redemption.claim_store_url is required when redemption.enabled is true".into(),
+        );
+    }
+    if redemption.max_scan_pages == Some(0) {
+        return Err("redemption.max_scan_pages must be greater than zero".into());
     }
     if redemption.codes.is_empty()
         && !redemption
@@ -594,6 +613,15 @@ impl Config {
             && let Some(key) = extract_solana_rpc_api_key(rpc_url)
         {
             self.redemption.solana_rpc_api_key = key;
+        }
+
+        if self.redemption.claim_store_url.is_empty()
+            && let Ok(url) = std::env::var("PAY_SESSION_REDIS_URL")
+        {
+            let url = url.trim();
+            if !url.is_empty() {
+                self.redemption.claim_store_url = url.to_string();
+            }
         }
 
         // `REDEMPTION_CODES` is stored in Doppler so redemption
@@ -851,6 +879,8 @@ impl From<figment::Error> for ConfigError {
 
 #[cfg(test)]
 mod tests {
+    use pay_api_types::Network;
+
     use super::{
         ParsedRedemptionSecret, RedemptionCampaignConfig, RedemptionConfig,
         parse_redemption_secret, validate_campaign_id, validate_redemption_code,
@@ -921,6 +951,7 @@ mod tests {
     fn rejects_duplicate_codes_across_campaigns() {
         let redemption = RedemptionConfig {
             solana_rpc_api_key: "test-key".to_string(),
+            claim_store_url: "redis://127.0.0.1/".to_string(),
             campaigns: vec![
                 RedemptionCampaignConfig {
                     id: "anthropic-tokyo-Q2-2026".to_string(),
@@ -953,5 +984,33 @@ mod tests {
         let error = validate_redemption_config(&redemption)
             .expect_err("enabled redemption requires durable deduplication");
         assert!(error.contains("redemption.solana_rpc_api_key is required"));
+    }
+
+    #[test]
+    fn rejects_redemption_without_durable_claim_store() {
+        let redemption = RedemptionConfig {
+            solana_rpc_api_key: "test-key".to_string(),
+            codes: vec!["CODE123".to_string()],
+            ..RedemptionConfig::default()
+        };
+
+        let error = validate_redemption_config(&redemption)
+            .expect_err("enabled redemption requires an atomic claim store");
+        assert!(error.contains("redemption.claim_store_url is required"));
+    }
+
+    #[test]
+    fn rejects_redemption_on_non_mainnet_networks() {
+        let redemption = RedemptionConfig {
+            network: Network::Sandbox,
+            solana_rpc_api_key: "test-key".to_string(),
+            claim_store_url: "redis://127.0.0.1/".to_string(),
+            codes: vec!["CODE123".to_string()],
+            ..RedemptionConfig::default()
+        };
+
+        let error = validate_redemption_config(&redemption)
+            .expect_err("Helius history cannot deduplicate sandbox redemptions");
+        assert!(error.contains("redemption.network must be mainnet"));
     }
 }
