@@ -151,15 +151,24 @@ pub async fn handler(
     // 3. Build the unsigned tx.
     let rpc_url = match state.rpc_url_for(cfg.network) {
         Ok(url) => url.to_string(),
-        Err(e) => return err_resp(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+        Err(e) => {
+            release_redemption_claim_best_effort(cfg, &req.code, &destination_pk).await;
+            return err_resp(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string());
+        }
     };
     let blockhash_str = match state.rpc.get_latest_blockhash(&rpc_url).await {
         Ok(b) => b,
-        Err(e) => return err_resp(StatusCode::BAD_GATEWAY, &e.to_string()),
+        Err(e) => {
+            release_redemption_claim_best_effort(cfg, &req.code, &destination_pk).await;
+            return err_resp(StatusCode::BAD_GATEWAY, &e.to_string());
+        }
     };
     let blockhash = match solana_hash::Hash::from_str(&blockhash_str) {
         Ok(b) => b,
-        Err(_) => return err_resp(StatusCode::BAD_GATEWAY, "blockhash decode failed"),
+        Err(_) => {
+            release_redemption_claim_best_effort(cfg, &req.code, &destination_pk).await;
+            return err_resp(StatusCode::BAD_GATEWAY, "blockhash decode failed");
+        }
     };
 
     let unsigned = match build_unsigned(
@@ -171,13 +180,36 @@ pub async fn handler(
         blockhash,
     ) {
         Ok(tx) => tx,
-        Err(msg) => return err_resp(StatusCode::INTERNAL_SERVER_ERROR, &msg),
+        Err(msg) => {
+            release_redemption_claim_best_effort(cfg, &req.code, &destination_pk).await;
+            return err_resp(StatusCode::INTERNAL_SERVER_ERROR, &msg);
+        }
     };
 
-    // 4. Sign + broadcast.
-    let signature = match sign_and_broadcast(unsigned, signer, &state, &rpc_url).await {
+    // 4. Sign and serialize before making the claim terminal. A signing or
+    // serialization failure has not sent funds and can safely be retried.
+    let signed_tx = match sign_transaction(unsigned, signer).await {
+        Ok(tx) => tx,
+        Err(msg) => {
+            release_redemption_claim_best_effort(cfg, &req.code, &destination_pk).await;
+            return err_resp(StatusCode::INTERNAL_SERVER_ERROR, &msg);
+        }
+    };
+    match mark_redemption_broadcasting(cfg, &req.code, &destination_pk).await {
+        Ok(true) => {}
+        Ok(false) => return err_resp(StatusCode::CONFLICT, "code claim was lost"),
+        Err(error) => {
+            warn!(%error, "redemption claim could not be made terminal");
+            return err_resp(StatusCode::BAD_GATEWAY, "redemption claim failed");
+        }
+    }
+    let signature = match broadcast_transaction(&state, &rpc_url, &signed_tx).await {
         Ok(sig) => sig,
-        Err(msg) => return err_resp(StatusCode::INTERNAL_SERVER_ERROR, &msg),
+        Err(msg) => {
+            // The claim is intentionally retained: the RPC may have accepted
+            // the transaction even when its response was lost.
+            return err_resp(StatusCode::BAD_GATEWAY, &msg);
+        }
     };
 
     if let Err(error) = record_redemption_signature(cfg, &req.code, &signature).await {
@@ -333,6 +365,58 @@ async fn acquire_redemption_claim(
     Ok(acquired.is_some())
 }
 
+async fn mark_redemption_broadcasting(
+    cfg: &RedemptionState,
+    code: &str,
+    destination: &Pubkey,
+) -> Result<bool, redis::RedisError> {
+    const TRANSITION: &str = r#"
+if redis.call('GET', KEYS[1]) == ARGV[1] then
+  redis.call('SET', KEYS[1], ARGV[2])
+  return 1
+end
+return 0
+"#;
+    let mut connection = cfg.claim_store.get_connection_manager().await?;
+    let changed: i32 = redis::Script::new(TRANSITION)
+        .key(redemption_claim_key(code))
+        .arg(format!("claimed:{destination}"))
+        .arg(format!("broadcasting:{destination}"))
+        .invoke_async(&mut connection)
+        .await?;
+    Ok(changed == 1)
+}
+
+async fn release_redemption_claim(
+    cfg: &RedemptionState,
+    code: &str,
+    destination: &Pubkey,
+) -> Result<bool, redis::RedisError> {
+    const RELEASE: &str = r#"
+if redis.call('GET', KEYS[1]) == ARGV[1] then
+  return redis.call('DEL', KEYS[1])
+end
+return 0
+"#;
+    let mut connection = cfg.claim_store.get_connection_manager().await?;
+    let deleted: i32 = redis::Script::new(RELEASE)
+        .key(redemption_claim_key(code))
+        .arg(format!("claimed:{destination}"))
+        .invoke_async(&mut connection)
+        .await?;
+    Ok(deleted == 1)
+}
+
+async fn release_redemption_claim_best_effort(
+    cfg: &RedemptionState,
+    code: &str,
+    destination: &Pubkey,
+) {
+    if let Err(error) = release_redemption_claim(cfg, code, destination).await {
+        warn!(%error, "failed to release pre-broadcast redemption claim");
+    }
+}
+
 async fn record_redemption_signature(
     cfg: &RedemptionState,
     code: &str,
@@ -400,15 +484,11 @@ fn build_unsigned(
     )))
 }
 
-/// Sign the message-bytes with the SolanaSigner and broadcast via the
-/// shared pay-api-core RPC client. Mirrors the pattern used in
-/// `subscriptions::co_sign_and_broadcast`.
-async fn sign_and_broadcast(
+/// Sign and serialize the transaction without contacting the RPC.
+async fn sign_transaction(
     mut tx: Transaction,
     signer: Arc<dyn SolanaSigner>,
-    state: &AppState,
-    rpc_url: &str,
-) -> Result<Signature, String> {
+) -> Result<String, String> {
     let fee_payer = signer.pubkey();
     let idx = tx
         .message
@@ -431,9 +511,17 @@ async fn sign_and_broadcast(
     let serialised = bincode::serialize(&tx).map_err(|e| format!("bincode: {e}"))?;
     let tx_b64 = base64::engine::general_purpose::STANDARD.encode(&serialised);
 
+    Ok(tx_b64)
+}
+
+async fn broadcast_transaction(
+    state: &AppState,
+    rpc_url: &str,
+    tx_b64: &str,
+) -> Result<Signature, String> {
     let sig_str = state
         .rpc
-        .send_raw_transaction(rpc_url, &tx_b64)
+        .send_raw_transaction(rpc_url, tx_b64)
         .await
         .map_err(|e: Error| e.to_string())?;
     Signature::from_str(&sig_str).map_err(|_| "rpc returned malformed signature".into())
