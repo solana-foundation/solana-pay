@@ -455,6 +455,13 @@ pub fn fetch_wallet_address(credentials: &OpenfortCredentials, account_id: &str)
 /// account requires auth on this network), connects the remote signer
 /// (which fetches and pins the wallet's Solana address), and cross-checks
 /// the address against the `pubkey` cached in `accounts.yml`.
+///
+/// Like the rest of the signer-resolution surface and the MPP/x402
+/// payment builders, this is synchronous and blocks on network I/O
+/// (it drives the connect round-trip on an internal runtime). Callers
+/// on async workers must isolate it with `tokio::task::spawn_blocking`
+/// — the same contract the payer proxy and MCP tools already follow
+/// for `build_credential` / `build_payment`.
 pub fn load_openfort_signer(
     account: &Account,
     name: &str,
