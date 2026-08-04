@@ -527,7 +527,7 @@ fn apply_prepared_request_auth(
         } => {
             // Silently appending `?{key}=` (empty) when the env var is
             // unset trips upstream auth checks with cryptic errors like
-            // Helius's `"missing api key"`. Fail loudly so operators
+            // the provider's `"missing api key"`. Fail loudly so operators
             // notice the missing config at the first request instead of
             // chasing it through upstream logs.
             let secret = std::env::var(value_from_env).map_err(|_| {
