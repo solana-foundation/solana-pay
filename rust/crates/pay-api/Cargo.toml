@@ -22,6 +22,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 pay-kit = { workspace = true, features = ["gcp_kms", "worker"] }
 solana-pubkey = { workspace = true }
+solana-keypair = { workspace = true }
 solana-signature = { workspace = true }
 solana-transaction = { workspace = true }
 solana-message = { workspace = true }

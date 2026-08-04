@@ -201,8 +201,9 @@ mod tests {
 
     #[tokio::test]
     async fn confidential_workers_are_created_per_configured_network() {
-        const TEST_KEYPAIR_BYTES: &str = "[41,99,180,88,51,57,48,80,61,63,219,75,176,49,116,254,227,176,196,204,122,47,166,133,155,252,217,0,253,17,49,143,47,94,121,167,195,136,72,22,157,48,77,88,63,96,57,122,181,243,236,188,241,134,174,224,100,246,17,170,104,17,151,48]";
-        let signer = std::sync::Arc::new(Signer::from_memory(TEST_KEYPAIR_BYTES).unwrap());
+        let keypair = solana_keypair::Keypair::new();
+        let keypair_bytes = serde_json::to_string(&keypair.to_bytes().to_vec()).unwrap();
+        let signer = std::sync::Arc::new(Signer::from_memory(&keypair_bytes).unwrap());
         let coin = Stablecoin {
             symbol: "USDC22".into(),
             mint: solana_pubkey::Pubkey::new_unique(),
