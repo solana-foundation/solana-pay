@@ -76,7 +76,7 @@ send:
 
 # Activation-campaign redemption. Reuses `send.fee_payer.*` as the hot
 # wallet that signs Transfer + Memo. Redis provides the atomic durable claim;
-# Helius detects redemptions made before the claim store was introduced.
+# The history provider detects redemptions made before the claim store was introduced.
 redemption:
   enabled: false
   currency: USDC

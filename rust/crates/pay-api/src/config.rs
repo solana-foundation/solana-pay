@@ -219,7 +219,8 @@ pub struct RedemptionConfig {
     #[serde(default = "default_redemption_network")]
     pub network: Network,
 
-    /// Helius enhanced-transactions API key. Required while enabled.
+    /// API credential for the configured transaction-history provider.
+    /// Required while redemption is enabled.
     #[serde(default)]
     pub solana_rpc_api_key: String,
 
@@ -591,14 +592,14 @@ impl Config {
     /// Resolve `redemption.solana_rpc_api_key` from the environment.
     ///
     /// Sources, first match wins:
-    ///   1. `HELIUS_API_KEY` (explicit, mirrors the MoonPay convention).
+    ///   1. `SOLANA_RPC_API_KEY` (explicit provider credential).
     ///   2. The `api-key=` query param of the mainnet RPC URL —
     ///      `RPC_URL` is already a Helius endpoint in prod (doppler
     ///      `gateway-402/prd`), so the dedup endpoint can piggyback on
     ///      the same secret without a separate doppler entry.
     fn apply_redemption_env(&mut self) -> Result<(), ConfigError> {
         if self.redemption.solana_rpc_api_key.is_empty()
-            && let Ok(key) = std::env::var("HELIUS_API_KEY")
+            && let Ok(key) = std::env::var("SOLANA_RPC_API_KEY")
         {
             let key = key.trim();
             if !key.is_empty() {
@@ -975,7 +976,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_redemption_without_helius_deduplication() {
+    fn rejects_redemption_without_provider_credential() {
         let redemption = RedemptionConfig {
             codes: vec!["CODE123".to_string()],
             ..RedemptionConfig::default()

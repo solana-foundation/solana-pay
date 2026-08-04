@@ -8,7 +8,7 @@
 //!
 //! The fee payer / hot wallet is `state.send.fee_payer` — the same
 //! GCP-KMS-backed signer the `/v1/send` endpoint uses. The redemption
-//! endpoint additionally needs the mint, amount, network, Helius API key,
+//! endpoint additionally needs the mint, amount, network, provider credential,
 //! and Redis claim store.
 
 use std::collections::HashMap;
@@ -124,8 +124,8 @@ pub async fn handler(
         }
         Ok(None) => {}
         Err(DedupScanError::Request(e)) => {
-            // Strip the request URL before logging — it carries the
-            // Helius `api-key=` query param and `reqwest::Error`'s
+            // Strip the request URL before logging — it carries the provider
+            // `api-key=` query param and `reqwest::Error`'s
             // Display impl prints it verbatim.
             warn!(error = %e.without_url(), "Helius dedup scan failed");
             return err_resp(StatusCode::BAD_GATEWAY, "redemption dedup check failed");
@@ -241,7 +241,7 @@ enum DedupScanError {
     NotConfigured,
 }
 
-/// Walk the hot wallet's Helius "transactions for address" history
+/// Walk the hot wallet's transaction-history provider "transactions for address" history
 /// looking for any prior tx whose memo program ix decodes to
 /// `pay-redeem:<code>`. Returns the matching signature when found.
 async fn find_prior_burn(
