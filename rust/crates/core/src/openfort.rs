@@ -214,7 +214,7 @@ impl OpenfortSigner {
     /// and a single-field body is trivially sorted.
     async fn call_sign(&self, message: &[u8]) -> std::result::Result<SignResponse, SignerError> {
         let path = format!("/v2/accounts/backend/{}/sign", self.account_id);
-        let data_hex = format!("0x{}", &*crate::keystore::store::hex_encode(message));
+        let data_hex = format!("0x{}", *crate::keystore::store::hex_encode(message));
         let body = serde_json::to_string(&serde_json::json!({ "data": data_hex }))
             .map_err(|e| SignerError::SerializationError(format!("body: {e}")))?;
         let jwt = self.wallet_jwt("POST", &path, &body)?;
