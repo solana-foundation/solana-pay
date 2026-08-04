@@ -36,6 +36,59 @@ use solana_signature::Signature;
 use solana_transaction::Transaction;
 use tracing::{error, info, warn};
 
+const RECLAIM_LEASE_TTL_SECONDS: u64 = 300;
+const RECLAIM_LEASE_PREFIX: &str = "pay-worker:reclaim:";
+
+struct ReclaimLease {
+    connection: redis::aio::ConnectionManager,
+    key: String,
+    owner: String,
+}
+
+impl ReclaimLease {
+    async fn acquire(redis_url: &str, address: &Pubkey) -> Result<Option<Self>, JobError> {
+        let client = redis::Client::open(redis_url)
+            .map_err(|error| JobError::Config(format!("Redis client: {error}")))?;
+        let mut connection = client
+            .get_connection_manager()
+            .await
+            .map_err(|error| JobError::Config(format!("Redis connect: {error}")))?;
+        let key = format!("{RECLAIM_LEASE_PREFIX}{address}");
+        let owner = format!("{}-{}", std::process::id(), unix_nanos());
+        let acquired: Option<String> = redis::cmd("SET")
+            .arg(&key)
+            .arg(&owner)
+            .arg("NX")
+            .arg("EX")
+            .arg(RECLAIM_LEASE_TTL_SECONDS)
+            .query_async(&mut connection)
+            .await
+            .map_err(|error| JobError::Config(format!("Redis reclaim lease: {error}")))?;
+        Ok(acquired.map(|_| Self {
+            connection,
+            key,
+            owner,
+        }))
+    }
+
+    async fn release(mut self) {
+        const RELEASE: &str = r#"
+if redis.call('GET', KEYS[1]) == ARGV[1] then
+  return redis.call('DEL', KEYS[1])
+end
+return 0
+"#;
+        if let Err(error) = redis::Script::new(RELEASE)
+            .key(&self.key)
+            .arg(&self.owner)
+            .invoke_async::<i32>(&mut self.connection)
+            .await
+        {
+            warn!(%error, key = %self.key, "failed to release reclaim lease; TTL will expire it");
+        }
+    }
+}
+
 /// A planned or executed on-chain step for one channel.
 struct PlannedStep {
     kind: StepKind,
@@ -91,6 +144,13 @@ fn init_tracing() {
 
 async fn run() -> Result<usize, JobError> {
     let dry_run = parse_dry_run();
+    let redis_url = if dry_run {
+        None
+    } else {
+        Some(std::env::var("PAY_SESSION_REDIS_URL").map_err(|_| {
+            JobError::Config("PAY_SESSION_REDIS_URL is required when DRY_RUN=false".into())
+        })?)
+    };
     let network = std::env::var("NETWORK")
         .ok()
         .map(|s| s.trim().to_string())
@@ -130,8 +190,26 @@ async fn run() -> Result<usize, JobError> {
     let mut skipped = 0usize;
     let mut acted = 0usize;
     let mut reclaim_candidates = Vec::new();
+    let mut reclaim_leases = Vec::new();
 
     for address in &addresses {
+        let lease = if let Some(redis_url) = redis_url.as_deref() {
+            match ReclaimLease::acquire(redis_url, address).await {
+                Ok(Some(lease)) => Some(lease),
+                Ok(None) => {
+                    skipped += 1;
+                    info!(channel = %address, "channel is already owned by another worker");
+                    continue;
+                }
+                Err(err) => {
+                    error!(channel = %address, error = %err, "failed to acquire channel lease");
+                    hard_failures += 1;
+                    continue;
+                }
+            }
+        } else {
+            None
+        };
         match process_channel(
             &rpc,
             &rpc_url,
@@ -147,20 +225,32 @@ async fn run() -> Result<usize, JobError> {
         .await
         {
             Ok(ChannelOutcome::Acted { steps }) => {
+                if let Some(lease) = lease {
+                    lease.release().await;
+                }
                 acted += 1;
                 info!(channel = %address, steps, "channel advanced");
             }
             Ok(ChannelOutcome::Skipped { reason }) => {
+                if let Some(lease) = lease {
+                    lease.release().await;
+                }
                 skipped += 1;
                 info!(channel = %address, reason = %reason, "channel skipped");
             }
             Ok(ChannelOutcome::Reclaim { instructions }) => {
+                if let Some(lease) = lease {
+                    reclaim_leases.push(lease);
+                }
                 reclaim_candidates.push(ChannelInstructionGroup {
                     channel_id: address.to_string(),
                     instructions,
                 });
             }
             Err(err) => {
+                if let Some(lease) = lease {
+                    lease.release().await;
+                }
                 // Per-channel errors don't abort the batch; only count as a
                 // hard failure when we were actually trying to broadcast.
                 if dry_run {
@@ -185,6 +275,9 @@ async fn run() -> Result<usize, JobError> {
     .await;
     acted += reclaim_outcome.acted;
     hard_failures += reclaim_outcome.failures;
+    for lease in reclaim_leases {
+        lease.release().await;
+    }
 
     info!(
         acted,
@@ -619,6 +712,13 @@ fn unix_now() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
+}
+
+fn unix_nanos() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos()
 }
 
 /// Redact any `api-key=` query param from an RPC URL before logging.

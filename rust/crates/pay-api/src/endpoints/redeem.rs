@@ -205,10 +205,15 @@ pub async fn handler(
     }
     let signature = match broadcast_transaction(&state, &rpc_url, &signed_tx).await {
         Ok(sig) => sig,
-        Err(msg) => {
-            // The claim is intentionally retained: the RPC may have accepted
-            // the transaction even when its response was lost.
-            return err_resp(StatusCode::BAD_GATEWAY, &msg);
+        Err(error) if is_deterministic_preflight_error(&error) => {
+            // A rejected preflight never submits the transaction, so the
+            // claim can be retried. Transport and timeout errors remain
+            // claimed because the RPC may have accepted the transaction.
+            release_redemption_claim_best_effort(cfg, &req.code, &destination_pk).await;
+            return err_resp(StatusCode::BAD_GATEWAY, &error.to_string());
+        }
+        Err(error) => {
+            return err_resp(StatusCode::BAD_GATEWAY, &error.to_string());
         }
     };
 
@@ -518,13 +523,27 @@ async fn broadcast_transaction(
     state: &AppState,
     rpc_url: &str,
     tx_b64: &str,
-) -> Result<Signature, String> {
-    let sig_str = state
-        .rpc
-        .send_raw_transaction(rpc_url, tx_b64)
-        .await
-        .map_err(|e: Error| e.to_string())?;
-    Signature::from_str(&sig_str).map_err(|_| "rpc returned malformed signature".into())
+) -> Result<Signature, Error> {
+    let sig_str = state.rpc.send_raw_transaction(rpc_url, tx_b64).await?;
+    Signature::from_str(&sig_str).map_err(|_| Error::RpcMalformed)
+}
+
+fn is_deterministic_preflight_error(error: &Error) -> bool {
+    let Error::RpcResponse(message) = error else {
+        return false;
+    };
+    let message = message.to_ascii_lowercase();
+    [
+        "simulation failed",
+        "transaction simulation failed",
+        "instructionerror",
+        "custom program error",
+        "insufficient funds",
+        "blockhash not found",
+        "blockhashnotfound",
+    ]
+    .iter()
+    .any(|marker| message.contains(marker))
 }
 
 async fn fee_payer_signer(state: &AppState) -> Result<Arc<dyn SolanaSigner>, Error> {
