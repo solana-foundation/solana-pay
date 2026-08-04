@@ -137,10 +137,9 @@ just docker-build-pay-api
 ```
 
 Actual deployment (Cloud Run service, runtime service account, RPC URL
-secrets) is managed by the Terraform stack in
-[`solana-foundation/agent-gateway`](https://github.com/solana-foundation/agent-gateway)'s
-`devops/terraform`, which pulls this image from Artifact Registry. See that
-repo's `DEPLOY_RUNBOOK.md` for the deploy flow.
+secrets) is managed by the operator's Terraform stack, which pulls this image
+from Artifact Registry. Refer to the deployment repository's runbook for the
+deploy flow.
 
 ## Layout
 

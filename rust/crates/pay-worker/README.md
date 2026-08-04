@@ -199,11 +199,10 @@ just docker-build-pay-worker
 ```
 
 Actual deployment (Cloud Run Job/service, scheduling, Redis, runtime service
-account) is managed by the Terraform stack in
-[`solana-foundation/agent-gateway`](https://github.com/solana-foundation/agent-gateway)'s
-`devops/terraform`, which pulls this image from Artifact Registry. See that
-repo's `DEPLOY_RUNBOOK.md` for the deploy flow, including how to trigger
-`close-channels` via `gcloud run jobs execute`.
+account) is managed by the operator's Terraform stack, which pulls this image
+from Artifact Registry. Refer to the deployment repository's runbook for the
+deploy flow, including how to trigger `close-channels` via `gcloud run jobs
+execute`.
 
 ## Limitations / TODOs
 
