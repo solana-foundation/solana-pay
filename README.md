@@ -106,6 +106,12 @@ When a command, Claude Code, Codex, or another MCP client hits a paid endpoint, 
 pay setup    # Touch ID on macOS, Windows Hello on Windows, GNOME Keyring on Linux, or choose 1Password
 ```
 
+Prefer to keep no key on the machine at all? `pay` can also sign through an [Openfort backend wallet](https://www.openfort.io/docs/products/server/accounts): the private key stays in Openfort's TEE, each payment is a policy-checked API call, and the local credentials are revocable.
+
+```sh
+pay account new agent --backend openfort   # connect an existing Openfort backend wallet (acc_…)
+```
+
 ### 📚 Open Source Catalog
 
 The paid API catalog is open source in the [`pay-skills`](https://github.com/solana-foundation/pay-skills) repo.

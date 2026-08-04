@@ -61,6 +61,9 @@ blake3 = { workspace = true }
 reqwest = { workspace = true }
 pay-keystore = { workspace = true }
 pay-kit = { workspace = true }
+# Openfort remote signer: ES256 `x-wallet-auth` JWTs + SolanaSigner impl.
+async-trait = "0.1"
+jsonwebtoken = { version = "10.4", features = ["rust_crypto"] }
 bincode = { workspace = true }
 solana-commitment-config = { workspace = true }
 solana-hash = { workspace = true }

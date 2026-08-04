@@ -108,7 +108,7 @@ pub(crate) fn load_account_or_legacy_signer(
     cli_account: Option<&str>,
     legacy_source: Option<&str>,
     intent: &pay_core::keystore::AuthIntent,
-) -> pay_core::Result<Option<pay_kit::mpp::solana_keychain::MemorySigner>> {
+) -> pay_core::Result<Option<pay_core::signer::ResolvedSigner>> {
     let env_account = std::env::var("PAY_ACTIVE_ACCOUNT")
         .ok()
         .map(|name| name.trim().to_string())
@@ -129,6 +129,9 @@ pub(crate) fn load_account_or_legacy_signer(
     }
 
     legacy_source
-        .map(|source| pay_core::signer::load_signer_with_intent(source, intent))
+        .map(|source| {
+            pay_core::signer::load_signer_with_intent(source, intent)
+                .map(pay_core::signer::ResolvedSigner::Memory)
+        })
         .transpose()
 }

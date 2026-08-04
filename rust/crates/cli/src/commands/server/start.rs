@@ -2430,9 +2430,15 @@ async fn resolve_signer_with_store(
                         "Account `{name}` is ephemeral but has no inline secret_key_b58"
                     ))
                 })?;
-                pay_kit::mpp::solana_keychain::MemorySigner::from_bytes(&bytes).map_err(|e| {
-                    pay_core::Error::Config(format!("Invalid keypair bytes for `{name}`: {e}"))
-                })?
+                pay_core::signer::ResolvedSigner::Memory(
+                    pay_kit::mpp::solana_keychain::MemorySigner::from_bytes(&bytes).map_err(
+                        |e| {
+                            pay_core::Error::Config(format!(
+                                "Invalid keypair bytes for `{name}`: {e}"
+                            ))
+                        },
+                    )?,
+                )
             } else {
                 let intent = pay_core::keystore::AuthIntent::use_gateway_fee_payer();
                 pay_core::signer::load_signer_from_account_with_intent(

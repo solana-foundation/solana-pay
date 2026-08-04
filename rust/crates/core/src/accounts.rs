@@ -74,6 +74,11 @@ pub enum Keystore {
     /// Inline ephemeral keypair stored directly in this file. Used for
     /// throwaway test wallets on sandbox/devnet/localnet.
     Ephemeral,
+    /// Openfort backend wallet — the private key lives in Openfort's TEE
+    /// and signing happens remotely over HTTPS. The `account` field holds
+    /// the Openfort account ID (`acc_…`); the API credentials are stored
+    /// as a credential blob in the platform secret store.
+    Openfort,
 }
 
 impl std::fmt::Display for Keystore {
@@ -85,6 +90,7 @@ impl std::fmt::Display for Keystore {
             Keystore::OnePassword => write!(f, "1password"),
             Keystore::File => write!(f, "file"),
             Keystore::Ephemeral => write!(f, "ephemeral"),
+            Keystore::Openfort => write!(f, "openfort"),
         }
     }
 }
@@ -120,8 +126,10 @@ pub struct Account {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub vault: Option<String>,
 
-    /// 1Password account identifier (UUID or shorthand) used to sign in/out
-    /// of the correct `op` session. Only for `keystore: 1password`.
+    /// Backend-specific account identifier:
+    /// - `keystore: 1password` — 1Password account UUID or shorthand used to
+    ///   sign in/out of the correct `op` session.
+    /// - `keystore: openfort` — Openfort backend wallet account ID (`acc_…`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub account: Option<String>,
 
@@ -289,9 +297,10 @@ impl Account {
     }
 
     /// Build the signer source string used by `pay_core::signer::load_signer`
-    /// for keystore-backed accounts. Returns `None` for ephemeral accounts
-    /// — those must be loaded via [`Account::pubkey`] + the inline secret
-    /// rather than through the external loader.
+    /// for keystore-backed accounts. Returns `None` for ephemeral and
+    /// Openfort accounts — ephemerals are loaded via [`Account::pubkey`] +
+    /// the inline secret, and Openfort accounts sign remotely without any
+    /// local keypair to load.
     pub fn signer_source(&self, name: &str) -> Option<String> {
         match self.keystore {
             Keystore::AppleKeychain => Some(format!("keychain:{name}")),
@@ -303,7 +312,7 @@ impl Account {
                     .to_string_lossy()
                     .into_owned()
             })),
-            Keystore::Ephemeral => None,
+            Keystore::Ephemeral | Keystore::Openfort => None,
         }
     }
 
@@ -933,6 +942,7 @@ mod tests {
     fn keystore_display_includes_ephemeral() {
         assert_eq!(Keystore::AppleKeychain.to_string(), "apple-keychain");
         assert_eq!(Keystore::Ephemeral.to_string(), "ephemeral");
+        assert_eq!(Keystore::Openfort.to_string(), "openfort");
     }
 
     #[test]
@@ -944,6 +954,7 @@ mod tests {
             Keystore::OnePassword,
             Keystore::File,
             Keystore::Ephemeral,
+            Keystore::Openfort,
         ] {
             let yaml = serde_yml::to_string(&ks).unwrap();
             let back: Keystore = serde_yml::from_str(&yaml).unwrap();

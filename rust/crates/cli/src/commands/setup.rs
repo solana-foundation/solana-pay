@@ -20,7 +20,8 @@ pub struct SetupCommand {
     pub force: bool,
 
     /// Storage backend: "keychain" (macOS), "gnome-keyring" (Linux),
-    /// "windows-hello" (Windows), or "file" (headless fallback).
+    /// "windows-hello" (Windows), "file" (headless fallback), or
+    /// "openfort" (remote Openfort backend wallet).
     #[arg(long)]
     pub backend: Option<String>,
 

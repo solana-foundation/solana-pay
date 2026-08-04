@@ -300,6 +300,59 @@ impl Keystore {
         Ok(keypair)
     }
 
+    // ── Credential blobs ────────────────────────────────────────────────
+    //
+    // Opaque secrets that are not Solana keypairs — e.g. API credentials
+    // for remote-signing backends where the private key never exists
+    // locally. Stored under a `credential:` key so they can never alias a
+    // keypair, with the same auth gating as keypair access.
+
+    /// Store an opaque credential blob for this account.
+    pub fn import_credential_with_intent(
+        &self,
+        account: &str,
+        credential: &[u8],
+        intent: &AuthIntent,
+    ) -> Result<()> {
+        validate_account_name(account)?;
+        if credential.is_empty() {
+            return Err(Error::InvalidKeypair(
+                "credential must not be empty".to_string(),
+            ));
+        }
+
+        if self.auth_on_write {
+            self.auth.authenticate(intent)?;
+        }
+
+        self.store.store(&credential_key(account), credential)
+    }
+
+    /// Load a credential blob. Triggers the auth gate.
+    pub fn load_credential_with_intent(
+        &self,
+        account: &str,
+        intent: &AuthIntent,
+    ) -> Result<Zeroizing<Vec<u8>>> {
+        validate_account_name(account)?;
+        self.auth.authenticate(intent)?;
+        self.store.load(&credential_key(account))
+    }
+
+    /// Check if a credential blob exists for this account.
+    pub fn credential_exists(&self, account: &str) -> bool {
+        validate_account_name(account).is_ok() && self.store.exists(&credential_key(account))
+    }
+
+    /// Delete a credential blob with a typed auth intent.
+    pub fn delete_credential_with_intent(&self, account: &str, intent: &AuthIntent) -> Result<()> {
+        validate_account_name(account)?;
+        if self.auth_on_write {
+            self.auth.authenticate(intent)?;
+        }
+        self.store.delete(&credential_key(account))
+    }
+
     /// Authenticate without loading anything (for standalone prompts).
     pub fn authenticate(&self, reason: &str) -> Result<()> {
         self.authenticate_intent(&AuthIntent::from_reason(reason))
@@ -322,6 +375,7 @@ const KEYPAIR_LEN: usize = 64;
 const PUBKEY_LEN: usize = 32;
 const KEYPAIR_KEY_PREFIX: &str = "keypair:";
 const PUBKEY_KEY_PREFIX: &str = "pubkey:";
+const CREDENTIAL_KEY_PREFIX: &str = "credential:";
 const RESERVED_PUBKEY_SUFFIX: &str = ".pubkey";
 
 fn validate_account_name(name: &str) -> Result<()> {
@@ -372,6 +426,10 @@ fn keypair_key(account: &str) -> String {
 
 fn pubkey_key(account: &str) -> String {
     format!("{PUBKEY_KEY_PREFIX}{account}")
+}
+
+fn credential_key(account: &str) -> String {
+    format!("{CREDENTIAL_KEY_PREFIX}{account}")
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────────
@@ -583,6 +641,87 @@ mod tests {
     fn keypair_key_naming() {
         assert_eq!(keypair_key("default"), "keypair:default");
         assert_eq!(pubkey_key("default"), "pubkey:default");
+        assert_eq!(credential_key("default"), "credential:default");
+    }
+
+    // ── Credential blob tests ───────────────────────────────────────────
+
+    #[test]
+    fn credential_roundtrip() {
+        let ks = Keystore::in_memory();
+        let intent = AuthIntent::from_reason("test");
+        let blob = br#"{"secret_key":"sk_test_x","wallet_secret":"abc"}"#;
+
+        assert!(!ks.credential_exists("of"));
+        ks.import_credential_with_intent("of", blob, &intent)
+            .unwrap();
+        assert!(ks.credential_exists("of"));
+        assert_eq!(
+            &*ks.load_credential_with_intent("of", &intent).unwrap(),
+            blob
+        );
+
+        ks.delete_credential_with_intent("of", &intent).unwrap();
+        assert!(!ks.credential_exists("of"));
+    }
+
+    #[test]
+    fn credential_rejects_empty_blob() {
+        let ks = Keystore::in_memory();
+        let result = ks.import_credential_with_intent("of", &[], &AuthIntent::from_reason("test"));
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("empty"));
+    }
+
+    #[test]
+    fn credential_does_not_alias_keypair() {
+        let ks = Keystore::in_memory();
+        let intent = AuthIntent::from_reason("test");
+        ks.import("acct", &test_keypair(), SyncMode::ThisDeviceOnly)
+            .unwrap();
+        ks.import_credential_with_intent("acct", b"blob", &intent)
+            .unwrap();
+
+        assert_eq!(&*ks.load_keypair("acct", "test").unwrap(), &test_keypair());
+        assert_eq!(
+            &*ks.load_credential_with_intent("acct", &intent).unwrap(),
+            b"blob"
+        );
+
+        ks.delete_credential_with_intent("acct", &intent).unwrap();
+        assert!(
+            ks.exists("acct"),
+            "deleting a credential must not remove the keypair"
+        );
+    }
+
+    #[test]
+    fn credential_load_denied_by_auth_gate() {
+        let ks = Keystore {
+            auth: Box::new(DenyAuth),
+            store: Box::new(store::InMemoryStore::new()),
+            auth_on_write: false,
+        };
+        let intent = AuthIntent::from_reason("test");
+        ks.import_credential_with_intent("of", b"blob", &intent)
+            .unwrap();
+
+        let result = ks.load_credential_with_intent("of", &intent);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("denied"));
+    }
+
+    #[test]
+    fn credential_import_denied_when_auth_on_write() {
+        let ks = Keystore {
+            auth: Box::new(DenyAuth),
+            store: Box::new(store::InMemoryStore::new()),
+            auth_on_write: true,
+        };
+        let result =
+            ks.import_credential_with_intent("of", b"blob", &AuthIntent::from_reason("test"));
+        assert!(result.is_err());
+        assert!(!ks.credential_exists("of"));
     }
 
     #[test]

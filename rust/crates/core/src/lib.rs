@@ -5,6 +5,7 @@ pub mod error;
 pub mod explorer;
 pub mod instructions;
 pub mod keystore;
+pub mod openfort;
 pub mod signer;
 pub mod skills;
 pub mod user_agent;

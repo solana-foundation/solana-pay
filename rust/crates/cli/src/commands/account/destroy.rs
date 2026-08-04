@@ -88,15 +88,17 @@ impl DestroyCommand {
         if !self.yes {
             let theme = dialoguer::theme::ColorfulTheme::default();
 
-            // Offer to export first
-            let export = Confirm::with_theme(&theme)
-                .with_prompt(format!(
-                    "Export '{}' before removing?",
-                    self.account.yellow()
-                ))
-                .default(true)
-                .interact()
-                .unwrap_or(false);
+            // Offer to export first. Openfort accounts have no local
+            // keypair to export — skip the offer.
+            let export = keystore_kind != KeystoreKind::Openfort
+                && Confirm::with_theme(&theme)
+                    .with_prompt(format!(
+                        "Export '{}' before removing?",
+                        self.account.yellow()
+                    ))
+                    .default(true)
+                    .interact()
+                    .unwrap_or(false);
 
             if export {
                 let export_path = format!("backup-{}.json", self.account);
@@ -127,8 +129,18 @@ impl DestroyCommand {
         }
 
         // Delete from keystore backend
-        let ks = keystore_for_kind(&keystore_kind, op_account)?;
-        if let Some(ks) = ks {
+        if keystore_kind == KeystoreKind::Openfort {
+            // Remove the API credential blob from the platform secret
+            // store. The backend wallet itself stays intact at Openfort.
+            let intent = pay_core::keystore::AuthIntent::delete_account(&self.account);
+            pay_core::openfort::delete_credentials(&self.account, &intent)
+                .map_err(|e| pay_core::Error::Config(format!("{keystore_kind} delete: {e}")))?;
+            eprintln!(
+                "{}",
+                "  Openfort credentials removed. The backend wallet still exists at Openfort."
+                    .dimmed()
+            );
+        } else if let Some(ks) = keystore_for_kind(&keystore_kind, op_account)? {
             let intent = pay_core::keystore::AuthIntent::delete_account(&self.account);
             ks.delete_with_intent(&self.account, &intent)
                 .map_err(|e| pay_core::Error::Config(format!("{keystore_kind} delete: {e}")))?;
@@ -228,6 +240,9 @@ fn keystore_for_kind(
         // no external keystore to delete from. The earlier `accounts.remove`
         // call already wiped the entry, so we just no-op here.
         KeystoreKind::Ephemeral => Ok(None),
+        // Openfort credential blobs are deleted through
+        // `pay_core::openfort::delete_credentials` before this is called.
+        KeystoreKind::Openfort => Ok(None),
     }
 }
 

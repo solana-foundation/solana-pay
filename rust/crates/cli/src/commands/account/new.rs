@@ -11,7 +11,8 @@ pub struct NewCommand {
     pub name: String,
 
     /// Storage backend: "keychain" (macOS), "gnome-keyring" (Linux),
-    /// "windows-hello" (Windows), or "file" (headless fallback).
+    /// "windows-hello" (Windows), "file" (headless fallback), or
+    /// "openfort" (remote Openfort backend wallet).
     #[arg(long)]
     pub backend: Option<String>,
 
@@ -59,6 +60,10 @@ pub fn create_account(
     force: bool,
 ) -> pay_core::Result<(String, &'static str)> {
     let backend_id = resolve_backend(backend)?;
+
+    if backend_id == "openfort" {
+        return create_openfort_account(name, force);
+    }
 
     let (ks, keystore_kind, backend_display, op_info) = build_keystore(&backend_id, vault, name)?;
 
@@ -115,6 +120,152 @@ pub fn create_account(
     )?;
 
     Ok((pubkey_b58, backend_display))
+}
+
+/// Connect an existing Openfort backend wallet as a pay account.
+///
+/// Prompts for the project secret key, the backend wallet account ID
+/// (`acc_…`), and the wallet secret; validates them by fetching the
+/// wallet's Solana address from Openfort; then stores the credentials as
+/// a blob in the platform secret store and registers the account in
+/// accounts.yml. No keypair is generated — signing happens remotely.
+fn create_openfort_account(name: &str, force: bool) -> pay_core::Result<(String, &'static str)> {
+    const BACKEND_DISPLAY: &str = "Openfort backend wallet";
+
+    if pay_core::openfort::credentials_exist(name) && !force {
+        let pubkey = pay_core::accounts::AccountsFile::load()
+            .ok()
+            .and_then(|f| {
+                f.named_account_for_network(pay_core::accounts::MAINNET_NETWORK, name)
+                    .and_then(|a| a.pubkey.clone())
+            })
+            .ok_or_else(|| {
+                pay_core::Error::Config(format!(
+                    "Openfort credentials for `{name}` already exist but the account is not \
+                     registered in accounts.yml. Re-run with --force to replace them."
+                ))
+            })?;
+        eprintln!();
+        crate::components::print_notice(
+            crate::components::NoticeLevel::Info,
+            "Account already exists",
+            &format!(
+                "`{name}` is already connected to an Openfort backend wallet.\n\
+                 Use --force to replace the stored credentials."
+            ),
+        );
+        return Ok((pubkey, BACKEND_DISPLAY));
+    }
+
+    if !std::io::IsTerminal::is_terminal(&std::io::stderr()) {
+        return Err(pay_core::Error::Config(
+            "Connecting an Openfort backend wallet requires an interactive terminal to \
+             enter the API credentials."
+                .to_string(),
+        ));
+    }
+
+    let theme = dialoguer::theme::ColorfulTheme::default();
+    eprintln!();
+    eprintln!(
+        "  Connect an Openfort backend wallet (dashboard.openfort.io → Developers → API keys)."
+    );
+
+    let secret_key: String = dialoguer::Password::with_theme(&theme)
+        .with_prompt("Openfort secret key (sk_live_… / sk_test_…)")
+        .interact()
+        .map_err(|e| pay_core::Error::Config(format!("Prompt error: {e}")))?;
+    let secret_key = secret_key.trim().to_string();
+    if !secret_key.starts_with("sk_") {
+        return Err(pay_core::Error::Config(
+            "The Openfort secret key must start with `sk_live_` or `sk_test_`.".to_string(),
+        ));
+    }
+
+    let account_id: String = dialoguer::Input::with_theme(&theme)
+        .with_prompt("Openfort backend wallet account ID (acc_…)")
+        .interact_text()
+        .map_err(|e| pay_core::Error::Config(format!("Prompt error: {e}")))?;
+    let account_id = account_id.trim().to_string();
+    if !account_id.starts_with("acc_") {
+        return Err(pay_core::Error::Config(
+            "The Openfort account ID must start with `acc_` (a Solana backend wallet \
+             from POST /v2/accounts/backend)."
+                .to_string(),
+        ));
+    }
+
+    let wallet_secret: String = dialoguer::Password::with_theme(&theme)
+        .with_prompt("Openfort wallet secret (base64 P-256 key)")
+        .interact()
+        .map_err(|e| pay_core::Error::Config(format!("Prompt error: {e}")))?;
+    let wallet_secret = wallet_secret.trim().to_string();
+
+    let credentials = pay_core::openfort::OpenfortCredentials {
+        secret_key,
+        wallet_secret,
+    };
+
+    // Validate the credentials and resolve the wallet's Solana address
+    // before persisting anything.
+    eprintln!("  {}", "Verifying with Openfort…".dimmed());
+    let pubkey = pay_core::openfort::fetch_wallet_address(&credentials, &account_id)?;
+
+    let ks = platform_credential_keystore()?;
+    let intent = pay_core::keystore::AuthIntent::create_account(name);
+    pay_core::openfort::store_credentials(&ks, name, &credentials, &intent)?;
+
+    save_account(
+        name,
+        pay_core::accounts::Keystore::Openfort,
+        &pubkey,
+        None,
+        None,
+        Some(account_id),
+    )?;
+
+    Ok((pubkey, BACKEND_DISPLAY))
+}
+
+/// Platform secret store used for Openfort credential blobs, with the
+/// same setup-time gating fallbacks as the keypair backends.
+fn platform_credential_keystore() -> pay_core::Result<Keystore> {
+    #[cfg(target_os = "macos")]
+    {
+        if Keystore::apple_touchid_available() {
+            Ok(Keystore::apple_keychain())
+        } else {
+            eprintln!(
+                "Note: Touch ID is not enrolled on this Mac; storing the credentials in Apple Keychain without a biometric gate."
+            );
+            Ok(Keystore::new(
+                pay_core::keystore::auth::NoAuth,
+                pay_core::keystore::macos::AppleKeychainStore,
+                false,
+            ))
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        gnome_keyring_for_account_write()
+    }
+    #[cfg(target_os = "windows")]
+    {
+        if !Keystore::windows_hello_available() {
+            return Err(pay_core::Error::Config(
+                "Windows Hello is not configured.".to_string(),
+            ));
+        }
+        Ok(Keystore::windows_hello())
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    {
+        Err(pay_core::Error::Config(
+            "Openfort accounts require a platform secret store, which is unavailable on \
+             this platform."
+                .to_string(),
+        ))
+    }
 }
 
 /// Resolved 1Password account info for storing in accounts.yml.
@@ -243,19 +394,19 @@ fn build_keystore(
 fn available_backends_hint() -> &'static str {
     #[cfg(target_os = "macos")]
     {
-        "'keychain'"
+        "'keychain' or 'openfort'"
     }
     #[cfg(target_os = "linux")]
     {
         if Keystore::gnome_keyring_available() {
-            "'gnome-keyring'"
+            "'gnome-keyring' or 'openfort'"
         } else {
             "'file'"
         }
     }
     #[cfg(target_os = "windows")]
     {
-        "'windows-hello'"
+        "'windows-hello' or 'openfort'"
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     {
@@ -379,13 +530,13 @@ pub fn pick_backend() -> pay_core::Result<String> {
 
     // Only show platform-native backend on the current OS
     #[cfg(target_os = "macos")]
-    let options = [Opt {
+    let mut options = vec![Opt {
         id: "keychain",
         label: "macOS Keychain (requires Touch ID)".into(),
     }];
 
     #[cfg(target_os = "linux")]
-    let options = {
+    let mut options = {
         if Keystore::gnome_keyring_available() {
             vec![Opt {
                 id: "gnome-keyring",
@@ -400,7 +551,7 @@ pub fn pick_backend() -> pay_core::Result<String> {
     };
 
     #[cfg(target_os = "windows")]
-    let options = {
+    let mut options = {
         if Keystore::windows_hello_available() {
             vec![Opt {
                 id: "windows-hello",
@@ -412,7 +563,17 @@ pub fn pick_backend() -> pay_core::Result<String> {
     };
 
     #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
-    let options: Vec<Opt> = Vec::new();
+    let mut options: Vec<Opt> = Vec::new();
+
+    // Openfort backend wallets sign remotely, but the API credentials
+    // still live in the platform secret store — only offer the option
+    // when one is available (the first entry is always platform-native).
+    if options.first().is_some_and(|o| o.id != "file") {
+        options.push(Opt {
+            id: "openfort",
+            label: "Openfort backend wallet (remote signing, key stays in Openfort's TEE)".into(),
+        });
+    }
 
     if options.is_empty() {
         #[cfg(target_os = "linux")]

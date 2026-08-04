@@ -263,6 +263,12 @@ pub(super) fn build_keystore(
             ))
         }
 
+        "openfort" => Err(pay_core::Error::Config(
+            "Openfort backend wallets hold no local keypair to import. Connect one with \
+             `pay account new <NAME> --backend openfort`."
+                .to_string(),
+        )),
+
         other => Err(pay_core::Error::Config(format!("Unknown backend: {other}"))),
     }
 }
