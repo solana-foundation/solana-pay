@@ -5,9 +5,9 @@ use pay_kit::mpp::solana_keychain::MemorySigner;
 use pay_kit::solana_keychain::{SignTransactionResult, SignerError, SolanaSigner};
 
 use crate::accounts::{
-    Account, AccountChoice, AccountsStore, Keystore, ResolvedEphemeral,
-    load_or_create_ephemeral_for_network, load_or_create_ephemeral_for_network_as,
-    resolve_account_for_network,
+    Account, AccountChoice, AccountsFile, AccountsStore, Keystore, MAINNET_NETWORK,
+    ResolvedEphemeral, load_or_create_ephemeral_for_network,
+    load_or_create_ephemeral_for_network_as, resolve_account_for_network,
 };
 use crate::keystore::{AuthGate, AuthIntent};
 use crate::{Error, Result};
@@ -105,13 +105,23 @@ pub fn load_signer_for_payment(source: &str, amount: &str, desc: &str) -> Result
 ///    normal `load_signer_with_reason` path; ephemeral accounts have
 ///    their inline secret bytes loaded directly (no Touch ID, no prompt).
 ///
-/// 2. **Lazy ephemeral creation** — if no mapping exists AND the network
+/// 2. **Network-agnostic fallback** — if an explicitly named account has
+///    no mapping on this network but exists on `mainnet` with a remote
+///    signing backend (`keystore: openfort`), use the mainnet entry. A
+///    remote signer signs raw bytes and carries no chain state, so it is
+///    valid on every network; without this fallback an explicit
+///    `--account` would silently shadow the remote signer with a lazy
+///    ephemeral of the same name. The mainnet entry's `auth_required`
+///    travels with it; add an explicit `accounts.<network>` entry to
+///    override per network.
+///
+/// 3. **Lazy ephemeral creation** — if no mapping exists AND the network
 ///    is one we consider "throwaway" (`localnet` / `devnet`), generate a
 ///    fresh ephemeral, persist it as `accounts.<network> + networks.<network>`,
 ///    and return it. The returned `Option<ResolvedEphemeral>` is `Some` only
 ///    in this case so the caller knows to print a notice.
 ///
-/// 3. **Mainnet without a wallet** — error. We never auto-create a wallet
+/// 4. **Mainnet without a wallet** — error. We never auto-create a wallet
 ///    for `mainnet`; the user must run `pay setup` to bind their real
 ///    wallet first. This is intentional — silently generating a mainnet
 ///    wallet would be a footgun.
@@ -171,6 +181,16 @@ pub fn load_signer_for_network_with_intent_and_override(
             )?;
             return Ok((signer, None));
         }
+        if let Some(account) = network_agnostic_fallback(&file, network, name).cloned() {
+            let signer = load_signer_from_account_with_intent_and_override(
+                &account,
+                name,
+                network,
+                intent,
+                auth_override,
+            )?;
+            return Ok((signer, None));
+        }
         if is_lazy_ephemeral_network(network) {
             let resolved = load_or_create_ephemeral_for_network_as(network, name, store)?;
             let signer = signer_from_ephemeral(&resolved.account)?;
@@ -204,6 +224,25 @@ pub fn load_signer_for_network_with_intent_and_override(
             }
         }
     }
+}
+
+/// Fall back to a same-named `mainnet` account when the current network
+/// has no mapping and the account signs remotely (`keystore: openfort`).
+///
+/// Keypair-backed accounts never fall through: silently reusing a mainnet
+/// key on another network is a footgun. A remote Openfort signer signs
+/// raw bytes and carries no chain state, so the same account is valid on
+/// every network.
+fn network_agnostic_fallback<'a>(
+    file: &'a AccountsFile,
+    network: &str,
+    name: &str,
+) -> Option<&'a Account> {
+    if network == MAINNET_NETWORK {
+        return None;
+    }
+    file.named_account_for_network(MAINNET_NETWORK, name)
+        .filter(|account| account.keystore == Keystore::Openfort)
 }
 
 /// Network-aware loader for a payment, with the same amount-prefixed
@@ -858,6 +897,71 @@ mod tests {
         };
 
         (temp_dir, account, keypair_bytes)
+    }
+
+    fn openfort_account(account_id: Option<&str>) -> Account {
+        Account {
+            keystore: Keystore::Openfort,
+            active: false,
+            auth_required: Some(true),
+            pubkey: Some("C78fUoBw1YDJDmzNx7viRZFnuhku3t3eiy9eiV2hafff".to_string()),
+            vault: None,
+            account: account_id.map(str::to_string),
+            path: None,
+            secret_key_b58: None,
+            created_at: None,
+            subscriptions: std::collections::BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn explicit_openfort_account_falls_back_from_mainnet_on_other_networks() {
+        // Registered on mainnet only (what `pay account new` writes), but
+        // addressed explicitly on localnet: resolution must reach the
+        // Openfort loader instead of shadowing the name with a lazy
+        // ephemeral. The missing-account-id error proves which path ran
+        // without needing keystore credentials.
+        let mut file = AccountsFile::default();
+        file.upsert(MAINNET_NETWORK, "openfort", openfort_account(None));
+        let store = MemoryAccountsStore::with_file(file);
+
+        let err = match load_signer_for_network_with_intent(
+            "localnet",
+            &store,
+            Some("openfort"),
+            &AuthIntent::default_payment(),
+        ) {
+            Err(err) => err,
+            Ok(_) => panic!("expected the Openfort loader to reject a missing account id"),
+        };
+
+        let Error::Config(msg) = err else {
+            panic!("expected Config error");
+        };
+        assert!(msg.contains("missing its `account` field"), "{msg}");
+        assert_eq!(store.save_count(), 0, "no ephemeral must be created");
+    }
+
+    #[test]
+    fn keypair_backed_mainnet_entry_does_not_fall_back() {
+        let (_temp_dir, account, _) = fresh_file_account(Some(false));
+        let mut file = AccountsFile::default();
+        file.upsert(MAINNET_NETWORK, "worker", account);
+        let store = MemoryAccountsStore::with_file(file);
+
+        let (signer, resolved) = load_signer_for_network_with_intent(
+            "localnet",
+            &store,
+            Some("worker"),
+            &AuthIntent::default_payment(),
+        )
+        .unwrap();
+
+        assert!(matches!(signer, ResolvedSigner::Memory(_)));
+        assert!(
+            resolved.is_some_and(|r| r.created),
+            "keypair-backed accounts must keep the lazy-ephemeral behavior"
+        );
     }
 
     #[test]
