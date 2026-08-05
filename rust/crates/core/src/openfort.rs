@@ -93,6 +93,22 @@ struct WalletClaims {
     req_hash: Option<String>,
 }
 
+/// Canonical JSON body for the sign call.
+///
+/// The server verifies the JWT's `reqHash` by re-serializing the body it
+/// parsed — keys sorted, no whitespace — and hashing that. Any other
+/// serialization (a single space after a colon is enough) fails with a
+/// bare 401 "Authentication failed"; verified against the live API. This
+/// body must therefore stay byte-identical to `JSON.stringify` of the
+/// key-sorted object: compact separators, fields in alphabetical order.
+/// `sign_body_is_canonical_json` pins the exact bytes — update it
+/// consciously when the shape changes.
+fn sign_request_body(message: &[u8]) -> std::result::Result<String, SignerError> {
+    let data_hex = format!("0x{}", *crate::keystore::store::hex_encode(message));
+    serde_json::to_string(&serde_json::json!({ "data": data_hex }))
+        .map_err(|e| SignerError::SerializationError(format!("body: {e}")))
+}
+
 /// Normalize the wallet secret to a PEM string `jsonwebtoken` can parse.
 /// Accepts either a full PEM (passed through) or a bare base64 PKCS#8 DER
 /// body (the single-line form the Openfort dashboard hands out).
@@ -209,14 +225,12 @@ impl OpenfortSigner {
     }
 
     /// `POST /v2/accounts/backend/{id}/sign` with hex-encoded message bytes.
-    /// The body is serialized once and reused verbatim for the JWT's
-    /// request hash — the server hashes the sorted-key JSON it receives,
-    /// and a single-field body is trivially sorted.
+    /// The body comes from [`sign_request_body`] and is reused verbatim
+    /// for the JWT's request hash — see the canonicalization contract
+    /// documented there.
     async fn call_sign(&self, message: &[u8]) -> std::result::Result<SignResponse, SignerError> {
         let path = format!("/v2/accounts/backend/{}/sign", self.account_id);
-        let data_hex = format!("0x{}", *crate::keystore::store::hex_encode(message));
-        let body = serde_json::to_string(&serde_json::json!({ "data": data_hex }))
-            .map_err(|e| SignerError::SerializationError(format!("body: {e}")))?;
+        let body = sign_request_body(message)?;
         let jwt = self.wallet_jwt("POST", &path, &body)?;
 
         let response = self
@@ -591,6 +605,15 @@ mod tests {
         let wrapped = wallet_secret_to_pem("ab cd\nef");
         assert!(wrapped.starts_with("-----BEGIN PRIVATE KEY-----\nabcdef\n"));
         assert!(wrapped.trim_end().ends_with("-----END PRIVATE KEY-----"));
+    }
+
+    /// Pins the sign body to the server's canonical serialization
+    /// (key-sorted, whitespace-free). A drift here is a live 401: the
+    /// server hashes its own canonical re-serialization for `reqHash`.
+    #[test]
+    fn sign_body_is_canonical_json() {
+        let body = sign_request_body(&[0xde, 0xad, 0xbe, 0xef]).unwrap();
+        assert_eq!(body, r#"{"data":"0xdeadbeef"}"#);
     }
 
     /// Known-answer test for the wallet JWT: ES256 header, the
