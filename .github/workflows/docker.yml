@@ -13,20 +13,105 @@ on:
 
 env:
   IMAGE: ghcr.io/solana-foundation/pay
+  # A dry run (workflow_dispatch with push=false) still builds every
+  # architecture — that is the point of it — but nothing may reach GHCR.
+  PUSH: ${{ github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.push) }}
 
 jobs:
-  docker:
-    runs-on: ubuntu-latest
+  # Each architecture builds on a runner of that architecture. The alternative,
+  # one runner with QEMU, would emulate `cargo build --release` for the foreign
+  # arch — an hours-long proposition for this image. `ubuntu-24.04-arm` is free
+  # for public repositories, so the second runner costs nothing here.
+  build:
+    name: Build ${{ matrix.platform }}
+    runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
       packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-latest
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
     steps:
+      - name: Prepare
+        run: |
+          platform="${{ matrix.platform }}"
+          echo "PLATFORM_PAIR=${platform//\//-}" >> "$GITHUB_ENV"
+
       - uses: actions/checkout@v5
+
+      - uses: docker/setup-buildx-action@v3
+
       - uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Labels only. The tag logic lives in the merge job, because tags belong
+      # to the manifest list rather than to either single-arch image.
+      - uses: docker/metadata-action@v5
+        id: meta
+        with:
+          images: ${{ env.IMAGE }}
+
+      - uses: docker/build-push-action@v6
+        id: build
+        with:
+          context: ./rust
+          platforms: ${{ matrix.platform }}
+          tags: ${{ env.IMAGE }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # `push-by-digest` uploads an untagged single-arch image; the merge
+          # job stitches the digests into one tag. On a dry run the build still
+          # runs and the result is simply discarded.
+          outputs: ${{ env.PUSH == 'true' && 'type=image,push-by-digest=true,name-canonical=true,push=true' || 'type=cacheonly' }}
+
+      - name: Export digest
+        if: env.PUSH == 'true'
+        run: |
+          mkdir -p "${{ runner.temp }}/digests"
+          digest="${{ steps.build.outputs.digest }}"
+          touch "${{ runner.temp }}/digests/${digest#sha256:}"
+
+      - name: Upload digest
+        if: env.PUSH == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: digests-${{ env.PLATFORM_PAIR }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge:
+    name: Merge manifest list
+    runs-on: ubuntu-latest
+    needs: build
+    # Same condition as env.PUSH, spelled out because a job-level `if` cannot
+    # read the `env` context.
+    if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.push)
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: ${{ runner.temp }}/digests
+          pattern: digests-*
+          merge-multiple: true
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
       - uses: docker/metadata-action@v5
         id: meta
         with:
@@ -35,9 +120,21 @@ jobs:
             type=match,pattern=^pay-v(.*)$,group=1
             type=raw,value=${{ github.ref_name }},enable=${{ startsWith(github.ref, 'refs/tags/pay-v') }}
             type=raw,value=latest
-      - uses: docker/build-push-action@v6
-        with:
-          context: ./rust
-          push: ${{ github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.push) }}
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
+
+      - name: Create manifest list and push
+        working-directory: ${{ runner.temp }}/digests
+        run: |
+          tags=()
+          while IFS= read -r tag; do
+            tags+=(-t "$tag")
+          done < <(jq -r '.tags[]' <<< "$DOCKER_METADATA_OUTPUT_JSON")
+
+          refs=()
+          for digest in *; do
+            refs+=("${IMAGE}@sha256:${digest}")
+          done
+
+          docker buildx imagetools create "${tags[@]}" "${refs[@]}"
+
+      - name: Inspect image
+        run: docker buildx imagetools inspect "${IMAGE}:${{ steps.meta.outputs.version }}"
