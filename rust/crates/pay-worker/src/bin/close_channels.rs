@@ -34,15 +34,76 @@ use solana_message::Message;
 use solana_pubkey::Pubkey;
 use solana_signature::Signature;
 use solana_transaction::Transaction;
+use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
 const RECLAIM_LEASE_TTL_SECONDS: u64 = 300;
 const RECLAIM_LEASE_PREFIX: &str = "pay-worker:reclaim:";
 
+struct LeaseHeartbeat {
+    cancel: CancellationToken,
+    handle: JoinHandle<()>,
+}
+
+impl LeaseHeartbeat {
+    fn start(
+        mut connection: redis::aio::ConnectionManager,
+        key: String,
+        owner: String,
+        ttl_seconds: u64,
+    ) -> Self {
+        const RENEW: &str = r#"
+if redis.call('GET', KEYS[1]) == ARGV[1] then
+  return redis.call('EXPIRE', KEYS[1], ARGV[2])
+end
+return 0
+"#;
+        let cancel = CancellationToken::new();
+        let task_cancel = cancel.clone();
+        let renewal_interval = Duration::from_secs((ttl_seconds / 3).max(1));
+        let handle = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(renewal_interval);
+            loop {
+                tokio::select! {
+                    () = task_cancel.cancelled() => return,
+                    _ = interval.tick() => {
+                        match redis::Script::new(RENEW)
+                            .key(&key)
+                            .arg(&owner)
+                            .arg(ttl_seconds)
+                            .invoke_async::<i32>(&mut connection)
+                            .await
+                        {
+                            Ok(1) => {}
+                            Ok(_) => {
+                                warn!(%key, "reclaim lease ownership was lost; stopping renewal");
+                                return;
+                            }
+                            Err(error) => {
+                                warn!(%error, %key, "failed to renew reclaim lease");
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        Self { cancel, handle }
+    }
+
+    async fn shutdown(self) {
+        self.cancel.cancel();
+        if let Err(error) = self.handle.await {
+            warn!(%error, "reclaim lease heartbeat task failed");
+        }
+    }
+}
+
 struct ReclaimLease {
     connection: redis::aio::ConnectionManager,
     key: String,
     owner: String,
+    heartbeat: LeaseHeartbeat,
 }
 
 impl ReclaimLease {
@@ -65,6 +126,12 @@ impl ReclaimLease {
             .await
             .map_err(|error| JobError::Config(format!("Redis reclaim lease: {error}")))?;
         Ok(acquired.map(|_| Self {
+            heartbeat: LeaseHeartbeat::start(
+                connection.clone(),
+                key.clone(),
+                owner.clone(),
+                RECLAIM_LEASE_TTL_SECONDS,
+            ),
             connection,
             key,
             owner,
@@ -72,6 +139,7 @@ impl ReclaimLease {
     }
 
     async fn release(mut self) {
+        self.heartbeat.shutdown().await;
         const RELEASE: &str = r#"
 if redis.call('GET', KEYS[1]) == ARGV[1] then
   return redis.call('DEL', KEYS[1])

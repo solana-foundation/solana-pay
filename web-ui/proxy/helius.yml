@@ -10,7 +10,7 @@ routing:
   auth:
     method: query_param
     key: "api-key"
-    value_from_env: SOLANA_RPC_API_KEY
+    value_from_env: HELIUS_API_KEY
 
 operator:
   # Mainnet — real USDC, real SOL fees. The operator's signer is

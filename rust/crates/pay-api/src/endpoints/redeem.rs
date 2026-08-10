@@ -257,6 +257,8 @@ fn redeem_memo(code: &str) -> String {
 struct HeliusTx {
     signature: String,
     #[serde(default)]
+    timestamp: Option<i64>,
+    #[serde(default)]
     instructions: Vec<HeliusIx>,
 }
 
@@ -340,6 +342,14 @@ async fn find_prior_burn(
         if txs.len() < HELIUS_PAGE_LIMIT {
             return Ok(None);
         }
+        if let Some(cutoff) = cfg.legacy_scan_cutoff_unix_seconds
+            && txs
+                .last()
+                .and_then(|tx| tx.timestamp)
+                .is_some_and(|timestamp| timestamp <= cutoff)
+        {
+            return Ok(None);
+        }
         cursor = txs.last().map(|t| t.signature.clone());
         if page + 1 == cfg.max_scan_pages {
             return Err(DedupScanError::PageCap);
@@ -398,7 +408,8 @@ async fn release_redemption_claim(
     destination: &Pubkey,
 ) -> Result<bool, redis::RedisError> {
     const RELEASE: &str = r#"
-if redis.call('GET', KEYS[1]) == ARGV[1] then
+local claim = redis.call('GET', KEYS[1])
+if claim == ARGV[1] or claim == ARGV[2] then
   return redis.call('DEL', KEYS[1])
 end
 return 0
@@ -407,6 +418,7 @@ return 0
     let deleted: i32 = redis::Script::new(RELEASE)
         .key(redemption_claim_key(code))
         .arg(format!("claimed:{destination}"))
+        .arg(format!("broadcasting:{destination}"))
         .invoke_async(&mut connection)
         .await?;
     Ok(deleted == 1)
@@ -569,6 +581,7 @@ pub struct RedemptionState {
     pub solana_rpc_api_key: String,
     pub helius_base: String,
     pub max_scan_pages: usize,
+    pub legacy_scan_cutoff_unix_seconds: Option<i64>,
     /// Active code → campaign grant, loaded from `REDEMPTION_CODES`
     /// (Doppler) at boot. Lookups in the handler are O(1).
     pub grants: HashMap<String, RedemptionGrant>,
@@ -656,6 +669,7 @@ impl RedemptionState {
             solana_rpc_api_key: cfg.solana_rpc_api_key.clone(),
             helius_base: cfg.helius_base.clone(),
             max_scan_pages: cfg.max_scan_pages.unwrap_or(DEFAULT_MAX_SCAN_PAGES),
+            legacy_scan_cutoff_unix_seconds: cfg.legacy_scan_cutoff_unix_seconds,
             grants,
             http_client,
             claim_store,

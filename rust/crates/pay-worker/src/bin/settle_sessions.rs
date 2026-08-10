@@ -34,6 +34,63 @@ const SETTLEMENT_LOCK_KEY: &str = "pay:jobs:settle-sessions:lock";
 const DEFAULT_RECONCILIATION_INTERVAL_SECONDS: u64 = 10;
 const DEFAULT_PORT: u64 = 8080;
 
+struct LeaseHeartbeat {
+    cancel: CancellationToken,
+    handle: tokio::task::JoinHandle<()>,
+}
+
+impl LeaseHeartbeat {
+    fn start(
+        mut connection: redis::aio::ConnectionManager,
+        owner: String,
+        ttl_seconds: u64,
+    ) -> Self {
+        const RENEW: &str = r#"
+if redis.call('GET', KEYS[1]) == ARGV[1] then
+  return redis.call('EXPIRE', KEYS[1], ARGV[2])
+end
+return 0
+"#;
+        let cancel = CancellationToken::new();
+        let task_cancel = cancel.clone();
+        let renewal_interval = Duration::from_secs((ttl_seconds / 3).max(1));
+        let handle = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(renewal_interval);
+            loop {
+                tokio::select! {
+                    () = task_cancel.cancelled() => return,
+                    _ = interval.tick() => {
+                        match redis::Script::new(RENEW)
+                            .key(SETTLEMENT_LOCK_KEY)
+                            .arg(&owner)
+                            .arg(ttl_seconds)
+                            .invoke_async::<i32>(&mut connection)
+                            .await
+                        {
+                            Ok(1) => {}
+                            Ok(_) => {
+                                warn!("settlement lease ownership was lost; stopping renewal");
+                                return;
+                            }
+                            Err(error) => {
+                                warn!(%error, "failed to renew settlement lease");
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        Self { cancel, handle }
+    }
+
+    async fn shutdown(self) {
+        self.cancel.cancel();
+        if let Err(error) = self.handle.await {
+            warn!(%error, "settlement lease heartbeat task failed");
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> std::process::ExitCode {
     let _telemetry = telemetry::init("pay-jobs-settle-sessions");
@@ -1203,6 +1260,7 @@ fn decode_voucher_signature(signature: &str) -> Result<[u8; 64], JobError> {
 struct SettlementLock {
     connection: redis::aio::ConnectionManager,
     owner: String,
+    heartbeat: LeaseHeartbeat,
 }
 
 impl SettlementLock {
@@ -1223,10 +1281,15 @@ impl SettlementLock {
             .query_async(&mut connection)
             .await
             .map_err(|error| JobError::Config(format!("Redis settlement lock: {error}")))?;
-        Ok(acquired.map(|_| Self { connection, owner }))
+        Ok(acquired.map(|_| Self {
+            heartbeat: LeaseHeartbeat::start(connection.clone(), owner.clone(), ttl_seconds),
+            connection,
+            owner,
+        }))
     }
 
     async fn release(mut self) {
+        self.heartbeat.shutdown().await;
         const RELEASE: &str = r#"
 if redis.call('GET', KEYS[1]) == ARGV[1] then
   return redis.call('DEL', KEYS[1])

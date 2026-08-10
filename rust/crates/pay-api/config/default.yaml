@@ -84,3 +84,6 @@ redemption:
   network: mainnet         # Helius transaction history is mainnet-only
   solana_rpc_api_key: ""   # required when redemption is enabled
   claim_store_url: ""      # Redis; PAY_SESSION_REDIS_URL is also accepted
+  # Required when enabled: Unix time when Redis claims became authoritative.
+  # The Helius legacy scan stops at this boundary to stay bounded.
+  legacy_scan_cutoff_unix_seconds:
