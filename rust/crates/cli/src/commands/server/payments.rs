@@ -596,6 +596,7 @@ pub(crate) fn build_charge_mpps(
     recipient: &str,
     network_slug: &str,
     rpc_url: &str,
+    realm: Option<&str>,
     challenge_binding_secret: &str,
     fee_payer: bool,
     fee_payer_signer: Option<Arc<dyn SolanaSigner>>,
@@ -610,6 +611,7 @@ pub(crate) fn build_charge_mpps(
                 decimals: *decimals,
                 network: network_slug.to_string(),
                 rpc_url: Some(rpc_url.to_string()),
+                realm: realm.map(str::to_string),
                 challenge_binding_secret: Some(challenge_binding_secret.to_string()),
                 fee_payer,
                 fee_payer_signer: fee_payer_signer.clone(),
@@ -620,6 +622,36 @@ pub(crate) fn build_charge_mpps(
         })
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| pay_core::Error::Config(format!("Failed to create MPP server: {e}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::build_charge_mpps;
+
+    #[test]
+    fn charge_server_uses_configured_operator_realm() {
+        let currencies = vec![(
+            "USDC".to_string(),
+            "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v".to_string(),
+            6,
+        )];
+        let cache = pay_kit::mpp::blockhash::BlockhashCache::new();
+        let servers = build_charge_mpps(
+            &currencies,
+            "CXhrFZJLKqjzmP3sjYLcF4dTeXWKCy9e2SXXZ2Yo6MPY",
+            "mainnet",
+            "https://api.mainnet-beta.solana.com",
+            Some("api.example.com"),
+            "0123456789abcdef0123456789abcdef",
+            false,
+            None,
+            &cache,
+        )
+        .expect("charge server");
+
+        assert_eq!(servers.len(), 1);
+        assert_eq!(servers[0].realm(), "api.example.com");
+    }
 }
 
 /// Build the x402 `upto` backend for the sandbox charge stack.
