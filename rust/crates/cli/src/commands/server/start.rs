@@ -722,6 +722,9 @@ impl StartCommand {
         let signer_cfg = op.and_then(|o| o.signer.clone());
         let legacy_signer_source = legacy_signer_source.map(str::to_string);
         let account_override = account_override.map(str::to_string);
+        let has_explicit_recipient = op.and_then(|o| o.recipient.as_ref()).is_some()
+            || self.recipient.is_some()
+            || std::env::var("PAY_PAYMENT_RECIPIENT").is_ok();
 
         // Create the runtime first — everything async runs inside it so
         // background tasks (like GCP auth token refresh) stay alive. Worker
@@ -755,12 +758,13 @@ impl StartCommand {
             //      (named entry in accounts.yml), and File (JSON keypair
             //      on disk).
             //
-            //   3. **Throwaway network slug** (`localnet` / `devnet`)**
+            //   3. **Fee-sponsoring throwaway network** (`localnet` / `devnet`)
             //      with no explicit signer** — smart default: route
             //      through the network-aware loader so users running
-            //      `pay gate api` against a localnet/devnet paywall
-            //      don't have to think about signers. Same code path as
-            //      the sandbox flag.
+            //      a fee-sponsoring `pay gate api` don't have to think about
+            //      signers. Client-funded sessions deliberately skip this:
+            //      creating an unused signer would make a devnet gateway
+            //      require SOL before it could serve a challenge.
             //
             //   4. **None** — leaves fee_payer_signer empty. Caught by
             //      the early-validation guard below if `fee_payer: true`.
@@ -769,18 +773,21 @@ impl StartCommand {
                 sandbox,
                 &network,
                 signer_cfg.as_ref(),
+                fee_payer,
             ) {
                 let (signer, generated) = payments::load_auto_fee_payer_signer(&network)?;
                 generated_gateway_account = generated;
                 Some(signer)
             } else if let Some(ref cfg) = signer_cfg {
                 Some(resolve_signer(cfg).await?)
-            } else if let Some(signer) = super::load_account_or_legacy_signer(
-                network.slug(),
-                account_override.as_deref(),
-                legacy_signer_source.as_deref(),
-                &pay_core::keystore::AuthIntent::use_gateway_fee_payer(),
-            )? {
+            } else if (fee_payer || !has_explicit_recipient)
+                && let Some(signer) = super::load_account_or_legacy_signer(
+                    network.slug(),
+                    account_override.as_deref(),
+                    legacy_signer_source.as_deref(),
+                    &pay_core::keystore::AuthIntent::use_gateway_fee_payer(),
+                )?
+            {
                 // Mainnet (or unknown network) with no `operator.signer`
                 // block but a default keypair from `pay setup` —
                 // typically `keychain:default`. Load it once at startup
@@ -3685,16 +3692,25 @@ endpoints:
             true,
             &SolanaNetwork::Localnet,
             Some(&signer),
+            false,
         ));
         assert!(!should_use_auto_fee_payer_signer(
             false,
             &SolanaNetwork::Mainnet,
             Some(&signer),
+            true,
         ));
         assert!(should_use_auto_fee_payer_signer(
             false,
             &SolanaNetwork::Devnet,
-            None
+            None,
+            true,
+        ));
+        assert!(!should_use_auto_fee_payer_signer(
+            false,
+            &SolanaNetwork::Devnet,
+            None,
+            false,
         ));
     }
 

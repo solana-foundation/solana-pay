@@ -24,8 +24,9 @@ pub(crate) fn should_use_auto_fee_payer_signer(
     sandbox: bool,
     network: &SolanaNetwork,
     signer_cfg: Option<&SignerConfig>,
+    fee_payer: bool,
 ) -> bool {
-    sandbox || (signer_cfg.is_none() && network.is_throwaway())
+    sandbox || (fee_payer && signer_cfg.is_none() && network.is_throwaway())
 }
 
 /// `(account_name, pubkey)` of a freshly generated gateway ephemeral.
