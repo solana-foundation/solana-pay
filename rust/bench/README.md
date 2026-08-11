@@ -22,6 +22,21 @@ runs as a **JIT mainnet-fork** (fetching the payment-channel program and USDC
 mint from that datasource). Current PayKit verifies genuine payment-channel
 opens, so the MPP-session benchmark cannot use an offline synthetic open.
 
+## Devnet Pingora smoke gate
+
+`configs/devnet-pingora.yml` is a deployable Pingora configuration for a
+headless, self-contained `GET /api/v1/compute` endpoint. It emits an MPP
+session challenge and returns `200` only after voucher verification; its
+`respond` route deliberately excludes an upstream application from this
+gateway measurement.
+
+Supply `PAY_PAYMENT_RECIPIENT`, `PAY_RPC_URL`, and a persistent random
+`PAY_SESSION_SECRET` through the service environment. The gateway uses
+client-funded channels (`operator.fee_payer: false`), so it does not need an
+operator key for this smoke test. A real devnet load run still requires the
+bench funder to hold devnet SOL and USDC; `pay-bench run` currently stops
+before funding rather than pretending it completed that transfer.
+
 ## Commands
 
 | Command | Purpose |
