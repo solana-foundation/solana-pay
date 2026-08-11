@@ -1200,10 +1200,573 @@ fn prune_resources(
     container.contains_key("methods") || container.contains_key("resources")
 }
 
+/// Derive a self-contained x402 Bazaar discovery extension for one OpenAPI 3
+/// operation. The runtime 402 remains authoritative for payment terms; this
+/// projection only describes how to invoke the exact matched HTTP operation
+/// and how to validate its successful JSON response.
+///
+/// Returns `None` rather than inventing metadata when the operation, an input
+/// schema, or a successful JSON response schema cannot be resolved. Local
+/// OpenAPI `$ref` values are materialized so the extension never contains
+/// references that point outside the payment envelope.
+pub fn bazaar_extension_for_operation(
+    doc: &Value,
+    method: &str,
+    request_path: &str,
+) -> Option<Value> {
+    let method_upper = method.to_ascii_uppercase();
+    let method_lower = method.to_ascii_lowercase();
+    let query_method = matches!(method_upper.as_str(), "GET" | "HEAD" | "DELETE");
+    let body_method = matches!(method_upper.as_str(), "POST" | "PUT" | "PATCH");
+    if !query_method && !body_method {
+        return None;
+    }
+
+    let paths = doc.get("paths")?.as_object()?;
+    let base_path = openapi3_base_path(doc);
+    let target = canonical_path(request_path);
+    let (path_item, operation) = paths.iter().find_map(|(path, item)| {
+        let combined = if base_path.is_empty() {
+            normalize_path(path)
+        } else {
+            format!("{}/{}", base_path, path.trim_start_matches('/'))
+        };
+        if !openapi_path_matches_request(&combined, &target) {
+            return None;
+        }
+        let path_item = item.as_object()?;
+        let operation = path_item.get(&method_lower)?.as_object()?;
+        Some((path_item, operation))
+    })?;
+
+    let mut query_properties = Map::new();
+    let mut query_required = Vec::new();
+    let mut path_properties = Map::new();
+    let mut path_required = Vec::new();
+    let mut header_properties = Map::new();
+    let mut header_required = Vec::new();
+    let mut query_examples = Map::new();
+    let mut path_examples = Map::new();
+    let mut header_examples = Map::new();
+
+    let mut parameters = Vec::new();
+    for parameter in path_item
+        .get("parameters")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .chain(
+            operation
+                .get("parameters")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten(),
+        )
+    {
+        let parameter = resolve_openapi_object(doc, parameter)?;
+        let location = parameter.get("in").and_then(Value::as_str)?;
+        let name = parameter.get("name").and_then(Value::as_str)?.to_string();
+        if let Some(index) = parameters
+            .iter()
+            .position(|existing: &&Map<String, Value>| {
+                existing.get("in").and_then(Value::as_str) == Some(location)
+                    && existing.get("name").and_then(Value::as_str) == Some(name.as_str())
+            })
+        {
+            parameters[index] = parameter;
+        } else {
+            parameters.push(parameter);
+        }
+    }
+
+    for parameter in parameters {
+        let location = parameter.get("in").and_then(Value::as_str)?;
+        let name = parameter.get("name").and_then(Value::as_str)?.to_string();
+        let normalized_name = name.to_ascii_lowercase();
+        if location == "header"
+            && matches!(
+                normalized_name.as_str(),
+                "authorization" | "payment-signature" | "x-payment" | "payment-required"
+            )
+        {
+            continue;
+        }
+        let schema = parameter.get("schema")?;
+        let schema = materialize_local_refs(doc, schema, &mut HashSet::new(), 0)?;
+        let required = parameter
+            .get("required")
+            .and_then(Value::as_bool)
+            .unwrap_or(location == "path");
+        let example = parameter
+            .get("example")
+            .or_else(|| parameter.get("schema").and_then(|s| s.get("example")))
+            .or_else(|| parameter.get("schema").and_then(|s| s.get("default")))
+            .cloned();
+        match location {
+            "query" => {
+                query_properties.insert(name.clone(), schema);
+                if let Some(example) = example {
+                    query_examples.insert(name.clone(), example);
+                }
+                if required {
+                    query_required.push(Value::String(name));
+                }
+            }
+            "path" => {
+                path_properties.insert(name.clone(), schema);
+                if let Some(example) = example {
+                    path_examples.insert(name.clone(), example);
+                }
+                if required {
+                    path_required.push(Value::String(name));
+                }
+            }
+            "header" => {
+                header_properties.insert(name.clone(), schema);
+                if let Some(example) = example {
+                    header_examples.insert(name.clone(), example);
+                }
+                if required {
+                    header_required.push(Value::String(name));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut input_info = Map::new();
+    input_info.insert("type".to_string(), json!("http"));
+    input_info.insert("method".to_string(), json!(method_upper));
+
+    let mut input_schema_properties = Map::new();
+    input_schema_properties.insert(
+        "type".to_string(),
+        json!({ "type": "string", "const": "http" }),
+    );
+    input_schema_properties.insert(
+        "method".to_string(),
+        json!({ "type": "string", "enum": [method_upper] }),
+    );
+    let mut input_required = vec![json!("type"), json!("method")];
+
+    if query_method || !query_properties.is_empty() {
+        input_info.insert("queryParams".to_string(), Value::Object(query_examples));
+        input_schema_properties.insert(
+            "queryParams".to_string(),
+            object_schema(query_properties, query_required),
+        );
+    }
+    if !path_properties.is_empty() {
+        input_info.insert("pathParams".to_string(), Value::Object(path_examples));
+        input_schema_properties.insert(
+            "pathParams".to_string(),
+            object_schema(path_properties, path_required),
+        );
+    }
+    if !header_properties.is_empty() {
+        input_info.insert("headers".to_string(), Value::Object(header_examples));
+        input_schema_properties.insert(
+            "headers".to_string(),
+            object_schema(header_properties, header_required),
+        );
+    }
+    if body_method && let Some(request_body) = operation.get("requestBody") {
+        let request_body = resolve_openapi_object(doc, request_body)?;
+        let body_required = request_body
+            .get("required")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let media = json_media_type(request_body.get("content")?.as_object()?)?;
+        let body_schema =
+            materialize_local_refs(doc, media.get("schema")?, &mut HashSet::new(), 0)?;
+        input_info.insert("bodyType".to_string(), json!("json"));
+        input_info.insert(
+            "body".to_string(),
+            media.get("example").cloned().unwrap_or_else(|| json!({})),
+        );
+        input_schema_properties.insert(
+            "bodyType".to_string(),
+            json!({ "type": "string", "enum": ["json"] }),
+        );
+        input_schema_properties.insert("body".to_string(), body_schema);
+        if body_required {
+            input_required.extend([json!("bodyType"), json!("body")]);
+        }
+    }
+
+    let responses = operation.get("responses")?.as_object()?;
+    let response = responses.get("200").or_else(|| {
+        responses
+            .iter()
+            .find(|(status, _)| status.len() == 3 && status.starts_with('2'))
+            .map(|(_, response)| response)
+    })?;
+    let response = resolve_openapi_object(doc, response)?;
+    let media = json_media_type(response.get("content")?.as_object()?)?;
+    let output_schema = materialize_local_refs(doc, media.get("schema")?, &mut HashSet::new(), 0)?;
+
+    let mut info = Map::new();
+    info.insert("input".to_string(), Value::Object(input_info));
+    let mut output_info = Map::new();
+    output_info.insert("type".to_string(), json!("json"));
+    if let Some(example) = media.get("example") {
+        output_info.insert("example".to_string(), example.clone());
+    }
+    info.insert("output".to_string(), Value::Object(output_info));
+
+    Some(json!({
+        "bazaar": {
+            "info": Value::Object(info),
+            "schema": {
+                "$schema": "https://json-schema.org/draft/2020-12/schema",
+                "type": "object",
+                "properties": {
+                    "input": {
+                        "type": "object",
+                        "properties": Value::Object(input_schema_properties),
+                        "required": input_required,
+                        "additionalProperties": false
+                    },
+                    "output": {
+                        "type": "object",
+                        "properties": {
+                            "type": { "type": "string", "const": "json" },
+                            "example": output_schema
+                        },
+                        "required": ["type"],
+                        "additionalProperties": false
+                    }
+                },
+                "required": ["input"]
+            }
+        }
+    }))
+}
+
+fn object_schema(properties: Map<String, Value>, required: Vec<Value>) -> Value {
+    let mut schema = Map::new();
+    schema.insert("type".to_string(), json!("object"));
+    schema.insert("properties".to_string(), Value::Object(properties));
+    if !required.is_empty() {
+        schema.insert("required".to_string(), Value::Array(required));
+    }
+    schema.insert("additionalProperties".to_string(), json!(false));
+    Value::Object(schema)
+}
+
+fn openapi_path_matches_request(template: &str, request_path: &str) -> bool {
+    let template = canonical_path(template);
+    let request_path = canonical_path(request_path);
+    if template == request_path {
+        return true;
+    }
+
+    let template_segments = template.split('/').collect::<Vec<_>>();
+    let request_segments = request_path.split('/').collect::<Vec<_>>();
+    template_segments.len() == request_segments.len()
+        && template_segments
+            .iter()
+            .zip(request_segments)
+            .all(|(template, request)| openapi_segment_matches_request(template, request))
+}
+
+fn openapi_segment_matches_request(template: &str, request: &str) -> bool {
+    let literals = template.split("{*}").collect::<Vec<_>>();
+    if literals.len() == 1 {
+        return template == request;
+    }
+    if !request.starts_with(literals[0]) {
+        return false;
+    }
+
+    let mut offset = literals[0].len();
+    for (index, literal) in literals.iter().enumerate().skip(1) {
+        let last = index == literals.len() - 1;
+        if request.len() <= offset {
+            return false;
+        }
+        let remaining = &request[offset + 1..];
+        if last {
+            return literal.is_empty() || remaining.ends_with(literal);
+        }
+        let Some(position) = remaining.find(literal) else {
+            return false;
+        };
+        offset += 1 + position + literal.len();
+    }
+    true
+}
+
+fn json_media_type(content: &Map<String, Value>) -> Option<&Value> {
+    content.get("application/json").or_else(|| {
+        content
+            .iter()
+            .find(|(content_type, _)| content_type.ends_with("+json"))
+            .map(|(_, media)| media)
+    })
+}
+
+fn resolve_openapi_object<'a>(doc: &'a Value, value: &'a Value) -> Option<&'a Map<String, Value>> {
+    let value = if let Some(reference) = value.get("$ref").and_then(Value::as_str) {
+        resolve_local_ref(doc, reference)?
+    } else {
+        value
+    };
+    value.as_object()
+}
+
+fn resolve_local_ref<'a>(doc: &'a Value, reference: &str) -> Option<&'a Value> {
+    let pointer = reference.strip_prefix('#')?;
+    doc.pointer(pointer)
+}
+
+fn materialize_local_refs(
+    doc: &Value,
+    value: &Value,
+    seen: &mut HashSet<String>,
+    depth: usize,
+) -> Option<Value> {
+    if depth > 16 {
+        return None;
+    }
+    match value {
+        Value::Array(values) => values
+            .iter()
+            .map(|value| materialize_local_refs(doc, value, seen, depth + 1))
+            .collect::<Option<Vec<_>>>()
+            .map(Value::Array),
+        Value::Object(object) => {
+            let mut materialized = Map::new();
+            if let Some(reference) = object.get("$ref").and_then(Value::as_str) {
+                if !seen.insert(reference.to_string()) {
+                    return None;
+                }
+                let target = resolve_local_ref(doc, reference)?;
+                materialized = materialize_local_refs(doc, target, seen, depth + 1)?
+                    .as_object()?
+                    .clone();
+                seen.remove(reference);
+            }
+            for (key, value) in object {
+                if key == "$ref" {
+                    continue;
+                }
+                materialized.insert(
+                    key.clone(),
+                    materialize_local_refs(doc, value, seen, depth + 1)?,
+                );
+            }
+            Some(Value::Object(materialized))
+        }
+        _ => Some(value.clone()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn bazaar_projection_materializes_exact_operation_contract() {
+        let doc = json!({
+            "openapi": "3.1.0",
+            "paths": {
+                "/commerce/preflight": {
+                    "get": {
+                        "parameters": [
+                            { "$ref": "#/components/parameters/TargetUrl" }
+                        ],
+                        "responses": {
+                            "200": {
+                                "description": "ok",
+                                "content": {
+                                    "application/json": {
+                                        "schema": { "$ref": "#/components/schemas/Result" }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            "components": {
+                "parameters": {
+                    "TargetUrl": {
+                        "name": "url",
+                        "in": "query",
+                        "required": true,
+                        "schema": {
+                            "type": "string",
+                            "format": "uri",
+                            "example": "https://example.com/paid"
+                        }
+                    }
+                },
+                "schemas": {
+                    "Result": {
+                        "type": "object",
+                        "required": ["decision"],
+                        "properties": {
+                            "decision": { "type": "string" }
+                        }
+                    }
+                }
+            }
+        });
+
+        let extension = bazaar_extension_for_operation(&doc, "GET", "commerce/preflight").unwrap();
+        assert_eq!(extension["bazaar"]["info"]["input"]["method"], "GET");
+        assert_eq!(
+            extension["bazaar"]["info"]["input"]["queryParams"]["url"],
+            "https://example.com/paid"
+        );
+        assert_eq!(
+            extension["bazaar"]["schema"]["properties"]["input"]["properties"]["queryParams"]["required"]
+                [0],
+            "url"
+        );
+        assert_eq!(
+            extension["bazaar"]["schema"]["properties"]["output"]["properties"]["example"]["properties"]
+                ["decision"]["type"],
+            "string"
+        );
+        assert!(!extension.to_string().contains("$ref"));
+    }
+
+    #[test]
+    fn bazaar_projection_omits_incomplete_operation() {
+        let doc = json!({
+            "openapi": "3.1.0",
+            "paths": {
+                "/missing-output": {
+                    "get": { "responses": { "200": { "description": "ok" } } }
+                }
+            }
+        });
+        assert!(bazaar_extension_for_operation(&doc, "GET", "missing-output").is_none());
+    }
+
+    #[test]
+    fn bazaar_projection_matches_concrete_request_to_templated_operation() {
+        let doc = json!({
+            "openapi": "3.1.0",
+            "paths": {
+                "/users/{userId}": {
+                    "parameters": [{
+                        "name": "userId",
+                        "in": "path",
+                        "required": true,
+                        "schema": { "type": "string" }
+                    }],
+                    "get": {
+                        "responses": {
+                            "200": {
+                                "description": "ok",
+                                "content": {
+                                    "application/json": {
+                                        "schema": { "type": "object" }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        let extension = bazaar_extension_for_operation(&doc, "GET", "/users/alice").unwrap();
+        assert_eq!(extension["bazaar"]["info"]["input"]["method"], "GET");
+        assert_eq!(
+            extension["bazaar"]["schema"]["properties"]["input"]["properties"]["pathParams"]["required"]
+                [0],
+            "userId"
+        );
+    }
+
+    #[test]
+    fn bazaar_projection_applies_operation_parameter_override_atomically() {
+        let doc = json!({
+            "openapi": "3.1.0",
+            "paths": {
+                "/items": {
+                    "parameters": [{
+                        "name": "limit",
+                        "in": "query",
+                        "required": true,
+                        "schema": { "type": "integer" }
+                    }],
+                    "get": {
+                        "parameters": [{
+                            "name": "limit",
+                            "in": "query",
+                            "required": false,
+                            "schema": { "type": "string" }
+                        }],
+                        "responses": {
+                            "200": {
+                                "description": "ok",
+                                "content": {
+                                    "application/json": {
+                                        "schema": { "type": "object" }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        let extension = bazaar_extension_for_operation(&doc, "GET", "/items").unwrap();
+        let query_schema =
+            &extension["bazaar"]["schema"]["properties"]["input"]["properties"]["queryParams"];
+        assert_eq!(query_schema["properties"]["limit"]["type"], "string");
+        assert!(query_schema.get("required").is_none());
+    }
+
+    #[test]
+    fn bazaar_projection_keeps_optional_request_body_optional() {
+        for method in ["post", "put", "patch"] {
+            let mut doc = json!({
+                "openapi": "3.1.0",
+                "paths": {
+                    "/items": {}
+                }
+            });
+            doc["paths"]["/items"][method] = json!({
+                "requestBody": {
+                    "required": false,
+                    "content": {
+                        "application/json": {
+                            "schema": { "type": "object" }
+                        }
+                    }
+                },
+                "responses": {
+                    "200": {
+                        "description": "ok",
+                        "content": {
+                            "application/json": {
+                                "schema": { "type": "object" }
+                            }
+                        }
+                    }
+                }
+            });
+
+            let extension = bazaar_extension_for_operation(&doc, method, "/items").unwrap();
+            let required = extension["bazaar"]["schema"]["properties"]["input"]["required"]
+                .as_array()
+                .unwrap();
+            assert!(!required.contains(&json!("bodyType")));
+            assert!(!required.contains(&json!("body")));
+            assert_eq!(
+                extension["bazaar"]["schema"]["properties"]["input"]["properties"]["body"]["type"],
+                "object"
+            );
+        }
+    }
 
     fn ep(method: pay_types::metering::HttpMethod, path: &str) -> Endpoint {
         Endpoint {

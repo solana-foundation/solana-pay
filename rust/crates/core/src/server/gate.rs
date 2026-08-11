@@ -15,6 +15,7 @@
 
 use std::sync::Arc;
 
+use base64::Engine as _;
 use bytes::Bytes;
 use http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, header};
 use pay_kit::mpp::server::{ChargeOptions, VerificationError};
@@ -312,6 +313,35 @@ pub enum GateDecision {
     /// Not gated (discovery / free / unknown) — let normal routing handle it
     /// (forward to the default upstream, or serve a control-plane route).
     Passthrough,
+}
+
+/// Add extension declarations to a generated x402 v2 PAYMENT-REQUIRED value
+/// without changing any payment requirement. Existing extension keys win so a
+/// future pay-kit implementation cannot be silently overwritten here.
+fn attach_x402_extensions(encoded: &str, additions: &serde_json::Value) -> Option<String> {
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .ok()?;
+    let mut envelope: serde_json::Value = serde_json::from_slice(&decoded).ok()?;
+    if envelope
+        .get("x402Version")
+        .and_then(serde_json::Value::as_u64)
+        != Some(2)
+    {
+        return None;
+    }
+    let root = envelope.as_object_mut()?;
+    let extensions = root
+        .entry("extensions".to_string())
+        .or_insert_with(|| json!({}))
+        .as_object_mut()?;
+    for (key, value) in additions.as_object()? {
+        extensions
+            .entry(key.clone())
+            .or_insert_with(|| value.clone());
+    }
+    let serialized = serde_json::to_vec(&envelope).ok()?;
+    Some(base64::engine::general_purpose::STANDARD.encode(serialized))
 }
 
 /// The framework-agnostic payment gate, parameterized over the host's
@@ -670,6 +700,18 @@ impl<S: PaymentState> PaymentGate<S> {
                 },
             ) {
                 Ok((name, value)) => {
+                    let value = self
+                        .state
+                        .openapi_document()
+                        .and_then(|doc| {
+                            crate::server::openapi::bazaar_extension_for_operation(
+                                doc,
+                                req.method.as_str(),
+                                path,
+                            )
+                        })
+                        .and_then(|extension| attach_x402_extensions(&value, &extension))
+                        .unwrap_or(value);
                     if let (Ok(n), Ok(v)) = (
                         HeaderName::from_bytes(name.as_bytes()),
                         HeaderValue::from_str(&value),
@@ -1852,6 +1894,29 @@ mod tests {
     // Ceiling $0.10 at 6 decimals == 100_000 base units (USDC).
     const CEILING_USD: f64 = 0.10;
     const CEILING_BASE: u64 = 100_000;
+
+    #[test]
+    fn x402_extension_attachment_preserves_existing_keys() {
+        let encoded = base64::engine::general_purpose::STANDARD.encode(
+            serde_json::to_vec(&json!({
+                "x402Version": 2,
+                "accepts": [],
+                "extensions": { "existing": { "kept": true } }
+            }))
+            .unwrap(),
+        );
+        let enriched = attach_x402_extensions(
+            &encoded,
+            &json!({ "bazaar": { "schema": { "type": "object" } } }),
+        )
+        .unwrap();
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(enriched)
+            .unwrap();
+        let envelope: serde_json::Value = serde_json::from_slice(&decoded).unwrap();
+        assert_eq!(envelope["extensions"]["existing"]["kept"], true);
+        assert_eq!(envelope["extensions"]["bazaar"]["schema"]["type"], "object");
+    }
 
     #[test]
     fn session_receipt_links_to_the_authorizing_transaction() {
