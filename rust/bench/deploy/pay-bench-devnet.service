@@ -1,0 +1,19 @@
+[Unit]
+Description=Pay Bench devnet MPP-session Pingora gateway
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/pay-bench/rust
+EnvironmentFile=/etc/pay-bench/devnet.env
+ExecStart=/home/ubuntu/pay-bench/rust/target/release/pay server start /home/ubuntu/pay-bench/rust/bench/configs/devnet-pingora.yml --bind 0.0.0.0:1402 --no-register
+Restart=on-failure
+RestartSec=2
+LimitNOFILE=262144
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

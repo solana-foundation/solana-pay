@@ -37,6 +37,12 @@ operator key for this smoke test. A real devnet load run still requires the
 bench funder to hold devnet SOL and USDC; `pay-bench run` currently stops
 before funding rather than pretending it completed that transfer.
 
+For the Ubuntu benchmark host, install
+`deploy/pay-bench-devnet.service` as `/etc/systemd/system/pay-bench-devnet.service`
+and place the three environment values in `/etc/pay-bench/devnet.env` with
+mode `0600`. The unit raises `LimitNOFILE` to `262144`, which is a prerequisite
+for any high-concurrency generator or proxy run.
+
 ## Commands
 
 | Command | Purpose |
