@@ -13,6 +13,118 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::{Network, Scheme};
 
+/// Durable state for an independently reusable fixture set. Unlike a load-run
+/// journal, this contains only public derivation metadata and progress; every
+/// wallet key remains recoverable from the funder seed and `setup_id`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FixtureState {
+    pub setup_id: String,
+    pub name: String,
+    pub network: Network,
+    pub funder_pubkey: String,
+    pub users: usize,
+    pub sol_lamports_per_user: u64,
+    pub assets: Vec<FixtureAsset>,
+    pub phase: FixturePhase,
+    /// The first index that still needs processing in the current phase. A
+    /// transaction is idempotently reconciled before this checkpoint moves.
+    pub next_user: usize,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FixtureAsset {
+    pub label: String,
+    pub mint: String,
+    pub token_program: String,
+    pub decimals: u8,
+    pub amount_base: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FixturePhase {
+    SettingUp,
+    Ready,
+    TearingDown,
+    TornDown,
+}
+
+/// Owns one setup journal at `~/.config/pay/bench/setups/<setup-id>.json`.
+pub struct FixtureJournal {
+    path: PathBuf,
+    state: FixtureState,
+}
+
+impl FixtureJournal {
+    fn dir() -> Result<PathBuf> {
+        Ok(Journal::dir()?.join("setups"))
+    }
+
+    fn path_for(setup_id: &str) -> Result<PathBuf> {
+        Ok(Self::dir()?.join(format!("{setup_id}.json")))
+    }
+
+    pub fn exists(setup_id: &str) -> Result<bool> {
+        Ok(Self::path_for(setup_id)?.exists())
+    }
+
+    pub fn create(state: FixtureState) -> Result<Self> {
+        let journal = Self {
+            path: Self::path_for(&state.setup_id)?,
+            state,
+        };
+        journal.save()?;
+        Ok(journal)
+    }
+
+    pub fn load(setup_id: &str) -> Result<Self> {
+        let path = Self::path_for(setup_id)?;
+        let raw = std::fs::read_to_string(&path)
+            .with_context(|| format!("reading fixture journal {}", path.display()))?;
+        let state = serde_json::from_str(&raw)
+            .with_context(|| format!("parsing fixture journal {}", path.display()))?;
+        Ok(Self { path, state })
+    }
+
+    pub fn state(&self) -> &FixtureState {
+        &self.state
+    }
+
+    pub fn set_phase(&mut self, phase: FixturePhase) -> Result<()> {
+        self.state.phase = phase;
+        self.save()
+    }
+
+    pub fn checkpoint(&mut self, next_user: usize) -> Result<()> {
+        self.state.next_user = next_user;
+        self.save()
+    }
+
+    fn save(&self) -> Result<()> {
+        let dir = self
+            .path
+            .parent()
+            .context("fixture journal path has no parent")?;
+        std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+        let mut state = self.state.clone();
+        state.updated_at = chrono::Utc::now().to_rfc3339();
+        let json = serde_json::to_string_pretty(&state)?;
+        let tmp = self.path.with_extension("json.tmp");
+        std::fs::write(&tmp, json.as_bytes())
+            .with_context(|| format!("writing {}", tmp.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
+        }
+        std::fs::rename(&tmp, &self.path)
+            .with_context(|| format!("renaming into {}", self.path.display()))?;
+        Ok(())
+    }
+}
+
 /// Lifecycle of a run. Anything other than `Complete`/`Failed` (terminal) means
 /// funds may still be deployed and a recovery sweep is warranted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

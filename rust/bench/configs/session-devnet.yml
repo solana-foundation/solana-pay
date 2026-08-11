@@ -1,0 +1,32 @@
+# Start this at a small user count after `devnet-fixture-100k.yml` is ready.
+# Increase `load.users` only after the previous run is clean; it must not
+# exceed the number of wallets in the selected --fixture-id.
+run:
+  name: session-devnet
+  scheme: mpp_session
+  network: devnet
+  rpc_url_env: BENCH_DEVNET_RPC_URL
+  mint: 4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU
+  funder:
+    keypair_env: BENCH_FUNDER_KEYPAIR
+  safety:
+    max_total_usdc: 1000.0
+    max_total_sol: 1000.0
+    require_confirmation: true
+
+load:
+  users: 100
+  requests_per_sec_per_user: 5
+  prepare_secs: 5
+  unleash_secs: 15
+  max_concurrency: 512
+
+endpoints:
+  - url: http://213.239.141.29:1402/api/v1/compute
+    method: GET
+    body: ""
+
+session:
+  deposit_usdc: 0.01
+  voucher_usdc: 0.000001
+  settle_onchain: false

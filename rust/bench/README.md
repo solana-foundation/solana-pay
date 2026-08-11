@@ -49,6 +49,8 @@ for any high-concurrency generator or proxy run.
 |---|---|
 | `rehearse <cfg>` | Full pipeline on a local fork — no real money. |
 | `run <cfg> [--yes]` | Real run; `--yes` required on real-money networks. |
+| `setup <cfg> --id <ID> --yes` | Create/resume a deterministic public-cluster wallet fixture. |
+| `teardown <ID> --config <cfg> --yes` | Return fixture tokens, close ATAs, and reclaim rent. |
 | `list-runs` | Recorded runs + outstanding-fund status. |
 | `recover <id> \| --all` | Resume settle+sweep for an interrupted run. |
 | `estimate <cfg>` | Validate a config and print parsed settings. |
@@ -79,6 +81,39 @@ session: { deposit_usdc: 0.10, voucher_usdc: 0.0001 }   # mpp_session only
 
 > **Secrets:** prefer `rpc_url_env` / `funder.keypair_env` over inlining an
 > API key or keypair in a committed config.
+
+## Reusable devnet fixture
+
+Use `configs/devnet-fixture-100k.yml` as the versioned allocation plan. A
+stable `--id` is part of the wallet derivation namespace, so the same funder
+and ID always recover the same 100,000 addresses. `setup` is resumable: it
+reconciles each target ATA to its configured balance before transferring only
+the missing amount. The journal stores no private keys or RPC URL.
+
+```sh
+export BENCH_DEVNET_RPC_URL='https://…'
+export BENCH_FUNDER_KEYPAIR='[solana keypair bytes]'
+
+# Review the caps in the YAML, then provision once.
+cargo run -p pay-bench --release -- setup \
+  bench/configs/devnet-fixture-100k.yml --id devnet-100k --yes
+
+# A real load run reuses the funded, deterministic wallet set and leaves
+# cleanup to the explicit teardown command.
+cargo run -p pay-bench --release -- run bench/configs/session-devnet.yml \
+  --fixture-id devnet-100k --yes
+
+# After all load runs are finished, return every token balance and close each
+# ATA to reclaim its rent to the funder.
+cargo run -p pay-bench --release -- teardown devnet-100k \
+  --config bench/configs/devnet-fixture-100k.yml --yes
+```
+
+The bundled file enables canonical devnet USDC. Add USDT only with the actual
+devnet mint you fund: PayKit intentionally never maps a devnet symbol to the
+mainnet USDT mint. The plan performs one idempotently reconciled transaction
+per derived wallet; it is intentionally restart-safe rather than relying on a
+one-off bulk-transfer script.
 
 ## Pipeline
 

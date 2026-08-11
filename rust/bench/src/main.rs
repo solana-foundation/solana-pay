@@ -12,6 +12,7 @@
 mod config;
 mod driver;
 mod engine;
+mod fixtures;
 mod journal;
 mod observability;
 mod rehearsal;
@@ -53,6 +54,30 @@ enum Cmd {
     Rehearse { config: String },
     /// Run a config for real. Requires --yes on real-money networks.
     Run {
+        config: String,
+        /// Reuse wallets prepared by `bench setup --id <ID>` instead of
+        /// funding a fresh timestamp-scoped wallet set.
+        #[arg(long)]
+        fixture_id: Option<String>,
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Provision deterministic wallets and token accounts for a reusable
+    /// public-cluster benchmark fixture. Requires --yes.
+    Setup {
+        config: String,
+        /// Stable fixture ID. Reusing an ID resumes the same derived wallets.
+        #[arg(long)]
+        id: Option<String>,
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Transfer fixture balances home and close all derived token accounts.
+    Teardown {
+        setup_id: String,
+        /// The same setup YAML used to create the fixture. It supplies the
+        /// RPC and funder reference without persisting either secret.
+        #[arg(long)]
         config: String,
         #[arg(long)]
         yes: bool,
@@ -136,7 +161,17 @@ async fn run(cmd: Cmd) -> Result<()> {
             let report = rehearsal::run(cfg).await?;
             finish(report)
         }
-        Cmd::Run { config, yes } => run_real(&config, yes).await,
+        Cmd::Run {
+            config,
+            fixture_id,
+            yes,
+        } => run_real(&config, fixture_id.as_deref(), yes).await,
+        Cmd::Setup { config, id, yes } => fixtures::setup(&config, id.as_deref(), yes).await,
+        Cmd::Teardown {
+            setup_id,
+            config,
+            yes,
+        } => fixtures::teardown(&setup_id, &config, yes).await,
         Cmd::ListRuns => list_runs(),
         Cmd::Recover { run_id, all } => recover(run_id, all).await,
         Cmd::Serve { config } => {
@@ -165,7 +200,7 @@ fn finish(report: report::ReportJson) -> Result<()> {
     Ok(())
 }
 
-async fn run_real(config: &str, yes: bool) -> Result<()> {
+async fn run_real(config: &str, fixture_id: Option<&str>, yes: bool) -> Result<()> {
     let cfg = RunConfig::from_yaml_path(config)?;
     if cfg.run.network.is_real_money() && cfg.run.safety.require_confirmation && !yes {
         bail!(
@@ -177,15 +212,24 @@ async fn run_real(config: &str, yes: bool) -> Result<()> {
         .resolve_rpc_url()?
         .context("a real run needs an RPC URL (rpc_url or rpc_url_env)")?;
     let funder_wallet = wallet::load_funder(&cfg.run.funder, cfg.run.network)?;
-    let funder = wallet::MainnetFunder {
+    let mainnet_funder = wallet::MainnetFunder {
         rpc_url: rpc_url.clone(),
         funder: funder_wallet.clone(),
+    };
+    let fixture_funder = wallet::FixtureFunder;
+    if let Some(id) = fixture_id {
+        fixtures::validate_ready_fixture(id, &cfg, &funder_wallet)?;
+    }
+    let funder: &dyn wallet::Funder = if fixture_id.is_some() {
+        &fixture_funder
+    } else {
+        &mainnet_funder
     };
     let scheme = scheme::build(&cfg);
 
     let run_id = journal::new_run_id(&cfg.run.name, &chrono::Utc::now());
     let mut jrnl = Journal::create(
-        run_id,
+        run_id.clone(),
         cfg.run.name.clone(),
         cfg.run.scheme,
         cfg.run.network,
@@ -195,8 +239,9 @@ async fn run_real(config: &str, yes: bool) -> Result<()> {
     let report = engine::run_pipeline(engine::PipelineParams {
         config: &cfg,
         scheme: scheme.as_ref(),
-        funder: &funder,
+        funder,
         funder_seed: funder_wallet.seed(),
+        wallet_set_id: fixture_id.unwrap_or(&run_id),
         rpc_url,
         host_override: None,
         journal: &mut jrnl,

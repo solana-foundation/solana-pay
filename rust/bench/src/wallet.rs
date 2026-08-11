@@ -242,6 +242,31 @@ impl Funder for NoopFunder {
     }
 }
 
+/// Fixture funder: setup has already created and funded deterministic wallets.
+/// The load pipeline must neither re-fund them nor sweep them; `bench teardown`
+/// owns that lifecycle and closes the ATAs after all reruns are finished.
+pub struct FixtureFunder;
+
+#[async_trait]
+impl Funder for FixtureFunder {
+    async fn fund(
+        &self,
+        _user: &Pubkey,
+        _sol_lamports: u64,
+        _token: Option<(&Pubkey, u64)>,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    async fn sweep(&self, _user: &Wallet, _mint: Option<&Pubkey>) -> Result<SweepResult> {
+        Ok(SweepResult::default())
+    }
+
+    fn kind(&self) -> &'static str {
+        "fixture"
+    }
+}
+
 /// Convert a canonical `solana_pubkey::Pubkey` into surfpool's `Pubkey` type via
 /// its string form, so a version skew between the two crates can't bite us.
 fn sp_pubkey(pk: &Pubkey) -> Result<surfpool_sdk::Pubkey> {

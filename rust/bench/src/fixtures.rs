@@ -1,0 +1,729 @@
+//! Reusable public-cluster fixture provisioning.
+//!
+//! A fixture derives every test wallet from one funder seed plus a stable
+//! setup ID. `setup` is safe to resume because it reconciles each derived ATA
+//! to its requested balance before transferring the difference; `teardown`
+//! re-derives the same wallets, returns their tokens, and closes their ATAs so
+//! the funder recovers rent.
+
+use std::str::FromStr;
+
+use anyhow::{Context, Result, bail, ensure};
+use pay_kit::mpp::solana_keychain::{SolanaSigner, memory::MemorySigner};
+use pay_kit::mpp::solana_rpc_client::rpc_client::RpcClient;
+use serde::Deserialize;
+use solana_instruction::Instruction;
+use solana_message::Message;
+use solana_program_pack::Pack;
+use solana_pubkey::Pubkey;
+use solana_signature::Signature;
+use solana_system_interface::instruction as system_instruction;
+use solana_transaction::Transaction;
+use spl_token_2022_interface::instruction as token_instruction;
+use spl_token_2022_interface::state::Account as TokenAccount;
+
+use crate::config::{FunderCfg, Network, RunConfig};
+use crate::journal::{FixtureAsset, FixtureJournal, FixturePhase, FixtureState};
+use crate::wallet::{Wallet, derive_user, load_funder};
+
+/// A conservative public-cluster transaction-fee allowance for each setup
+/// transaction. Actual fees are RPC-controlled, so this is a preflight floor,
+/// not a fee quote.
+const SETUP_FEE_ALLOWANCE_LAMPORTS: u64 = 10_000;
+
+/// A standalone YAML file purpose-built for setup/teardown. It is deliberately
+/// separate from the request-load config: fixture allocation is an explicit,
+/// reviewable spend plan rather than an incidental side effect of load shape.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SetupConfig {
+    pub setup: SetupMeta,
+    pub assets: Vec<AssetConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SetupMeta {
+    pub name: String,
+    pub network: Network,
+    #[serde(default)]
+    pub rpc_url_env: Option<String>,
+    #[serde(default)]
+    pub rpc_url: Option<String>,
+    #[serde(default)]
+    pub funder: FunderCfg,
+    pub users: usize,
+    #[serde(default)]
+    pub sol_lamports_per_user: u64,
+    /// Hard ceiling for the SOL allocation plus estimated ATA rent. This is
+    /// checked before the first transaction is submitted.
+    pub max_total_sol: f64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AssetConfig {
+    /// Human label shown in progress and stored in the fixture journal.
+    pub label: String,
+    /// Explicit mint; never silently substitute a mainnet mint on devnet.
+    pub mint: String,
+    /// SPL Token or Token-2022 program owning the mint.
+    pub token_program: String,
+    pub decimals: u8,
+    /// Exact human amount allocated to each derived wallet, e.g. `"0.01"`.
+    pub amount_per_user: String,
+    /// Per-asset hard ceiling, expressed with the same decimal precision.
+    pub max_total_amount: String,
+}
+
+impl SetupConfig {
+    pub fn from_yaml_path(path: &str) -> Result<Self> {
+        let raw = std::fs::read_to_string(path).with_context(|| format!("reading {path}"))?;
+        let cfg: Self = serde_yml::from_str(&raw).with_context(|| format!("parsing {path}"))?;
+        cfg.validate()?;
+        Ok(cfg)
+    }
+
+    fn validate(&self) -> Result<()> {
+        ensure!(self.setup.users > 0, "setup.users must be > 0");
+        ensure!(
+            self.setup.max_total_sol >= 0.0,
+            "setup.max_total_sol must be >= 0"
+        );
+        ensure!(!self.assets.is_empty(), "at least one asset is required");
+        ensure!(
+            self.setup.network != Network::Fork,
+            "fixture setup requires devnet or mainnet; use `bench rehearse` for a fork"
+        );
+        for asset in &self.assets {
+            ensure!(
+                !asset.label.trim().is_empty(),
+                "asset.label cannot be empty"
+            );
+            Pubkey::from_str(&asset.mint)
+                .with_context(|| format!("asset `{}` has an invalid mint", asset.label))?;
+            Pubkey::from_str(&asset.token_program)
+                .with_context(|| format!("asset `{}` has an invalid token_program", asset.label))?;
+            let amount = decimal_to_base(&asset.amount_per_user, asset.decimals)?;
+            let cap = decimal_to_base(&asset.max_total_amount, asset.decimals)?;
+            let total = amount
+                .checked_mul(self.setup.users as u64)
+                .context("asset total overflow")?;
+            ensure!(
+                total <= cap,
+                "asset `{}` needs {} base units, exceeding max_total_amount `{}`",
+                asset.label,
+                total,
+                asset.max_total_amount
+            );
+        }
+        Ok(())
+    }
+
+    fn resolve_rpc_url(&self) -> Result<String> {
+        if let Some(url) = &self.setup.rpc_url {
+            return Ok(url.clone());
+        }
+        let var = self
+            .setup
+            .rpc_url_env
+            .as_ref()
+            .context("setup needs rpc_url or rpc_url_env")?;
+        std::env::var(var).with_context(|| format!("rpc_url_env `{var}` is not set"))
+    }
+
+    fn journal_assets(&self) -> Result<Vec<FixtureAsset>> {
+        self.assets
+            .iter()
+            .map(|asset| {
+                Ok(FixtureAsset {
+                    label: asset.label.clone(),
+                    mint: asset.mint.clone(),
+                    token_program: asset.token_program.clone(),
+                    decimals: asset.decimals,
+                    amount_base: decimal_to_base(&asset.amount_per_user, asset.decimals)?,
+                })
+            })
+            .collect()
+    }
+}
+
+/// Create or resume a deterministic fixture set.
+pub async fn setup(config_path: &str, id: Option<&str>, yes: bool) -> Result<()> {
+    let config = SetupConfig::from_yaml_path(config_path)?;
+    require_confirmation(yes, "setup")?;
+    let rpc_url = config.resolve_rpc_url()?;
+    let funder = load_funder(&config.setup.funder, config.setup.network)?;
+    let setup_id = id
+        .map(str::to_owned)
+        .unwrap_or_else(|| new_setup_id(&config.setup.name));
+    validate_setup_id(&setup_id)?;
+    let assets = config.journal_assets()?;
+
+    let mut journal = if FixtureJournal::exists(&setup_id)? {
+        let existing = FixtureJournal::load(&setup_id)?;
+        ensure_same_fixture(existing.state(), &config, &funder, &assets)?;
+        existing
+    } else {
+        let now = chrono::Utc::now().to_rfc3339();
+        FixtureJournal::create(FixtureState {
+            setup_id: setup_id.clone(),
+            name: config.setup.name.clone(),
+            network: config.setup.network,
+            funder_pubkey: funder.pubkey.to_string(),
+            users: config.setup.users,
+            sol_lamports_per_user: config.setup.sol_lamports_per_user,
+            assets: assets.clone(),
+            phase: FixturePhase::SettingUp,
+            next_user: 0,
+            created_at: now.clone(),
+            updated_at: now,
+        })?
+    };
+
+    ensure!(
+        journal.state().phase != FixturePhase::TornDown,
+        "fixture `{setup_id}` was torn down; choose a new --id to derive a fresh set"
+    );
+    ensure!(
+        journal.state().phase != FixturePhase::TearingDown,
+        "fixture `{setup_id}` is being torn down; finish teardown before setting it up again"
+    );
+    if journal.state().phase == FixturePhase::Ready {
+        println!("fixture `{setup_id}` is already ready; use teardown when the load test is done");
+        return Ok(());
+    }
+
+    let ata_rent = rpc_minimum_ata_rent(&rpc_url).await?;
+    let minimum_sol = enforce_sol_cap(&config, assets.len(), ata_rent)?;
+    verify_funder_sol_balance(&rpc_url, &funder, minimum_sol).await?;
+    ensure_funder_atas(&rpc_url, &funder, &assets).await?;
+    verify_funder_balances(&rpc_url, &funder, &assets, config.setup.users).await?;
+
+    journal.set_phase(FixturePhase::SettingUp)?;
+    let seed = funder.seed();
+    let start = journal.state().next_user;
+    for index in start..config.setup.users {
+        let user = derive_user(&seed, &setup_id, index as u32);
+        reconcile_setup_user(
+            &rpc_url,
+            &funder,
+            &user,
+            config.setup.sol_lamports_per_user,
+            &assets,
+        )
+        .await
+        .with_context(|| format!("setting up user {index}"))?;
+        journal.checkpoint(index + 1)?;
+        if (index + 1) % 100 == 0 || index + 1 == config.setup.users {
+            tracing::info!(
+                setup_id,
+                completed = index + 1,
+                users = config.setup.users,
+                "fixture setup progress"
+            );
+        }
+    }
+    journal.set_phase(FixturePhase::Ready)?;
+    println!(
+        "fixture `{setup_id}` ready: {} deterministic wallets × {} token account(s)",
+        config.setup.users,
+        assets.len()
+    );
+    Ok(())
+}
+
+/// Reclaim every fixture balance and close every derived ATA to return rent to
+/// the funder. The same `setup_id` makes the user signing keys recoverable.
+pub async fn teardown(setup_id: &str, config_path: &str, yes: bool) -> Result<()> {
+    require_confirmation(yes, "teardown")?;
+    validate_setup_id(setup_id)?;
+    let mut journal = FixtureJournal::load(setup_id)?;
+    ensure!(
+        journal.state().phase != FixturePhase::TornDown,
+        "fixture `{setup_id}` is already torn down"
+    );
+    let config = SetupConfig::from_yaml_path(config_path)?;
+    let rpc_url = config.resolve_rpc_url()?;
+    let funder = load_funder(&config.setup.funder, journal.state().network)
+        .context("teardown must use the same funder configured for setup")?;
+    ensure_same_fixture(journal.state(), &config, &funder, &config.journal_assets()?)?;
+    ensure!(
+        funder.pubkey.to_string() == journal.state().funder_pubkey,
+        "BENCH_FUNDER_KEYPAIR does not match fixture `{setup_id}`'s funder"
+    );
+
+    ensure_funder_atas(&rpc_url, &funder, &journal.state().assets).await?;
+    if journal.state().phase != FixturePhase::TearingDown {
+        journal.set_phase(FixturePhase::TearingDown)?;
+        journal.checkpoint(0)?;
+    }
+    let seed = funder.seed();
+    let start = journal.state().next_user.min(journal.state().users);
+    for index in start..journal.state().users {
+        let user = derive_user(&seed, setup_id, index as u32);
+        reconcile_teardown_user(&rpc_url, &funder, &user, &journal.state().assets)
+            .await
+            .with_context(|| format!("tearing down user {index}"))?;
+        journal.checkpoint(index + 1)?;
+        if (index + 1) % 100 == 0 || index + 1 == journal.state().users {
+            tracing::info!(
+                setup_id,
+                completed = index + 1,
+                users = journal.state().users,
+                "fixture teardown progress"
+            );
+        }
+    }
+    journal.set_phase(FixturePhase::TornDown)?;
+    println!("fixture `{setup_id}` torn down; token accounts closed and rent reclaimed");
+    Ok(())
+}
+
+/// Ensure a load run points at a completed fixture made by the same funder and
+/// network. The fixture amounts remain deliberately independent from the load
+/// config: the session challenge determines the actual required deposit.
+pub fn validate_ready_fixture(setup_id: &str, run: &RunConfig, funder: &Wallet) -> Result<()> {
+    let fixture = FixtureJournal::load(setup_id)?;
+    ensure!(
+        fixture.state().phase == FixturePhase::Ready,
+        "fixture `{setup_id}` is not ready; run `bench setup ... --id {setup_id} --yes` first"
+    );
+    ensure!(
+        fixture.state().network == run.run.network,
+        "fixture `{setup_id}` targets {:?}, but the load config targets {:?}",
+        fixture.state().network,
+        run.run.network
+    );
+    ensure!(
+        fixture.state().funder_pubkey == funder.pubkey.to_string(),
+        "fixture `{setup_id}` belongs to a different funder"
+    );
+    ensure!(
+        fixture.state().users >= run.load.users,
+        "fixture `{setup_id}` has {} wallets but the load requests {} users",
+        fixture.state().users,
+        run.load.users
+    );
+    Ok(())
+}
+
+fn require_confirmation(yes: bool, operation: &str) -> Result<()> {
+    if yes {
+        return Ok(());
+    }
+    bail!(
+        "fixture {operation} submits transactions; re-run with --yes after reviewing the YAML caps"
+    )
+}
+
+fn validate_setup_id(id: &str) -> Result<()> {
+    ensure!(!id.is_empty(), "setup ID cannot be empty");
+    ensure!(
+        id.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'),
+        "setup ID may contain only letters, digits, `-`, and `_`"
+    );
+    Ok(())
+}
+
+fn new_setup_id(name: &str) -> String {
+    let slug: String = name
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+    format!("{slug}-{}", chrono::Utc::now().format("%Y%m%dT%H%M%SZ"))
+}
+
+fn ensure_same_fixture(
+    state: &FixtureState,
+    config: &SetupConfig,
+    funder: &Wallet,
+    assets: &[FixtureAsset],
+) -> Result<()> {
+    ensure!(
+        state.name == config.setup.name,
+        "existing fixture name does not match config"
+    );
+    ensure!(
+        state.network == config.setup.network,
+        "existing fixture network does not match config"
+    );
+    ensure!(
+        state.funder_pubkey == funder.pubkey.to_string(),
+        "existing fixture uses another funder"
+    );
+    ensure!(
+        state.users == config.setup.users,
+        "existing fixture user count does not match config"
+    );
+    ensure!(
+        state.sol_lamports_per_user == config.setup.sol_lamports_per_user,
+        "existing fixture SOL allocation does not match config"
+    );
+    ensure!(
+        state.assets == assets,
+        "existing fixture assets do not match config"
+    );
+    Ok(())
+}
+
+fn enforce_sol_cap(config: &SetupConfig, asset_count: usize, ata_rent: u64) -> Result<u64> {
+    let users = config.setup.users as u128;
+    let per_user = u128::from(config.setup.sol_lamports_per_user)
+        .checked_add(u128::from(ata_rent) * asset_count as u128)
+        .and_then(|total| total.checked_add(u128::from(SETUP_FEE_ALLOWANCE_LAMPORTS)))
+        .context("SOL allocation overflow")?;
+    let estimated_lamports = per_user
+        .checked_mul(users)
+        .context("SOL allocation overflow")?;
+    let estimated = estimated_lamports as f64 / 1_000_000_000.0;
+    ensure!(
+        estimated <= config.setup.max_total_sol,
+        "fixture estimates {estimated:.4} SOL (allocation + ATA rent), exceeding setup.max_total_sol={:.4}",
+        config.setup.max_total_sol
+    );
+    tracing::info!(
+        estimated_sol = estimated,
+        ata_rent_lamports = ata_rent,
+        "fixture plan within SOL cap"
+    );
+    u64::try_from(estimated_lamports).context("fixture SOL allocation exceeds u64")
+}
+
+async fn verify_funder_sol_balance(rpc_url: &str, funder: &Wallet, minimum: u64) -> Result<()> {
+    let available = rpc_balance(rpc_url, &funder.pubkey).await?;
+    ensure!(
+        available >= minimum,
+        "funder has {available} lamports; fixture needs at least {minimum} for allocations, ATA rent, and fee allowance"
+    );
+    Ok(())
+}
+
+async fn ensure_funder_atas(rpc_url: &str, funder: &Wallet, assets: &[FixtureAsset]) -> Result<()> {
+    let instructions = assets
+        .iter()
+        .map(|asset| create_ata_ix(&funder.pubkey, &funder.pubkey, asset))
+        .collect::<Result<Vec<_>>>()?;
+    send_transaction(rpc_url, funder, None, instructions).await?;
+    Ok(())
+}
+
+async fn verify_funder_balances(
+    rpc_url: &str,
+    funder: &Wallet,
+    assets: &[FixtureAsset],
+    users: usize,
+) -> Result<()> {
+    for asset in assets {
+        let ata = associated_token_address(&funder.pubkey, asset)?;
+        let available = token_balance(rpc_url, &ata).await?.context(
+            "funder ATA missing after idempotent creation; check the configured token program",
+        )?;
+        let needed = asset
+            .amount_base
+            .checked_mul(users as u64)
+            .context("asset funding total overflow")?;
+        ensure!(
+            available >= needed,
+            "funder {} ATA has {available} base units; fixture needs {needed}. Fund it before setup.",
+            asset.label
+        );
+    }
+    Ok(())
+}
+
+async fn reconcile_setup_user(
+    rpc_url: &str,
+    funder: &Wallet,
+    user: &Wallet,
+    sol_lamports: u64,
+    assets: &[FixtureAsset],
+) -> Result<()> {
+    let mut instructions = Vec::new();
+    let current_sol = rpc_balance(rpc_url, &user.pubkey).await?;
+    if current_sol < sol_lamports {
+        instructions.push(system_instruction::transfer(
+            &funder.pubkey,
+            &user.pubkey,
+            sol_lamports - current_sol,
+        ));
+    }
+    for asset in assets {
+        let user_ata = associated_token_address(&user.pubkey, asset)?;
+        let current = token_balance(rpc_url, &user_ata).await?;
+        let current_amount = current.unwrap_or(0);
+        ensure!(
+            current_amount <= asset.amount_base,
+            "derived wallet {} already has {} {} base units (fixture target is {}); refuse to mix funds",
+            user.pubkey,
+            current_amount,
+            asset.label,
+            asset.amount_base
+        );
+        if current.is_none() {
+            instructions.push(create_ata_ix(&funder.pubkey, &user.pubkey, asset)?);
+        }
+        if current_amount < asset.amount_base {
+            let funder_ata = associated_token_address(&funder.pubkey, asset)?;
+            if current.is_some() {
+                instructions.push(create_ata_ix(&funder.pubkey, &user.pubkey, asset)?);
+            }
+            instructions.push(
+                token_instruction::transfer_checked(
+                    &token_program(asset)?,
+                    &funder_ata,
+                    &mint(asset)?,
+                    &user_ata,
+                    &funder.pubkey,
+                    &[],
+                    asset.amount_base - current_amount,
+                    asset.decimals,
+                )
+                .map_err(|error| anyhow::anyhow!("building {} transfer: {error}", asset.label))?,
+            );
+        }
+    }
+    send_transaction(rpc_url, funder, None, instructions).await?;
+    Ok(())
+}
+
+async fn reconcile_teardown_user(
+    rpc_url: &str,
+    funder: &Wallet,
+    user: &Wallet,
+    assets: &[FixtureAsset],
+) -> Result<()> {
+    let mut instructions = Vec::new();
+    for asset in assets {
+        let user_ata = associated_token_address(&user.pubkey, asset)?;
+        let Some(balance) = token_balance(rpc_url, &user_ata).await? else {
+            continue;
+        };
+        let funder_ata = associated_token_address(&funder.pubkey, asset)?;
+        if balance > 0 {
+            instructions.push(
+                token_instruction::transfer_checked(
+                    &token_program(asset)?,
+                    &user_ata,
+                    &mint(asset)?,
+                    &funder_ata,
+                    &user.pubkey,
+                    &[],
+                    balance,
+                    asset.decimals,
+                )
+                .map_err(|error| {
+                    anyhow::anyhow!("building {} recovery transfer: {error}", asset.label)
+                })?,
+            );
+        }
+        instructions.push(
+            token_instruction::close_account(
+                &token_program(asset)?,
+                &user_ata,
+                &funder.pubkey,
+                &user.pubkey,
+                &[],
+            )
+            .map_err(|error| anyhow::anyhow!("building {} ATA close: {error}", asset.label))?,
+        );
+    }
+    let sol = rpc_balance(rpc_url, &user.pubkey).await?;
+    if sol > 0 {
+        instructions.push(system_instruction::transfer(
+            &user.pubkey,
+            &funder.pubkey,
+            sol,
+        ));
+    }
+    send_transaction(rpc_url, funder, Some(user), instructions).await?;
+    Ok(())
+}
+
+fn create_ata_ix(payer: &Pubkey, owner: &Pubkey, asset: &FixtureAsset) -> Result<Instruction> {
+    Ok(
+        pay_kit::mpp::program::payment_channels::build_create_associated_token_account_instruction(
+            payer,
+            owner,
+            &mint(asset)?,
+            &token_program(asset)?,
+        ),
+    )
+}
+
+fn associated_token_address(owner: &Pubkey, asset: &FixtureAsset) -> Result<Pubkey> {
+    let (ata, _) = pay_kit::mpp::program::payment_channels::find_associated_token_address(
+        owner,
+        &mint(asset)?,
+        &token_program(asset)?,
+    );
+    Ok(ata)
+}
+
+fn mint(asset: &FixtureAsset) -> Result<Pubkey> {
+    asset
+        .mint
+        .parse()
+        .with_context(|| format!("invalid {} mint in fixture journal", asset.label))
+}
+
+fn token_program(asset: &FixtureAsset) -> Result<Pubkey> {
+    asset
+        .token_program
+        .parse()
+        .with_context(|| format!("invalid {} token program in fixture journal", asset.label))
+}
+
+async fn rpc_minimum_ata_rent(rpc_url: &str) -> Result<u64> {
+    let url = rpc_url.to_string();
+    tokio::task::spawn_blocking(move || {
+        RpcClient::new(url)
+            .get_minimum_balance_for_rent_exemption(TokenAccount::LEN)
+            .context("fetching minimum ATA rent")
+    })
+    .await
+    .context("joining ATA rent RPC task")?
+}
+
+async fn rpc_balance(rpc_url: &str, address: &Pubkey) -> Result<u64> {
+    let url = rpc_url.to_string();
+    let address = *address;
+    tokio::task::spawn_blocking(move || {
+        RpcClient::new(url)
+            .get_balance(&address)
+            .context("fetching SOL balance")
+    })
+    .await
+    .context("joining SOL balance RPC task")?
+}
+
+async fn token_balance(rpc_url: &str, address: &Pubkey) -> Result<Option<u64>> {
+    let url = rpc_url.to_string();
+    let address = *address;
+    tokio::task::spawn_blocking(move || {
+        let rpc = RpcClient::new(url);
+        let account = rpc
+            .get_multiple_accounts(&[address])
+            .context("fetching token account")?
+            .into_iter()
+            .next()
+            .flatten();
+        match account {
+            Some(account) => TokenAccount::unpack(&account.data)
+                .map(|account| Some(account.amount))
+                .context("decoding token account"),
+            None => Ok(None),
+        }
+    })
+    .await
+    .context("joining token balance RPC task")?
+}
+
+async fn send_transaction(
+    rpc_url: &str,
+    fee_payer: &Wallet,
+    additional_signer: Option<&Wallet>,
+    instructions: Vec<Instruction>,
+) -> Result<()> {
+    if instructions.is_empty() {
+        return Ok(());
+    }
+    let url = rpc_url.to_string();
+    let blockhash = tokio::task::spawn_blocking({
+        let url = url.clone();
+        move || {
+            RpcClient::new(url)
+                .get_latest_blockhash()
+                .context("fetching recent blockhash")
+        }
+    })
+    .await
+    .context("joining blockhash RPC task")??;
+    let message = Message::new_with_blockhash(&instructions, Some(&fee_payer.pubkey), &blockhash);
+    let mut transaction = Transaction::new_unsigned(message);
+    sign_transaction(&mut transaction, fee_payer).await?;
+    if let Some(signer) = additional_signer
+        && signer.pubkey != fee_payer.pubkey
+    {
+        sign_transaction(&mut transaction, signer).await?;
+    }
+    let serialized = bincode::serialize(&transaction).context("serializing fixture transaction")?;
+    tokio::task::spawn_blocking(move || {
+        let transaction: Transaction =
+            bincode::deserialize(&serialized).context("deserializing fixture transaction")?;
+        RpcClient::new(url)
+            .send_and_confirm_transaction(&transaction)
+            .context("broadcasting fixture transaction")
+    })
+    .await
+    .context("joining broadcast RPC task")??;
+    Ok(())
+}
+
+async fn sign_transaction(transaction: &mut Transaction, wallet: &Wallet) -> Result<()> {
+    let signer =
+        MemorySigner::from_bytes(&wallet.keypair).context("loading derived wallet signer")?;
+    let signature = signer
+        .sign_message(&transaction.message_data())
+        .await
+        .context("signing fixture transaction")?;
+    let index = transaction
+        .message
+        .account_keys
+        .iter()
+        .position(|key| *key == wallet.pubkey)
+        .context("fixture signer is absent from transaction")?;
+    transaction.signatures[index] = Signature::from(<[u8; 64]>::from(signature));
+    Ok(())
+}
+
+fn decimal_to_base(value: &str, decimals: u8) -> Result<u64> {
+    let value = value.trim();
+    ensure!(!value.is_empty(), "token amount cannot be empty");
+    ensure!(!value.starts_with('-'), "token amount cannot be negative");
+    let (whole, fraction) = value.split_once('.').unwrap_or((value, ""));
+    ensure!(
+        whole.chars().all(|c| c.is_ascii_digit()) && fraction.chars().all(|c| c.is_ascii_digit()),
+        "token amount `{value}` must be a decimal number"
+    );
+    ensure!(
+        fraction.len() <= usize::from(decimals),
+        "token amount `{value}` has more than {decimals} decimal places"
+    );
+    let whole = whole.parse::<u64>().context("token amount is too large")?;
+    let scale = 10u64.pow(u32::from(decimals));
+    let fraction = if fraction.is_empty() {
+        0
+    } else {
+        let padded = format!("{fraction:0<width$}", width = usize::from(decimals));
+        padded
+            .parse::<u64>()
+            .context("token fraction is too large")?
+    };
+    whole
+        .checked_mul(scale)
+        .and_then(|base| base.checked_add(fraction))
+        .context("token amount overflows base units")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{SetupConfig, decimal_to_base};
+
+    #[test]
+    fn decimal_amounts_are_exact() {
+        assert_eq!(decimal_to_base("0.000001", 6).unwrap(), 1);
+        assert_eq!(decimal_to_base("1.25", 6).unwrap(), 1_250_000);
+        assert_eq!(decimal_to_base("2", 6).unwrap(), 2_000_000);
+        assert!(decimal_to_base("0.0000001", 6).is_err());
+        assert!(decimal_to_base("-1", 6).is_err());
+    }
+
+    #[test]
+    fn bundled_devnet_fixture_is_within_its_caps() {
+        let config: SetupConfig =
+            serde_yml::from_str(include_str!("../configs/devnet-fixture-100k.yml")).unwrap();
+        config.validate().unwrap();
+    }
+}

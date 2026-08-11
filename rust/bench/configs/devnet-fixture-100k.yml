@@ -1,0 +1,35 @@
+# Reusable deterministic wallet fixture for the public devnet Pingora gate.
+#
+# This is a spend plan, not a load profile. `bench setup --id devnet-100k`
+# derives every wallet from BENCH_FUNDER_KEYPAIR + the stable ID, so a later
+# `bench teardown devnet-100k` can close the exact same ATAs and reclaim rent.
+setup:
+  name: devnet-100k
+  network: devnet
+  rpc_url_env: BENCH_DEVNET_RPC_URL
+  funder:
+    keypair_env: BENCH_FUNDER_KEYPAIR
+  users: 100000
+  # Enough SOL for the payer side of a real payment-channel open; ATA rent is
+  # separately estimated and included in max_total_sol before setup begins.
+  sol_lamports_per_user: 5000000
+  max_total_sol: 1000.0
+
+assets:
+  # Canonical devnet USDC. 0.01 × 100,000 means the funder needs 1,000 USDC.
+  - label: USDC
+    mint: 4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU
+    token_program: TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA
+    decimals: 6
+    amount_per_user: "0.01"
+    max_total_amount: "1000"
+
+  # Add the specific devnet USDT mint you control here. PayKit intentionally
+  # does not substitute mainnet USDT on devnet, so this must be a real devnet
+  # mint and its token program/decimals must match on-chain.
+  # - label: USDT
+  #   mint: <devnet-usdt-mint>
+  #   token_program: TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA
+  #   decimals: 6
+  #   amount_per_user: "0.01"
+  #   max_total_amount: "1000"

@@ -26,6 +26,9 @@ pub struct PipelineParams<'a> {
     pub scheme: &'a dyn BenchScheme,
     pub funder: &'a dyn Funder,
     pub funder_seed: [u8; 32],
+    /// Wallet derivation namespace. Usually the run ID; a prepared fixture
+    /// supplies its stable setup ID so load runs reuse pre-provisioned wallets.
+    pub wallet_set_id: &'a str,
     pub rpc_url: String,
     /// Forced `Host` header (rehearsal proxy). `None` on mainnet.
     pub host_override: Option<String>,
@@ -90,7 +93,7 @@ pub async fn run_pipeline(p: PipelineParams<'_>) -> Result<ReportJson> {
     let ctxs: Vec<UserCtx> = (0..load.users as u32)
         .map(|i| UserCtx {
             index: i,
-            wallet: wallet::derive_user(&p.funder_seed, &run_id, i),
+            wallet: wallet::derive_user(&p.funder_seed, p.wallet_set_id, i),
             rpc_url: p.rpc_url.clone(),
             endpoint: endpoint.clone(),
             http: prep_http.clone(),

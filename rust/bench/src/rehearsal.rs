@@ -252,7 +252,7 @@ async fn drive(
     let scheme = scheme::build(cfg);
     let run_id = journal::new_run_id(&cfg.run.name, &chrono::Utc::now());
     let mut jrnl = Journal::create(
-        run_id,
+        run_id.clone(),
         cfg.run.name.clone(),
         cfg.run.scheme,
         Network::Fork,
@@ -263,6 +263,7 @@ async fn drive(
         scheme: scheme.as_ref(),
         funder,
         funder_seed: funder_wallet.seed(),
+        wallet_set_id: &run_id,
         rpc_url,
         host_override: Some(HOST_HEADER.to_string()),
         journal: &mut jrnl,
