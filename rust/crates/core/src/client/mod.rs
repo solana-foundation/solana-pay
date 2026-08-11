@@ -8,5 +8,6 @@ pub mod runner;
 pub mod sandbox;
 pub mod send;
 pub mod session;
+pub mod session_manager;
 pub mod subscription;
 pub mod x402;

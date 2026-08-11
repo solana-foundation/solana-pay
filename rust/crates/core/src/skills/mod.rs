@@ -200,6 +200,13 @@ pub struct RankedServiceSummary {
     pub service: ServiceSummary,
     pub score: u32,
     pub reasons: Vec<String>,
+    /// Whether this candidate clearly fits the query (whole-query hit on
+    /// name/title/use-case/description/endpoint, ≥75% of query terms
+    /// matched, or a name/title term hit with ≥50% coverage). Term-overlap
+    /// noise — shared catalog namespaces, substring coincidences — never
+    /// sets this, so "no strong candidate" is the catalog-miss signal for
+    /// the capability-request path.
+    pub strong: bool,
 }
 
 /// Level 2 result: a resource group returned by [`service_detail`].
@@ -397,6 +404,7 @@ pub fn search_services_ranked(
     let terms = tokenize_query(query);
     let query_lower = query.trim().to_lowercase();
     let limit = limit.clamp(1, 20);
+    let namespace_orgs = namespace_orgs(catalog);
 
     let mut ranked: Vec<RankedServiceSummary> = catalog
         .providers
@@ -407,7 +415,8 @@ pub fn search_services_ranked(
                 .unwrap_or(true)
         })
         .filter_map(|svc| {
-            let (score, reasons) = score_service_for_query(svc, &query_lower, &terms);
+            let (score, reasons, strong) =
+                score_service_for_query(svc, &query_lower, &terms, &namespace_orgs);
             if score == 0 {
                 return None;
             }
@@ -415,6 +424,7 @@ pub fn search_services_ranked(
                 service: summarize_service(svc),
                 score,
                 reasons,
+                strong,
             })
         })
         .collect();
@@ -427,6 +437,28 @@ pub fn search_services_ranked(
     });
     ranked.truncate(limit);
     ranked
+}
+
+/// Query-specificity floor for the weak-results half of
+/// [`is_catalog_miss`]: with fewer meaningful terms the query is too vague
+/// to distinguish "the catalog lacks this" from "the phrasing matched
+/// poorly", and the capability-request prompt would fire on ordinary fuzzy
+/// searches.
+const SPECIFIC_QUERY_TERMS: usize = 4;
+
+/// Whether a ranked search outcome counts as a catalog miss for the
+/// capability-request flow: a hard miss (nothing matched at all), or a
+/// specific query (>= [`SPECIFIC_QUERY_TERMS`] meaningful terms) that
+/// produced only weak keyword noise. Measured on the 900-case routing
+/// fixture (`pay-mcp` bench): never fires when a strong candidate exists,
+/// ~6% of vague covered prompts hard-miss and ~4% of specific covered
+/// prompts are weak-only — each false fire costs one declined elicitation,
+/// not a submission.
+pub fn is_catalog_miss(query: &str, ranked: &[RankedServiceSummary]) -> bool {
+    if ranked.is_empty() {
+        return true;
+    }
+    !ranked.iter().any(|r| r.strong) && tokenize_query(query).len() >= SPECIFIC_QUERY_TERMS
 }
 
 fn tokenize_query(query: &str) -> Vec<String> {
@@ -498,11 +530,32 @@ fn tokenize_query(query: &str) -> Vec<String> {
         .collect()
 }
 
+/// Catalog org prefixes shared by 3+ providers. A curation namespace like
+/// `solana-foundation/` appears on dozens of unrelated providers, so a query
+/// term matching only that prefix carries no information about the provider
+/// (the classic failure: "solana …" matched every curated entry, surfacing
+/// an air-quality API for a priority-fee query). A brand org that fronts one
+/// or two providers (`quicknode/`, `vybenetwork/`) stays matchable.
+fn namespace_orgs(catalog: &Catalog) -> std::collections::HashSet<String> {
+    let mut counts: std::collections::HashMap<&str, u32> = std::collections::HashMap::new();
+    for svc in &catalog.providers {
+        if let Some((org, _)) = svc.fqn.split_once('/') {
+            *counts.entry(org).or_default() += 1;
+        }
+    }
+    counts
+        .into_iter()
+        .filter(|(_, n)| *n >= 3)
+        .map(|(org, _)| org.to_lowercase())
+        .collect()
+}
+
 fn score_service_for_query(
     svc: &Service,
     query_lower: &str,
     terms: &[String],
-) -> (u32, Vec<String>) {
+    namespace_orgs: &std::collections::HashSet<String>,
+) -> (u32, Vec<String>, bool) {
     let mut score = 0u32;
     let mut reasons = Vec::new();
 
@@ -513,35 +566,51 @@ fn score_service_for_query(
     let use_case = svc.meta.use_case.clone().unwrap_or_default().to_lowercase();
     let category = svc.meta.category.to_lowercase();
 
+    // Term matching sees the fqn without a shared curation namespace; the
+    // whole-query checks below keep the full fqn (an exact ask for a
+    // namespaced provider should still hit).
+    let fqn_for_terms = match fqn.split_once('/') {
+        Some((org, rest)) if namespace_orgs.contains(org) => rest,
+        _ => fqn.as_str(),
+    };
+
+    let mut whole_query_hit = false;
     if !query_lower.is_empty() {
         if fqn.contains(query_lower) || short_name.contains(query_lower) {
             score += 90;
+            whole_query_hit = true;
             reasons.push("provider name matches the task".to_string());
         }
         if title.contains(query_lower) {
             score += 80;
+            whole_query_hit = true;
             reasons.push("provider title matches the task".to_string());
         }
         if use_case.contains(query_lower) {
             score += 70;
+            whole_query_hit = true;
             reasons.push("provider use case directly matches the task".to_string());
         }
         if description.contains(query_lower) {
             score += 55;
+            whole_query_hit = true;
             reasons.push("provider description matches the task".to_string());
         }
     }
 
     let mut matched_terms = 0u32;
+    let mut name_term_hit = false;
     for term in terms {
         let mut term_matched = false;
-        if contains_query_term(&fqn, term) || contains_query_term(&short_name, term) {
+        if contains_query_term(fqn_for_terms, term) || contains_query_term(&short_name, term) {
             score += 24;
             term_matched = true;
+            name_term_hit = true;
         }
         if contains_query_term(&title, term) {
             score += 18;
             term_matched = true;
+            name_term_hit = true;
         }
         if contains_query_term(&use_case, term) {
             score += 14;
@@ -564,8 +633,9 @@ fn score_service_for_query(
         }
     }
 
+    let mut coverage = 0u32;
     if !terms.is_empty() {
-        let coverage = matched_terms * 100 / terms.len() as u32;
+        coverage = matched_terms * 100 / terms.len() as u32;
         score += coverage;
         if coverage == 100 {
             reasons.push("all important query terms match this provider".to_string());
@@ -588,15 +658,21 @@ fn score_service_for_query(
         })
     {
         score += 45;
+        whole_query_hit = true;
         reasons.push("a specific endpoint matches the task".to_string());
     }
 
-    if svc.endpoint_count <= 5 {
-        score += 12;
-    } else if svc.endpoint_count <= 20 {
-        score += 6;
-    } else if svc.endpoint_count >= 100 {
-        score = score.saturating_sub(8);
+    // Size adjustment is a tiebreaker between real matches, not evidence:
+    // without the score-gate a zero-match 2-endpoint provider still scored
+    // 12 and showed up as a "candidate" for any query.
+    if score > 0 {
+        if svc.endpoint_count <= 5 {
+            score += 12;
+        } else if svc.endpoint_count <= 20 {
+            score += 6;
+        } else if svc.endpoint_count >= 100 {
+            score = score.saturating_sub(8);
+        }
     }
 
     if is_demo_provider(&fqn, &description) && !query_mentions_demo(query_lower, terms) {
@@ -607,7 +683,19 @@ fn score_service_for_query(
         reasons.push("provider metadata partially matches the task".to_string());
     }
 
-    (score, reasons)
+    // "Clearly fits": the full query appeared somewhere meaningful, most
+    // query terms matched, or a term hit the provider's own name/title
+    // (high signal — the provider is named after the thing) alongside at
+    // least half the terms. Queries carry words a fitting provider
+    // legitimately lacks ("find … in paris"), so 100% coverage is not
+    // required; prose-only matches on a minority of terms ("solana" in a
+    // description) stay weak. Weak candidates are still returned for the
+    // caller to weigh, but they are not evidence the capability exists.
+    let strong = whole_query_hit
+        || (!terms.is_empty() && coverage >= 75)
+        || (name_term_hit && coverage >= 50);
+
+    (score, reasons, strong)
 }
 
 fn endpoint_term_matches(svc: &Service, term: &str) -> bool {
@@ -2504,7 +2592,10 @@ mod tests {
         let cat = catalog_for_provider_routing();
         let results = search_services_ranked(&cat, "find instagram influencers in paris", None, 5);
         assert_eq!(results[0].service.name, "socialintel/influencer-search");
-        assert!(results[0].score > results[1].score);
+        // The broad providers match no query term; the size bonus alone used
+        // to keep them in the list (score 6-12), which is exactly the noise
+        // the score-gate removes.
+        assert_eq!(results.len(), 1);
     }
 
     #[test]
@@ -2540,6 +2631,167 @@ mod tests {
             results[0].service.name,
             "solana-foundation/payment-debugger"
         );
+    }
+
+    /// Reproduces the "solana priority fee forecasts" failure: a curation
+    /// namespace shared by most of the catalog, plus a provider whose name
+    /// only coincidentally overlaps the query ("fee" in "pricefeeds").
+    fn catalog_with_shared_namespace() -> Catalog {
+        let json = r#"{
+            "version": "1",
+            "generated_at": "2026-04-21T00:00:00Z",
+            "base_url": "https://cdn.example.com/v1",
+            "providers": [
+                {
+                    "fqn": "solana-foundation/air-quality",
+                    "title": "Air Quality API",
+                    "description": "Real-time air quality index by location.",
+                    "use_case": "Use for pollution monitoring and AQI lookups.",
+                    "category": "data",
+                    "service_url": "https://air.example.com",
+                    "endpoint_count": 2,
+                    "has_metering": true,
+                    "min_price_usd": 0.01,
+                    "max_price_usd": 0.01,
+                    "sha": "air"
+                },
+                {
+                    "fqn": "solana-foundation/text-to-speech",
+                    "title": "Text to Speech",
+                    "description": "Neural TTS voices.",
+                    "use_case": "Use for speech synthesis and narration.",
+                    "category": "media",
+                    "service_url": "https://tts.example.com",
+                    "endpoint_count": 3,
+                    "has_metering": true,
+                    "min_price_usd": 0.02,
+                    "max_price_usd": 0.2,
+                    "sha": "tts"
+                },
+                {
+                    "fqn": "solana-foundation/fact-check",
+                    "title": "Fact Check",
+                    "description": "Claim verification against fact-check databases.",
+                    "use_case": "Use for verifying claims and misinformation checks.",
+                    "category": "search",
+                    "service_url": "https://facts.example.com",
+                    "endpoint_count": 1,
+                    "has_metering": true,
+                    "min_price_usd": 0.005,
+                    "max_price_usd": 0.005,
+                    "sha": "facts"
+                },
+                {
+                    "fqn": "solana-foundation/pricefeeds",
+                    "title": "Price Feeds",
+                    "description": "Crypto and stock price feeds.",
+                    "use_case": "Use for token prices, stock quotes, and market data.",
+                    "category": "finance",
+                    "service_url": "https://prices.example.com",
+                    "endpoint_count": 4,
+                    "has_metering": true,
+                    "min_price_usd": 0.001,
+                    "max_price_usd": 0.01,
+                    "sha": "prices"
+                },
+                {
+                    "fqn": "quicknode/rpc",
+                    "title": "QuickNode",
+                    "description": "Pay-per-request JSON-RPC access to blockchain networks including Solana.",
+                    "use_case": "Use for raw blockchain RPC methods, Solana getSlot, account reads, transaction submission, and chain data access.",
+                    "category": "compute",
+                    "service_url": "https://quicknode.example.com",
+                    "endpoint_count": 1,
+                    "has_metering": true,
+                    "min_price_usd": 0.01,
+                    "max_price_usd": 0.01,
+                    "sha": "quicknode"
+                }
+            ]
+        }"#;
+        serde_json::from_str(json).unwrap()
+    }
+
+    #[test]
+    fn catalog_miss_fires_on_empty_results() {
+        assert!(is_catalog_miss("watercooling a macbook", &[]));
+    }
+
+    #[test]
+    fn catalog_miss_fires_on_specific_query_with_only_weak_matches() {
+        let cat = catalog_with_shared_namespace();
+        let results = search_services_ranked(&cat, "solana priority fee forecasts", None, 5);
+        assert!(!results.is_empty());
+        assert!(is_catalog_miss("solana priority fee forecasts", &results));
+    }
+
+    #[test]
+    fn catalog_miss_holds_back_on_vague_query_with_weak_matches() {
+        let cat = catalog_for_provider_routing();
+        // Covered by quicknode/rpc but phrased fuzzily: only "transaction"
+        // matches, so nothing is strong — with two meaningful terms the
+        // query is too vague to treat as a gap, and the model-mediated
+        // request_capability hint takes over instead of a prompt.
+        let results = search_services_ranked(&cat, "push this transaction", None, 5);
+        assert!(!results.is_empty());
+        assert!(results.iter().all(|r| !r.strong));
+        assert!(!is_catalog_miss("push this transaction", &results));
+    }
+
+    #[test]
+    fn catalog_miss_negative_when_strong_candidate_exists() {
+        let cat = catalog_for_provider_routing();
+        let query = "find instagram influencers in paris";
+        let results = search_services_ranked(&cat, query, None, 5);
+        assert!(results.iter().any(|r| r.strong));
+        assert!(!is_catalog_miss(query, &results));
+    }
+
+    #[test]
+    fn ranked_search_shared_namespace_earns_no_term_credit() {
+        let cat = catalog_with_shared_namespace();
+        let results = search_services_ranked(&cat, "solana priority fee forecasts", None, 5);
+        // Term-overlap noise still returns candidates ("solana" in
+        // quicknode's use case) but none of them clearly fits, so none is
+        // strong — the capability-request offer in search_catalog keys off
+        // exactly this.
+        assert!(!results.is_empty());
+        assert!(results.iter().all(|r| !r.strong));
+        // The air-quality API previously scored on this query purely via the
+        // shared `solana-foundation/` prefix; with namespace credit gone it
+        // matches no term at all.
+        assert!(
+            !results
+                .iter()
+                .any(|r| r.service.name == "solana-foundation/air-quality")
+        );
+    }
+
+    #[test]
+    fn ranked_search_shared_namespace_still_matches_whole_fqn_query() {
+        let cat = catalog_with_shared_namespace();
+        let results = search_services_ranked(&cat, "solana-foundation/air-quality", None, 5);
+        assert_eq!(results[0].service.name, "solana-foundation/air-quality");
+        assert!(results[0].strong);
+    }
+
+    #[test]
+    fn ranked_search_brand_org_keeps_term_credit() {
+        let cat = catalog_with_shared_namespace();
+        // `quicknode/` fronts a single provider, so the org prefix is a brand
+        // name, not a curation namespace — it must stay matchable.
+        let results = search_services_ranked(&cat, "quicknode getslot", None, 5);
+        assert_eq!(results[0].service.name, "quicknode/rpc");
+        assert!(results[0].strong);
+    }
+
+    #[test]
+    fn ranked_search_marks_clear_fit_strong() {
+        let cat = catalog_for_provider_routing();
+        let results = search_services_ranked(&cat, "find instagram influencers in paris", None, 5);
+        let top = &results[0];
+        assert_eq!(top.service.name, "socialintel/influencer-search");
+        assert!(top.strong);
     }
 
     // ── find_service ────────────────────────────────────────────────────────

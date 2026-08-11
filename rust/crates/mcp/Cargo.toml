@@ -18,8 +18,9 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yml = { workspace = true }
 rmcp = { workspace = true }
+rand = { workspace = true }
 reqwest = { workspace = true }
-schemars = { workspace = true }
+schemars = "1"
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
@@ -28,5 +29,5 @@ tracing-subscriber = { workspace = true }
 # E2E tests pair the pay-mcp server with an in-process rmcp client over a
 # duplex transport. The `client` feature is only needed for tests; pulling
 # it in here keeps the production build lean.
-rmcp = { version = "0.9", features = ["server", "transport-io", "elicitation", "schemars", "client"] }
+rmcp = { version = "3.1", features = ["server", "transport-io", "elicitation", "schemars", "request-state", "client"] }
 tempfile = { workspace = true }

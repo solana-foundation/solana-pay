@@ -1,6 +1,8 @@
+#![allow(deprecated)] // MCP roots remain required for local-file authorization.
+
 use base64::{Engine, engine::general_purpose};
 use pay_core::client::fetch::{RedirectPolicy, RequestBody};
-use rmcp::model::{CallToolResult, Content, RawResource, Root};
+use rmcp::model::{CallToolResult, ContentBlock, Resource, Root};
 use rmcp::schemars;
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -140,6 +142,7 @@ fn is_http_token_byte(byte: u8) -> bool {
 pub async fn run(
     params: Params,
     peer: rmcp::Peer<rmcp::service::RoleServer>,
+    payment_sessions: pay_core::session_manager::SessionManager,
 ) -> Result<CallToolResult, rmcp::ErrorData> {
     if params.body.is_some() && params.body_file.is_some() {
         return Ok(super::tool_error(
@@ -181,14 +184,15 @@ pub async fn run(
         RedirectPolicy::Follow
     };
 
-    let response = tokio::task::spawn_blocking(move || {
+    let response = crate::auth::spawn_blocking_with_elicitation(&peer, move |elicitation| {
         do_paid_fetch(
             &method,
             &url,
             &headers,
             body.as_ref(),
             redirect_policy,
-            Some(peer),
+            Some(elicitation),
+            &payment_sessions,
         )
     })
     .await
@@ -438,22 +442,22 @@ fn body_to_mcp_content(
     body: Vec<u8>,
     content_type: Option<&str>,
     empty_message: &str,
-) -> Vec<Content> {
+) -> Vec<ContentBlock> {
     if body.is_empty() {
-        return vec![Content::text(empty_message.to_string())];
+        return vec![ContentBlock::text(empty_message.to_string())];
     }
 
     let mime = mime_from_content_type(content_type);
 
     if mime.starts_with("image/") {
         let encoded = general_purpose::STANDARD.encode(&body);
-        return vec![Content::image(encoded, mime)];
+        return vec![ContentBlock::image(encoded, mime)];
     }
 
     if is_binary_content_type(&mime) {
         return match write_body_to_tempfile(&body, &mime) {
             Ok(path) => {
-                let note = Content::text(format!(
+                let note = ContentBlock::text(format!(
                     "Binary response ({} bytes, {mime}) written to {path}",
                     body.len()
                 ));
@@ -468,7 +472,7 @@ fn body_to_mcp_content(
                     vec![note]
                 }
             }
-            Err(err) => vec![Content::text(format!(
+            Err(err) => vec![ContentBlock::text(format!(
                 "Binary response ({} bytes, {mime}) — failed to spill to tempfile: {err}",
                 body.len()
             ))],
@@ -559,7 +563,7 @@ struct ExtractedMedia {
 /// JSON with a `<mime, N bytes → /path>` placeholder. Images are additionally
 /// surfaced as `Content::image` so the model can see them. Whatever text
 /// remains is size-capped by [`text_content_capped`].
-fn text_body_to_content(text: String) -> Vec<Content> {
+fn text_body_to_content(text: String) -> Vec<ContentBlock> {
     if let Ok(mut value) = serde_json::from_str::<Value>(&text) {
         let mut extracted = Vec::new();
         extract_media_from_json(&mut value, &mut extracted);
@@ -585,9 +589,12 @@ fn text_body_to_content(text: String) -> Vec<Content> {
 ///   for handing a client a file by reference — clients that support these
 ///   types can open/play them, and we avoid inlining multi-megabyte base64
 ///   that would flood the context.
-fn media_as_content_block(media: &ExtractedMedia) -> Option<Content> {
+fn media_as_content_block(media: &ExtractedMedia) -> Option<ContentBlock> {
     if media.mime.starts_with("image/") {
-        return Some(Content::image(media.encoded.clone(), media.mime.clone()));
+        return Some(ContentBlock::image(
+            media.encoded.clone(),
+            media.mime.clone(),
+        ));
     }
     if media.mime.starts_with("audio/")
         || media.mime.starts_with("video/")
@@ -603,34 +610,34 @@ fn media_as_content_block(media: &ExtractedMedia) -> Option<Content> {
 }
 
 /// Build a `resource_link` content block referencing a media file on disk.
-fn resource_link_for_file(path: &str, mime: &str, bytes: usize) -> Content {
+fn resource_link_for_file(path: &str, mime: &str, bytes: usize) -> ContentBlock {
     let name = path
         .rsplit(['/', '\\'])
         .next()
         .filter(|s| !s.is_empty())
         .unwrap_or(path)
         .to_string();
-    let mut resource = RawResource::new(format!("file://{path}"), name);
-    resource.mime_type = Some(mime.to_string());
-    resource.size = u32::try_from(bytes).ok();
-    Content::resource_link(resource)
+    let resource = Resource::new(format!("file://{path}"), name)
+        .with_mime_type(mime)
+        .with_size(bytes as u64);
+    ContentBlock::resource_link(resource)
 }
 
 /// Return the text as inline `Content::text`, or — when it exceeds
 /// [`MAX_TEXT_INLINE_BYTES`] — spill the full body to a tempfile and return a
 /// short preview plus the path, so a huge response can't flood the context.
-fn text_content_capped(text: String) -> Content {
+fn text_content_capped(text: String) -> ContentBlock {
     if text.len() <= MAX_TEXT_INLINE_BYTES {
-        return Content::text(text);
+        return ContentBlock::text(text);
     }
     let preview: String = text.chars().take(TEXT_PREVIEW_BYTES).collect();
     match write_body_to_tempfile(text.as_bytes(), "text/plain") {
-        Ok(path) => Content::text(format!(
+        Ok(path) => ContentBlock::text(format!(
             "Large text response ({} bytes) written to {path}. First {} chars:\n{preview}",
             text.len(),
             preview.len()
         )),
-        Err(err) => Content::text(format!(
+        Err(err) => ContentBlock::text(format!(
             "Large text response ({} bytes) — failed to spill to tempfile: {err}. First {} chars:\n{preview}",
             text.len(),
             preview.len()
@@ -821,13 +828,110 @@ fn sniff_media_mime(bytes: &[u8]) -> Option<&'static str> {
 /// octet streams — round-trip without UTF-8 mangling.
 type PaidFetchResult = (Vec<u8>, Option<String>);
 
+type SessionOpener =
+    fn(
+        &pay_core::mpp::Challenge,
+        &dyn pay_core::accounts::AccountsStore,
+        Option<&str>,
+        Option<&str>,
+        &str,
+        bool,
+        pay_core::signer::AuthOverride,
+    ) -> Result<pay_core::session_manager::PreparedOperatorSession, pay_core::Error>;
+
+#[allow(clippy::too_many_arguments)]
+fn chosen_payment_headers(
+    chosen: pay_core::client::mpp::ChosenPayment,
+    store: &dyn pay_core::accounts::AccountsStore,
+    network_override: Option<&str>,
+    account_override: Option<&str>,
+    resource_url: &str,
+    extra_headers: &[(String, String)],
+    auth_override: pay_core::signer::AuthOverride,
+) -> Result<Vec<(String, String)>, pay_core::Error> {
+    use pay_core::client::mpp::ChosenPayment;
+
+    let mut headers = extra_headers.to_vec();
+    match chosen {
+        ChosenPayment::Mpp(challenge) => {
+            let (authorization, _ephemeral) =
+                pay_core::client::mpp::build_credential_with_override(
+                    challenge.as_ref(),
+                    store,
+                    network_override,
+                    account_override,
+                    Some(resource_url),
+                    auth_override,
+                )?;
+            headers.push(("Authorization".to_string(), authorization));
+        }
+        ChosenPayment::X402(challenge) => {
+            let built = pay_core::client::x402::build_payment_with_override(
+                challenge.as_ref(),
+                store,
+                network_override,
+                account_override,
+                Some(resource_url),
+                auth_override,
+            )?;
+            headers.extend(
+                built
+                    .headers
+                    .into_iter()
+                    .map(|(name, value)| (name.to_string(), value)),
+            );
+        }
+        ChosenPayment::X402Upto(challenge) => {
+            let built = pay_core::client::x402::build_upto_payment_with_override(
+                challenge.as_ref(),
+                store,
+                network_override,
+                account_override,
+                Some(resource_url),
+                auth_override,
+            )?;
+            headers.extend(
+                built
+                    .headers
+                    .into_iter()
+                    .map(|(name, value)| (name.to_string(), value)),
+            );
+        }
+    }
+    Ok(headers)
+}
+
 fn do_paid_fetch(
     method: &str,
     url: &str,
     extra_headers: &[(String, String)],
     body: Option<&RequestBody>,
     redirect_policy: RedirectPolicy,
-    peer: Option<rmcp::Peer<rmcp::service::RoleServer>>,
+    elicitation: Option<tokio::sync::mpsc::UnboundedSender<crate::auth::BrokerRequest>>,
+    payment_sessions: &pay_core::session_manager::SessionManager,
+) -> Result<PaidFetchResult, pay_core::Error> {
+    do_paid_fetch_with_session_opener(
+        method,
+        url,
+        extra_headers,
+        body,
+        redirect_policy,
+        elicitation,
+        payment_sessions,
+        pay_core::session_manager::prepare_operator_session_with_override,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn do_paid_fetch_with_session_opener(
+    method: &str,
+    url: &str,
+    extra_headers: &[(String, String)],
+    body: Option<&RequestBody>,
+    redirect_policy: RedirectPolicy,
+    elicitation: Option<tokio::sync::mpsc::UnboundedSender<crate::auth::BrokerRequest>>,
+    payment_sessions: &pay_core::session_manager::SessionManager,
+    session_opener: SessionOpener,
 ) -> Result<PaidFetchResult, pay_core::Error> {
     use pay_core::client::runner::RunOutcome;
 
@@ -845,7 +949,7 @@ fn do_paid_fetch(
     };
 
     // Build a fresh elicitation-backed AuthGate per signing operation when
-    // we have a peer AND no local biometric is available. A local Touch ID /
+    // we have a request broker AND no local biometric is available. A local Touch ID /
     // Windows Hello / polkit prompt is faster and more familiar than a
     // round-trip through the MCP client UI, so we prefer it whenever the
     // platform offers it. `PAY_FORCE_ELICITATION=1` opts back into the
@@ -854,9 +958,10 @@ fn do_paid_fetch(
     //
     // When None (e.g. unit tests, or biometrics-available path), each
     // `_with_override` call gets `None` and falls back to the platform
-    // default gate. The peer is cheap to clone (it wraps an Arc).
+    // default gate. The broker keeps server-to-client requests associated
+    // with the originating tools/call under MCP 2026-07-28 (SEP-2260).
     let make_auth_override = || -> pay_core::signer::AuthOverride {
-        let peer = peer.as_ref()?;
+        let elicitation = elicitation.as_ref()?;
         let force = std::env::var("PAY_FORCE_ELICITATION")
             .ok()
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
@@ -864,34 +969,80 @@ fn do_paid_fetch(
         if !force && pay_keystore::Keystore::any_biometric_available() {
             return None;
         }
-        Some(Box::new(crate::ElicitationAuth::new(peer.clone())) as Box<dyn pay_keystore::AuthGate>)
+        Some(
+            Box::new(crate::ElicitationAuth::via_broker(elicitation.clone()))
+                as Box<dyn pay_keystore::AuthGate>,
+        )
     };
 
     let store = pay_core::accounts::FileAccountsStore::default_path();
     let network_override = std::env::var("PAY_NETWORK_ENFORCED").ok();
     let account_override = std::env::var("PAY_ACTIVE_ACCOUNT").ok();
+    let session_slot = payment_sessions.slot(
+        url,
+        network_override.as_deref(),
+        account_override.as_deref(),
+    )?;
+    let mut session = session_slot.blocking_acquire();
 
-    // SIWMPP pre-attach: if a cached authenticate token covers this URL
-    // (URL-prefix match against a tracked Active subscription with a
-    // non-expired token), attach it BEFORE the first fetch. On hit the
-    // server validates the token and skips the 402 entirely — no Touch
-    // ID prompt, no extra round trip. On miss this is a no-op.
+    // Pre-attach a cached subscription token or reusable operator-session
+    // proof before challenge discovery. Explicit caller authorization wins;
+    // subscriptions win over sessions because both occupy Authorization.
     let cached_auth_header =
         pay_core::client::authenticate::cached_header_for_resource(&store, url);
-    let initial_headers: Vec<(String, String)> = match cached_auth_header.as_deref() {
-        Some(token)
-            if !extra_headers
-                .iter()
-                .any(|(k, _)| k.eq_ignore_ascii_case("authorization")) =>
-        {
-            let mut h = extra_headers.to_vec();
-            h.push(("Authorization".to_string(), token.to_string()));
-            h
+    let has_explicit_authorization = extra_headers
+        .iter()
+        .any(|(name, _)| name.eq_ignore_ascii_case("authorization"));
+    let mut initial_headers = extra_headers.to_vec();
+    let mut used_cached_session = false;
+    if !has_explicit_authorization {
+        if let Some(token) = cached_auth_header {
+            initial_headers.push(("Authorization".to_string(), token));
+        } else if let Some(authorization) = session.authorization() {
+            initial_headers.push(("Authorization".to_string(), authorization.to_string()));
+            used_cached_session = true;
         }
-        _ => extra_headers.to_vec(),
-    };
+    }
 
-    let outcome = fetch_request(&initial_headers)?;
+    let mut outcome = fetch_request(&initial_headers)?;
+    if used_cached_session {
+        outcome = match outcome {
+            completed @ RunOutcome::Completed { .. } => return interpret_retry(completed),
+            RunOutcome::PaymentRejected {
+                retryable: true, ..
+            } => {
+                let retried = fetch_request(&initial_headers)?;
+                match retried {
+                    completed @ RunOutcome::Completed { .. } => return interpret_retry(completed),
+                    rejected @ RunOutcome::PaymentRejected {
+                        retryable: true, ..
+                    } => return interpret_retry(rejected),
+                    RunOutcome::PaymentRejected {
+                        retryable: false, ..
+                    } => {
+                        session.clear();
+                        fetch_request(extra_headers)?
+                    }
+                    challenge @ RunOutcome::SessionChallenge { .. } => {
+                        session.clear();
+                        challenge
+                    }
+                    other => other,
+                }
+            }
+            RunOutcome::PaymentRejected {
+                retryable: false, ..
+            } => {
+                session.clear();
+                fetch_request(extra_headers)?
+            }
+            challenge @ RunOutcome::SessionChallenge { .. } => {
+                session.clear();
+                challenge
+            }
+            other => other,
+        };
+    }
 
     match outcome {
         RunOutcome::MppChallenge {
@@ -901,7 +1052,6 @@ fn do_paid_fetch(
             x402_upto_accepts,
             ..
         } => {
-            use pay_core::client::mpp::ChosenPayment;
             let mut challenges = Vec::with_capacity(1 + alternatives.len());
             challenges.push((*challenge).clone());
             challenges.extend(alternatives);
@@ -916,54 +1066,15 @@ fn do_paid_fetch(
                 network_override.as_deref(),
                 account_override.as_deref(),
             )?;
-            let mut headers = extra_headers.to_vec();
-            match chosen {
-                ChosenPayment::Mpp(ch) => {
-                    let (auth_header, _ephemeral) =
-                        pay_core::client::mpp::build_credential_with_override(
-                            ch.as_ref(),
-                            &store,
-                            network_override.as_deref(),
-                            account_override.as_deref(),
-                            Some(url),
-                            make_auth_override(),
-                        )?;
-                    headers.push(("Authorization".to_string(), auth_header));
-                }
-                ChosenPayment::X402(challenge) => {
-                    let built_payment = pay_core::client::x402::build_payment_with_override(
-                        challenge.as_ref(),
-                        &store,
-                        network_override.as_deref(),
-                        account_override.as_deref(),
-                        Some(url),
-                        make_auth_override(),
-                    )?;
-                    headers.extend(
-                        built_payment
-                            .headers
-                            .into_iter()
-                            .map(|(name, value)| (name.to_string(), value)),
-                    );
-                }
-                ChosenPayment::X402Upto(challenge) => {
-                    let built_payment =
-                        pay_core::client::x402::build_upto_payment_with_override(
-                        challenge.as_ref(),
-                        &store,
-                        network_override.as_deref(),
-                        account_override.as_deref(),
-                        Some(url),
-                        make_auth_override(),
-                    )?;
-                    headers.extend(
-                        built_payment
-                            .headers
-                            .into_iter()
-                            .map(|(name, value)| (name.to_string(), value)),
-                    );
-                }
-            }
+            let headers = chosen_payment_headers(
+                chosen,
+                &store,
+                network_override.as_deref(),
+                account_override.as_deref(),
+                url,
+                extra_headers,
+                make_auth_override(),
+            )?;
             interpret_retry(fetch_request(&headers)?)
         }
         RunOutcome::X402Challenge { challenge, .. } => {
@@ -1064,9 +1175,54 @@ fn do_paid_fetch(
                 ))
             }
         }
-        RunOutcome::SessionChallenge { .. } => Err(pay_core::Error::Mpp(
-            "402 Payment Required (MPP session) — session payments require a stateful client with a Fiber channel".to_string(),
-        )),
+        RunOutcome::SessionChallenge {
+            challenge,
+            x402_alternative,
+            x402_upto_accepts,
+            ..
+        } => {
+            if !pay_core::session_manager::is_operator_session(&challenge)
+                && (x402_alternative.is_some() || !x402_upto_accepts.is_empty())
+            {
+                let chosen = pay_core::client::mpp::choose_payment(
+                    &[],
+                    x402_alternative.as_deref(),
+                    &x402_upto_accepts,
+                    &store,
+                    network_override.as_deref(),
+                    account_override.as_deref(),
+                )?;
+                let headers = chosen_payment_headers(
+                    chosen,
+                    &store,
+                    network_override.as_deref(),
+                    account_override.as_deref(),
+                    url,
+                    extra_headers,
+                    make_auth_override(),
+                )?;
+                return interpret_retry(fetch_request(&headers)?);
+            }
+
+            let prepared = session_opener(
+                &challenge,
+                &store,
+                network_override.as_deref(),
+                account_override.as_deref(),
+                url,
+                network_override.as_deref() == Some("localnet"),
+                make_auth_override(),
+            )?;
+            let mut headers = extra_headers.to_vec();
+            headers.push(("Authorization".to_string(), prepared.open_authorization));
+            let retry = fetch_request(&headers)?;
+            if matches!(retry, RunOutcome::Completed { .. }) {
+                session.adopt(prepared.use_authorization);
+            } else {
+                session.clear();
+            }
+            interpret_retry(retry)
+        }
         RunOutcome::SubscriptionChallenge {
             challenge,
             authenticate,
@@ -1115,9 +1271,7 @@ fn do_paid_fetch(
             "402 Payment Required but no recognized protocol".to_string(),
         )),
         RunOutcome::Completed {
-            body,
-            content_type,
-            ..
+            body, content_type, ..
         } => Ok((body.unwrap_or_default(), content_type)),
     }
 }
@@ -1210,6 +1364,62 @@ fn interpret_retry(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static SESSION_OPEN_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+    fn fake_session_opener(
+        _challenge: &pay_core::mpp::Challenge,
+        _store: &dyn pay_core::accounts::AccountsStore,
+        _network_override: Option<&str>,
+        _account_override: Option<&str>,
+        _resource_url: &str,
+        _sandbox: bool,
+        _auth_override: pay_core::signer::AuthOverride,
+    ) -> Result<pay_core::session_manager::PreparedOperatorSession, pay_core::Error> {
+        SESSION_OPEN_CALLS.fetch_add(1, Ordering::SeqCst);
+        Ok(pay_core::session_manager::PreparedOperatorSession {
+            open_authorization: "Payment open-test".to_string(),
+            use_authorization: "Payment use-test".to_string(),
+        })
+    }
+
+    fn read_request(stream: &mut std::net::TcpStream) -> String {
+        let mut bytes = Vec::new();
+        let mut chunk = [0u8; 1024];
+        loop {
+            let count = stream.read(&mut chunk).unwrap();
+            if count == 0 {
+                break;
+            }
+            bytes.extend_from_slice(&chunk[..count]);
+            if bytes.windows(4).any(|window| window == b"\r\n\r\n") {
+                break;
+            }
+        }
+        String::from_utf8(bytes).unwrap()
+    }
+
+    fn session_challenge_header() -> String {
+        let request = serde_json::json!({
+            "amount": "1",
+            "currency": "USDC",
+            "recipient": "So11111111111111111111111111111111111111112",
+            "methodDetails": {
+                "network": "solana:mainnet",
+                "channelProgram": "So11111111111111111111111111111111111111112",
+                "voucherSigner": "operator",
+                "operator": "So11111111111111111111111111111111111111112"
+            }
+        });
+        let encoded =
+            general_purpose::URL_SAFE_NO_PAD.encode(serde_json::to_vec(&request).unwrap());
+        format!(
+            "Payment id=\"session-test\", realm=\"test\", method=\"solana\", intent=\"session\", request=\"{encoded}\""
+        )
+    }
 
     #[test]
     fn params_deserialize_minimal() {
@@ -1303,12 +1513,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("photo.png");
         std::fs::write(&path, b"image bytes").unwrap();
-        let root = Root {
-            uri: reqwest::Url::from_directory_path(dir.path())
+        let root = Root::new(
+            reqwest::Url::from_directory_path(dir.path())
                 .unwrap()
                 .to_string(),
-            name: Some("workspace".to_string()),
-        };
+        )
+        .with_name("workspace");
 
         let file = resolve_body_file_path("photo.png", &[root]).unwrap();
         assert_eq!(file.path, std::fs::canonicalize(path).unwrap());
@@ -1320,12 +1530,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("payload.json");
         std::fs::write(&path, br#"{"approved":true}"#).unwrap();
-        let root = Root {
-            uri: reqwest::Url::from_directory_path(dir.path())
+        let root = Root::new(
+            reqwest::Url::from_directory_path(dir.path())
                 .unwrap()
                 .to_string(),
-            name: Some("workspace".to_string()),
-        };
+        )
+        .with_name("workspace");
 
         let file = resolve_body_file_path("payload.json", &[root]).unwrap();
         std::fs::write(&path, b"changed").unwrap();
@@ -1346,12 +1556,12 @@ mod tests {
         std::fs::create_dir(&outside).unwrap();
         std::fs::write(root_path.join("payload"), b"approved").unwrap();
         std::fs::write(outside.join("payload"), b"outside!").unwrap();
-        let root = Root {
-            uri: reqwest::Url::from_directory_path(&root_path)
+        let root = Root::new(
+            reqwest::Url::from_directory_path(&root_path)
                 .unwrap()
                 .to_string(),
-            name: Some("workspace".to_string()),
-        };
+        )
+        .with_name("workspace");
 
         let file = resolve_body_file_path("payload", &[root]).unwrap();
         std::fs::rename(&root_path, &moved_root).unwrap();
@@ -1364,12 +1574,11 @@ mod tests {
     fn rejects_file_outside_declared_roots() {
         let allowed = tempfile::tempdir().unwrap();
         let outside = tempfile::NamedTempFile::new().unwrap();
-        let root = Root {
-            uri: reqwest::Url::from_directory_path(allowed.path())
+        let root = Root::new(
+            reqwest::Url::from_directory_path(allowed.path())
                 .unwrap()
                 .to_string(),
-            name: None,
-        };
+        );
 
         let error = resolve_body_file_path(outside.path().to_str().unwrap(), &[root]).unwrap_err();
         assert!(error.contains("outside the MCP client's declared filesystem roots"));
@@ -1380,18 +1589,16 @@ mod tests {
         let first = tempfile::tempdir().unwrap();
         let second = tempfile::tempdir().unwrap();
         let roots = [
-            Root {
-                uri: reqwest::Url::from_directory_path(first.path())
+            Root::new(
+                reqwest::Url::from_directory_path(first.path())
                     .unwrap()
                     .to_string(),
-                name: None,
-            },
-            Root {
-                uri: reqwest::Url::from_directory_path(second.path())
+            ),
+            Root::new(
+                reqwest::Url::from_directory_path(second.path())
                     .unwrap()
                     .to_string(),
-                name: None,
-            },
+            ),
         ];
 
         let error = resolve_body_file_path("photo.png", &roots).unwrap_err();
@@ -1481,8 +1688,104 @@ mod tests {
 
     #[test]
     fn do_paid_fetch_returns_error_for_invalid_url() {
-        let result = do_paid_fetch("GET", "not-a-url", &[], None, RedirectPolicy::Follow, None);
+        let result = do_paid_fetch(
+            "GET",
+            "not-a-url",
+            &[],
+            None,
+            RedirectPolicy::Follow,
+            None,
+            &pay_core::session_manager::SessionManager::default(),
+        );
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn paid_fetch_opens_and_adopts_an_mpp_session() {
+        SESSION_OPEN_CALLS.store(0, Ordering::SeqCst);
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let challenge = session_challenge_header();
+        let x402 = serde_json::json!({
+            "x402Version": 2,
+            "accepts": [{
+                "scheme": "upto",
+                "network": "solana:mainnet",
+                "amount": "250000",
+                "asset": "USDC",
+                "payTo": "So11111111111111111111111111111111111111112"
+            }]
+        });
+        let x402 = general_purpose::STANDARD.encode(serde_json::to_vec(&x402).unwrap());
+
+        let server = std::thread::spawn(move || {
+            let (mut first, _) = listener.accept().unwrap();
+            let first_request = read_request(&mut first);
+            assert!(
+                !first_request
+                    .to_ascii_lowercase()
+                    .contains("authorization:")
+            );
+            let response = format!(
+                "HTTP/1.1 402 Payment Required\r\nWWW-Authenticate: {challenge}\r\nPayment-Required: {x402}\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}"
+            );
+            first.write_all(response.as_bytes()).unwrap();
+
+            let (mut retry, _) = listener.accept().unwrap();
+            let retry_request = read_request(&mut retry);
+            assert!(
+                retry_request
+                    .to_ascii_lowercase()
+                    .contains("authorization: payment open-test")
+            );
+            retry
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                )
+                .unwrap();
+
+            let (mut reused, _) = listener.accept().unwrap();
+            let reused_request = read_request(&mut reused);
+            assert!(
+                reused_request
+                    .to_ascii_lowercase()
+                    .contains("authorization: payment use-test")
+            );
+            reused
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 6\r\nConnection: close\r\n\r\nreused",
+                )
+                .unwrap();
+        });
+
+        let manager = pay_core::session_manager::SessionManager::default();
+        let result = do_paid_fetch_with_session_opener(
+            "POST",
+            &format!("http://{address}/v1/chat"),
+            &[],
+            Some(&RequestBody::text("{}")),
+            RedirectPolicy::Follow,
+            None,
+            &manager,
+            fake_session_opener,
+        )
+        .unwrap();
+
+        assert_eq!(result.0, b"ok");
+        let reused = do_paid_fetch_with_session_opener(
+            "POST",
+            &format!("http://{address}/v1/chat"),
+            &[],
+            Some(&RequestBody::text("{}")),
+            RedirectPolicy::Follow,
+            None,
+            &manager,
+            fake_session_opener,
+        )
+        .unwrap();
+        assert_eq!(reused.0, b"reused");
+        assert_eq!(SESSION_OPEN_CALLS.load(Ordering::SeqCst), 1);
+        server.join().unwrap();
     }
 
     #[test]
@@ -1881,7 +2184,7 @@ mod tests {
             .find_map(|c| c.as_resource_link())
             .expect("resource_link");
         assert_eq!(link.mime_type.as_deref(), Some("application/pdf"));
-        assert_eq!(link.size, Some(body.len() as u32));
+        assert_eq!(link.size, Some(body.len() as u64));
         let _ = std::fs::remove_file(path);
     }
 

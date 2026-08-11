@@ -10,16 +10,14 @@
 //! round-trip — without needing a real Pay account, real signing, or any
 //! out-of-process server.
 
-use std::sync::Arc;
-use std::time::Duration;
-
 use pay_keystore::{AuthGate, AuthIntent};
 use pay_mcp::ElicitationAuth;
 use rmcp::{
-    ClientHandler, ErrorData as McpError, ServerHandler, ServiceExt,
+    ClientHandler, ErrorData as McpError, ServerHandler,
     model::*,
-    service::{RequestContext, RoleClient},
+    service::{RequestContext, RoleClient, RoleServer, serve_directly},
 };
+use std::sync::Arc;
 use tokio::sync::Mutex;
 
 /// Minimal server with no tools — we only need it to be alive so we can
@@ -33,7 +31,7 @@ impl ServerHandler for BareServer {}
 #[derive(Clone)]
 struct ConfigurableClient {
     action: ElicitationAction,
-    last_request: Arc<Mutex<Option<CreateElicitationRequestParam>>>,
+    last_request: Arc<Mutex<Option<ElicitRequestParams>>>,
 }
 
 impl ConfigurableClient {
@@ -48,47 +46,43 @@ impl ConfigurableClient {
 impl ClientHandler for ConfigurableClient {
     async fn create_elicitation(
         &self,
-        request: CreateElicitationRequestParam,
+        request: ElicitRequestParams,
         _context: RequestContext<RoleClient>,
-    ) -> Result<CreateElicitationResult, McpError> {
+    ) -> Result<ElicitResult, McpError> {
         *self.last_request.lock().await = Some(request);
         let content = if matches!(self.action, ElicitationAction::Accept) {
             Some(serde_json::json!({ "approved": true }))
         } else {
             None
         };
-        Ok(CreateElicitationResult {
-            action: self.action.clone(),
-            content,
+        let result = ElicitResult::new(self.action.clone());
+        Ok(match content {
+            Some(content) => result.with_content(content),
+            None => result,
         })
     }
 }
 
 async fn run_with_action(
     action: ElicitationAction,
-) -> (
-    Result<(), pay_keystore::Error>,
-    Option<CreateElicitationRequestParam>,
-) {
+) -> (Result<(), pay_keystore::Error>, Option<ElicitRequestParams>) {
     let (server_transport, client_transport) = tokio::io::duplex(8192);
 
-    let server = BareServer
-        .serve(server_transport)
-        .await
-        .expect("server should serve");
     let client_handler = ConfigurableClient::new(action);
-    let client = client_handler
-        .clone()
-        .serve(client_transport)
-        .await
-        .expect("client should serve");
-
-    // Let the initialize handshake finish before we send elicitation.
-    // 1s is generous enough for CI runners under load — rmcp 0.9's
-    // server-side `on_initialized` hook is unreliable under this duplex
-    // setup, so we fall back to a fixed delay. The outer 30s timeout in
-    // each test wraps this so a stuck handshake fails loudly.
-    tokio::time::sleep(Duration::from_secs(1)).await;
+    let client_info = ClientInfo::new(
+        ClientCapabilities::builder().enable_elicitation().build(),
+        Implementation::new("pay-mcp-test-client", "0.0.0"),
+    )
+    .with_protocol_version(ProtocolVersion::V_2025_06_18);
+    let server_info = ServerInfo::new(ServerCapabilities::default())
+        .with_protocol_version(ProtocolVersion::V_2025_06_18);
+    let server =
+        serve_directly::<RoleServer, _, _, _, _>(BareServer, server_transport, Some(client_info));
+    let client = serve_directly::<RoleClient, _, _, _, _>(
+        client_handler.clone(),
+        client_transport,
+        Some(server_info.into()),
+    );
 
     let server_peer = server.peer().clone();
     let auth = ElicitationAuth::new(server_peer);
@@ -111,20 +105,6 @@ async fn run_with_action(
     (result, received)
 }
 
-// These three tests reliably hang under rmcp 0.9's `tokio::io::duplex`
-// transport — `peer.create_elicitation` never receives its response —
-// and that hang reproduces both locally and on CI runners regardless of
-// any code in this PR (verified by stashing every PR-local change and
-// re-running). The test file was added in `569c317 feat: enable
-// elicitation` but its CI never executed (no Rust workflow ran on that
-// commit), so the hang has been latent since day one.
-//
-// Ignored until we either (a) upgrade rmcp to a version where the duplex
-// roundtrip works, (b) replace the in-memory duplex with a real socket
-// pair, or (c) drive the I/O loops manually. The protocol-level builder
-// tests (in `src/auth.rs`) still exercise schema + message construction.
-
-#[ignore = "rmcp 0.9 duplex transport hangs on elicitation roundtrip — see file comment"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn auth_succeeds_when_client_accepts() {
     let (result, received) = run_with_action(ElicitationAction::Accept).await;
@@ -135,19 +115,19 @@ async fn auth_succeeds_when_client_accepts() {
 
     let req = received.expect("client should have received an elicitation");
     // The message should carry the amount and operator from the intent.
+    let ElicitRequestParams::FormElicitationParams { message, .. } = req else {
+        panic!("expected form elicitation");
+    };
     assert!(
-        req.message.contains("$0.50"),
-        "message should mention amount: {:?}",
-        req.message
+        message.contains("$0.50"),
+        "message should mention amount: {message:?}"
     );
     assert!(
-        req.message.contains("test API call"),
-        "message should mention reason: {:?}",
-        req.message
+        message.contains("test API call"),
+        "message should mention reason: {message:?}"
     );
 }
 
-#[ignore = "rmcp 0.9 duplex transport hangs on elicitation roundtrip — see file comment"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn auth_fails_closed_when_client_declines() {
     let (result, received) = run_with_action(ElicitationAction::Decline).await;
@@ -159,7 +139,6 @@ async fn auth_fails_closed_when_client_declines() {
     assert!(received.is_some(), "client should have seen the request");
 }
 
-#[ignore = "rmcp 0.9 duplex transport hangs on elicitation roundtrip — see file comment"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn auth_fails_closed_when_client_cancels() {
     let (result, _received) = run_with_action(ElicitationAction::Cancel).await;

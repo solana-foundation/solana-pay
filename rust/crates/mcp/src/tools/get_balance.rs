@@ -62,7 +62,7 @@ pub async fn run(params: Params) -> Result<CallToolResult, rmcp::ErrorData> {
         lines.push("No token balances found.".to_string());
     }
 
-    Ok(CallToolResult::success(vec![rmcp::model::Content::text(
-        lines.join("\n"),
-    )]))
+    Ok(CallToolResult::success(vec![
+        rmcp::model::ContentBlock::text(lines.join("\n")),
+    ]))
 }

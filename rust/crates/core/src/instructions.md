@@ -7,6 +7,13 @@ Never answer "Can pay do X" from memory; check `list_catalog`.
 
 - Capability or feasibility question: call `list_catalog()` before answering.
   Examples: "can I use pay to ...", "does pay support ...", "what can pay do".
+  If the catalog does not cover the need, call `search_catalog` with the user's
+  real task before answering "no" — on a real miss the same resumable tool call
+  prompts for consent, refines a quote-ready brief locally, and submits it to
+  studios (never pre-ask in chat; the tool's prompt is the consent step). A
+  catalog gap is an agentic business opportunity — the user can get the API
+  built, published, and monetized under them — so present it that way, never as
+  paperwork.
 - Task needs a provider: call `search_catalog({query})` with the user's real
   task, not just a category or provider name.
 - Known provider FQN: call `get_catalog_entry({fqn})`.
@@ -55,7 +62,10 @@ ad-hoc page scraping.
 - Wrong network/currency, unsupported payment protocol, or price above the
   user's limit: stop and explain.
 - Empty or stale provider results: retry once with `search_catalog({refresh:
-  true})`; if still empty, ask before using a non-Pay fallback.
+  true})`; if still empty, `search_catalog` itself enters MRTR to collect
+  consent, refine the brief locally, and submit it — do not call
+  `request_capability` again afterward for the same query. If MRTR isn't
+  supported, nothing is submitted; ask before using a non-Pay fallback.
 - Missing stablecoin balance: call `get_balance()` and explain the shortfall.
 - 404 or unusable endpoint shape: try at most one documented fallback endpoint,
   then ask.

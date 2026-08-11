@@ -271,6 +271,33 @@ pub fn open_payment_channel_session_header(
     resource_url: &str,
     sandbox: bool,
 ) -> Result<(SessionHandle, String)> {
+    open_payment_channel_session_header_with_override(
+        challenge,
+        request,
+        store,
+        network_override,
+        account_override,
+        deposit,
+        resource_url,
+        sandbox,
+        None,
+    )
+}
+
+/// Variant of [`open_payment_channel_session_header`] that accepts an
+/// optional auth-gate override for MCP elicitation-backed approval.
+#[allow(clippy::too_many_arguments)]
+pub fn open_payment_channel_session_header_with_override(
+    challenge: &PaymentChallenge,
+    request: &SessionRequest,
+    store: &dyn crate::accounts::AccountsStore,
+    network_override: Option<&str>,
+    account_override: Option<&str>,
+    deposit: u64,
+    resource_url: &str,
+    sandbox: bool,
+    auth_override: crate::signer::AuthOverride,
+) -> Result<(SessionHandle, String)> {
     use pay_kit::mpp::client::{
         DerivePaymentChannelOpenParams, PaymentChannelOpenOptions,
         PaymentChannelSessionOpenOptions, create_payment_channel_session_opener,
@@ -291,12 +318,14 @@ pub fn open_payment_channel_session_header(
         &limit.display,
         &prompt_context.operator,
     );
-    let (signer, ephemeral_notice) = crate::signer::load_signer_for_network_with_intent(
-        &network,
-        store,
-        account_override,
-        &intent,
-    )?;
+    let (signer, ephemeral_notice) =
+        crate::signer::load_signer_for_network_with_intent_and_override(
+            &network,
+            store,
+            account_override,
+            &intent,
+            auth_override,
+        )?;
     let payer = signer.pubkey();
 
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -425,9 +454,19 @@ pub fn voucher_header_sync(handle: &SessionHandle, amount: u64) -> Result<String
     rt.block_on(handle.voucher_header(amount))
 }
 
+/// Build the reusable operator-signed `use` credential from synchronous
+/// client frontends such as the payer proxy and MCP curl worker.
+pub fn use_header_sync(handle: &SessionHandle) -> Result<String> {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| Error::Mpp(format!("Failed to build runtime: {e}")))?;
+    rt.block_on(handle.use_header())
+}
+
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
-pub(crate) fn canonical_session_origin(resource_url: &str) -> Result<String> {
+pub fn canonical_session_origin(resource_url: &str) -> Result<String> {
     let url = reqwest::Url::parse(resource_url)
         .map_err(|e| Error::Mpp(format!("invalid session authorization URL: {e}")))?;
     if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {

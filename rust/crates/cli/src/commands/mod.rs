@@ -582,6 +582,7 @@ fn handle_outcome(
             challenge,
             advertised_challenges,
             resource_url,
+            ..
         } => {
             print_verbose_challenges(&advertised_challenges, verbose, is_json);
             let req: Option<SessionRequest> = challenge.request.decode().ok();

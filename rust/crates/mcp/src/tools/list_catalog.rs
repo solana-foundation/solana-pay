@@ -116,9 +116,9 @@ pub async fn run(params: Params) -> Result<CallToolResult, rmcp::ErrorData> {
         }
     };
 
-    Ok(CallToolResult::success(vec![rmcp::model::Content::text(
-        json,
-    )]))
+    Ok(CallToolResult::success(vec![
+        rmcp::model::ContentBlock::text(json),
+    ]))
 }
 
 fn build_response(
@@ -155,7 +155,7 @@ fn build_response(
         provider_count,
         categories: grouped.into_values().collect(),
         services: include_details.then_some(services),
-        next_step: "For an actionable task, call search_catalog with the user's real task. For a capability yes/no answer, answer from this full catalog.",
+        next_step: "For an actionable task, call search_catalog with the user's real task. For a capability yes/no answer, answer from this full catalog — but if the catalog does not cover the user's need, call search_catalog with the real task before answering no: on a miss it prompts the user itself with an offer to have the capability built, published, and monetized under them (never pre-ask in chat; treat the gap as an opportunity, not a dead end).",
     }
 }
 
