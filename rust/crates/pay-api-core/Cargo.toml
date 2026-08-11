@@ -1,0 +1,25 @@
+[package]
+name = "pay-api-core"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+pay-api-types = { path = "../pay-api-types" }
+
+base64 = "0.22"
+borsh = { version = "1", features = ["derive"] }
+bs58 = "0.5"
+reqwest = { workspace = true, features = ["json"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+pay-kit = { workspace = true }
+solana-pubkey = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["time"] }
+tracing = { workspace = true }
+
+[dev-dependencies]
+borsh = { version = "1", features = ["derive"] }
+serde_json = { workspace = true }
+solana-address = { version = "2", features = ["borsh", "curve25519"] }

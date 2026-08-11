@@ -1,0 +1,48 @@
+[package]
+name = "pay-api"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "pay-api"
+path = "src/main.rs"
+
+[dependencies]
+pay-api-core = { path = "../pay-api-core" }
+pay-api-types = { path = "../pay-api-types" }
+
+axum = { workspace = true }
+figment = { workspace = true, features = ["yaml"] }
+opentelemetry = { workspace = true }
+opentelemetry-otlp = { workspace = true }
+opentelemetry-semantic-conventions = { workspace = true }
+opentelemetry_sdk = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+pay-kit = { workspace = true, features = ["gcp_kms", "worker"] }
+solana-pubkey = { workspace = true }
+solana-keypair = { workspace = true }
+solana-sanitize = { workspace = true }
+solana-signature = { workspace = true }
+solana-transaction = { workspace = true }
+solana-message = { workspace = true }
+solana-instruction = { workspace = true }
+solana-hash = { workspace = true }
+solana-system-interface = "3"
+spl-token-2022-interface = "2.1.0"
+base64 = "0.22"
+bincode = { workspace = true }
+bs58 = "0.5"
+blake3 = { workspace = true }
+redis = { version = "0.32", features = ["aio", "tokio-comp", "connection-manager"] }
+reqwest = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal", "time", "net"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors", "trace", "timeout"] }
+tracing = { workspace = true }
+tracing-opentelemetry = { workspace = true }
+tracing-subscriber = { workspace = true }
+url = "2"
+uuid = { workspace = true }

@@ -43,6 +43,32 @@ docker-build:
 docker-run *ARGS:
     docker run --rm pay {{ARGS}}
 
+# Build the pay-api service image.
+docker-build-pay-api:
+    docker build -f crates/pay-api/Dockerfile -t pay-api .
+
+# Build the pay-worker (close-channels, settle-sessions) service image.
+docker-build-pay-worker:
+    docker build -f crates/pay-worker/Dockerfile -t pay-worker .
+
+# ── pay-worker operator jobs ────────────────────────────────────────────────
+#
+# Dry-run (default, SAFE — logs the plan, signs/sends NOTHING):
+#   CHANNEL_ADDRESSES=<b58,b58,...> just close-channels
+#
+# Real run (BROADCASTS — requires an explicit DRY_RUN=false):
+#   DRY_RUN=false CHANNEL_ADDRESSES=<b58,...> just close-channels
+#
+# The fee payer comes from PAY_API_SEND__FEE_PAYER__KEY_NAME / __PUBKEY
+# (GCP KMS) or LOCAL_FEE_PAYER_PRIVATE_KEY. Prefer running under Doppler:
+#   doppler run -- just close-channels
+close-channels:
+    cargo run --release -p pay-worker --bin close-channels
+
+# Preview durable session watermark reconciliation (DRY_RUN defaults true).
+settle-sessions:
+    cargo run --release -p pay-worker --bin settle-sessions
+
 # Gate an API with a paywall
 gate-api PAYWALL *ARGS:
     cargo run -- gate api {{PAYWALL}} {{ARGS}}

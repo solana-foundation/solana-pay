@@ -3135,6 +3135,7 @@ dependencies = [
  "atomic",
  "pear",
  "serde",
+ "serde_yaml 0.9.34+deprecated",
  "toml 0.8.23",
  "uncased",
  "version_check",
@@ -6408,6 +6409,76 @@ dependencies = [
 ]
 
 [[package]]
+name = "pay-api"
+version = "0.27.0"
+dependencies = [
+ "axum",
+ "base64 0.22.1",
+ "bincode",
+ "blake3",
+ "bs58",
+ "figment",
+ "opentelemetry 0.31.0",
+ "opentelemetry-otlp",
+ "opentelemetry-semantic-conventions 0.31.0",
+ "opentelemetry_sdk 0.31.0",
+ "pay-api-core",
+ "pay-api-types",
+ "redis",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "solana-hash 3.1.0",
+ "solana-instruction 3.2.0",
+ "solana-keypair",
+ "solana-message 3.1.0",
+ "solana-pay-kit",
+ "solana-pubkey 3.0.0",
+ "solana-sanitize 3.0.1",
+ "solana-signature",
+ "solana-system-interface 3.1.0",
+ "solana-transaction",
+ "spl-token-2022-interface",
+ "thiserror 2.0.18",
+ "tokio",
+ "tower",
+ "tower-http",
+ "tracing",
+ "tracing-opentelemetry 0.32.1",
+ "tracing-subscriber",
+ "url 2.5.8",
+ "uuid",
+]
+
+[[package]]
+name = "pay-api-core"
+version = "0.27.0"
+dependencies = [
+ "base64 0.22.1",
+ "borsh 1.7.0",
+ "bs58",
+ "pay-api-types",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "solana-address 2.5.0",
+ "solana-pay-kit",
+ "solana-pubkey 3.0.0",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "pay-api-types"
+version = "0.27.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "pay-core"
 version = "0.27.0"
 dependencies = [
@@ -6570,6 +6641,40 @@ dependencies = [
  "serde_json",
  "serde_yml",
  "solana-pay-kit",
+]
+
+[[package]]
+name = "pay-worker"
+version = "0.27.0"
+dependencies = [
+ "axum",
+ "base64 0.22.1",
+ "bincode",
+ "bs58",
+ "figment",
+ "opentelemetry 0.31.0",
+ "opentelemetry-otlp",
+ "opentelemetry-semantic-conventions 0.31.0",
+ "opentelemetry_sdk 0.31.0",
+ "pay-api-core",
+ "redis",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "solana-address 2.5.0",
+ "solana-instruction 3.2.0",
+ "solana-message 3.1.0",
+ "solana-pay-kit",
+ "solana-pubkey 3.0.0",
+ "solana-signature",
+ "solana-transaction",
+ "spl-token-2022-interface",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-util 0.7.18",
+ "tracing",
+ "tracing-opentelemetry 0.32.1",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -14667,6 +14772,7 @@ dependencies = [
  "tower",
  "tower-layer",
  "tower-service",
+ "tracing",
  "url 2.5.8",
 ]
 
