@@ -1,0 +1,32 @@
+# Higher-concurrency session load for **proxy-only profiling**. Run the proxy
+# in one process and drive it from another:
+#   bench --otlp localhost:4318 --pyroscope=http://localhost:4040 serve bench/configs/session-load.yml
+#   bench load bench/configs/session-load.yml --proxy <PROXY_URL> --rpc <RPC_URL>
+#
+# Only the `serve` process is profiled, so the flamegraph is the proxy alone.
+# deposit_usdc >= unleash_secs * requests_per_sec_per_user * voucher_usdc.
+run:
+  name: session-load
+  scheme: mpp_session
+  network: fork
+  rpc_url_env: BENCH_FORK_RPC_URL
+  safety:
+    max_total_usdc: 1000.0
+    max_total_sol: 1000.0
+    require_confirmation: false
+
+load:
+  users: 100
+  requests_per_sec_per_user: 25
+  prepare_secs: 5
+  unleash_secs: 15
+  max_concurrency: 2048
+
+endpoints:
+  - url: "http://placeholder.local/v1/charge"  # overridden at runtime
+    method: POST
+    body: "{}"
+
+session:
+  deposit_usdc: 1.0      # channel cap per user
+  voucher_usdc: 0.001    # per-request voucher increment

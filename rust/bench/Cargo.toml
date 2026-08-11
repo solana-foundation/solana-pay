@@ -1,0 +1,59 @@
+[package]
+name = "pay-bench"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+publish = false
+
+[[bin]]
+name = "bench"
+path = "src/main.rs"
+
+# Not a workspace default-member: a plain `cargo build` skips it (and its heavy
+# surfpool/solana dep tree). Build/run explicitly with `-p pay-bench`.
+
+[dependencies]
+pay-core = { workspace = true, features = ["server", "otel"] }
+pay-types = { workspace = true }
+pay-kit = { workspace = true }
+solana-pubkey = { workspace = true }
+solana-message = { workspace = true }
+solana-signature = { workspace = true }
+solana-system-interface = { workspace = true }
+solana-transaction = { workspace = true }
+
+tokio = { workspace = true, features = ["full"] }
+reqwest = { workspace = true }
+axum = { workspace = true }
+
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yml = { workspace = true }
+
+clap = { workspace = true }
+chrono = { workspace = true }
+bs58 = { workspace = true }
+rand = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+tracing-opentelemetry = { workspace = true }
+opentelemetry = { workspace = true }
+opentelemetry-otlp = { workspace = true }
+opentelemetry-semantic-conventions = { workspace = true }
+opentelemetry_sdk = { workspace = true }
+
+anyhow = "1"
+async-trait = "0.1"
+futures = "0.3"
+hdrhistogram = "7"
+hkdf = "0.12"
+sha2 = "0.10"
+ed25519-dalek = "2"
+socket2 = "0.5"
+# CPU flamegraph profiling → Pyroscope (Grafana). pprof-rs sampling backend.
+pyroscope = "0.5"
+pyroscope_pprofrs = "0.2"
+
+# Embedded validator for rehearsal (fork) runs. Same pinned rev as pay-core's
+# dev-dependency so the lock resolves to a single copy.
+surfpool-sdk = { git = "https://github.com/solana-foundation/surfpool", rev = "b46c47e06c28ed1aa31e119215b479b70e72d4c3" }

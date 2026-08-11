@@ -1,0 +1,117 @@
+# pay-bench
+
+A production-grade load/scaling harness for the Pay proxy. Goal: prove a
+single proxy can hold large numbers of concurrent MPP sessions and measure how
+each payment scheme / intent scales.
+
+The bench is a **pure client**: it provisions funded wallets, pre-builds a
+request buffer, unleashes load at a target rate against a proxy URL, then
+settles and sweeps every wallet back to the funder. Every run is **journalled
+and resumable** so an interrupted mainnet run never strands funds.
+
+## Quick start (rehearsal — no real funds)
+
+```sh
+export BENCH_FORK_RPC_URL='https://your-read-only-solana-rpc.example'
+cargo run -p pay-bench --release -- rehearse bench/configs/session-fork.yml
+```
+
+Rehearsal boots an embedded **surfpool** validator and a local pay proxy, then
+runs the full pipeline against them. With a `rpc_url` in the config, surfpool
+runs as a **JIT mainnet-fork** (fetching the payment-channel program and USDC
+mint from that datasource). Current PayKit verifies genuine payment-channel
+opens, so the MPP-session benchmark cannot use an offline synthetic open.
+
+## Commands
+
+| Command | Purpose |
+|---|---|
+| `rehearse <cfg>` | Full pipeline on a local fork — no real money. |
+| `run <cfg> [--yes]` | Real run; `--yes` required on real-money networks. |
+| `list-runs` | Recorded runs + outstanding-fund status. |
+| `recover <id> \| --all` | Resume settle+sweep for an interrupted run. |
+| `estimate <cfg>` | Validate a config and print parsed settings. |
+
+## Config
+
+```yaml
+run:
+  name: charge-fork
+  scheme: mpp_charge          # mpp_charge | mpp_session | x402_exact
+  network: fork               # fork | mainnet | devnet
+  rpc_url: "https://…"        # fork datasource, or mainnet RPC (prefer rpc_url_env)
+  funder: { keypair_env: BENCH_FUNDER_KEYPAIR }
+  safety:
+    max_total_usdc: 100.0     # hard caps, enforced pre-flight
+    max_total_sol: 200.0
+    require_confirmation: true
+load:
+  users: 30000                # = concurrent channels for sessions
+  requests_per_sec_per_user: 1
+  prepare_secs: 30            # window to pre-build the request buffer
+  unleash_secs: 60            # measured window
+  max_concurrency: 2048
+endpoints:
+  - { url: "https://<proxy>/v1/charge", method: POST, body: "{}" }
+session: { deposit_usdc: 0.10, voucher_usdc: 0.0001 }   # mpp_session only
+```
+
+> **Secrets:** prefer `rpc_url_env` / `funder.keypair_env` over inlining an
+> API key or keypair in a committed config.
+
+## Pipeline
+
+`resolve → fund + provision → prepare → unleash → settle + sweep`, journalled at
+every transition (`~/.config/pay/bench/<run-id>.json`, 0600, atomic writes).
+
+- **Deterministic keys** — each user wallet is `HKDF(funder_secret, run_id,
+  index)`, so no secret is ever stored and any run is recoverable from the
+  funder + run id.
+- **Money safety** — pre-flight spend caps, `--yes` gate on real money, and
+  `recover` to sweep an interrupted run to zero stranded funds.
+
+## Observability
+
+Console logs are always on. Each phase logs its duration
+(`phase: provisioned elapsed_ms=…`), and per-user `provision`/`prepare` work
+runs inside spans (`provision{index=N}`). Worker threads are named
+`bench-worker-N` and shown in logs, so you can see what each thread is doing.
+
+Export spans + metrics to an OTLP collector to view full traces:
+
+```sh
+cargo run -p pay-bench -- --otlp 127.0.0.1:4318 rehearse bench/configs/charge-fork.yml
+# or: OTEL_EXPORTER_OTLP_ENDPOINT=http://collector:4318 cargo run -p pay-bench -- rehearse …
+```
+
+The pay server uses the same OTLP stack (`pay server start --otlp-sidecar …`)
+and now names its runtime threads (`pay-server-worker-N`, `pay-mcp-worker-N`)
+with spans on the payment middleware, session, and charge paths — so a bench
+run and the proxy show up in one correlated trace view.
+
+Tune verbosity with `RUST_LOG` (default
+`info,pay_core=error,hyper=warn,reqwest=warn,tower=warn`).
+
+## Schemes
+
+| Scheme | Status | Notes |
+|---|---|---|
+| `mpp_charge` | ✅ M1 | One on-chain-settled credential per request. **Pipeline-correctness** scheme — Solana-bound, not the 30k path. |
+| `mpp_session` | ✅ | Open a genuine channel once → off-chain vouchers (in-order, monotonic) → settle on close. Session runs require a JIT fork or a funded real network. |
+| `self_test` | ✅ | No on-chain work — fires plain GETs at a free path. Generator/proxy ceiling check (`configs/selftest-10k.yml`). |
+| `x402_exact` | ⏳ M5 | Per-request signed payment; deferred settlement. `up_to` is server-side volume-tier pricing, not a separate scheme. |
+
+## Known characteristics
+
+- **Charge on a fork** collides under replay protection: surfpool's fixed
+  blockhash makes a user's repeated charges *identical* (same signature), so
+  only the first settles and the rest 402 with "already processed". This is a
+  fork artifact, not a harness bug — and exactly why sessions (distinct
+  monotonic vouchers, no blockhash) are the throughput path.
+- **`session-offline.yml` is historical only.** Current PayKit rejects it
+  deliberately, because it cannot validate real payment-channel opens.
+- **One box may not source 30k req/s.** Use a self-test ceiling check and
+  distributed generators before attributing a limit to the proxy.
+
+Not a workspace default-member: a plain `cargo build` skips it. Build/run with
+`-p pay-bench`.

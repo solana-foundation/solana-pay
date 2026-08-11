@@ -1,0 +1,290 @@
+//! `bench` — Pay mainnet scaling harness.
+//!
+//! Subcommands:
+//!   rehearse <cfg>   full pipeline on a local surfpool fork (no real funds)
+//!   run <cfg>        real run (mainnet); --yes required on real-money networks
+//!   list-runs        show recorded runs + outstanding-fund status
+//!   recover <id>     resume settle+sweep for an interrupted run (or --all)
+//!   estimate <cfg>   validate a config and print parsed settings
+//!
+//! See `bench/README.md` and the approved plan for the design.
+
+mod config;
+mod driver;
+mod engine;
+mod journal;
+mod observability;
+mod rehearsal;
+mod report;
+mod scheme;
+mod wallet;
+
+use anyhow::{Context, Result, bail};
+use clap::{Parser, Subcommand};
+
+use crate::config::{Network, RunConfig};
+use crate::journal::Journal;
+
+#[derive(Parser)]
+#[command(name = "bench", about = "Pay mainnet scaling harness", version)]
+struct Cli {
+    #[command(subcommand)]
+    cmd: Cmd,
+    /// Export spans + metrics to this OTLP endpoint (host:port or URL). Falls
+    /// back to OTEL_EXPORTER_OTLP_ENDPOINT. Console logs are always on.
+    #[arg(long, global = true, value_name = "HOST:PORT|URL")]
+    otlp: Option<String>,
+    /// Push CPU profiles (flamegraphs) to a Pyroscope server. Bare `--pyroscope`
+    /// uses the local LGTM (`http://localhost:4040`); explore in Grafana →
+    /// Pyroscope, app `pay-bench`.
+    #[arg(
+        long,
+        global = true,
+        value_name = "URL",
+        num_args = 0..=1,
+        default_missing_value = "http://localhost:4040"
+    )]
+    pyroscope: Option<String>,
+}
+
+#[derive(Subcommand)]
+enum Cmd {
+    /// Rehearse a config against a local surfpool fork (no real funds).
+    Rehearse { config: String },
+    /// Run a config for real. Requires --yes on real-money networks.
+    Run {
+        config: String,
+        #[arg(long)]
+        yes: bool,
+    },
+    /// List recorded runs and their status.
+    ListRuns,
+    /// Recover (settle + sweep) an interrupted run, or all outstanding runs.
+    Recover {
+        #[arg(required_unless_present = "all")]
+        run_id: Option<String>,
+        #[arg(long)]
+        all: bool,
+    },
+    /// Validate a config and print the parsed settings.
+    Estimate { config: String },
+    /// Spin only the proxy (+ fork) and block, so it can be profiled in
+    /// isolation. Drive it from a separate `bench load` process.
+    Serve { config: String },
+    /// Drive load against an external proxy (started by `bench serve`).
+    Load {
+        config: String,
+        #[arg(long)]
+        proxy: String,
+        #[arg(long)]
+        rpc: String,
+    },
+}
+
+/// Service/profiler identity per subcommand: the proxy-only `serve` process
+/// reports as `pay-proxy` so its traces/metrics/flamegraph stay separate from
+/// the load generator (`pay-bench`).
+fn identity(cmd: &Cmd) -> &'static str {
+    match cmd {
+        Cmd::Serve { .. } => "pay-proxy",
+        _ => "pay-bench",
+    }
+}
+
+fn main() -> Result<()> {
+    let cli = Cli::parse();
+    let otlp = cli
+        .otlp
+        .clone()
+        .or_else(|| std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT").ok());
+    let service = identity(&cli.cmd);
+    // Hold the guard for the whole process so OTLP batches flush on exit.
+    let _guard = observability::init(service, otlp.as_deref());
+    warn_incomplete();
+
+    // Optional CPU profiling → Pyroscope (flamegraphs in Grafana).
+    let profiler = match cli.pyroscope.as_deref() {
+        Some(url) => {
+            use pyroscope::PyroscopeAgent;
+            use pyroscope_pprofrs::{PprofConfig, pprof_backend};
+            let agent = PyroscopeAgent::builder(url, service)
+                .backend(pprof_backend(PprofConfig::new().sample_rate(100)))
+                .build()
+                .context("pyroscope build")?;
+            tracing::info!(url, app = service, "pyroscope profiling enabled");
+            Some(agent.start().context("pyroscope start")?)
+        }
+        None => None,
+    };
+
+    let rt = observability::named_runtime("bench").context("build bench runtime")?;
+    let result = rt.block_on(run(cli.cmd));
+
+    // Stop + flush the profiler so the last samples reach Pyroscope.
+    if let Some(running) = profiler
+        && let Ok(ready) = running.stop()
+    {
+        ready.shutdown();
+    }
+    result
+}
+
+async fn run(cmd: Cmd) -> Result<()> {
+    match cmd {
+        Cmd::Rehearse { config } => {
+            let cfg = RunConfig::from_yaml_path(&config)?;
+            let report = rehearsal::run(cfg).await?;
+            finish(report)
+        }
+        Cmd::Run { config, yes } => run_real(&config, yes).await,
+        Cmd::ListRuns => list_runs(),
+        Cmd::Recover { run_id, all } => recover(run_id, all).await,
+        Cmd::Serve { config } => {
+            let cfg = RunConfig::from_yaml_path(&config)?;
+            rehearsal::serve_proxy(cfg).await
+        }
+        Cmd::Load { config, proxy, rpc } => {
+            let cfg = RunConfig::from_yaml_path(&config)?;
+            let report = rehearsal::load(cfg, proxy, rpc).await?;
+            finish(report)
+        }
+        Cmd::Estimate { config } => {
+            let cfg = RunConfig::from_yaml_path(&config)?;
+            println!("{cfg:#?}");
+            Ok(())
+        }
+    }
+}
+
+/// Print the summary and write a JSON artifact next to the cwd.
+fn finish(report: report::ReportJson) -> Result<()> {
+    println!("{}", report.summary());
+    let path = std::path::PathBuf::from(format!("bench-report-{}.json", report.run_id));
+    report.write_json(&path)?;
+    println!("report written to {}", path.display());
+    Ok(())
+}
+
+async fn run_real(config: &str, yes: bool) -> Result<()> {
+    let cfg = RunConfig::from_yaml_path(config)?;
+    if cfg.run.network.is_real_money() && cfg.run.safety.require_confirmation && !yes {
+        bail!(
+            "network `{:?}` spends real funds — re-run with --yes to confirm",
+            cfg.run.network
+        );
+    }
+    let rpc_url = cfg
+        .resolve_rpc_url()?
+        .context("a real run needs an RPC URL (rpc_url or rpc_url_env)")?;
+    let funder_wallet = wallet::load_funder(&cfg.run.funder, cfg.run.network)?;
+    let funder = wallet::MainnetFunder {
+        rpc_url: rpc_url.clone(),
+        funder: funder_wallet.clone(),
+    };
+    let scheme = scheme::build(&cfg);
+
+    let run_id = journal::new_run_id(&cfg.run.name, &chrono::Utc::now());
+    let mut jrnl = Journal::create(
+        run_id,
+        cfg.run.name.clone(),
+        cfg.run.scheme,
+        cfg.run.network,
+        funder_wallet.pubkey.to_string(),
+    )?;
+
+    let report = engine::run_pipeline(engine::PipelineParams {
+        config: &cfg,
+        scheme: scheme.as_ref(),
+        funder: &funder,
+        funder_seed: funder_wallet.seed(),
+        rpc_url,
+        host_override: None,
+        journal: &mut jrnl,
+    })
+    .await?;
+    finish(report)
+}
+
+fn list_runs() -> Result<()> {
+    let runs = Journal::scan_all()?;
+    if runs.is_empty() {
+        println!("no recorded runs (looked in {})", Journal::dir()?.display());
+        return Ok(());
+    }
+    println!(
+        "{:<34} {:<13} {:<9} {:>6} {:>6}  STATUS",
+        "RUN ID", "SCHEME", "NETWORK", "USERS", "UNSWPT"
+    );
+    for r in runs {
+        let unswept = r.users.iter().filter(|u| u.funded && !u.swept).count();
+        println!(
+            "{:<34} {:<13} {:<9} {:>6} {:>6}  {:?}",
+            r.run_id,
+            format!("{:?}", r.scheme),
+            format!("{:?}", r.network),
+            r.users.len(),
+            unswept,
+            r.status,
+        );
+    }
+    Ok(())
+}
+
+async fn recover(run_id: Option<String>, all: bool) -> Result<()> {
+    let targets: Vec<journal::RunState> = if all {
+        Journal::scan_incomplete()?
+    } else {
+        vec![
+            Journal::load(&run_id.expect("clap guarantees run_id when !all"))?
+                .state()
+                .clone(),
+        ]
+    };
+    if targets.is_empty() {
+        println!("nothing to recover — no outstanding runs");
+        return Ok(());
+    }
+    for state in targets {
+        let unswept = state.users.iter().filter(|u| u.funded && !u.swept).count();
+        println!(
+            "recover {} ({:?}, {:?}): {} unswept of {} users",
+            state.run_id,
+            state.scheme,
+            state.network,
+            unswept,
+            state.users.len()
+        );
+        match state.network {
+            Network::Fork => {
+                // Fork ledgers are ephemeral; once the validator is gone there
+                // is nothing on-chain to sweep. Mark the journal terminal.
+                let mut j = Journal::load(&state.run_id)?;
+                j.set_status(journal::Status::Complete)?;
+                println!("  fork run — ledger ephemeral, marked complete");
+            }
+            Network::Mainnet | Network::Devnet => {
+                // Real sweep lands in M4 (MainnetFunder). The wallets are
+                // re-derivable from the funder secret + run_id; surface that.
+                bail!(
+                    "  mainnet/devnet recovery not implemented yet (M4): \
+                     re-derive users from funder + run_id `{}` and sweep",
+                    state.run_id
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Warn loudly if any prior run still has outstanding funds.
+fn warn_incomplete() {
+    if let Ok(runs) = Journal::scan_incomplete() {
+        let real: Vec<_> = runs.iter().filter(|r| r.network.is_real_money()).collect();
+        if !real.is_empty() {
+            tracing::warn!(
+                count = real.len(),
+                "outstanding real-money runs may hold funds — `bench list-runs` / `bench recover`"
+            );
+        }
+    }
+}
