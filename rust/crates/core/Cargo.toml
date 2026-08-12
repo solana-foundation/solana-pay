@@ -38,7 +38,9 @@ serde_json = { workspace = true }
 serde_yml = { workspace = true }
 csv = { workspace = true }
 base64 = { workspace = true }
-chrono = { workspace = true }
+# `serde` feature: the `pay push` journal (client::push::journal) stores RFC
+# 3339 timestamps as `DateTime<Utc>` fields that round-trip through JSONL.
+chrono = { workspace = true, features = ["serde"] }
 percent-encoding = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }

@@ -362,7 +362,7 @@ mod tests {
         for (input, expected) in [
             (format!("recipient,other\n{address},1\n"), "unknown `other`"),
             (
-                format!("recipient,amount\n,1\n"),
+                "recipient,amount\n,1\n".to_string(),
                 "line 2 recipient must not be empty",
             ),
             (

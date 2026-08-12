@@ -116,6 +116,12 @@ fn polkit_action_for_intent(intent: &AuthIntent) -> &'static str {
         AuthIntent::AuthorizePayment { limit, .. } => limit
             .map(polkit_payment_limit_action)
             .unwrap_or(POLKIT_ACTION_PAYMENT),
+        // A batch is "a series of payments" like a session budget; reuse the
+        // same action plus the existing per-limit-bucket mapping rather than
+        // installing a whole new policy action for Slice 2.
+        AuthIntent::AuthorizeBatch { limit, .. } => limit
+            .map(polkit_payment_limit_action)
+            .unwrap_or(POLKIT_ACTION_SESSION),
         AuthIntent::CreateAccount(_) => POLKIT_ACTION_CREATE,
         AuthIntent::ImportAccount(_) => POLKIT_ACTION_IMPORT,
         AuthIntent::ExportAccount(_) => POLKIT_ACTION_EXPORT,
@@ -626,6 +632,29 @@ mod tests {
         assert_eq!(
             polkit_action_for_intent(&AuthIntent::use_gateway_fee_payer()),
             POLKIT_ACTION_GATEWAY_FEE_PAYER
+        );
+    }
+
+    #[test]
+    fn batch_intents_use_session_action_bucketed_by_limit() {
+        assert_eq!(
+            polkit_action_for_intent(&AuthIntent::authorize_batch(
+                "default", 10, "1.00", "1.00", "$0.05", "USDG", "mainnet", "a42f82c1",
+            )),
+            "sh.pay.authorize-payment-up-to-usd-005"
+        );
+        assert_eq!(
+            polkit_action_for_intent(&AuthIntent::authorize_batch(
+                "default",
+                10,
+                "1.00",
+                "1.00",
+                "not-a-dollar-amount",
+                "USDG",
+                "mainnet",
+                "a42f82c1",
+            )),
+            POLKIT_ACTION_SESSION
         );
     }
 
