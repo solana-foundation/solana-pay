@@ -87,8 +87,8 @@ impl SetupConfig {
     fn validate(&self) -> Result<()> {
         ensure!(self.setup.users > 0, "setup.users must be > 0");
         ensure!(
-            self.setup.max_total_sol >= 0.0,
-            "setup.max_total_sol must be >= 0"
+            self.setup.max_total_sol.is_finite() && self.setup.max_total_sol >= 0.0,
+            "setup.max_total_sol must be a finite number >= 0"
         );
         ensure!(!self.assets.is_empty(), "at least one asset is required");
         ensure!(
@@ -724,6 +724,13 @@ mod tests {
     fn bundled_devnet_fixture_is_within_its_caps() {
         let config: SetupConfig =
             serde_yml::from_str(include_str!("../configs/devnet-fixture-100k.yml")).unwrap();
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn bundled_devnet_usdg_fixture_is_within_its_caps() {
+        let config: SetupConfig =
+            serde_yml::from_str(include_str!("../configs/devnet-fixture-100k-usdg.yml")).unwrap();
         config.validate().unwrap();
     }
 }

@@ -84,11 +84,13 @@ session: { deposit_usdc: 0.10, voucher_usdc: 0.0001 }   # mpp_session only
 
 ## Reusable devnet fixture
 
-Use `configs/devnet-fixture-100k.yml` as the versioned allocation plan. A
-stable `--id` is part of the wallet derivation namespace, so the same funder
-and ID always recover the same 100,000 addresses. `setup` is resumable: it
-reconciles each target ATA to its configured balance before transferring only
-the missing amount. The journal stores no private keys or RPC URL.
+Use one of the versioned 100,000-wallet allocation plans:
+`configs/devnet-fixture-100k.yml` for devnet USDC or
+`configs/devnet-fixture-100k-usdg.yml` for devnet USDG (Token-2022). A stable
+`--id` is part of the wallet derivation namespace, so the same funder and ID
+always recover the same 100,000 addresses. `setup` is resumable: it reconciles
+each target ATA to its configured balance before transferring only the missing
+amount. The journal stores no private keys or RPC URL.
 
 ```sh
 export BENCH_DEVNET_RPC_URL='https://…'
@@ -109,11 +111,18 @@ cargo run -p pay-bench --release -- teardown devnet-100k \
   --config bench/configs/devnet-fixture-100k.yml --yes
 ```
 
-The bundled file enables canonical devnet USDC. Add USDT only with the actual
-devnet mint you fund: PayKit intentionally never maps a devnet symbol to the
-mainnet USDT mint. The plan performs one idempotently reconciled transaction
-per derived wallet; it is intentionally restart-safe rather than relying on a
-one-off bulk-transfer script.
+For USDG, use a distinct setup ID so its derived wallets cannot collide with
+the USDC fixture:
+
+```sh
+cargo run -p pay-bench --release -- setup \
+  bench/configs/devnet-fixture-100k-usdg.yml --id devnet-100k-usdg --yes
+```
+
+The plan performs one idempotently reconciled transaction per derived wallet;
+it is intentionally restart-safe rather than relying on a one-off bulk-
+transfer script. Add USDT only with the actual devnet mint you fund: PayKit
+intentionally never maps a devnet symbol to the mainnet USDT mint.
 
 ## Pipeline
 
