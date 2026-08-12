@@ -6483,7 +6483,6 @@ dependencies = [
  "futures-util",
  "hmac 0.12.1",
  "http 1.4.2",
- "jsonwebtoken",
  "libc",
  "md-5",
  "mime_guess",
@@ -6506,6 +6505,7 @@ dependencies = [
  "solana-commitment-config",
  "solana-hash 3.1.0",
  "solana-instruction 3.2.0",
+ "solana-keychain",
  "solana-message 3.1.0",
  "solana-pay-kit",
  "solana-pubkey 3.0.0",
@@ -10414,24 +10414,29 @@ dependencies = [
 [[package]]
 name = "solana-keychain"
 version = "1.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c6faefd705bf8e950cf15d7ab0690246abfaf3b898b556e8be3482b21ed2f95a"
+source = "git+https://github.com/solana-foundation/solana-keychain.git?rev=867003e86627d9538871f6ca6ea0a2f2e0773608#867003e86627d9538871f6ca6ea0a2f2e0773608"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
  "bincode",
  "bs58",
+ "chrono",
+ "getrandom 0.2.17",
+ "getrandom 0.3.4",
  "google-cloud-auth",
  "google-cloud-kms-v1",
+ "hex",
+ "jsonwebtoken",
  "log",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "solana-sdk",
  "solana-shred-version",
  "solana-signature",
  "thiserror 2.0.18",
- "tokio",
+ "uuid",
  "zeroize",
 ]
 
