@@ -12,6 +12,7 @@
 mod config;
 mod driver;
 mod engine;
+mod fixture_rpc;
 mod fixtures;
 mod journal;
 mod observability;

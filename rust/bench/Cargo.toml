@@ -22,8 +22,13 @@ solana-signature = { workspace = true }
 solana-system-interface = { workspace = true }
 solana-transaction = { workspace = true }
 solana-instruction = { workspace = true }
+solana-commitment-config = { workspace = true }
+solana-hash = { workspace = true }
+solana-account = "3.4.0"
+solana-transaction-status-client-types = "4.0.0"
 
 tokio = { workspace = true, features = ["full"] }
+tokio-util = "0.7"
 reqwest = { workspace = true }
 axum = { workspace = true }
 

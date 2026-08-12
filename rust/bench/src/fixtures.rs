@@ -7,10 +7,11 @@
 //! the funder recovers rent.
 
 use std::str::FromStr;
+use std::time::Instant;
 
 use anyhow::{Context, Result, bail, ensure};
+use futures::{StreamExt, TryStreamExt};
 use pay_kit::mpp::solana_keychain::{SolanaSigner, memory::MemorySigner};
-use pay_kit::mpp::solana_rpc_client::rpc_client::RpcClient;
 use serde::Deserialize;
 use solana_instruction::Instruction;
 use solana_message::Message;
@@ -22,15 +23,44 @@ use solana_transaction::Transaction;
 use spl_token_2022_interface::extension::StateWithExtensions;
 use spl_token_2022_interface::instruction as token_instruction;
 use spl_token_2022_interface::state::Account as TokenAccount;
+use tokio_util::sync::CancellationToken;
 
 use crate::config::{FunderCfg, Network, RunConfig};
-use crate::journal::{FixtureAsset, FixtureJournal, FixturePhase, FixtureState};
+use crate::fixture_rpc::{ExecutionConfig, FixtureRpc};
+use crate::journal::{
+    FixtureAsset, FixtureJournal, FixturePhase, FixtureState, PendingTransaction,
+};
 use crate::wallet::{Wallet, derive_user, load_funder};
 
 /// A conservative public-cluster transaction-fee allowance for each setup
 /// transaction. Actual fees are RPC-controlled, so this is a preflight floor,
 /// not a fee quote.
 const SETUP_FEE_ALLOWANCE_LAMPORTS: u64 = 10_000;
+
+struct PreparedUser {
+    index: usize,
+    wallet: Wallet,
+    instructions: Vec<Instruction>,
+}
+
+#[derive(Clone, Copy)]
+struct SetupWindow<'a> {
+    rpc: &'a FixtureRpc,
+    funder: &'a Wallet,
+    seed: &'a [u8; 32],
+    setup_id: &'a str,
+    sol_lamports: u64,
+    assets: &'a [FixtureAsset],
+}
+
+#[derive(Clone, Copy)]
+struct TeardownWindow<'a> {
+    rpc: &'a FixtureRpc,
+    funder: &'a Wallet,
+    seed: &'a [u8; 32],
+    setup_id: &'a str,
+    assets: &'a [FixtureAsset],
+}
 
 /// A standalone YAML file purpose-built for setup/teardown. It is deliberately
 /// separate from the request-load config: fixture allocation is an explicit,
@@ -40,6 +70,8 @@ const SETUP_FEE_ALLOWANCE_LAMPORTS: u64 = 10_000;
 pub struct SetupConfig {
     pub setup: SetupMeta,
     pub assets: Vec<AssetConfig>,
+    #[serde(default)]
+    pub execution: ExecutionConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -92,6 +124,7 @@ impl SetupConfig {
             "setup.max_total_sol must be a finite number >= 0"
         );
         ensure!(!self.assets.is_empty(), "at least one asset is required");
+        self.execution.validate()?;
         ensure!(
             self.setup.network != Network::Fork,
             "fixture setup requires devnet or mainnet; use `bench rehearse` for a fork"
@@ -154,6 +187,7 @@ pub async fn setup(config_path: &str, id: Option<&str>, yes: bool) -> Result<()>
     let config = SetupConfig::from_yaml_path(config_path)?;
     require_confirmation(yes, "setup")?;
     let rpc_url = config.resolve_rpc_url()?;
+    let rpc = FixtureRpc::new(rpc_url.clone(), config.execution.clone());
     let funder = load_funder(&config.setup.funder, config.setup.network)?;
     let setup_id = id
         .map(str::to_owned)
@@ -177,6 +211,7 @@ pub async fn setup(config_path: &str, id: Option<&str>, yes: bool) -> Result<()>
             assets: assets.clone(),
             phase: FixturePhase::SettingUp,
             next_user: 0,
+            pending: Vec::new(),
             created_at: now.clone(),
             updated_at: now,
         })?
@@ -195,36 +230,102 @@ pub async fn setup(config_path: &str, id: Option<&str>, yes: bool) -> Result<()>
         return Ok(());
     }
 
-    let ata_rent = rpc_minimum_ata_rent(&rpc_url).await?;
+    resolve_pending(&rpc, &mut journal).await?;
+    let ata_rent = rpc_minimum_ata_rent(&rpc).await?;
     let minimum_sol = enforce_sol_cap(&config, assets.len(), ata_rent)?;
-    verify_funder_sol_balance(&rpc_url, &funder, minimum_sol).await?;
-    ensure_funder_atas(&rpc_url, &funder, &assets).await?;
-    verify_funder_balances(&rpc_url, &funder, &assets, config.setup.users).await?;
+    verify_funder_sol_balance(&rpc, &funder, minimum_sol).await?;
+    ensure_funder_atas(&rpc, &funder, &assets, &mut journal, "setup", usize::MAX).await?;
+    verify_funder_balances(&rpc, &funder, &assets, config.setup.users).await?;
 
     journal.set_phase(FixturePhase::SettingUp)?;
     let seed = funder.seed();
     let start = journal.state().next_user;
-    for index in start..config.setup.users {
-        let user = derive_user(&seed, &setup_id, index as u32);
-        reconcile_setup_user(
-            &rpc_url,
-            &funder,
-            &user,
-            config.setup.sol_lamports_per_user,
-            &assets,
-        )
-        .await
-        .with_context(|| format!("setting up user {index}"))?;
-        journal.checkpoint(index + 1)?;
-        if (index + 1) % 100 == 0 || index + 1 == config.setup.users {
+    let cancellation = CancellationToken::new();
+    let signal_cancel = cancellation.clone();
+    let signal_task = tokio::spawn(async move {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            signal_cancel.cancel();
+        }
+    });
+    let mut window_start = start;
+    let progress_started = Instant::now();
+    while window_start < config.setup.users {
+        let window_end = (window_start + config.execution.window_users).min(config.setup.users);
+        let mut prepared = tokio::select! {
+            _ = cancellation.cancelled() => {
+                signal_task.abort();
+                bail!("fixture setup cancelled before window {window_start}..{window_end}; rerun to resume")
+            },
+            result = prepare_setup_window(
+                SetupWindow {
+                    rpc: &rpc,
+                    funder: &funder,
+                    seed: &seed,
+                    setup_id: &setup_id,
+                    sol_lamports: config.setup.sol_lamports_per_user,
+                    assets: &assets,
+                },
+                window_start,
+                window_end,
+                config.execution.reconcile_concurrency,
+            ) => match result {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    signal_task.abort();
+                    return Err(error);
+                }
+            },
+        };
+        prepared.sort_by_key(|item| item.index);
+        for item in prepared {
+            if cancellation.is_cancelled() {
+                signal_task.abort();
+                bail!(
+                    "fixture setup cancelled before window submission; rerun to resume from user {window_start}"
+                );
+            }
+            let result = send_transaction(
+                &rpc,
+                &funder,
+                None,
+                item.instructions,
+                &mut journal,
+                "setup",
+                item.index,
+            )
+            .await
+            .with_context(|| format!("setting up user {}", item.index));
+            if let Err(error) = result {
+                signal_task.abort();
+                return Err(error);
+            }
+        }
+        journal.checkpoint(window_end)?;
+        if cancellation.is_cancelled() {
+            signal_task.abort();
+            bail!(
+                "fixture setup cancelled after window {window_start}..{window_end} was persisted; rerun to resume"
+            );
+        }
+        if window_end % 100 == 0 || window_end == config.setup.users {
+            let completed = window_end.saturating_sub(start);
+            let elapsed_seconds = progress_started.elapsed().as_secs_f64();
+            let users_per_second = completed as f64 / elapsed_seconds.max(0.001);
+            let remaining = config.setup.users.saturating_sub(window_end);
+            let estimated_remaining_seconds = (remaining as f64 / users_per_second).ceil() as u64;
             tracing::info!(
                 setup_id,
-                completed = index + 1,
+                completed = window_end,
                 users = config.setup.users,
+                elapsed_seconds,
+                users_per_second,
+                estimated_remaining_seconds,
                 "fixture setup progress"
             );
         }
+        window_start = window_end;
     }
+    signal_task.abort();
     journal.set_phase(FixturePhase::Ready)?;
     println!(
         "fixture `{setup_id}` ready: {} deterministic wallets × {} token account(s)",
@@ -246,6 +347,7 @@ pub async fn teardown(setup_id: &str, config_path: &str, yes: bool) -> Result<()
     );
     let config = SetupConfig::from_yaml_path(config_path)?;
     let rpc_url = config.resolve_rpc_url()?;
+    let rpc = FixtureRpc::new(rpc_url.clone(), config.execution.clone());
     let funder = load_funder(&config.setup.funder, journal.state().network)
         .context("teardown must use the same funder configured for setup")?;
     ensure_same_fixture(journal.state(), &config, &funder, &config.journal_assets()?)?;
@@ -254,28 +356,108 @@ pub async fn teardown(setup_id: &str, config_path: &str, yes: bool) -> Result<()
         "BENCH_FUNDER_KEYPAIR does not match fixture `{setup_id}`'s funder"
     );
 
-    ensure_funder_atas(&rpc_url, &funder, &journal.state().assets).await?;
+    resolve_pending(&rpc, &mut journal).await?;
+    let teardown_assets = journal.state().assets.clone();
+    ensure_funder_atas(
+        &rpc,
+        &funder,
+        &teardown_assets,
+        &mut journal,
+        "teardown",
+        usize::MAX,
+    )
+    .await?;
     if journal.state().phase != FixturePhase::TearingDown {
         journal.set_phase(FixturePhase::TearingDown)?;
         journal.checkpoint(0)?;
     }
     let seed = funder.seed();
     let start = journal.state().next_user.min(journal.state().users);
-    for index in start..journal.state().users {
-        let user = derive_user(&seed, setup_id, index as u32);
-        reconcile_teardown_user(&rpc_url, &funder, &user, &journal.state().assets)
+    let cancellation = CancellationToken::new();
+    let signal_cancel = cancellation.clone();
+    let signal_task = tokio::spawn(async move {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            signal_cancel.cancel();
+        }
+    });
+    let mut window_start = start;
+    let progress_started = Instant::now();
+    while window_start < journal.state().users {
+        let window_end = (window_start + config.execution.window_users).min(journal.state().users);
+        let mut prepared = tokio::select! {
+            _ = cancellation.cancelled() => {
+                signal_task.abort();
+                bail!("fixture teardown cancelled before window {window_start}..{window_end}; rerun to resume")
+            },
+            result = prepare_teardown_window(
+                TeardownWindow {
+                    rpc: &rpc,
+                    funder: &funder,
+                    seed: &seed,
+                    setup_id,
+                    assets: &teardown_assets,
+                },
+                window_start,
+                window_end,
+                config.execution.reconcile_concurrency,
+            ) => match result {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    signal_task.abort();
+                    return Err(error);
+                }
+            },
+        };
+        prepared.sort_by_key(|item| item.index);
+        for item in prepared {
+            if cancellation.is_cancelled() {
+                signal_task.abort();
+                bail!(
+                    "fixture teardown cancelled before window submission; rerun to resume from user {window_start}"
+                );
+            }
+            let result = send_transaction(
+                &rpc,
+                &funder,
+                Some(&item.wallet),
+                item.instructions,
+                &mut journal,
+                "teardown",
+                item.index,
+            )
             .await
-            .with_context(|| format!("tearing down user {index}"))?;
-        journal.checkpoint(index + 1)?;
-        if (index + 1) % 100 == 0 || index + 1 == journal.state().users {
+            .with_context(|| format!("tearing down user {}", item.index));
+            if let Err(error) = result {
+                signal_task.abort();
+                return Err(error);
+            }
+        }
+        journal.checkpoint(window_end)?;
+        if cancellation.is_cancelled() {
+            signal_task.abort();
+            bail!(
+                "fixture teardown cancelled after window {window_start}..{window_end} was persisted; rerun to resume"
+            );
+        }
+        if window_end % 100 == 0 || window_end == journal.state().users {
+            let completed = window_end.saturating_sub(start);
+            let elapsed_seconds = progress_started.elapsed().as_secs_f64();
+            let users_per_second = completed as f64 / elapsed_seconds.max(0.001);
+            let remaining = journal.state().users.saturating_sub(window_end);
+            let estimated_remaining_seconds = (remaining as f64 / users_per_second).ceil() as u64;
             tracing::info!(
                 setup_id,
-                completed = index + 1,
+                completed = window_end,
                 users = journal.state().users,
+                elapsed_seconds,
+                users_per_second,
+                estimated_remaining_seconds,
                 "fixture teardown progress"
             );
         }
+        window_start = window_end;
     }
+    signal_task.abort();
     journal.set_phase(FixturePhase::TornDown)?;
     println!("fixture `{setup_id}` torn down; token accounts closed and rent reclaimed");
     Ok(())
@@ -392,8 +574,8 @@ fn enforce_sol_cap(config: &SetupConfig, asset_count: usize, ata_rent: u64) -> R
     u64::try_from(estimated_lamports).context("fixture SOL allocation exceeds u64")
 }
 
-async fn verify_funder_sol_balance(rpc_url: &str, funder: &Wallet, minimum: u64) -> Result<()> {
-    let available = rpc_balance(rpc_url, &funder.pubkey).await?;
+async fn verify_funder_sol_balance(rpc: &FixtureRpc, funder: &Wallet, minimum: u64) -> Result<()> {
+    let available = rpc_balance(rpc, &funder.pubkey).await?;
     ensure!(
         available >= minimum,
         "funder has {available} lamports; fixture needs at least {minimum} for allocations, ATA rent, and fee allowance"
@@ -401,24 +583,40 @@ async fn verify_funder_sol_balance(rpc_url: &str, funder: &Wallet, minimum: u64)
     Ok(())
 }
 
-async fn ensure_funder_atas(rpc_url: &str, funder: &Wallet, assets: &[FixtureAsset]) -> Result<()> {
+async fn ensure_funder_atas(
+    rpc: &FixtureRpc,
+    funder: &Wallet,
+    assets: &[FixtureAsset],
+    journal: &mut FixtureJournal,
+    operation: &str,
+    user_index: usize,
+) -> Result<()> {
     let instructions = assets
         .iter()
         .map(|asset| create_ata_ix(&funder.pubkey, &funder.pubkey, asset))
         .collect::<Result<Vec<_>>>()?;
-    send_transaction(rpc_url, funder, None, instructions).await?;
+    send_transaction(
+        rpc,
+        funder,
+        None,
+        instructions,
+        journal,
+        operation,
+        user_index,
+    )
+    .await?;
     Ok(())
 }
 
 async fn verify_funder_balances(
-    rpc_url: &str,
+    rpc: &FixtureRpc,
     funder: &Wallet,
     assets: &[FixtureAsset],
     users: usize,
 ) -> Result<()> {
     for asset in assets {
         let ata = associated_token_address(&funder.pubkey, asset)?;
-        let available = token_balance(rpc_url, &ata).await?.context(
+        let available = token_balance(rpc, &ata).await?.context(
             "funder ATA missing after idempotent creation; check the configured token program",
         )?;
         let needed = asset
@@ -434,15 +632,46 @@ async fn verify_funder_balances(
     Ok(())
 }
 
-async fn reconcile_setup_user(
-    rpc_url: &str,
+async fn prepare_setup_window(
+    window: SetupWindow<'_>,
+    start: usize,
+    end: usize,
+    concurrency: usize,
+) -> Result<Vec<PreparedUser>> {
+    let prepared = futures::stream::iter(start..end)
+        .map(move |index| {
+            let user = derive_user(window.seed, window.setup_id, index as u32);
+            async move {
+                let instructions = prepare_setup_user(
+                    window.rpc,
+                    window.funder,
+                    &user,
+                    window.sol_lamports,
+                    window.assets,
+                )
+                .await?;
+                Ok::<_, anyhow::Error>(PreparedUser {
+                    index,
+                    wallet: user,
+                    instructions,
+                })
+            }
+        })
+        .buffer_unordered(concurrency)
+        .try_collect()
+        .await?;
+    Ok(prepared)
+}
+
+async fn prepare_setup_user(
+    rpc: &FixtureRpc,
     funder: &Wallet,
     user: &Wallet,
     sol_lamports: u64,
     assets: &[FixtureAsset],
-) -> Result<()> {
+) -> Result<Vec<Instruction>> {
     let mut instructions = Vec::new();
-    let current_sol = rpc_balance(rpc_url, &user.pubkey).await?;
+    let current_sol = rpc_balance(rpc, &user.pubkey).await?;
     if current_sol < sol_lamports {
         instructions.push(system_instruction::transfer(
             &funder.pubkey,
@@ -452,7 +681,7 @@ async fn reconcile_setup_user(
     }
     for asset in assets {
         let user_ata = associated_token_address(&user.pubkey, asset)?;
-        let current = token_balance(rpc_url, &user_ata).await?;
+        let current = token_balance(rpc, &user_ata).await?;
         let current_amount = current.unwrap_or(0);
         ensure!(
             current_amount <= asset.amount_base,
@@ -485,20 +714,43 @@ async fn reconcile_setup_user(
             );
         }
     }
-    send_transaction(rpc_url, funder, None, instructions).await?;
-    Ok(())
+    Ok(instructions)
 }
 
-async fn reconcile_teardown_user(
-    rpc_url: &str,
+async fn prepare_teardown_window(
+    window: TeardownWindow<'_>,
+    start: usize,
+    end: usize,
+    concurrency: usize,
+) -> Result<Vec<PreparedUser>> {
+    futures::stream::iter(start..end)
+        .map(move |index| {
+            let user = derive_user(window.seed, window.setup_id, index as u32);
+            async move {
+                let instructions =
+                    prepare_teardown_user(window.rpc, window.funder, &user, window.assets).await?;
+                Ok::<_, anyhow::Error>(PreparedUser {
+                    index,
+                    wallet: user,
+                    instructions,
+                })
+            }
+        })
+        .buffer_unordered(concurrency)
+        .try_collect()
+        .await
+}
+
+async fn prepare_teardown_user(
+    rpc: &FixtureRpc,
     funder: &Wallet,
     user: &Wallet,
     assets: &[FixtureAsset],
-) -> Result<()> {
+) -> Result<Vec<Instruction>> {
     let mut instructions = Vec::new();
     for asset in assets {
         let user_ata = associated_token_address(&user.pubkey, asset)?;
-        let Some(balance) = token_balance(rpc_url, &user_ata).await? else {
+        let Some(balance) = token_balance(rpc, &user_ata).await? else {
             continue;
         };
         let funder_ata = associated_token_address(&funder.pubkey, asset)?;
@@ -530,7 +782,7 @@ async fn reconcile_teardown_user(
             .map_err(|error| anyhow::anyhow!("building {} ATA close: {error}", asset.label))?,
         );
     }
-    let sol = rpc_balance(rpc_url, &user.pubkey).await?;
+    let sol = rpc_balance(rpc, &user.pubkey).await?;
     if sol > 0 {
         instructions.push(system_instruction::transfer(
             &user.pubkey,
@@ -538,8 +790,7 @@ async fn reconcile_teardown_user(
             sol,
         ));
     }
-    send_transaction(rpc_url, funder, Some(user), instructions).await?;
-    Ok(())
+    Ok(instructions)
 }
 
 fn create_ata_ix(payer: &Pubkey, owner: &Pubkey, asset: &FixtureAsset) -> Result<Instruction> {
@@ -576,71 +827,48 @@ fn token_program(asset: &FixtureAsset) -> Result<Pubkey> {
         .with_context(|| format!("invalid {} token program in fixture journal", asset.label))
 }
 
-async fn rpc_minimum_ata_rent(rpc_url: &str) -> Result<u64> {
-    let url = rpc_url.to_string();
-    tokio::task::spawn_blocking(move || {
-        RpcClient::new(url)
-            .get_minimum_balance_for_rent_exemption(TokenAccount::LEN)
-            .context("fetching minimum ATA rent")
-    })
-    .await
-    .context("joining ATA rent RPC task")?
+async fn rpc_minimum_ata_rent(rpc: &FixtureRpc) -> Result<u64> {
+    rpc.minimum_balance_for_rent(TokenAccount::LEN)
+        .await
+        .context("fetching minimum ATA rent")
 }
 
-async fn rpc_balance(rpc_url: &str, address: &Pubkey) -> Result<u64> {
-    let url = rpc_url.to_string();
-    let address = *address;
-    tokio::task::spawn_blocking(move || {
-        RpcClient::new(url)
-            .get_balance(&address)
-            .context("fetching SOL balance")
-    })
-    .await
-    .context("joining SOL balance RPC task")?
+async fn rpc_balance(rpc: &FixtureRpc, address: &Pubkey) -> Result<u64> {
+    rpc.balance(address).await.context("fetching SOL balance")
 }
 
-async fn token_balance(rpc_url: &str, address: &Pubkey) -> Result<Option<u64>> {
-    let url = rpc_url.to_string();
-    let address = *address;
-    tokio::task::spawn_blocking(move || {
-        let rpc = RpcClient::new(url);
-        let account = rpc
-            .get_multiple_accounts(&[address])
-            .context("fetching token account")?
-            .into_iter()
-            .next()
-            .flatten();
-        match account {
-            Some(account) => StateWithExtensions::<TokenAccount>::unpack(&account.data)
-                .map(|account| Some(account.base.amount))
-                .context("decoding token account"),
-            None => Ok(None),
-        }
-    })
-    .await
-    .context("joining token balance RPC task")?
+async fn token_balance(rpc: &FixtureRpc, address: &Pubkey) -> Result<Option<u64>> {
+    let account = rpc
+        .accounts(&[*address])
+        .await
+        .context("fetching token account")?
+        .into_iter()
+        .next()
+        .flatten();
+    match account {
+        Some(account) => StateWithExtensions::<TokenAccount>::unpack(&account.data)
+            .map(|account| Some(account.base.amount))
+            .context("decoding token account"),
+        None => Ok(None),
+    }
 }
 
 async fn send_transaction(
-    rpc_url: &str,
+    rpc: &FixtureRpc,
     fee_payer: &Wallet,
     additional_signer: Option<&Wallet>,
     instructions: Vec<Instruction>,
+    journal: &mut FixtureJournal,
+    operation: &str,
+    user_index: usize,
 ) -> Result<()> {
     if instructions.is_empty() {
         return Ok(());
     }
-    let url = rpc_url.to_string();
-    let blockhash = tokio::task::spawn_blocking({
-        let url = url.clone();
-        move || {
-            RpcClient::new(url)
-                .get_latest_blockhash()
-                .context("fetching recent blockhash")
-        }
-    })
-    .await
-    .context("joining blockhash RPC task")??;
+    let (blockhash, last_valid_block_height) = rpc
+        .latest_blockhash()
+        .await
+        .context("fetching recent blockhash")?;
     let message = Message::new_with_blockhash(&instructions, Some(&fee_payer.pubkey), &blockhash);
     let mut transaction = Transaction::new_unsigned(message);
     sign_transaction(&mut transaction, fee_payer).await?;
@@ -649,16 +877,61 @@ async fn send_transaction(
     {
         sign_transaction(&mut transaction, signer).await?;
     }
-    let serialized = bincode::serialize(&transaction).context("serializing fixture transaction")?;
-    tokio::task::spawn_blocking(move || {
-        let transaction: Transaction =
-            bincode::deserialize(&serialized).context("deserializing fixture transaction")?;
-        RpcClient::new(url)
-            .send_and_confirm_transaction(&transaction)
-            .context("broadcasting fixture transaction")
-    })
-    .await
-    .context("joining broadcast RPC task")??;
+    let signature = transaction
+        .signatures
+        .first()
+        .copied()
+        .context("fixture transaction has no fee-payer signature")?;
+    journal.add_pending(PendingTransaction {
+        signature: signature.to_string(),
+        operation: operation.to_owned(),
+        user_index,
+        last_valid_block_height,
+    })?;
+    rpc.submit_and_confirm(&transaction)
+        .await
+        .context("broadcasting fixture transaction")?;
+    journal.clear_pending(&signature.to_string())?;
+    Ok(())
+}
+
+async fn resolve_pending(rpc: &FixtureRpc, journal: &mut FixtureJournal) -> Result<()> {
+    let pending = journal.state().pending.clone();
+    for transaction in pending {
+        let signature = Signature::from_str(&transaction.signature).with_context(|| {
+            format!(
+                "invalid pending transaction signature {}",
+                transaction.signature
+            )
+        })?;
+        if let Some(status) = rpc.signature_status(signature).await? {
+            if let Some(error) = status.err {
+                bail!(
+                    "pending {} transaction {} failed: {error:?}",
+                    transaction.operation,
+                    transaction.signature
+                );
+            }
+            journal.clear_pending(&transaction.signature)?;
+            continue;
+        }
+        let current_height = rpc.block_height().await?;
+        if current_height >= transaction.last_valid_block_height {
+            tracing::warn!(
+                signature = %transaction.signature,
+                operation = %transaction.operation,
+                user_index = transaction.user_index,
+                "pending fixture transaction expired before confirmation; reconciliation will rebuild it"
+            );
+            journal.clear_pending(&transaction.signature)?;
+            continue;
+        }
+        bail!(
+            "pending {} transaction {} has not confirmed and its blockhash is still valid; refusing to rebuild it",
+            transaction.operation,
+            transaction.signature
+        );
+    }
     Ok(())
 }
 

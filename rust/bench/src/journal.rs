@@ -29,8 +29,18 @@ pub struct FixtureState {
     /// The first index that still needs processing in the current phase. A
     /// transaction is idempotently reconciled before this checkpoint moves.
     pub next_user: usize,
+    #[serde(default)]
+    pub pending: Vec<PendingTransaction>,
     pub created_at: String,
     pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingTransaction {
+    pub signature: String,
+    pub operation: String,
+    pub user_index: usize,
+    pub last_valid_block_height: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -99,6 +109,21 @@ impl FixtureJournal {
 
     pub fn checkpoint(&mut self, next_user: usize) -> Result<()> {
         self.state.next_user = next_user;
+        self.save()
+    }
+
+    pub fn add_pending(&mut self, pending: PendingTransaction) -> Result<()> {
+        self.state
+            .pending
+            .retain(|item| item.signature != pending.signature);
+        self.state.pending.push(pending);
+        self.save()
+    }
+
+    pub fn clear_pending(&mut self, signature: &str) -> Result<()> {
+        self.state
+            .pending
+            .retain(|item| item.signature != signature);
         self.save()
     }
 
@@ -320,3 +345,29 @@ pub fn new_run_id(name: &str, now: &chrono::DateTime<chrono::Utc>) -> String {
 
 #[allow(dead_code)]
 fn _is_path(_: &Path) {}
+
+#[cfg(test)]
+mod tests {
+    use super::FixtureState;
+
+    #[test]
+    fn legacy_fixture_journal_defaults_pending_transactions() {
+        let raw = r#"
+        {
+          "setup_id": "legacy",
+          "name": "legacy",
+          "network": "devnet",
+          "funder_pubkey": "11111111111111111111111111111111",
+          "users": 1,
+          "sol_lamports_per_user": 0,
+          "assets": [],
+          "phase": "setting_up",
+          "next_user": 0,
+          "created_at": "2026-01-01T00:00:00Z",
+          "updated_at": "2026-01-01T00:00:00Z"
+        }
+        "#;
+        let state: FixtureState = serde_json::from_str(raw).unwrap();
+        assert!(state.pending.is_empty());
+    }
+}
