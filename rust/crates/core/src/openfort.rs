@@ -239,7 +239,11 @@ fn build_signer(credentials: &OpenfortCredentials, account_id: &str) -> Result<O
         account_id.to_string(),
         credentials.wallet_secret.clone(),
     )
-    .map_err(|e| Error::Config(format!("Invalid Openfort credentials for `{account_id}`: {e}")))?;
+    .map_err(|e| {
+        Error::Config(format!(
+            "Invalid Openfort credentials for `{account_id}`: {e}"
+        ))
+    })?;
 
     // The payment client paths are synchronous and create their own tokio
     // runtimes for header building, so a throwaway current-thread runtime
