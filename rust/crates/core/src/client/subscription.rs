@@ -490,6 +490,9 @@ pub fn parse_subscription_receipt(header: &str) -> Result<ParsedSubscriptionRece
         pay_kit::mpp::ReceiptKind::Charge(_) => Err(Error::Mpp(
             "Receipt is a charge receipt, not subscription".into(),
         )),
+        pay_kit::mpp::ReceiptKind::Session { .. } => Err(Error::Mpp(
+            "Receipt is a session receipt, not subscription".into(),
+        )),
     }
 }
 

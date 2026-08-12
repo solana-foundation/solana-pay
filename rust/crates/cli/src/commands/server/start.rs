@@ -1044,6 +1044,11 @@ impl StartCommand {
                         min_voucher_delta: sess.min_voucher_delta,
                         voucher_signer,
                         operator_signing_key: None,
+                        fee_payer_signer: if fee_payer {
+                            fee_payer_signer.clone()
+                        } else {
+                            None
+                        },
                         idle_timeout_options_seconds: sess.idle_timeout_options_seconds.clone(),
                         idle_timeout_seconds,
                         grace_period_seconds:
@@ -2887,9 +2892,10 @@ async fn gateway_verify(
                         // intent-agnostic shape.
                         let receipt = match &kind {
                             pay_kit::mpp::ReceiptKind::Charge(r) => r.clone(),
-                            // The charge verify path never produces a
-                            // Subscription kind; this arm is unreachable.
+                            // The charge verify path never produces either
+                            // extension kind; these arms are unreachable.
                             pay_kit::mpp::ReceiptKind::Subscription { base, .. } => base.clone(),
+                            pay_kit::mpp::ReceiptKind::Session { base, .. } => base.clone(),
                         };
 
                         // Log successful payment to PDB

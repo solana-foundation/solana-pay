@@ -1070,6 +1070,25 @@ impl SessionMpp {
         &self.session_config.currency
     }
 
+    /// Whether a challenge currency selects this session backend.
+    ///
+    /// PayKit advertises stablecoins as mint addresses even when Pay was
+    /// configured with a symbol such as `USDC`, so dispatch must compare the
+    /// normalized wire values rather than the original config strings.
+    pub fn accepts_currency(&self, currency: &str) -> bool {
+        if self.currency().eq_ignore_ascii_case(currency) {
+            return true;
+        }
+        let network = Some(self.network());
+        matches!(
+            (
+                pay_kit::mpp::resolve_stablecoin_mint(self.currency(), network),
+                pay_kit::mpp::resolve_stablecoin_mint(currency, network),
+            ),
+            (Some(configured), Some(advertised)) if configured == advertised
+        )
+    }
+
     /// Create from a [`SessionConfig`] and an HMAC secret key.
     pub fn new(config: SessionConfig, challenge_binding_secret: impl Into<String>) -> Self {
         Self::new_with_channel_store(
@@ -1538,10 +1557,11 @@ impl SessionMpp {
                     .process_open_with_outcome(p, context)
                     .await
                     .map_err(|e| Error::Mpp(format!("Session open failed: {e}")))?;
+                let replay = acceptance.replay;
+                let signature = Some(acceptance.transaction_signature);
                 let state = acceptance.state;
-                let signature = open_transaction_signature(&p.transaction);
 
-                if !acceptance.replay {
+                if !replay {
                     telemetry::record_payment_channel_opened(
                         signature.as_deref().unwrap_or_default(),
                         &state.channel_id,
@@ -1590,14 +1610,15 @@ impl SessionMpp {
             }
 
             SessionAction::TopUp(p) => {
-                let state = self
+                let acceptance = self
                     .server
-                    .process_topup(p)
+                    .process_topup_with_outcome(p)
                     .await
                     .map_err(|e| Error::Mpp(format!("TopUp failed: {e}")))?;
+                let signature = Some(acceptance.transaction_signature);
+                let state = acceptance.state;
                 self.record_committed_watermark(state.channel_id.clone(), state.cumulative);
                 self.touch_channel(state.channel_id.clone()).await?;
-                let signature = open_transaction_signature(&p.transaction);
                 Ok(SessionOutcome::Active { state, signature })
             }
 
@@ -1824,31 +1845,10 @@ pub fn test_channel_state(
     }
 }
 
-/// Base58 transaction signature of a client-submitted base64 transaction —
-/// used as the receipt reference for opens and top-ups (the fee payer's
-/// signature in slot 0 is the transaction id).
-fn open_transaction_signature(tx_base64: &str) -> Option<String> {
-    decode_base64_transaction(tx_base64)
-        .ok()?
-        .signatures
-        .first()
-        .map(|signature| signature.to_string())
-}
-
 fn spl_token_program() -> solana_pubkey::Pubkey {
     use pay_kit::mpp::protocol::solana::programs;
     use std::str::FromStr;
     solana_pubkey::Pubkey::from_str(programs::TOKEN_PROGRAM).expect("valid SPL token program id")
-}
-
-/// Decode a client-built open transaction. Delegates to the shared
-/// payment-channels decoder, which accepts both legacy (pay Rust client) and v0
-/// versioned (canonical pay-kit JS client) wire formats.
-fn decode_base64_transaction(
-    tx_base64: &str,
-) -> Result<solana_transaction::versioned::VersionedTransaction> {
-    pay_kit::mpp::program::payment_channels::decode_transaction(tx_base64)
-        .map_err(|e| Error::Mpp(e.to_string()))
 }
 
 fn decode_voucher_signature(signature: &str) -> Result<[u8; 64]> {
@@ -1933,6 +1933,17 @@ mod tests {
     fn test_session_mpp() -> SessionMpp {
         SessionMpp::new(test_session_config(), "test-secret")
             .with_blockhash_cache(test_blockhash_cache())
+    }
+
+    #[test]
+    fn session_currency_matches_its_advertised_mint() {
+        let mut config = test_session_config();
+        config.currency = "USDC".to_string();
+        let session = SessionMpp::new(config, "test-secret");
+
+        assert!(session.accepts_currency("USDC"));
+        assert!(session.accepts_currency(pay_kit::mpp::mints::USDC_MAINNET));
+        assert!(!session.accepts_currency(pay_kit::mpp::mints::USDG_MAINNET));
     }
 
     fn test_keypair() -> (ed25519_dalek::SigningKey, Box<dyn SolanaSigner>) {
