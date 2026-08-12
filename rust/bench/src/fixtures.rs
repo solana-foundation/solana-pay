@@ -19,6 +19,7 @@ use solana_pubkey::Pubkey;
 use solana_signature::Signature;
 use solana_system_interface::instruction as system_instruction;
 use solana_transaction::Transaction;
+use spl_token_2022_interface::extension::StateWithExtensions;
 use spl_token_2022_interface::instruction as token_instruction;
 use spl_token_2022_interface::state::Account as TokenAccount;
 
@@ -610,8 +611,8 @@ async fn token_balance(rpc_url: &str, address: &Pubkey) -> Result<Option<u64>> {
             .next()
             .flatten();
         match account {
-            Some(account) => TokenAccount::unpack(&account.data)
-                .map(|account| Some(account.amount))
+            Some(account) => StateWithExtensions::<TokenAccount>::unpack(&account.data)
+                .map(|account| Some(account.base.amount))
                 .context("decoding token account"),
             None => Ok(None),
         }
