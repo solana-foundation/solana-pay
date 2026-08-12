@@ -30,16 +30,17 @@ session challenge and returns `200` only after voucher verification; its
 `respond` route deliberately excludes an upstream application from this
 gateway measurement.
 
-Supply `PAY_PAYMENT_RECIPIENT`, `PAY_RPC_URL`, and a persistent random
-`PAY_SESSION_SECRET` through the service environment. The gateway uses
-client-funded channels (`operator.fee_payer: false`), so it does not need an
-operator key for this smoke test. A real devnet load run still requires the
-bench funder to hold devnet SOL and USDC; `pay-bench run` currently stops
-before funding rather than pretending it completed that transfer.
+Supply `PAY_PAYMENT_RECIPIENT`, `PAY_RPC_URL`,
+`PAY_SETTLEMENT_KEYPAIR_PATH`, and a persistent random `PAY_SESSION_SECRET`
+through the service environment. The settlement keypair is the configured
+operator signer: the gateway advertises `feePayer: true`, co-signs each
+validated open, pays the transaction fee plus channel-account rent, and later
+settles the channel. A real devnet load run still requires its retained fixture
+wallets to be provisioned with devnet SOL and USDtest before `pay-bench run`.
 
 For the Ubuntu benchmark host, install
 `deploy/pay-bench-devnet.service` as `/etc/systemd/system/pay-bench-devnet.service`
-and place the three environment values in `/etc/pay-bench/devnet.env` with
+and place the four environment values in `/etc/pay-bench/devnet.env` with
 mode `0600`. The unit raises `LimitNOFILE` to `262144`, which is a prerequisite
 for any high-concurrency generator or proxy run.
 

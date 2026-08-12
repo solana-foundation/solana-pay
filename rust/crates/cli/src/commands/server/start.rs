@@ -1084,7 +1084,11 @@ impl StartCommand {
                         min_voucher_delta: sess.min_voucher_delta,
                         voucher_signer,
                         operator_signing_key: None,
-                        fee_payer_signer: fee_payer_signer.clone(),
+                        fee_payer_signer: if fee_payer {
+                            fee_payer_signer.clone()
+                        } else {
+                            None
+                        },
                         idle_timeout_options_seconds: sess.idle_timeout_options_seconds.clone(),
                         idle_timeout_seconds,
                         grace_period_seconds:
