@@ -23,15 +23,34 @@ pub struct NewCommand {
     /// Replace existing account.
     #[arg(long)]
     pub force: bool,
+
+    /// Openfort project secret key (env: OPENFORT_SECRET_KEY).
+    #[arg(long)]
+    pub secret_key: Option<String>,
+
+    /// Openfort wallet secret, base64 P-256 (env: OPENFORT_WALLET_SECRET).
+    #[arg(long)]
+    pub wallet_secret: Option<String>,
+
+    /// Openfort backend wallet ID `acc_…` (env: OPENFORT_ACCOUNT_ID).
+    /// Defaults to the project's only Solana wallet, or prompts to pick.
+    #[arg(long)]
+    pub account_id: Option<String>,
 }
 
 impl NewCommand {
     pub fn run(self) -> pay_core::Result<()> {
+        let openfort = OpenfortInputs::resolve(
+            self.secret_key.clone(),
+            self.wallet_secret.clone(),
+            self.account_id.clone(),
+        );
         let (pubkey, backend_name) = create_account(
             &self.name,
             self.backend.as_deref(),
             self.vault.as_deref(),
             self.force,
+            &openfort,
         )?;
         eprintln!();
 
@@ -58,11 +77,12 @@ pub fn create_account(
     backend: Option<&str>,
     vault: Option<&str>,
     force: bool,
+    openfort: &OpenfortInputs,
 ) -> pay_core::Result<(String, &'static str)> {
     let backend_id = resolve_backend(backend)?;
 
     if backend_id == "openfort" {
-        return create_openfort_account(name, force);
+        return create_openfort_account(name, force, openfort);
     }
 
     let (ks, keystore_kind, backend_display, op_info) = build_keystore(&backend_id, vault, name)?;
@@ -122,14 +142,115 @@ pub fn create_account(
     Ok((pubkey_b58, backend_display))
 }
 
+/// Openfort credentials supplied up front, so setup can run without a TTY.
+///
+/// Each field falls back to an environment variable when the flag is
+/// absent; anything still missing is prompted for interactively.
+#[derive(Clone, Default)]
+pub struct OpenfortInputs {
+    /// Project secret key (`sk_live_…` / `sk_test_…`), or `OPENFORT_SECRET_KEY`.
+    pub secret_key: Option<String>,
+    /// Base64 P-256 wallet secret, or `OPENFORT_WALLET_SECRET`.
+    pub wallet_secret: Option<String>,
+    /// Backend wallet ID (`acc_…`), or `OPENFORT_ACCOUNT_ID`. When absent,
+    /// the wallet is discovered from the project.
+    pub account_id: Option<String>,
+}
+
+impl OpenfortInputs {
+    /// Merge CLI flags with the environment; flags win.
+    pub fn resolve(
+        secret_key: Option<String>,
+        wallet_secret: Option<String>,
+        account_id: Option<String>,
+    ) -> Self {
+        fn from_env(key: &str) -> Option<String> {
+            std::env::var(key)
+                .ok()
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty())
+        }
+        Self {
+            secret_key: secret_key.or_else(|| from_env("OPENFORT_SECRET_KEY")),
+            wallet_secret: wallet_secret.or_else(|| from_env("OPENFORT_WALLET_SECRET")),
+            account_id: account_id.or_else(|| from_env("OPENFORT_ACCOUNT_ID")),
+        }
+    }
+}
+
+/// Fail with a clear message when a value has to be prompted for but
+/// there is no terminal to prompt on.
+fn require_tty(missing: &str) -> pay_core::Result<()> {
+    if std::io::IsTerminal::is_terminal(&std::io::stderr()) {
+        return Ok(());
+    }
+    Err(pay_core::Error::Config(format!(
+        "No terminal to prompt for the Openfort {missing}.\n\
+         Pass it non-interactively instead: --secret-key / --wallet-secret / \
+         --account-id, or the OPENFORT_SECRET_KEY / OPENFORT_WALLET_SECRET / \
+         OPENFORT_ACCOUNT_ID environment variables."
+    )))
+}
+
+/// Pick which backend wallet to connect from the project's Solana wallets.
+///
+/// One wallet is used automatically; several are offered as a list; none
+/// is an error pointing at the dashboard, since pay cannot create a wallet
+/// without the wallet secret that the dashboard alone can issue.
+fn choose_wallet(
+    wallets: Vec<pay_core::openfort::BackendWallet>,
+    theme: &dialoguer::theme::ColorfulTheme,
+) -> pay_core::Result<String> {
+    match wallets.len() {
+        0 => Err(pay_core::Error::Config(
+            "This Openfort project has no Solana backend wallet yet.\n\
+             Create one at https://dashboard.openfort.io → Accounts → New account \
+             (chain type: Solana / SVM), then run this command again."
+                .to_string(),
+        )),
+        1 => {
+            let wallet = wallets.into_iter().next().expect("len checked");
+            eprintln!(
+                "  {} {}",
+                "Using backend wallet".dimmed(),
+                wallet.address.as_str()
+            );
+            Ok(wallet.id)
+        }
+        _ => {
+            require_tty("backend wallet choice")?;
+            let labels: Vec<String> = wallets
+                .iter()
+                .map(|w| format!("{}  ({})", w.address, w.id))
+                .collect();
+            let choice = Select::with_theme(theme)
+                .with_prompt("Which Openfort backend wallet?")
+                .items(&labels)
+                .default(0)
+                .interact()
+                .map_err(|e| pay_core::Error::Config(format!("Prompt error: {e}")))?;
+            Ok(wallets
+                .into_iter()
+                .nth(choice)
+                .expect("index from Select")
+                .id)
+        }
+    }
+}
+
 /// Connect an existing Openfort backend wallet as a pay account.
 ///
-/// Prompts for the project secret key, the backend wallet account ID
-/// (`acc_…`), and the wallet secret; validates them by fetching the
-/// wallet's Solana address from Openfort; then stores the credentials as
-/// a blob in the platform secret store and registers the account in
-/// accounts.yml. No keypair is generated — signing happens remotely.
-fn create_openfort_account(name: &str, force: bool) -> pay_core::Result<(String, &'static str)> {
+/// Resolves the project secret key, the backend wallet, and the wallet
+/// secret — from flags, the environment, or interactive prompts — then
+/// validates them by fetching the wallet's Solana address from Openfort,
+/// stores the credentials as a blob in the platform secret store, and
+/// registers the account in accounts.yml. No keypair is generated —
+/// signing happens remotely.
+fn create_openfort_account(
+    name: &str,
+    force: bool,
+    inputs: &OpenfortInputs,
+) -> pay_core::Result<(String, &'static str)> {
     const BACKEND_DISPLAY: &str = "Openfort backend wallet";
 
     if pay_core::openfort::credentials_exist(name) && !force {
@@ -157,36 +278,44 @@ fn create_openfort_account(name: &str, force: bool) -> pay_core::Result<(String,
         return Ok((pubkey, BACKEND_DISPLAY));
     }
 
-    if !std::io::IsTerminal::is_terminal(&std::io::stderr()) {
-        return Err(pay_core::Error::Config(
-            "Connecting an Openfort backend wallet requires an interactive terminal to \
-             enter the API credentials."
-                .to_string(),
-        ));
+    let theme = dialoguer::theme::ColorfulTheme::default();
+    let will_prompt = (inputs.secret_key.is_none() || inputs.wallet_secret.is_none())
+        && std::io::IsTerminal::is_terminal(&std::io::stderr());
+    if will_prompt {
+        eprintln!();
+        eprintln!(
+            "  Connect an Openfort backend wallet (dashboard.openfort.io → Developers → API keys)."
+        );
     }
 
-    let theme = dialoguer::theme::ColorfulTheme::default();
-    eprintln!();
-    eprintln!(
-        "  Connect an Openfort backend wallet (dashboard.openfort.io → Developers → API keys)."
-    );
-
-    let secret_key: String = dialoguer::Password::with_theme(&theme)
-        .with_prompt("Openfort secret key (sk_live_… / sk_test_…)")
-        .interact()
-        .map_err(|e| pay_core::Error::Config(format!("Prompt error: {e}")))?;
-    let secret_key = secret_key.trim().to_string();
+    let secret_key = match &inputs.secret_key {
+        Some(key) => key.trim().to_string(),
+        None => {
+            require_tty("secret key")?;
+            dialoguer::Password::with_theme(&theme)
+                .with_prompt("Openfort secret key (sk_live_… / sk_test_…)")
+                .interact()
+                .map_err(|e| pay_core::Error::Config(format!("Prompt error: {e}")))?
+                .trim()
+                .to_string()
+        }
+    };
     if !secret_key.starts_with("sk_") {
         return Err(pay_core::Error::Config(
             "The Openfort secret key must start with `sk_live_` or `sk_test_`.".to_string(),
         ));
     }
 
-    let account_id: String = dialoguer::Input::with_theme(&theme)
-        .with_prompt("Openfort backend wallet account ID (acc_…)")
-        .interact_text()
-        .map_err(|e| pay_core::Error::Config(format!("Prompt error: {e}")))?;
-    let account_id = account_id.trim().to_string();
+    // The wallet is discovered from the project rather than pasted. Listing
+    // needs only the secret key, so it doubles as a fail-fast check on the
+    // key before the wallet secret is asked for.
+    let account_id = match &inputs.account_id {
+        Some(id) => id.trim().to_string(),
+        None => choose_wallet(
+            pay_core::openfort::list_solana_wallets(&secret_key)?,
+            &theme,
+        )?,
+    };
     if !account_id.starts_with("acc_") {
         return Err(pay_core::Error::Config(
             "The Openfort account ID must start with `acc_` (a Solana backend wallet \
@@ -195,11 +324,18 @@ fn create_openfort_account(name: &str, force: bool) -> pay_core::Result<(String,
         ));
     }
 
-    let wallet_secret: String = dialoguer::Password::with_theme(&theme)
-        .with_prompt("Openfort wallet secret (base64 P-256 key)")
-        .interact()
-        .map_err(|e| pay_core::Error::Config(format!("Prompt error: {e}")))?;
-    let wallet_secret = wallet_secret.trim().to_string();
+    let wallet_secret = match &inputs.wallet_secret {
+        Some(secret) => secret.trim().to_string(),
+        None => {
+            require_tty("wallet secret")?;
+            dialoguer::Password::with_theme(&theme)
+                .with_prompt("Openfort wallet secret (base64 P-256 key)")
+                .interact()
+                .map_err(|e| pay_core::Error::Config(format!("Prompt error: {e}")))?
+                .trim()
+                .to_string()
+        }
+    };
 
     let credentials = pay_core::openfort::OpenfortCredentials {
         secret_key,

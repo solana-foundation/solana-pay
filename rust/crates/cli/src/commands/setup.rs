@@ -38,12 +38,34 @@ pub struct SetupCommand {
     /// from its hot wallet. Reuses an existing account when present.
     #[arg(long, value_name = "CODE")]
     pub redeem: Option<String>,
+
+    /// Openfort project secret key (env: OPENFORT_SECRET_KEY).
+    #[arg(long)]
+    pub secret_key: Option<String>,
+
+    /// Openfort wallet secret, base64 P-256 (env: OPENFORT_WALLET_SECRET).
+    #[arg(long)]
+    pub wallet_secret: Option<String>,
+
+    /// Openfort backend wallet ID `acc_…` (env: OPENFORT_ACCOUNT_ID).
+    /// Defaults to the project's only Solana wallet, or prompts to pick.
+    #[arg(long)]
+    pub account_id: Option<String>,
 }
 
 /// Per-request timeout for the redemption POST.
 const REDEEM_TIMEOUT_SECS: u64 = 30;
 
 impl SetupCommand {
+    /// Openfort credentials from flags, falling back to the environment.
+    fn openfort_inputs(&self) -> super::account::new::OpenfortInputs {
+        super::account::new::OpenfortInputs::resolve(
+            self.secret_key.clone(),
+            self.wallet_secret.clone(),
+            self.account_id.clone(),
+        )
+    }
+
     pub fn run(self) -> pay_core::Result<()> {
         if self.update {
             return run_update();
@@ -106,6 +128,7 @@ impl SetupCommand {
             Some(&backend),
             self.vault.as_deref(),
             self.force,
+            &self.openfort_inputs(),
         )?;
         super::buzz_setup::maybe_configure();
 
@@ -158,6 +181,7 @@ impl SetupCommand {
                 self.backend.as_deref(),
                 self.vault.as_deref(),
                 self.force,
+                &self.openfort_inputs(),
             )?;
             (pk, false)
         };

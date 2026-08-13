@@ -173,6 +173,99 @@ fn load_credentials(
     })
 }
 
+// ── Wallet discovery ────────────────────────────────────────────────────────
+
+const OPENFORT_API_BASE: &str = "https://api.openfort.io";
+
+/// A developer-custody Solana backend wallet in an Openfort project.
+pub struct BackendWallet {
+    /// Openfort account ID (`acc_…`).
+    pub id: String,
+    /// The wallet's Solana address, base58.
+    pub address: String,
+}
+
+#[derive(Deserialize)]
+struct AccountsPage {
+    data: Vec<AccountRecord>,
+}
+
+#[derive(Deserialize)]
+struct AccountRecord {
+    id: String,
+    address: String,
+    #[serde(rename = "chainType")]
+    chain_type: Option<String>,
+    custody: Option<String>,
+}
+
+/// List the project's Solana backend wallets via `GET /v2/accounts`.
+///
+/// Only the project secret key is needed — no wallet secret, no JWT — so
+/// this doubles as a fail-fast check that the key is valid before setup
+/// asks for anything else. Results are narrowed to what pay can actually
+/// sign with: SVM chain type and developer custody (the `/v2/accounts/
+/// backend/{id}/sign` endpoint rejects end-user embedded wallets).
+pub fn list_solana_wallets(secret_key: &str) -> Result<Vec<BackendWallet>> {
+    // rustls explicitly: the Solana RPC crates force reqwest's native-tls
+    // backend on in this workspace, and native-tls on macOS tops out at
+    // TLS 1.2 while api.openfort.io requires 1.3.
+    let client = reqwest::Client::builder()
+        .use_rustls_tls()
+        .https_only(true)
+        .timeout(std::time::Duration::from_secs(30))
+        .connect_timeout(std::time::Duration::from_secs(5))
+        .build()
+        .map_err(|e| Error::Config(format!("Failed to build HTTP client: {e}")))?;
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| Error::Config(format!("Failed to create runtime: {e}")))?;
+
+    let page: AccountsPage = rt.block_on(async {
+        let response = client
+            .get(format!("{OPENFORT_API_BASE}/v2/accounts?limit=100"))
+            .bearer_auth(secret_key)
+            .send()
+            .await
+            .map_err(|e| Error::Config(format!("Could not reach Openfort: {e}")))?;
+
+        let status = response.status();
+        if !status.is_success() {
+            return Err(Error::Config(match status.as_u16() {
+                401 | 403 => "Openfort rejected that secret key (HTTP 401/403). Check that \
+                              you copied a project secret key (`sk_live_…` / `sk_test_…`) \
+                              from dashboard.openfort.io → Developers → API keys."
+                    .to_string(),
+                code => format!("Openfort API error {code} listing accounts."),
+            }));
+        }
+
+        response
+            .json::<AccountsPage>()
+            .await
+            .map_err(|e| Error::Config(format!("Failed to parse the Openfort account list: {e}")))
+    })?;
+
+    Ok(signable_solana_wallets(page.data))
+}
+
+/// Narrow an account listing to the wallets pay can sign with: Solana
+/// chain type and developer custody. `POST /v2/accounts/backend/{id}/sign`
+/// rejects everything else, so offering them would only fail later.
+fn signable_solana_wallets(records: Vec<AccountRecord>) -> Vec<BackendWallet> {
+    records
+        .into_iter()
+        .filter(|a| a.chain_type.as_deref() == Some("SVM"))
+        .filter(|a| a.custody.as_deref().is_none_or(|c| c == "Developer"))
+        .map(|a| BackendWallet {
+            id: a.id,
+            address: a.address,
+        })
+        .collect()
+}
+
 // ── Account resolution ──────────────────────────────────────────────────────
 
 /// Build an initialized [`OpenfortSigner`] and return its Solana address
@@ -309,6 +402,29 @@ mod tests {
         .map(|_| ())
         .unwrap_err();
         assert!(err.to_string().contains("missing its `account` field"));
+    }
+
+    /// Only wallets pay can actually sign with survive the filter: SVM
+    /// chain type, developer custody. An EVM wallet or an end-user
+    /// embedded wallet in the same project must not be offered.
+    #[test]
+    fn wallet_list_keeps_only_signable_solana_wallets() {
+        let page: AccountsPage = serde_json::from_str(
+            r#"{"data":[
+                {"id":"acc_svm","address":"4LTNH","chainType":"SVM","custody":"Developer"},
+                {"id":"acc_evm","address":"0xabc","chainType":"EVM","custody":"Developer"},
+                {"id":"acc_user","address":"9xQeW","chainType":"SVM","custody":"User"},
+                {"id":"acc_bare","address":"7uNbA","chainType":"SVM"}
+            ]}"#,
+        )
+        .unwrap();
+
+        let kept: Vec<String> = signable_solana_wallets(page.data)
+            .into_iter()
+            .map(|w| w.id)
+            .collect();
+
+        assert_eq!(kept, vec!["acc_svm", "acc_bare"]);
     }
 
     #[test]
