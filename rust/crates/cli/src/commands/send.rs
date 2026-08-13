@@ -548,6 +548,7 @@ mod tests {
     fn test_account(pubkey: Option<&str>) -> Account {
         Account {
             keystore: Keystore::AppleKeychain,
+            provider: None,
             active: false,
             auth_required: Some(false),
             pubkey: pubkey.map(str::to_string),

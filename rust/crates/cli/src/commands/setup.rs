@@ -20,8 +20,8 @@ pub struct SetupCommand {
     pub force: bool,
 
     /// Storage backend: "keychain" (macOS), "gnome-keyring" (Linux),
-    /// "windows-hello" (Windows), "file" (headless fallback), or
-    /// "openfort" (remote Openfort backend wallet).
+    /// "windows-hello" (Windows), "file" (headless fallback), or a remote
+    /// signing backend registered in `pay_core::remote` ("openfort").
     #[arg(long)]
     pub backend: Option<String>,
 
@@ -39,31 +39,26 @@ pub struct SetupCommand {
     #[arg(long, value_name = "CODE")]
     pub redeem: Option<String>,
 
-    /// Openfort project secret key (env: OPENFORT_SECRET_KEY).
-    #[arg(long)]
-    pub secret_key: Option<String>,
+    /// Remote-backend credential as `key=value`, repeatable (e.g.
+    /// `--credential secret_key=sk_live_…`). Each field also reads
+    /// `{PROVIDER}_{FIELD}` from the environment.
+    #[arg(long = "credential", value_name = "KEY=VALUE")]
+    pub credentials: Vec<String>,
 
-    /// Openfort wallet secret, base64 P-256 (env: OPENFORT_WALLET_SECRET).
+    /// Remote-backend wallet id (env: `{PROVIDER}_WALLET_ID`). Defaults to
+    /// the account's only Solana wallet, or prompts to pick.
     #[arg(long)]
-    pub wallet_secret: Option<String>,
-
-    /// Openfort backend wallet ID `acc_…` (env: OPENFORT_ACCOUNT_ID).
-    /// Defaults to the project's only Solana wallet, or prompts to pick.
-    #[arg(long)]
-    pub account_id: Option<String>,
+    pub wallet_id: Option<String>,
 }
 
 /// Per-request timeout for the redemption POST.
 const REDEEM_TIMEOUT_SECS: u64 = 30;
 
 impl SetupCommand {
-    /// Openfort credentials from flags, falling back to the environment.
-    fn openfort_inputs(&self) -> super::account::new::OpenfortInputs {
-        super::account::new::OpenfortInputs::resolve(
-            self.secret_key.clone(),
-            self.wallet_secret.clone(),
-            self.account_id.clone(),
-        )
+    /// Remote-backend credentials from flags, falling back to the
+    /// environment.
+    fn remote_inputs(&self) -> pay_core::Result<super::account::new::RemoteInputs> {
+        super::account::new::RemoteInputs::resolve(&self.credentials, self.wallet_id.clone())
     }
 
     pub fn run(self) -> pay_core::Result<()> {
@@ -128,7 +123,7 @@ impl SetupCommand {
             Some(&backend),
             self.vault.as_deref(),
             self.force,
-            &self.openfort_inputs(),
+            &self.remote_inputs()?,
         )?;
         super::buzz_setup::maybe_configure();
 
@@ -181,7 +176,7 @@ impl SetupCommand {
                 self.backend.as_deref(),
                 self.vault.as_deref(),
                 self.force,
-                &self.openfort_inputs(),
+                &self.remote_inputs()?,
             )?;
             (pk, false)
         };

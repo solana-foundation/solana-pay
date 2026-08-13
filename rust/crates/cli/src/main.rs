@@ -311,9 +311,8 @@ fn main() {
             vault: None,
             update: false,
             redeem: None,
-            secret_key: None,
-            wallet_secret: None,
-            account_id: None,
+            credentials: Vec::new(),
+            wallet_id: None,
         })
         .run()
         {

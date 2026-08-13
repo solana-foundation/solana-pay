@@ -107,6 +107,7 @@ impl ImportCommand {
             pay_core::accounts::MAINNET_NETWORK,
             &name,
             pay_core::accounts::Account {
+                provider: None,
                 keystore: keystore_kind,
                 active: false,
                 auth_required: Some(true),
@@ -263,11 +264,16 @@ pub(super) fn build_keystore(
             ))
         }
 
-        "openfort" => Err(pay_core::Error::Config(
-            "Openfort backend wallets hold no local keypair to import. Connect one with \
-             `pay account new <NAME> --backend openfort`."
-                .to_string(),
-        )),
+        // Any registered remote backend: the key is in the provider's
+        // custody, so there is nothing local to import.
+        other if pay_core::remote::provider(other).is_some() => {
+            let provider = pay_core::remote::provider(other).expect("checked above");
+            Err(pay_core::Error::Config(format!(
+                "A {} holds no local keypair to import. Connect one with \
+                 `pay account new <NAME> --backend {other}`.",
+                provider.display_name()
+            )))
+        }
 
         other => Err(pay_core::Error::Config(format!("Unknown backend: {other}"))),
     }

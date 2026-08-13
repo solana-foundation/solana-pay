@@ -1250,6 +1250,7 @@ mod tests {
         let pubkey = "4BuiY9QUUfPoAGNJBja3JapAuVWMc9c7in6UCgyC2zPR";
         let account = Account {
             keystore: Keystore::Ephemeral,
+            provider: None,
             active: true,
             auth_required: Some(false),
             pubkey: Some(pubkey.to_string()),

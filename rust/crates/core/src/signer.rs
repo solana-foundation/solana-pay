@@ -1,5 +1,5 @@
 //! Resolve a signer from a keypair source — file path, Keychain, 1Password,
-//! or a remote signing backend (Openfort).
+//! or a remote signing backend (`pay_core::remote`).
 
 use pay_kit::mpp::solana_keychain::MemorySigner;
 use pay_kit::solana_keychain::{SignTransactionResult, SignerError, SolanaSigner};
@@ -13,12 +13,14 @@ use crate::keystore::{AuthGate, AuthIntent};
 use crate::{Error, Result};
 
 /// Signer resolved from a pay account — a local in-memory keypair or a
-/// remote Openfort backend wallet. Implements [`SolanaSigner`] by
-/// delegation, so both MPP and x402 payment paths accept it wherever a
+/// remote backend's signer. Implements [`SolanaSigner`] by delegation, so
+/// both MPP and x402 payment paths accept it wherever a
 /// `&dyn SolanaSigner` is expected.
 pub enum ResolvedSigner {
-    Memory(MemorySigner),
-    Openfort(crate::openfort::OpenfortSigner),
+    Memory(Box<MemorySigner>),
+    /// Any provider registered in [`crate::remote`]; pay never needs to
+    /// know which one.
+    Remote(Box<dyn SolanaSigner>),
 }
 
 #[async_trait::async_trait]
@@ -26,7 +28,7 @@ impl SolanaSigner for ResolvedSigner {
     fn pubkey(&self) -> solana_pubkey::Pubkey {
         match self {
             ResolvedSigner::Memory(signer) => signer.pubkey(),
-            ResolvedSigner::Openfort(signer) => signer.pubkey(),
+            ResolvedSigner::Remote(signer) => signer.pubkey(),
         }
     }
 
@@ -36,7 +38,7 @@ impl SolanaSigner for ResolvedSigner {
     ) -> std::result::Result<SignTransactionResult, SignerError> {
         match self {
             ResolvedSigner::Memory(signer) => signer.sign_transaction(tx).await,
-            ResolvedSigner::Openfort(signer) => signer.sign_transaction(tx).await,
+            ResolvedSigner::Remote(signer) => signer.sign_transaction(tx).await,
         }
     }
 
@@ -46,14 +48,14 @@ impl SolanaSigner for ResolvedSigner {
     ) -> std::result::Result<solana_signature::Signature, SignerError> {
         match self {
             ResolvedSigner::Memory(signer) => signer.sign_message(message).await,
-            ResolvedSigner::Openfort(signer) => signer.sign_message(message).await,
+            ResolvedSigner::Remote(signer) => signer.sign_message(message).await,
         }
     }
 
     async fn is_available(&self) -> bool {
         match self {
             ResolvedSigner::Memory(signer) => signer.is_available().await,
-            ResolvedSigner::Openfort(signer) => signer.is_available().await,
+            ResolvedSigner::Remote(signer) => signer.is_available().await,
         }
     }
 }
@@ -107,7 +109,7 @@ pub fn load_signer_for_payment(source: &str, amount: &str, desc: &str) -> Result
 ///
 /// 2. **Network-agnostic fallback** — if an explicitly named account has
 ///    no mapping on this network but exists on `mainnet` with a remote
-///    signing backend (`keystore: openfort`), use the mainnet entry. A
+///    signing backend (`keystore: remote`), use the mainnet entry. A
 ///    remote signer signs raw bytes and carries no chain state, so it is
 ///    valid on every network; without this fallback an explicit
 ///    `--account` would silently shadow the remote signer with a lazy
@@ -227,12 +229,12 @@ pub fn load_signer_for_network_with_intent_and_override(
 }
 
 /// Fall back to a same-named `mainnet` account when the current network
-/// has no mapping and the account signs remotely (`keystore: openfort`).
+/// has no mapping and the account signs remotely (`keystore: remote`).
 ///
 /// Keypair-backed accounts never fall through: silently reusing a mainnet
-/// key on another network is a footgun. A remote Openfort signer signs
-/// raw bytes and carries no chain state, so the same account is valid on
-/// every network.
+/// key on another network is a footgun. A remote signer signs raw bytes
+/// and carries no chain state, so the same account is valid on every
+/// network.
 fn network_agnostic_fallback<'a>(
     file: &'a AccountsFile,
     network: &str,
@@ -242,7 +244,7 @@ fn network_agnostic_fallback<'a>(
         return None;
     }
     file.named_account_for_network(MAINNET_NETWORK, name)
-        .filter(|account| account.keystore == Keystore::Openfort)
+        .filter(|account| account.keystore == Keystore::Remote)
 }
 
 /// Network-aware loader for a payment, with the same amount-prefixed
@@ -340,11 +342,12 @@ pub fn load_keypair_bytes_from_account_with_intent_and_override(
     auth_override: AuthOverride,
 ) -> Result<crate::keystore::Zeroizing<Vec<u8>>> {
     let account_intent = intent.with_account_context(name);
-    if account.keystore == Keystore::Openfort {
+    if account.keystore == Keystore::Remote {
         let _ = auth_override;
+        let backend = account.provider.as_deref().unwrap_or("remote");
         return Err(Error::Config(format!(
-            "Account `{name}` is an Openfort backend wallet: its private key lives in \
-             Openfort's TEE and cannot be loaded or exported locally."
+            "Account `{name}` signs through the `{backend}` backend: its private key \
+             lives in the provider's custody and cannot be loaded or exported locally."
         )));
     }
     if account.keystore == Keystore::Ephemeral {
@@ -473,7 +476,7 @@ pub fn load_keypair_bytes_from_account_with_intent_and_override(
             maybe_authenticate_file_account(account, network, &account_intent, auth_override)?;
             load_signer_keypair_bytes_with_intent(&source, &account_intent)
         }
-        Keystore::Ephemeral | Keystore::Openfort => unreachable!("handled above"),
+        Keystore::Ephemeral | Keystore::Remote => unreachable!("handled above"),
     }
 }
 
@@ -504,14 +507,8 @@ pub fn load_signer_from_account_with_intent_and_override(
     intent: &AuthIntent,
     auth_override: AuthOverride,
 ) -> Result<ResolvedSigner> {
-    if account.keystore == Keystore::Openfort {
-        return crate::openfort::load_openfort_signer(
-            account,
-            name,
-            network,
-            intent,
-            auth_override,
-        );
+    if account.keystore == Keystore::Remote {
+        return crate::remote::load_remote_signer(account, name, network, intent, auth_override);
     }
 
     let bytes = load_keypair_bytes_from_account_with_intent_and_override(
@@ -527,7 +524,7 @@ pub fn load_signer_from_account_with_intent_and_override(
              Re-import the account: `pay account destroy --name {name}` then `pay account new --name {name}`."
         ))
     })?;
-    Ok(ResolvedSigner::Memory(memory))
+    Ok(ResolvedSigner::Memory(Box::new(memory)))
 }
 
 fn signer_from_ephemeral(account: &Account) -> Result<ResolvedSigner> {
@@ -535,7 +532,7 @@ fn signer_from_ephemeral(account: &Account) -> Result<ResolvedSigner> {
         Error::Config("Ephemeral account is missing its inline `secret_key_b58` field".to_string())
     })?;
     MemorySigner::from_bytes(&bytes)
-        .map(ResolvedSigner::Memory)
+        .map(|s| ResolvedSigner::Memory(Box::new(s)))
         .map_err(|e| Error::Config(format!("Invalid ephemeral keypair bytes: {e}")))
 }
 
@@ -885,6 +882,7 @@ mod tests {
 
         let account = Account {
             keystore: Keystore::File,
+            provider: None,
             active: false,
             auth_required,
             pubkey: Some(bs58::encode(verifying_key.to_bytes()).into_string()),
@@ -899,9 +897,10 @@ mod tests {
         (temp_dir, account, keypair_bytes)
     }
 
-    fn openfort_account(account_id: Option<&str>) -> Account {
+    fn remote_account(account_id: Option<&str>) -> Account {
         Account {
-            keystore: Keystore::Openfort,
+            keystore: Keystore::Remote,
+            provider: Some("openfort".to_string()),
             active: false,
             auth_required: Some(true),
             pubkey: Some("C78fUoBw1YDJDmzNx7viRZFnuhku3t3eiy9eiV2hafff".to_string()),
@@ -915,14 +914,14 @@ mod tests {
     }
 
     #[test]
-    fn explicit_openfort_account_falls_back_from_mainnet_on_other_networks() {
+    fn explicit_remote_account_falls_back_from_mainnet_on_other_networks() {
         // Registered on mainnet only (what `pay account new` writes), but
         // addressed explicitly on localnet: resolution must reach the
-        // Openfort loader instead of shadowing the name with a lazy
+        // remote loader instead of shadowing the name with a lazy
         // ephemeral. The missing-account-id error proves which path ran
         // without needing keystore credentials.
         let mut file = AccountsFile::default();
-        file.upsert(MAINNET_NETWORK, "openfort", openfort_account(None));
+        file.upsert(MAINNET_NETWORK, "openfort", remote_account(None));
         let store = MemoryAccountsStore::with_file(file);
 
         let err = match load_signer_for_network_with_intent(
@@ -932,7 +931,7 @@ mod tests {
             &AuthIntent::default_payment(),
         ) {
             Err(err) => err,
-            Ok(_) => panic!("expected the Openfort loader to reject a missing account id"),
+            Ok(_) => panic!("expected the remote loader to reject a missing wallet id"),
         };
 
         let Error::Config(msg) = err else {
@@ -1045,6 +1044,7 @@ mod tests {
         full.extend_from_slice(&verifying_key.to_bytes());
         Account {
             keystore: Keystore::Ephemeral,
+            provider: None,
             active: false,
             auth_required: Some(false),
             pubkey: Some(bs58::encode(verifying_key.to_bytes()).into_string()),
@@ -1057,9 +1057,10 @@ mod tests {
         }
     }
 
-    fn fresh_openfort_account(account_id: Option<&str>) -> Account {
+    fn fresh_remote_account(account_id: Option<&str>) -> Account {
         Account {
-            keystore: Keystore::Openfort,
+            keystore: Keystore::Remote,
+            provider: Some("openfort".to_string()),
             active: false,
             auth_required: Some(false),
             pubkey: None,
@@ -1073,8 +1074,8 @@ mod tests {
     }
 
     #[test]
-    fn openfort_account_refuses_raw_keypair_access() {
-        let account = fresh_openfort_account(Some("acc_test"));
+    fn remote_account_refuses_raw_keypair_access() {
+        let account = fresh_remote_account(Some("acc_test"));
 
         let err = load_keypair_bytes_from_account_with_intent(
             &account,
@@ -1085,10 +1086,8 @@ mod tests {
         .unwrap_err();
 
         let msg = err.to_string();
-        assert!(
-            msg.contains("Openfort backend wallet"),
-            "wrong error: {msg}"
-        );
+        // The message names the account's own backend, whichever it is.
+        assert!(msg.contains("`openfort` backend"), "wrong error: {msg}");
         assert!(
             msg.contains("cannot be loaded or exported"),
             "wrong error: {msg}"
@@ -1096,13 +1095,13 @@ mod tests {
     }
 
     #[test]
-    fn load_signer_for_network_routes_openfort_accounts() {
-        // An Openfort account missing its `acc_…` id fails inside the
-        // Openfort resolution path — proving the network loader routes
-        // `keystore: openfort` entries to the remote signer instead of
+    fn load_signer_for_network_routes_remote_accounts() {
+        // A remote account missing its wallet id fails inside the remote
+        // resolution path — proving the network loader routes
+        // `keystore: remote` entries to the remote signer instead of
         // the local keypair path.
         let mut file = AccountsFile::default();
-        file.upsert(MAINNET_NETWORK, "default", fresh_openfort_account(None));
+        file.upsert(MAINNET_NETWORK, "default", fresh_remote_account(None));
         let store = MemoryAccountsStore::with_file(file);
 
         let err = load_signer_for_network(MAINNET_NETWORK, &store)
@@ -1297,6 +1296,7 @@ mod tests {
     fn signer_from_ephemeral_rejects_missing_inline_secret() {
         let account = Account {
             keystore: Keystore::Ephemeral,
+            provider: None,
             active: false,
             auth_required: Some(false),
             pubkey: None,

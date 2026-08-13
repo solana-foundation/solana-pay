@@ -11,8 +11,8 @@ pub struct NewCommand {
     pub name: String,
 
     /// Storage backend: "keychain" (macOS), "gnome-keyring" (Linux),
-    /// "windows-hello" (Windows), "file" (headless fallback), or
-    /// "openfort" (remote Openfort backend wallet).
+    /// "windows-hello" (Windows), "file" (headless fallback), or a remote
+    /// signing backend registered in `pay_core::remote` ("openfort").
     #[arg(long)]
     pub backend: Option<String>,
 
@@ -24,33 +24,27 @@ pub struct NewCommand {
     #[arg(long)]
     pub force: bool,
 
-    /// Openfort project secret key (env: OPENFORT_SECRET_KEY).
-    #[arg(long)]
-    pub secret_key: Option<String>,
+    /// Remote-backend credential as `key=value`, repeatable (e.g.
+    /// `--credential secret_key=sk_live_…`). Each field also reads
+    /// `{PROVIDER}_{FIELD}` from the environment.
+    #[arg(long = "credential", value_name = "KEY=VALUE")]
+    pub credentials: Vec<String>,
 
-    /// Openfort wallet secret, base64 P-256 (env: OPENFORT_WALLET_SECRET).
+    /// Remote-backend wallet id (env: `{PROVIDER}_WALLET_ID`). Defaults to
+    /// the account's only Solana wallet, or prompts to pick.
     #[arg(long)]
-    pub wallet_secret: Option<String>,
-
-    /// Openfort backend wallet ID `acc_…` (env: OPENFORT_ACCOUNT_ID).
-    /// Defaults to the project's only Solana wallet, or prompts to pick.
-    #[arg(long)]
-    pub account_id: Option<String>,
+    pub wallet_id: Option<String>,
 }
 
 impl NewCommand {
     pub fn run(self) -> pay_core::Result<()> {
-        let openfort = OpenfortInputs::resolve(
-            self.secret_key.clone(),
-            self.wallet_secret.clone(),
-            self.account_id.clone(),
-        );
+        let remote = RemoteInputs::resolve(&self.credentials, self.wallet_id.clone())?;
         let (pubkey, backend_name) = create_account(
             &self.name,
             self.backend.as_deref(),
             self.vault.as_deref(),
             self.force,
-            &openfort,
+            &remote,
         )?;
         eprintln!();
 
@@ -77,12 +71,13 @@ pub fn create_account(
     backend: Option<&str>,
     vault: Option<&str>,
     force: bool,
-    openfort: &OpenfortInputs,
+    remote: &RemoteInputs,
 ) -> pay_core::Result<(String, &'static str)> {
     let backend_id = resolve_backend(backend)?;
 
-    if backend_id == "openfort" {
-        return create_openfort_account(name, force, openfort);
+    if let Some(provider) = pay_core::remote::provider(&backend_id) {
+        let inputs = remote.clone().with_env_wallet_id(provider.id());
+        return create_remote_account(name, provider, force, &inputs);
     }
 
     let (ks, keystore_kind, backend_display, op_info) = build_keystore(&backend_id, vault, name)?;
@@ -142,40 +137,80 @@ pub fn create_account(
     Ok((pubkey_b58, backend_display))
 }
 
-/// Openfort credentials supplied up front, so setup can run without a TTY.
+/// Remote-backend credentials supplied up front, so setup can run without
+/// a TTY.
 ///
-/// Each field falls back to an environment variable when the flag is
-/// absent; anything still missing is prompted for interactively.
+/// Values are provider-agnostic: `--credential key=value` (repeatable)
+/// names any field the chosen provider declares, and each field also
+/// falls back to a `{PROVIDER}_{FIELD}` environment variable —
+/// `OPENFORT_SECRET_KEY` for Openfort's `secret_key`. Anything still
+/// missing is prompted for interactively.
 #[derive(Clone, Default)]
-pub struct OpenfortInputs {
-    /// Project secret key (`sk_live_…` / `sk_test_…`), or `OPENFORT_SECRET_KEY`.
-    pub secret_key: Option<String>,
-    /// Base64 P-256 wallet secret, or `OPENFORT_WALLET_SECRET`.
-    pub wallet_secret: Option<String>,
-    /// Backend wallet ID (`acc_…`), or `OPENFORT_ACCOUNT_ID`. When absent,
-    /// the wallet is discovered from the project.
-    pub account_id: Option<String>,
+pub struct RemoteInputs {
+    /// Credential values keyed by [`CredentialField::key`](pay_core::remote::CredentialField).
+    pub credentials: std::collections::BTreeMap<String, String>,
+    /// Provider-side wallet id, or `{PROVIDER}_WALLET_ID`. When absent,
+    /// the wallet is discovered from the account.
+    pub wallet_id: Option<String>,
 }
 
-impl OpenfortInputs {
-    /// Merge CLI flags with the environment; flags win.
-    pub fn resolve(
-        secret_key: Option<String>,
-        wallet_secret: Option<String>,
-        account_id: Option<String>,
-    ) -> Self {
-        fn from_env(key: &str) -> Option<String> {
-            std::env::var(key)
-                .ok()
+impl RemoteInputs {
+    /// Parse repeated `key=value` credential flags and the wallet id.
+    pub fn resolve(credentials: &[String], wallet_id: Option<String>) -> pay_core::Result<Self> {
+        let mut map = std::collections::BTreeMap::new();
+        for entry in credentials {
+            let (key, value) = entry.split_once('=').ok_or_else(|| {
+                pay_core::Error::Config(format!(
+                    "Invalid --credential `{entry}`: expected key=value."
+                ))
+            })?;
+            map.insert(key.trim().to_string(), value.trim().to_string());
+        }
+        Ok(Self {
+            credentials: map,
+            wallet_id: wallet_id
                 .map(|v| v.trim().to_string())
-                .filter(|v| !v.is_empty())
-        }
-        Self {
-            secret_key: secret_key.or_else(|| from_env("OPENFORT_SECRET_KEY")),
-            wallet_secret: wallet_secret.or_else(|| from_env("OPENFORT_WALLET_SECRET")),
-            account_id: account_id.or_else(|| from_env("OPENFORT_ACCOUNT_ID")),
-        }
+                .filter(|v| !v.is_empty()),
+        })
     }
+
+    /// A credential from the flags, else `{PROVIDER}_{FIELD}` in the
+    /// environment.
+    fn credential(
+        &self,
+        provider: &dyn pay_core::remote::RemoteProvider,
+        field: &pay_core::remote::CredentialField,
+    ) -> Option<String> {
+        self.credentials
+            .get(field.key)
+            .cloned()
+            .or_else(|| env_var(&env_key(provider.id(), field.key)))
+    }
+
+    /// Fill the wallet id from `{PROVIDER}_WALLET_ID` when no flag set it.
+    fn with_env_wallet_id(mut self, provider_id: &str) -> Self {
+        if self.wallet_id.is_none() {
+            self.wallet_id = env_var(&env_key(provider_id, "wallet_id"))
+                // Openfort's wallet id is an account id; accept the name
+                // its own docs and dashboard use.
+                .or_else(|| env_var(&env_key(provider_id, "account_id")));
+        }
+        self
+    }
+}
+
+/// `openfort` + `secret_key` → `OPENFORT_SECRET_KEY`.
+fn env_key(provider_id: &str, field: &str) -> String {
+    format!("{provider_id}_{field}")
+        .to_uppercase()
+        .replace('-', "_")
+}
+
+fn env_var(key: &str) -> Option<String> {
+    std::env::var(key)
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
 }
 
 /// Fail with a clear message when a value has to be prompted for but
@@ -185,28 +220,25 @@ fn require_tty(missing: &str) -> pay_core::Result<()> {
         return Ok(());
     }
     Err(pay_core::Error::Config(format!(
-        "No terminal to prompt for the Openfort {missing}.\n\
-         Pass it non-interactively instead: --secret-key / --wallet-secret / \
-         --account-id, or the OPENFORT_SECRET_KEY / OPENFORT_WALLET_SECRET / \
-         OPENFORT_ACCOUNT_ID environment variables."
+        "No terminal to prompt for `{missing}`.\n\
+         Pass it non-interactively instead: --credential {missing}=<value> (repeatable) \
+         and --wallet-id, or the matching {{PROVIDER}}_{{FIELD}} environment variables."
     )))
 }
 
-/// Pick which backend wallet to connect from the project's Solana wallets.
+/// Pick which wallet to connect from those the credentials can sign for.
 ///
 /// One wallet is used automatically; several are offered as a list; none
-/// is an error pointing at the dashboard, since pay cannot create a wallet
-/// without the wallet secret that the dashboard alone can issue.
+/// defers to the provider's own guidance, since pay does not create
+/// wallets on a provider's behalf.
 fn choose_wallet(
-    wallets: Vec<pay_core::openfort::BackendWallet>,
+    wallets: Vec<pay_core::remote::RemoteWallet>,
+    provider: &dyn pay_core::remote::RemoteProvider,
     theme: &dialoguer::theme::ColorfulTheme,
 ) -> pay_core::Result<String> {
     match wallets.len() {
         0 => Err(pay_core::Error::Config(
-            "This Openfort project has no Solana backend wallet yet.\n\
-             Create one at https://dashboard.openfort.io → Accounts → New account \
-             (chain type: Solana / SVM), then run this command again."
-                .to_string(),
+            provider.no_wallets_hint().to_string(),
         )),
         1 => {
             let wallet = wallets.into_iter().next().expect("len checked");
@@ -224,7 +256,7 @@ fn choose_wallet(
                 .map(|w| format!("{}  ({})", w.address, w.id))
                 .collect();
             let choice = Select::with_theme(theme)
-                .with_prompt("Which Openfort backend wallet?")
+                .with_prompt(format!("Which {}?", provider.display_name()))
                 .items(&labels)
                 .default(0)
                 .interact()
@@ -238,22 +270,23 @@ fn choose_wallet(
     }
 }
 
-/// Connect an existing Openfort backend wallet as a pay account.
+/// Connect a wallet held by a remote signing backend as a pay account.
 ///
-/// Resolves the project secret key, the backend wallet, and the wallet
-/// secret — from flags, the environment, or interactive prompts — then
-/// validates them by fetching the wallet's Solana address from Openfort,
-/// stores the credentials as a blob in the platform secret store, and
-/// registers the account in accounts.yml. No keypair is generated —
-/// signing happens remotely.
-fn create_openfort_account(
+/// Provider-agnostic: the credentials to collect, how to validate them,
+/// how to list wallets, and how to connect all come from the
+/// [`RemoteProvider`](pay_core::remote::RemoteProvider) implementation.
+/// Each credential is taken from a flag, then the environment, then an
+/// interactive prompt. Nothing is persisted until the wallet's address
+/// resolves. No keypair is generated — signing happens remotely.
+fn create_remote_account(
     name: &str,
+    provider: &'static dyn pay_core::remote::RemoteProvider,
     force: bool,
-    inputs: &OpenfortInputs,
+    inputs: &RemoteInputs,
 ) -> pay_core::Result<(String, &'static str)> {
-    const BACKEND_DISPLAY: &str = "Openfort backend wallet";
+    let display = provider.display_name();
 
-    if pay_core::openfort::credentials_exist(name) && !force {
+    if pay_core::remote::credentials_exist(name) && !force {
         let pubkey = pay_core::accounts::AccountsFile::load()
             .ok()
             .and_then(|f| {
@@ -262,7 +295,7 @@ fn create_openfort_account(
             })
             .ok_or_else(|| {
                 pay_core::Error::Config(format!(
-                    "Openfort credentials for `{name}` already exist but the account is not \
+                    "Credentials for `{name}` already exist but the account is not \
                      registered in accounts.yml. Re-run with --force to replace them."
                 ))
             })?;
@@ -271,99 +304,94 @@ fn create_openfort_account(
             crate::components::NoticeLevel::Info,
             "Account already exists",
             &format!(
-                "`{name}` is already connected to an Openfort backend wallet.\n\
+                "`{name}` is already connected to a {display}.\n\
                  Use --force to replace the stored credentials."
             ),
         );
-        return Ok((pubkey, BACKEND_DISPLAY));
+        return Ok((pubkey, display));
     }
 
     let theme = dialoguer::theme::ColorfulTheme::default();
-    let will_prompt = (inputs.secret_key.is_none() || inputs.wallet_secret.is_none())
+    let fields = provider.credential_fields();
+    let will_prompt = fields
+        .iter()
+        .any(|f| inputs.credential(provider, f).is_none())
         && std::io::IsTerminal::is_terminal(&std::io::stderr());
     if will_prompt {
         eprintln!();
-        eprintln!(
-            "  Connect an Openfort backend wallet (dashboard.openfort.io → Developers → API keys)."
-        );
+        eprintln!("  {}", provider.credentials_hint());
     }
 
-    let secret_key = match &inputs.secret_key {
-        Some(key) => key.trim().to_string(),
-        None => {
-            require_tty("secret key")?;
-            dialoguer::Password::with_theme(&theme)
-                .with_prompt("Openfort secret key (sk_live_… / sk_test_…)")
-                .interact()
-                .map_err(|e| pay_core::Error::Config(format!("Prompt error: {e}")))?
-                .trim()
-                .to_string()
+    // Collect credentials in the provider's declared order, stopping at
+    // the first invalid value so a typo costs one prompt, not a round trip.
+    let mut credentials = pay_core::remote::Credentials::new();
+    let mut discovered: Option<Vec<pay_core::remote::RemoteWallet>> = None;
+
+    for field in fields {
+        let value = match inputs.credential(provider, field) {
+            Some(value) => value,
+            None => {
+                require_tty(field.key)?;
+                prompt_credential(&theme, field)?
+            }
+        };
+        provider.validate_credential(field.key, &value)?;
+        credentials.insert(field.key.to_string(), value);
+
+        // Discover as soon as the provider has enough to list wallets:
+        // it validates the credentials so far, and the wallet is chosen
+        // before the remaining secrets are asked for.
+        if discovered.is_none() && inputs.wallet_id.is_none() {
+            discovered = provider.discover(&credentials).ok();
         }
-    };
-    if !secret_key.starts_with("sk_") {
-        return Err(pay_core::Error::Config(
-            "The Openfort secret key must start with `sk_live_` or `sk_test_`.".to_string(),
-        ));
     }
 
-    // The wallet is discovered from the project rather than pasted. Listing
-    // needs only the secret key, so it doubles as a fail-fast check on the
-    // key before the wallet secret is asked for.
-    let account_id = match &inputs.account_id {
+    let wallet_id = match &inputs.wallet_id {
         Some(id) => id.trim().to_string(),
-        None => choose_wallet(
-            pay_core::openfort::list_solana_wallets(&secret_key)?,
-            &theme,
-        )?,
-    };
-    if !account_id.starts_with("acc_") {
-        return Err(pay_core::Error::Config(
-            "The Openfort account ID must start with `acc_` (a Solana backend wallet \
-             from POST /v2/accounts/backend)."
-                .to_string(),
-        ));
-    }
-
-    let wallet_secret = match &inputs.wallet_secret {
-        Some(secret) => secret.trim().to_string(),
         None => {
-            require_tty("wallet secret")?;
-            dialoguer::Password::with_theme(&theme)
-                .with_prompt("Openfort wallet secret (base64 P-256 key)")
-                .interact()
-                .map_err(|e| pay_core::Error::Config(format!("Prompt error: {e}")))?
-                .trim()
-                .to_string()
+            let wallets = match discovered {
+                Some(wallets) => wallets,
+                None => provider.discover(&credentials)?,
+            };
+            choose_wallet(wallets, provider, &theme)?
         }
     };
+    provider.validate_wallet_id(&wallet_id)?;
 
-    let credentials = pay_core::openfort::OpenfortCredentials {
-        secret_key,
-        wallet_secret,
-    };
-
-    // Validate the credentials and resolve the wallet's Solana address
-    // before persisting anything.
-    eprintln!("  {}", "Verifying with Openfort…".dimmed());
-    let pubkey = pay_core::openfort::fetch_wallet_address(&credentials, &account_id)?;
+    // Resolve the wallet's address before persisting anything.
+    eprintln!("  {}", format!("Verifying with {display}…").dimmed());
+    let pubkey = pay_core::remote::fetch_wallet_address(provider, &credentials, &wallet_id)?;
 
     let ks = platform_credential_keystore()?;
     let intent = pay_core::keystore::AuthIntent::create_account(name);
-    pay_core::openfort::store_credentials(&ks, name, &credentials, &intent)?;
+    pay_core::remote::store_credentials(&ks, name, &credentials, &intent)?;
 
-    save_account(
-        name,
-        pay_core::accounts::Keystore::Openfort,
-        &pubkey,
-        None,
-        None,
-        Some(account_id),
-    )?;
+    save_account_remote(name, provider.id(), &pubkey, &wallet_id)?;
 
-    Ok((pubkey, BACKEND_DISPLAY))
+    Ok((pubkey, display))
 }
 
-/// Platform secret store used for Openfort credential blobs, with the
+/// Prompt for one credential, masked when the provider marks it secret.
+fn prompt_credential(
+    theme: &dialoguer::theme::ColorfulTheme,
+    field: &pay_core::remote::CredentialField,
+) -> pay_core::Result<String> {
+    let value = if field.secret {
+        dialoguer::Password::with_theme(theme)
+            .with_prompt(field.label)
+            .interact()
+    } else {
+        dialoguer::Input::<String>::with_theme(theme)
+            .with_prompt(field.label)
+            .interact_text()
+    };
+    Ok(value
+        .map_err(|e| pay_core::Error::Config(format!("Prompt error: {e}")))?
+        .trim()
+        .to_string())
+}
+
+/// Platform secret store used for remote credential blobs, with the
 /// same setup-time gating fallbacks as the keypair backends.
 fn platform_credential_keystore() -> pay_core::Result<Keystore> {
     #[cfg(target_os = "macos")]
@@ -397,7 +425,7 @@ fn platform_credential_keystore() -> pay_core::Result<Keystore> {
     #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     {
         Err(pay_core::Error::Config(
-            "Openfort accounts require a platform secret store, which is unavailable on \
+            "Remote-backend accounts require a platform secret store, which is unavailable on \
              this platform."
                 .to_string(),
         ))
@@ -525,28 +553,31 @@ fn build_keystore(
     }
 }
 
-/// Comma-separated list of backends that work on the current OS.
-/// Used in error messages so we don't suggest `keychain` to a Linux user.
-fn available_backends_hint() -> &'static str {
+/// Comma-separated list of backends that work on the current OS, platform
+/// keystore first and every registered remote backend after it. Used in
+/// error messages so we don't suggest `keychain` to a Linux user.
+fn available_backends_hint() -> String {
     #[cfg(target_os = "macos")]
-    {
-        "'keychain' or 'openfort'"
-    }
+    let platform = Some("keychain");
     #[cfg(target_os = "linux")]
-    {
-        if Keystore::gnome_keyring_available() {
-            "'gnome-keyring' or 'openfort'"
-        } else {
-            "'file'"
-        }
-    }
+    let platform = if Keystore::gnome_keyring_available() {
+        Some("gnome-keyring")
+    } else {
+        return "'file'".to_string();
+    };
     #[cfg(target_os = "windows")]
-    {
-        "'windows-hello' or 'openfort'"
-    }
+    let platform = Some("windows-hello");
     #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
-    {
-        "a supported platform backend"
+    let platform: Option<&str> = None;
+
+    let quoted: Vec<String> = platform
+        .into_iter()
+        .chain(pay_core::remote::provider_ids())
+        .map(|id| format!("'{id}'"))
+        .collect();
+    match quoted.len() {
+        0 => "a supported platform backend".to_string(),
+        _ => quoted.join(" or "),
     }
 }
 
@@ -701,14 +732,19 @@ pub fn pick_backend() -> pay_core::Result<String> {
     #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     let mut options: Vec<Opt> = Vec::new();
 
-    // Openfort backend wallets sign remotely, but the API credentials
-    // still live in the platform secret store — only offer the option
-    // when one is available (the first entry is always platform-native).
+    // Remote backends sign elsewhere, but their API credentials still
+    // live in the platform secret store — only offer them when one is
+    // available (the first entry is always platform-native).
     if options.first().is_some_and(|o| o.id != "file") {
-        options.push(Opt {
-            id: "openfort",
-            label: "Openfort backend wallet (remote signing, key stays in Openfort's TEE)".into(),
-        });
+        for provider in pay_core::remote::providers() {
+            options.push(Opt {
+                id: provider.id(),
+                label: format!(
+                    "{} (remote signing — the key stays in the provider's custody)",
+                    provider.display_name()
+                ),
+            });
+        }
     }
 
     if options.is_empty() {
@@ -748,12 +784,42 @@ pub fn save_account(
         name,
         pay_core::accounts::Account {
             keystore,
+            provider: None,
             active: false,
             auth_required: Some(true),
             pubkey: Some(pubkey.to_string()),
             vault,
             account,
             path,
+            secret_key_b58: None,
+            created_at: None,
+            subscriptions: std::collections::BTreeMap::new(),
+        },
+    );
+    accounts.save()
+}
+
+/// Register a remote-backend account: `keystore: remote` plus the
+/// provider id and the provider-side wallet id.
+pub fn save_account_remote(
+    name: &str,
+    provider_id: &str,
+    pubkey: &str,
+    wallet_id: &str,
+) -> pay_core::Result<()> {
+    let mut accounts = pay_core::accounts::AccountsFile::load()?;
+    accounts.upsert(
+        pay_core::accounts::MAINNET_NETWORK,
+        name,
+        pay_core::accounts::Account {
+            keystore: pay_core::accounts::Keystore::Remote,
+            provider: Some(provider_id.to_string()),
+            active: false,
+            auth_required: Some(true),
+            pubkey: Some(pubkey.to_string()),
+            vault: None,
+            account: Some(wallet_id.to_string()),
+            path: None,
             secret_key_b58: None,
             created_at: None,
             subscriptions: std::collections::BTreeMap::new(),

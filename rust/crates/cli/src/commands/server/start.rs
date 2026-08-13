@@ -2430,7 +2430,7 @@ async fn resolve_signer_with_store(
                         "Account `{name}` is ephemeral but has no inline secret_key_b58"
                     ))
                 })?;
-                pay_core::signer::ResolvedSigner::Memory(
+                pay_core::signer::ResolvedSigner::Memory(Box::new(
                     pay_kit::mpp::solana_keychain::MemorySigner::from_bytes(&bytes).map_err(
                         |e| {
                             pay_core::Error::Config(format!(
@@ -2438,7 +2438,7 @@ async fn resolve_signer_with_store(
                             ))
                         },
                     )?,
-                )
+                ))
             } else {
                 let intent = pay_core::keystore::AuthIntent::use_gateway_fee_payer();
                 pay_core::signer::load_signer_from_account_with_intent(
@@ -3744,6 +3744,7 @@ endpoints:
     fn ephemeral_account_with_known_pubkey() -> (Account, String) {
         let pubkey = bs58::encode(&VALID_TEST_KEYPAIR_BYTES[32..]).into_string();
         let acct = Account {
+            provider: None,
             keystore: AcctKeystore::Ephemeral,
             active: false,
             auth_required: Some(false),
@@ -3923,6 +3924,7 @@ endpoints:
         // base58. Should fail with a helpful message naming the account.
         let mut file = AccountsFile::default();
         let bad = Account {
+            provider: None,
             keystore: AcctKeystore::Ephemeral,
             active: false,
             auth_required: Some(false),

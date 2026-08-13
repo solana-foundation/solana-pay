@@ -122,6 +122,7 @@ fn persistence_round_trip_through_memory_store() {
         "default",
         Account {
             keystore: Keystore::Ephemeral,
+            provider: None,
             active: true,
             auth_required: Some(false),
             pubkey: Some("LocalSubscriber11111111111111111111111111111".to_string()),

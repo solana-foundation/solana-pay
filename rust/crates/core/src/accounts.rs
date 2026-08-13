@@ -74,11 +74,12 @@ pub enum Keystore {
     /// Inline ephemeral keypair stored directly in this file. Used for
     /// throwaway test wallets on sandbox/devnet/localnet.
     Ephemeral,
-    /// Openfort backend wallet — the private key lives in Openfort's TEE
-    /// and signing happens remotely over HTTPS. The `account` field holds
-    /// the Openfort account ID (`acc_…`); the API credentials are stored
-    /// as a credential blob in the platform secret store.
-    Openfort,
+    /// A remote signing backend: the private key lives in a provider's
+    /// custody and signing happens over HTTPS. The `provider` field names
+    /// the backend (`openfort`, …), `account` holds the provider-side
+    /// wallet id, and the API credentials are stored as a credential blob
+    /// in the platform secret store.
+    Remote,
 }
 
 impl std::fmt::Display for Keystore {
@@ -90,7 +91,7 @@ impl std::fmt::Display for Keystore {
             Keystore::OnePassword => write!(f, "1password"),
             Keystore::File => write!(f, "file"),
             Keystore::Ephemeral => write!(f, "ephemeral"),
-            Keystore::Openfort => write!(f, "openfort"),
+            Keystore::Remote => write!(f, "remote"),
         }
     }
 }
@@ -104,6 +105,12 @@ fn is_false(b: &bool) -> bool {
 pub struct Account {
     /// Which keystore backend stores the secret key.
     pub keystore: Keystore,
+
+    /// Remote backend id for `keystore: remote` (`openfort`, …). Free
+    /// text: a new provider registers itself in `pay_core::remote`
+    /// without changing this file's schema.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
 
     /// Whether this account is the active one for its network. Only one
     /// account per network should have this set. If none is set, the first
@@ -129,7 +136,8 @@ pub struct Account {
     /// Backend-specific account identifier:
     /// - `keystore: 1password` — 1Password account UUID or shorthand used to
     ///   sign in/out of the correct `op` session.
-    /// - `keystore: openfort` — Openfort backend wallet account ID (`acc_…`).
+    /// - `keystore: remote` — the provider-side wallet id (for Openfort,
+    ///   an account ID like `acc_…`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub account: Option<String>,
 
@@ -298,9 +306,9 @@ impl Account {
 
     /// Build the signer source string used by `pay_core::signer::load_signer`
     /// for keystore-backed accounts. Returns `None` for ephemeral and
-    /// Openfort accounts — ephemerals are loaded via [`Account::pubkey`] +
-    /// the inline secret, and Openfort accounts sign remotely without any
-    /// local keypair to load.
+    /// remote accounts — ephemerals are loaded via [`Account::pubkey`] +
+    /// the inline secret, and remote accounts sign through their provider
+    /// without any local keypair to load.
     pub fn signer_source(&self, name: &str) -> Option<String> {
         match self.keystore {
             Keystore::AppleKeychain => Some(format!("keychain:{name}")),
@@ -312,7 +320,7 @@ impl Account {
                     .to_string_lossy()
                     .into_owned()
             })),
-            Keystore::Ephemeral | Keystore::Openfort => None,
+            Keystore::Ephemeral | Keystore::Remote => None,
         }
     }
 
@@ -530,8 +538,9 @@ impl AccountsFile {
 /// Result of looking up an account for a network.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AccountChoice {
-    /// Network has an account configured.
-    Resolved { name: String, account: Account },
+    /// Network has an account configured. Boxed to keep the enum small:
+    /// `Account` dwarfs the unit variant beside it.
+    Resolved { name: String, account: Box<Account> },
     /// Network has no entry in the accounts map at all. Caller may
     /// choose to lazily create one (for ephemeral networks like
     /// sandbox/devnet/localnet) or surface "no wallet configured".
@@ -544,7 +553,7 @@ pub fn resolve_account_for_network(network: &str, file: &AccountsFile) -> Accoun
     match file.account_for_network(network) {
         Some((name, account)) => AccountChoice::Resolved {
             name: name.to_string(),
-            account: account.clone(),
+            account: Box::new(account.clone()),
         },
         None => AccountChoice::Missing,
     }
@@ -734,7 +743,7 @@ pub fn load_or_create_ephemeral_for_network_as(
                 return Ok(ResolvedEphemeral {
                     network: network.to_string(),
                     account_name: name,
-                    account,
+                    account: *account,
                     created: false,
                 });
             }
@@ -811,6 +820,7 @@ fn generate_ephemeral_account() -> Account {
     full.extend_from_slice(&verifying_key.to_bytes());
     Account {
         keystore: Keystore::Ephemeral,
+        provider: None,
         active: false,
         auth_required: Some(false),
         pubkey: Some(bs58::encode(verifying_key.to_bytes()).into_string()),
@@ -884,6 +894,7 @@ mod tests {
     fn keychain_account(pubkey: &str) -> Account {
         Account {
             keystore: Keystore::AppleKeychain,
+            provider: None,
             active: false,
             auth_required: None,
             pubkey: Some(pubkey.to_string()),
@@ -899,6 +910,7 @@ mod tests {
     fn fake_ephemeral(pubkey: &str) -> Account {
         Account {
             keystore: Keystore::Ephemeral,
+            provider: None,
             active: false,
             auth_required: Some(false),
             pubkey: Some(pubkey.to_string()),
@@ -942,7 +954,7 @@ mod tests {
     fn keystore_display_includes_ephemeral() {
         assert_eq!(Keystore::AppleKeychain.to_string(), "apple-keychain");
         assert_eq!(Keystore::Ephemeral.to_string(), "ephemeral");
-        assert_eq!(Keystore::Openfort.to_string(), "openfort");
+        assert_eq!(Keystore::Remote.to_string(), "remote");
     }
 
     #[test]
@@ -954,7 +966,7 @@ mod tests {
             Keystore::OnePassword,
             Keystore::File,
             Keystore::Ephemeral,
-            Keystore::Openfort,
+            Keystore::Remote,
         ] {
             let yaml = serde_yml::to_string(&ks).unwrap();
             let back: Keystore = serde_yml::from_str(&yaml).unwrap();
@@ -981,6 +993,7 @@ mod tests {
     fn signer_source_file_uses_path_when_set() {
         let acct = Account {
             keystore: Keystore::File,
+            provider: None,
             active: false,
             auth_required: None,
             pubkey: None,
@@ -1001,6 +1014,7 @@ mod tests {
     fn signer_source_file_falls_back_to_default_path() {
         let acct = Account {
             keystore: Keystore::File,
+            provider: None,
             active: false,
             auth_required: None,
             pubkey: None,
@@ -1026,6 +1040,7 @@ mod tests {
         let raw_bytes: Vec<u8> = (0u8..64).collect();
         let acct = Account {
             keystore: Keystore::Ephemeral,
+            provider: None,
             active: false,
             auth_required: Some(false),
             pubkey: Some("pk".to_string()),

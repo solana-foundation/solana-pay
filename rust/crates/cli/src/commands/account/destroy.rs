@@ -88,9 +88,9 @@ impl DestroyCommand {
         if !self.yes {
             let theme = dialoguer::theme::ColorfulTheme::default();
 
-            // Offer to export first. Openfort accounts have no local
-            // keypair to export — skip the offer.
-            let export = keystore_kind != KeystoreKind::Openfort
+            // Offer to export first. Remote-backend accounts have no
+            // local keypair to export — skip the offer.
+            let export = keystore_kind != KeystoreKind::Remote
                 && Confirm::with_theme(&theme)
                     .with_prompt(format!(
                         "Export '{}' before removing?",
@@ -129,16 +129,15 @@ impl DestroyCommand {
         }
 
         // Delete from keystore backend
-        if keystore_kind == KeystoreKind::Openfort {
+        if keystore_kind == KeystoreKind::Remote {
             // Remove the API credential blob from the platform secret
-            // store. The backend wallet itself stays intact at Openfort.
+            // store. The wallet itself stays intact at the provider.
             let intent = pay_core::keystore::AuthIntent::delete_account(&self.account);
-            pay_core::openfort::delete_credentials(&self.account, &intent)
+            pay_core::remote::delete_credentials(&self.account, &intent)
                 .map_err(|e| pay_core::Error::Config(format!("{keystore_kind} delete: {e}")))?;
             eprintln!(
                 "{}",
-                "  Openfort credentials removed. The backend wallet still exists at Openfort."
-                    .dimmed()
+                "  Credentials removed. The wallet still exists at the provider.".dimmed()
             );
         } else if let Some(ks) = keystore_for_kind(&keystore_kind, op_account)? {
             let intent = pay_core::keystore::AuthIntent::delete_account(&self.account);
@@ -240,9 +239,9 @@ fn keystore_for_kind(
         // no external keystore to delete from. The earlier `accounts.remove`
         // call already wiped the entry, so we just no-op here.
         KeystoreKind::Ephemeral => Ok(None),
-        // Openfort credential blobs are deleted through
-        // `pay_core::openfort::delete_credentials` before this is called.
-        KeystoreKind::Openfort => Ok(None),
+        // Remote credential blobs are deleted through
+        // `pay_core::remote::delete_credentials` before this is called.
+        KeystoreKind::Remote => Ok(None),
     }
 }
 
@@ -254,6 +253,7 @@ fn discover_legacy_account(name: &str) -> Option<Account> {
         if ks.exists(name) {
             let pubkey = ks.pubkey(name).ok().map(|b| bs58::encode(&b).into_string());
             return Some(Account {
+                provider: None,
                 keystore: KeystoreKind::AppleKeychain,
                 active: false,
                 auth_required: Some(true),
@@ -274,6 +274,7 @@ fn discover_legacy_account(name: &str) -> Option<Account> {
         if ks.exists(name) {
             let pubkey = ks.pubkey(name).ok().map(|b| bs58::encode(&b).into_string());
             return Some(Account {
+                provider: None,
                 keystore: KeystoreKind::GnomeKeyring,
                 active: false,
                 auth_required: Some(true),
@@ -293,6 +294,7 @@ fn discover_legacy_account(name: &str) -> Option<Account> {
         if ks.exists(name) {
             let pubkey = ks.pubkey(name).ok().map(|b| bs58::encode(&b).into_string());
             return Some(Account {
+                provider: None,
                 keystore: KeystoreKind::OnePassword,
                 active: false,
                 auth_required: Some(true),
