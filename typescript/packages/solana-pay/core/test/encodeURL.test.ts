@@ -41,6 +41,24 @@ describe('encodeURL', () => {
             expect(String(url)).toBe(`solana:${recipient}?amount=1`);
         });
 
+        it('encodes a fractional amount without float64 corruption', () => {
+            const recipient = address('FnHyam9w4NZoWR6mKN1CuGBritdsEWZQa4Z4oawLZGxa');
+            const amount = 716844.32;
+
+            const url = encodeURL({ recipient, amount });
+
+            expect(String(url)).toBe(`solana:${recipient}?amount=716844.32`);
+        });
+
+        it('encodes a large integer amount as decimals, not scientific notation', () => {
+            const recipient = address('FnHyam9w4NZoWR6mKN1CuGBritdsEWZQa4Z4oawLZGxa');
+            const amount = 1e21;
+
+            const url = encodeURL({ recipient, amount });
+
+            expect(String(url)).toBe(`solana:${recipient}?amount=1000000000000000000000`);
+        });
+
         it('encodes a url with recipient, amount and token', () => {
             const recipient = address('FnHyam9w4NZoWR6mKN1CuGBritdsEWZQa4Z4oawLZGxa');
             const amount = 1.01;
