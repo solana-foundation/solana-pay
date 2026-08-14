@@ -15,7 +15,7 @@ use std::sync::Mutex;
 
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
-use pay_core::client::session::SessionHandle;
+use pay_core::client::session::{SessionHandle, voucher_header_sync};
 use pay_kit::mpp::client::{
     PaymentChannelOpenOptions, PaymentChannelSessionOpenOptions,
     create_payment_channel_session_opener,
@@ -255,15 +255,25 @@ impl BenchScheme for MppSession {
         let handle = self
             .handle(ctx.index)
             .with_context(|| format!("no session handle for user {}", ctx.index))?;
-        let mut presigned = VecDeque::with_capacity(self.pre_sign_requests_per_user);
-        for _ in 0..self.pre_sign_requests_per_user {
-            presigned.push_back(
-                handle
-                    .voucher_header(self.voucher_base)
-                    .await
-                    .map_err(|e| anyhow::anyhow!("pre-sign voucher: {e}"))?,
-            );
-        }
+        let presigned = if self.pre_sign_requests_per_user > 0 {
+            let count = self.pre_sign_requests_per_user;
+            let voucher_base = self.voucher_base;
+            let signing_handle = handle.clone();
+            tokio::task::spawn_blocking(move || -> Result<VecDeque<String>> {
+                let mut headers = VecDeque::with_capacity(count);
+                for _ in 0..count {
+                    headers.push_back(
+                        voucher_header_sync(&signing_handle, voucher_base)
+                            .map_err(|e| anyhow::anyhow!("pre-sign voucher: {e}"))?,
+                    );
+                }
+                Ok(headers)
+            })
+            .await
+            .context("pre-sign task panicked")??
+        } else {
+            VecDeque::new()
+        };
         Ok(Box::new(SessionSource {
             index: ctx.index,
             handle,
