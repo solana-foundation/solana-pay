@@ -81,6 +81,57 @@ fn authorization_intent(
     )
 }
 
+/// Prove that every row `plan` intends to sign is exactly the row the
+/// authorization prompt showed the user — same recipient, same amount, no
+/// row added or dropped — before the permit accepts the plan at all.
+///
+/// `plan` and `manifest` are supplied separately by the caller, so nothing
+/// upstream of this call structurally guarantees they describe the same
+/// batch. Without this check a caller could show `manifest`'s recipients on
+/// the approval prompt and then hand the permit a `plan` built from a
+/// different recipient set; every downstream signature would be produced
+/// against the unreviewed plan.
+fn validate_plan_matches_manifest(
+    manifest: &TransferManifest,
+    plan: &TransactionPlan,
+) -> Result<()> {
+    let mut expected: HashMap<u64, (Pubkey, u64)> = manifest
+        .rows
+        .iter()
+        .map(|row| (row.row_number, (row.recipient, row.amount_raw)))
+        .collect();
+
+    for chunk in &plan.chunks {
+        for entry in &chunk.entries {
+            match expected.remove(&entry.row_number) {
+                Some((recipient, amount_raw))
+                    if recipient == entry.recipient && amount_raw == entry.amount_raw => {}
+                Some(_) => {
+                    return Err(Error::Config(format!(
+                        "plan row {} does not match the authorized manifest's recipient/amount",
+                        entry.row_number
+                    )));
+                }
+                None => {
+                    return Err(Error::Config(format!(
+                        "plan row {} is not present in the authorized manifest",
+                        entry.row_number
+                    )));
+                }
+            }
+        }
+    }
+
+    if !expected.is_empty() {
+        return Err(Error::Config(format!(
+            "plan is missing {} manifest row(s) that were shown for approval",
+            expected.len()
+        )));
+    }
+
+    Ok(())
+}
+
 #[derive(Debug, Clone, Copy)]
 struct SignedChunkRecord {
     blockhash: Hash,
@@ -175,6 +226,8 @@ impl BatchSigningPermit {
         ttl: chrono::Duration,
         auth_override: AuthOverride,
     ) -> Result<Self> {
+        validate_plan_matches_manifest(manifest, &plan)?;
+
         let manifest_hash_prefix = super::manifest_hash_prefix(&manifest.hash_hex()).to_string();
         let recipient_count = manifest.rows.len();
         let intent = authorization_intent(&summary, recipient_count, &manifest_hash_prefix);
@@ -1189,6 +1242,49 @@ mod tests {
         let tx = build_unsigned_transaction(&plan, &permit);
         let err = permit.sign_chunk(0, &tx, 1_000).unwrap_err();
         assert!(err.to_string().contains("expired"), "{err}");
+    }
+
+    #[test]
+    fn authorize_rejects_a_plan_whose_recipient_does_not_match_the_approved_manifest() {
+        // The exact authorization-binding gap Greptile flagged: the prompt
+        // is built from `manifest`, but a caller could hand `authorize` an
+        // unrelated `plan` — here, one signing a different recipient than
+        // the one the manifest (and therefore the approval prompt) showed.
+        let (store, sender) = fresh_account_and_store();
+        let (manifest, approved_plan) =
+            manifest_and_plan(&sender, 1, FeePayerMode::SelfFunded, &sender);
+        let mut mismatched_plan = approved_plan;
+        let approved_recipient = manifest.rows[0].recipient;
+        let swapped_recipient = Pubkey::new_unique();
+        assert_ne!(approved_recipient, swapped_recipient);
+        mismatched_plan.chunks[0].entries[0].recipient = swapped_recipient;
+
+        let max_total_raw = mismatched_plan.total_token_raw().unwrap();
+        let summary = BatchAuthorizationSummary {
+            account: "default",
+            currency: "USDG",
+            currency_decimals: 6,
+            network: "localnet",
+            recipient_total_raw: max_total_raw,
+            max_total_raw,
+        };
+        let err = BatchSigningPermit::authorize(
+            "localnet",
+            &store,
+            Some("default"),
+            manifest.context.network_genesis_hash,
+            &manifest,
+            mismatched_plan,
+            summary,
+            chrono::Duration::hours(1),
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("does not match the authorized manifest's recipient/amount"),
+            "{err}"
+        );
     }
 
     #[test]
