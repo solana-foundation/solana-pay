@@ -33,6 +33,8 @@ pub struct ReportJson {
     pub drain_secs: f64,
     pub completed_rps: f64,
     pub accepted_rps: f64,
+    pub measured_rps: f64,
+    pub measurement: &'static str,
     pub target_achievement_pct: f64,
     pub signing_rps: f64,
     pub service_latency_ms: LatencyMs,
@@ -81,6 +83,11 @@ impl ReportJson {
         users: usize,
         r: &DriverReport,
     ) -> Self {
+        let (measurement, measured_rps) = if scheme == "self_test" {
+            ("completed", r.completed_rps)
+        } else {
+            ("accepted", r.accepted_rps)
+        };
         ReportJson {
             code: code_fingerprint(),
             host: host_fingerprint(),
@@ -102,8 +109,10 @@ impl ReportJson {
             drain_secs: r.drain.as_secs_f64(),
             completed_rps: r.completed_rps,
             accepted_rps: r.accepted_rps,
+            measured_rps,
+            measurement,
             target_achievement_pct: if r.target_rps > 0.0 {
-                100.0 * r.accepted_rps / r.target_rps
+                100.0 * measured_rps / r.target_rps
             } else {
                 0.0
             },
@@ -158,8 +167,9 @@ impl ReportJson {
             self.scheduled, self.dispatched, self.completed, self.accepted, self.ok, ok_pct, self.fail, self.dropped
         ));
         s.push_str(&format!(
-            "throughput {:.0} accepted/s ({:.1}% of {:.0} target)  {:.0} completed/s  {:.0} signed/s over {:.1}s (+{:.3}s drain)\n",
-            self.accepted_rps,
+            "throughput {:.0} {}/s ({:.1}% of {:.0} target)  {:.0} completed/s  {:.0} signed/s over {:.1}s (+{:.3}s drain)\n",
+            self.measured_rps,
+            self.measurement,
             self.target_achievement_pct,
             self.target_rps,
             self.completed_rps,

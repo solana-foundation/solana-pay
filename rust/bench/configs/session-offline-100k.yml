@@ -13,7 +13,7 @@ load:
   users: 100000
   requests_per_sec_per_user: 10
   unleash_secs: 60
-  max_concurrency: 32768
+  max_concurrency: 8192
   workers: 128
 
 endpoints:
