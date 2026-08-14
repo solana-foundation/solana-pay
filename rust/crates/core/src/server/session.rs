@@ -29,7 +29,7 @@ use pay_kit::mpp::{
     VoucherSignatureType, parse_authorization,
 };
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -44,7 +44,7 @@ const INTENT: &str = "session";
 const METHOD: &str = "solana";
 const DEFAULT_REALM: &str = "MPP Session";
 
-const VERIFIED_CHALLENGE_CACHE_ENTRIES: usize = 8;
+const VERIFIED_CHALLENGE_CACHE_ENTRIES: usize = 1_024;
 
 thread_local! {
     /// Challenge echoes rotate slowly compared with voucher traffic. Keep a
@@ -52,9 +52,44 @@ thread_local! {
     /// session request decoded once per worker, rather than once per voucher.
     /// Every echoed field and the binding secret are compared on a hit; an id
     /// collision or altered echo therefore still takes the fail-closed path.
-    static VERIFIED_CHALLENGES: RefCell<Vec<VerifiedChallenge>> = const {
-        RefCell::new(Vec::new())
-    };
+    static VERIFIED_CHALLENGES: RefCell<VerifiedChallengeCache> =
+        RefCell::new(VerifiedChallengeCache::default());
+}
+
+#[derive(Default)]
+struct VerifiedChallengeCache {
+    entries: HashMap<String, VerifiedChallenge>,
+    insertion_order: VecDeque<String>,
+}
+
+impl VerifiedChallengeCache {
+    fn get(&self, binding_secret: &str, echo: &ChallengeEcho) -> Option<SessionRequest> {
+        self.entries
+            .get(&echo.id)
+            .filter(|cached| cached.matches(binding_secret, echo))
+            .map(|cached| cached.decoded.clone())
+    }
+
+    fn insert(&mut self, binding_secret: &str, echo: &ChallengeEcho, decoded: SessionRequest) {
+        if self.entries.contains_key(&echo.id) {
+            self.entries.insert(
+                echo.id.clone(),
+                VerifiedChallenge::new(binding_secret, echo, decoded),
+            );
+            return;
+        }
+        while self.entries.len() >= VERIFIED_CHALLENGE_CACHE_ENTRIES {
+            let Some(oldest) = self.insertion_order.pop_front() else {
+                break;
+            };
+            self.entries.remove(&oldest);
+        }
+        self.insertion_order.push_back(echo.id.clone());
+        self.entries.insert(
+            echo.id.clone(),
+            VerifiedChallenge::new(binding_secret, echo, decoded),
+        );
+    }
 }
 
 #[derive(Clone)]
@@ -1534,12 +1569,9 @@ impl SessionMpp {
         credential: &pay_kit::mpp::PaymentCredential,
     ) -> Result<SessionRequest> {
         let echo = &credential.challenge;
-        if let Some(request) = VERIFIED_CHALLENGES.with_borrow(|cache| {
-            cache
-                .iter()
-                .find(|cached| cached.matches(&self.challenge_binding_secret, echo))
-                .map(|cached| cached.decoded.clone())
-        }) {
+        if let Some(request) =
+            VERIFIED_CHALLENGES.with_borrow(|cache| cache.get(&self.challenge_binding_secret, echo))
+        {
             return Ok(request);
         }
         let challenge = PaymentChallenge {
@@ -1563,14 +1595,7 @@ impl SessionMpp {
             .decode()
             .map_err(|e| Error::Mpp(format!("Invalid session challenge request: {e}")))?;
         VERIFIED_CHALLENGES.with_borrow_mut(|cache| {
-            if cache.len() == VERIFIED_CHALLENGE_CACHE_ENTRIES {
-                cache.remove(0);
-            }
-            cache.push(VerifiedChallenge::new(
-                &self.challenge_binding_secret,
-                echo,
-                request.clone(),
-            ));
+            cache.insert(&self.challenge_binding_secret, echo, request.clone());
         });
         Ok(request)
     }
@@ -2229,6 +2254,37 @@ mod tests {
             .await
             .expect_err("altered cached echo should error");
         assert!(err.to_string().contains("did not issue"), "got: {err}");
+    }
+
+    #[test]
+    fn verified_challenge_cache_is_bounded() {
+        let session = test_session_mpp();
+        let request = session.challenge(None).unwrap().request;
+        let mut cache = VerifiedChallengeCache::default();
+        let mut first = None;
+        let mut last = None;
+
+        for index in 0..=VERIFIED_CHALLENGE_CACHE_ENTRIES {
+            let challenge = PaymentChallenge::with_challenge_binding_secret(
+                "test-secret",
+                "test-realm",
+                METHOD,
+                INTENT,
+                request.clone(),
+            );
+            let echo = challenge.to_echo();
+            if index == 0 {
+                first = Some(echo.clone());
+            }
+            if index == VERIFIED_CHALLENGE_CACHE_ENTRIES {
+                last = Some(echo.clone());
+            }
+            cache.insert("test-secret", &echo, request.decode().unwrap());
+        }
+
+        assert_eq!(cache.entries.len(), VERIFIED_CHALLENGE_CACHE_ENTRIES);
+        assert!(cache.get("test-secret", &first.unwrap()).is_none());
+        assert!(cache.get("test-secret", &last.unwrap()).is_some());
     }
 
     #[tokio::test]
