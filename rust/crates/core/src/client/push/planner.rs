@@ -554,6 +554,65 @@ fn build_planned_chunk(
     })
 }
 
+/// Build the real (unsigned) transaction for `chunk`, ready for
+/// [`super::permit::BatchSigningPermit::sign_chunk`]. This is the
+/// production counterpart of `build_planned_chunk`'s internal
+/// instruction-building (which only proves the chunk *fits*, at packing
+/// time, against a placeholder blockhash): the executor calls this once it
+/// has a live blockhash, right before signing, so staleness is bounded to
+/// one round trip rather than however long a chunk sat in a plan.
+///
+/// `blockhash` must be a recently-fetched value from the network the chunk
+/// targets; this function performs no RPC itself, matching every other
+/// pure/read-only-preflight function in this module.
+pub fn build_chunk_transaction(
+    chunk: &PlannedChunk,
+    mint: &Pubkey,
+    token_program: &Pubkey,
+    decimals: u8,
+    sender: &Pubkey,
+    fee_payer: &Pubkey,
+    blockhash: Hash,
+) -> Result<Transaction> {
+    let last = chunk.entries.len().checked_sub(1).ok_or_else(|| {
+        Error::Config("cannot build a transaction for a chunk with no entries".to_string())
+    })?;
+    let kit_entries: Vec<TransferEntry> = chunk
+        .entries
+        .iter()
+        .enumerate()
+        .map(|(position, entry)| TransferEntry {
+            recipient: entry.recipient,
+            amount: entry.amount_raw,
+            ata_creation_required: entry.ata_creation_required,
+            memo: if position == last {
+                Some(chunk.memo.clone())
+            } else {
+                None
+            },
+        })
+        .collect();
+
+    let mut instructions = vec![
+        compute_unit_price_instruction(chunk.compute_unit_price_micro_lamports),
+        compute_unit_limit_instruction(chunk.compute_unit_limit),
+    ];
+    instructions.extend(
+        build_spl_transfer_batch_instructions(
+            sender,
+            mint,
+            token_program,
+            decimals,
+            fee_payer,
+            &kit_entries,
+        )
+        .map_err(kit_error)?,
+    );
+
+    let message = Message::new_with_blockhash(&instructions, Some(fee_payer), &blockhash);
+    Ok(Transaction::new_unsigned(message))
+}
+
 fn estimate_compute_units(transfer_count: usize, ata_create_count: usize) -> u32 {
     let total = COMPUTE_BUDGET_OVERHEAD_UNITS
         + MEMO_OVERHEAD_UNITS

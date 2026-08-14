@@ -6438,6 +6438,7 @@ dependencies = [
  "bincode",
  "blake3",
  "bs58",
+ "chrono",
  "figment",
  "opentelemetry 0.31.0",
  "opentelemetry-otlp",
@@ -6476,15 +6477,24 @@ name = "pay-api-core"
 version = "0.27.0"
 dependencies = [
  "base64 0.22.1",
+ "bincode",
+ "blake3",
  "borsh 1.7.0",
  "bs58",
+ "chrono",
  "pay-api-types",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
  "solana-address 2.5.0",
+ "solana-hash 3.1.0",
+ "solana-instruction 3.2.0",
+ "solana-keypair",
+ "solana-message 3.1.0",
  "solana-pay-kit",
  "solana-pubkey 3.0.0",
+ "solana-signature",
+ "solana-transaction",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -6494,6 +6504,7 @@ dependencies = [
 name = "pay-api-types"
 version = "0.27.0"
 dependencies = [
+ "schemars 0.8.22",
  "serde",
  "serde_json",
  "thiserror 2.0.18",

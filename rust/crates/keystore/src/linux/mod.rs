@@ -118,7 +118,7 @@ fn polkit_action_for_intent(intent: &AuthIntent) -> &'static str {
             .unwrap_or(POLKIT_ACTION_PAYMENT),
         // A batch is "a series of payments" like a session budget; reuse the
         // same action plus the existing per-limit-bucket mapping rather than
-        // installing a whole new policy action for Slice 2.
+        // installing a whole new policy action for `pay push`.
         AuthIntent::AuthorizeBatch { limit, .. } => limit
             .map(polkit_payment_limit_action)
             .unwrap_or(POLKIT_ACTION_SESSION),

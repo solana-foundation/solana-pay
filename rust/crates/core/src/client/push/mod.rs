@@ -1,15 +1,26 @@
-//! Transport-independent primitives for a `pay push` batch payout.
+//! Transport-independent primitives for a `pay push` batch payout, plus the
+//! executor that drives them end to end.
 //!
-//! Parsing and manifest construction happen before a wallet is unlocked. This
-//! module deliberately does not know how a batch is signed or submitted.
+//! Parsing and manifest construction happen before a wallet is unlocked, and
+//! `manifest`/`planner`/`permit`/`journal` deliberately don't know how a
+//! batch is broadcast — that's `executor`'s job:
 //!
-//! Slice 2 delivers the CSV manifest (`manifest`), read-only preflight and
-//! deterministic packing (`planner`), the one-approval signing permit
-//! (`permit`), and the durable, fsync-before-broadcast journal (`journal`).
-//! Broadcast/confirm execution (`executor`, `direct`, `gasless`) is a later
-//! slice — nothing in this module performs network I/O other than the
-//! explicitly read-only preflight RPC lookups described in the plan.
+//! - `manifest`: the canonical CSV manifest, content-hashed into a
+//!   `batchId`.
+//! - `planner`: read-only preflight and deterministic packing of manifest
+//!   rows into chunks.
+//! - `permit`: the one-approval signing permit
+//!   ([`permit::BatchSigningPermit`]) — the only thing that ever touches the
+//!   loaded signer.
+//! - `journal`: the durable, fsync-before-broadcast event log and its resume
+//!   reducer.
+//! - `executor`: the bounded, backpressured pipeline
+//!   ([`executor::PushExecutor`]) that pulls chunks from `planner`, signs
+//!   them via `permit`, journals them, and broadcasts them through a
+//!   pluggable [`executor::ChunkBroadcaster`] (direct-to-RPC for self-funded
+//!   runs, pay-api's `/api/v1/transfer-batches` for gasless ones).
 
+pub mod executor;
 pub mod journal;
 pub mod manifest;
 pub mod permit;

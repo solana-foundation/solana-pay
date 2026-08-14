@@ -2,12 +2,12 @@
 //!
 //! `pay push` shows one Touch ID / platform-auth prompt per process
 //! invocation ([`AuthIntent::AuthorizeBatch`]), then loads the signer exactly
-//! once into a [`BatchSigningPermit`]. Everything downstream (a later
-//! slice's bounded executor) hands the permit a *prepared* transaction per
-//! chunk and gets back a signature or a rejection — it never touches the raw
-//! signer. `sign_chunk` re-validates every field the plan requires before
-//! producing a signature, so a compromised or buggy caller cannot get the
-//! permit to sign anything outside the exact authorized plan.
+//! once into a [`BatchSigningPermit`]. Everything downstream
+//! ([`super::executor::PushExecutor`]) hands the permit a *prepared*
+//! transaction per chunk and gets back a signature or a rejection — it never
+//! touches the raw signer. `sign_chunk` re-validates every field the plan
+//! requires before producing a signature, so a compromised or buggy caller
+//! cannot get the permit to sign anything outside the exact authorized plan.
 
 use std::collections::HashMap;
 
