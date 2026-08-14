@@ -7,14 +7,11 @@
 
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use futures::future::BoxFuture;
 use futures::{FutureExt, StreamExt, stream::FuturesUnordered};
 use hdrhistogram::Histogram;
-use tokio::sync::Semaphore;
 
 use crate::scheme::{RequestSource, build_request};
 
@@ -86,8 +83,6 @@ type InFlight = BoxFuture<'static, Completion>;
 #[derive(Clone)]
 struct WorkerContext {
     http: reqwest::Client,
-    permits: Arc<Semaphore>,
-    max_in_flight: Arc<AtomicUsize>,
     worker_max_in_flight: usize,
     cfg: DriverConfig,
     started: Instant,
@@ -107,6 +102,7 @@ struct LocalMetrics {
     ok: u64,
     fail: u64,
     dropped: u64,
+    max_in_flight: usize,
     status: HashMap<u16, u64>,
     errors: HashMap<String, u64>,
     rps_series: Vec<u64>,
@@ -127,6 +123,7 @@ impl LocalMetrics {
             ok: 0,
             fail: 0,
             dropped: 0,
+            max_in_flight: 0,
             status: HashMap::new(),
             errors: HashMap::new(),
             rps_series: Vec::new(),
@@ -205,6 +202,7 @@ impl LocalMetrics {
         self.ok += other.ok;
         self.fail += other.fail;
         self.dropped += other.dropped;
+        self.max_in_flight += other.max_in_flight;
         for (status, count) in other.status {
             *self.status.entry(status).or_insert(0) += count;
         }
@@ -291,13 +289,9 @@ pub async fn run(sources: Vec<Box<dyn RequestSource>>, cfg: DriverConfig) -> Dri
     // Client/pool construction is setup, not part of the measured window.
     let started = Instant::now();
     let deadline = started + cfg.deadline;
-    let permits = Arc::new(Semaphore::new(cfg.max_concurrency.max(1)));
-    let max_in_flight = Arc::new(AtomicUsize::new(0));
     let worker_context = WorkerContext {
         // Replaced by each worker's independently-owned client below.
         http: worker_clients[0].clone(),
-        permits,
-        max_in_flight: Arc::clone(&max_in_flight),
         worker_max_in_flight,
         cfg,
         started,
@@ -338,7 +332,10 @@ pub async fn run(sources: Vec<Box<dyn RequestSource>>, cfg: DriverConfig) -> Dri
         signing_latency_ms: latency_summary(&totals.signing_us),
         schedule_delay_ms: latency_summary(&totals.schedule_delay_us),
         end_to_end_latency_ms: latency_summary(&totals.end_to_end_us),
-        max_in_flight: max_in_flight.load(Ordering::Relaxed),
+        // Workers have disjoint fixed caps. Summing their observed peaks is a
+        // conservative aggregate peak without a contended global counter in
+        // the measured path.
+        max_in_flight: totals.max_in_flight,
         status_counts: totals.status,
         error_counts: totals.errors,
         rps_series: totals.rps_series,
@@ -349,8 +346,6 @@ pub async fn run(sources: Vec<Box<dyn RequestSource>>, cfg: DriverConfig) -> Dri
 async fn run_worker(sources: Vec<Box<dyn RequestSource>>, context: WorkerContext) -> LocalMetrics {
     let WorkerContext {
         http,
-        permits,
-        max_in_flight,
         worker_max_in_flight,
         cfg,
         started,
@@ -388,9 +383,6 @@ async fn run_worker(sources: Vec<Box<dyn RequestSource>>, context: WorkerContext
             if scheduled > Instant::now() {
                 break;
             }
-            let Ok(permit) = Arc::clone(&permits).try_acquire_owned() else {
-                break;
-            };
             schedule.pop();
             let mut state = slots[slot].take().expect("ready source slot");
             debug_assert_eq!(scheduled, state.next_scheduled);
@@ -403,7 +395,7 @@ async fn run_worker(sources: Vec<Box<dyn RequestSource>>, context: WorkerContext
                     let signing_started = Instant::now();
                     let request = state.source.next_request().await;
                     let signing = signing_started.elapsed();
-                    let completion = match request {
+                    match request {
                         Ok(request) => {
                             let dispatched = Instant::now();
                             let result = build_request(
@@ -456,20 +448,14 @@ async fn run_worker(sources: Vec<Box<dyn RequestSource>>, context: WorkerContext
                             error: Some("signing".to_string()),
                             completed_at: Instant::now(),
                         },
-                    };
-                    drop(permit);
-                    completion
+                    }
                 }
                 .boxed(),
             );
-            let used = cfg
-                .max_concurrency
-                .max(1)
-                .saturating_sub(permits.available_permits());
-            max_in_flight.fetch_max(used, Ordering::Relaxed);
+            metrics.max_in_flight = metrics.max_in_flight.max(in_flight.len());
         }
 
-        let next = if permits.available_permits() == 0 {
+        let next = if in_flight.len() >= worker_max_in_flight {
             deadline
         } else {
             schedule
@@ -551,6 +537,7 @@ fn classify_error(error: &reqwest::Error) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use axum::{Router, http::StatusCode, routing::get};
