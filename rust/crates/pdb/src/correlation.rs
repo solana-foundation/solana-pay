@@ -982,7 +982,7 @@ fn x402_scheme_from_required(encoded: &str) -> Option<String> {
 
 /// Scheme from a base64 `PAYMENT-SIGNATURE` payment envelope — `accepted.scheme`
 /// (canonical x402 v2), a top-level `scheme`, or `upto` inferred from a
-/// payment-channel payload (`channelId`/`profile`).
+/// tab payload (`channelId`/`profile`).
 fn x402_scheme_from_payment(encoded: &str) -> Option<String> {
     let json = decode_json_value(encoded)?;
     if let Some(scheme) = value_string(json.get("accepted").and_then(|a| a.get("scheme"))) {

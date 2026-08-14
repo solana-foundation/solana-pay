@@ -1,6 +1,6 @@
 # pay-worker
 
-Operator maintenance jobs for pay-kit payment-channel deployments.
+Operator maintenance jobs for pay-kit tab deployments.
 
 The crate ships two binaries:
 
@@ -8,7 +8,7 @@ The crate ships two binaries:
 - **`settle-sessions`** scans durable Redis session vouchers, compares them to
   on-chain state, and batches both newer watermarks and due idle closes.
 
-`close-channels` closes a list of on-chain payment channels (the MPP payment-channels program,
+`close-channels` closes a list of on-chain tabs (the MPP tabs program,
 `CHNLxYvVA28MJP9PrFuDXccuoGXAx7jBacfLEkahyGsX`) by driving each through the
 program's adaptive state machine, signing with a GCP-KMS-backed fee payer.
 
@@ -120,7 +120,7 @@ channel's **open** (creation) transaction:
 1. `getSignaturesForAddress(channel)`, paginated to the OLDEST signature — that
    is the `open`.
 2. `getTransaction(sig, base64)`, bincode-decoded; find the instruction whose
-   program id is the payment-channels program and whose `data[0] == 1` (the
+   program id is the tabs program and whose `data[0] == 1` (the
    `open` discriminator).
 3. The `open` ix data is `[disc(1)][salt(8)][deposit(8)][grace(4)][open_slot(8)][count(4)][entries(count×34)]`.
    The preimage = `ix_data[29..]` = `count || entries` (each entry =
@@ -145,7 +145,7 @@ The empty-plan case works naturally: `count = 0` → preimage = the 4 bytes
   overridable via `JOBS_TREASURY_OWNER`.
 - token program resolved from the mint account's owner (SPL Token vs Token-2022).
 - `event_authority` = PDA(`["event_authority"]`, program); `self_program` = the
-  payment-channels program id.
+  tabs program id.
 
 ## Example invocations
 

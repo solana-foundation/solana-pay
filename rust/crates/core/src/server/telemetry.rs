@@ -38,7 +38,7 @@ pub fn record_metric_baselines() {
         channel_kind = "payment_channel",
         verification = "account_confirmed",
         metric = METRIC_PAYMENT_CHANNELS_OPENED,
-        "payment-channel open confirmed",
+        "tab open confirmed",
     );
     for retryable in [true, false] {
         tracing::info!(
@@ -406,12 +406,12 @@ pub fn record_payment_channel_closed(signature: &str, channel: &str) {
         monotonic_counter.pay_payment_channels_closed_total = 1_u64,
         protocol = "mpp/session",
         metric = METRIC_PAYMENT_CHANNELS_CLOSED,
-        "payment-channel settlement confirmed",
+        "tab settlement confirmed",
     );
     tracing::info!(
         signature = %signature,
         channel = %channel,
-        "payment-channel settlement details",
+        "tab settlement details",
     );
 }
 
@@ -429,7 +429,7 @@ pub fn record_payment_channel_opened(
         channel_kind = "payment_channel",
         verification = "account_confirmed",
         metric = METRIC_PAYMENT_CHANNELS_OPENED,
-        "payment-channel open confirmed",
+        "tab open confirmed",
     );
     tracing::info!(
         gauge.pay_payment_channel_escrowed_base_units = escrowed,
@@ -438,19 +438,19 @@ pub fn record_payment_channel_opened(
         network,
         protocol = "mpp/session",
         metric = METRIC_PAYMENT_CHANNEL_ESCROWED,
-        "payment-channel escrow confirmed",
+        "tab escrow confirmed",
     );
     tracing::info!(
         gauge.pay_payment_channel_client = 1_u64,
         client_id,
         protocol = "mpp/session",
         metric = METRIC_PAYMENT_CHANNEL_CLIENT,
-        "payment-channel client confirmed",
+        "tab client confirmed",
     );
     tracing::info!(
         signature = %signature,
         channel = %channel,
-        "payment-channel open details",
+        "tab open details",
     );
 }
 
@@ -471,7 +471,7 @@ pub fn record_payment_channel_voucher_cumulative(
         network,
         protocol = "mpp/session",
         metric = METRIC_PAYMENT_CHANNEL_VOUCHER_CUMULATIVE,
-        "payment-channel voucher persisted",
+        "tab voucher persisted",
     );
 }
 

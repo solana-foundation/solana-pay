@@ -1,7 +1,7 @@
 //! `close-channels` — operator maintenance job.
 //!
-//! Given a list of payment-channel addresses, advance each toward closure via
-//! the payment-channels program's adaptive state machine, signing with a
+//! Given a list of tab addresses, advance each toward closure via
+//! the tabs program's adaptive state machine, signing with a
 //! GCP-KMS-backed fee payer.
 //!
 //! SAFETY: `DRY_RUN` defaults to `true`. Nothing is signed or sent unless

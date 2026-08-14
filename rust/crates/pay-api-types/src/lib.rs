@@ -102,7 +102,7 @@ pub struct Receipt {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub subscription: Option<ReceiptSubscription>,
     /// Programs invoked at the top level. Useful for callers that want to
-    /// surface "via payment-channels" / "memo" badges without re-parsing.
+    /// surface "via tabs" / "memo" badges without re-parsing.
     pub programs: Vec<String>,
     /// New SPL token accounts that were created in this transaction. Each
     /// entry costs the sender ~0.00204 SOL of rent so the UI can surface it.
@@ -159,7 +159,7 @@ pub struct ReceiptIntent {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub action: Option<String>,
     /// The on-chain program backing the intent when one applies
-    /// (payment-channels, multi-delegator).
+    /// (tabs, multi-delegator).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub program_id: Option<String>,
 }
@@ -182,7 +182,7 @@ pub enum ReceiptIntentKind {
     Transfer,
 }
 
-/// Lifecycle state of the underlying payment-channel account.
+/// Lifecycle state of the underlying tab account.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ChannelStatus {

@@ -15,7 +15,7 @@ pub struct Config {
     /// Supported networks → RPC config.
     pub networks: HashMap<String, NetworkConfig>,
 
-    /// Base58 owner of the treasury ATA the payment-channels program credits
+    /// Base58 owner of the treasury ATA the tabs program credits
     /// protocol fees to. `distribute` checks the treasury ATA against
     /// `ATA(treasury_owner, mint, token_program)`.
     pub treasury_owner: String,

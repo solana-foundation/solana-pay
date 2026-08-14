@@ -1,4 +1,4 @@
-//! Fetch and decode an MPP payment-channel account.
+//! Fetch and decode an MPP tab account.
 //!
 //! The Channel struct (auto-generated from the on-chain IDL) is laid out as:
 //!
@@ -82,7 +82,7 @@ impl ChannelStatus {
 }
 
 /// Resolve the channel account among a set of candidate addresses by querying
-/// the cluster for whichever one is owned by the payment-channels program.
+/// the cluster for whichever one is owned by the tabs program.
 ///
 /// `candidates` is typically the `accounts` list of the program instruction —
 /// we don't know which slot holds the channel PDA without the IDL, so we let

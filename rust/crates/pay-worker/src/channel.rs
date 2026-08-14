@@ -1,5 +1,5 @@
 //! Channel decoding, distribution-preimage recovery, and instruction building
-//! for the payment-channels program.
+//! for the tabs program.
 //!
 //! Reuses pay-kit's Codama-generated [`Channel`] account (borsh-decoded via
 //! `Channel::from_bytes`) and its instruction builders, plus pay-api-core's
@@ -127,7 +127,7 @@ pub async fn discover_distributed_channels(
 }
 
 /// Fetch and borsh-decode a channel account. Returns `Ok(None)` when the
-/// account doesn't exist, isn't owned by the payment-channels program, or
+/// account doesn't exist, isn't owned by the tabs program, or
 /// isn't a decodable `Channel` (e.g. a 1-byte tombstone / `ClosedChannel`).
 pub async fn fetch_channel(
     rpc: &RpcClient,
@@ -239,7 +239,7 @@ async fn find_open_signature(
 }
 
 /// Decode a base64 bincode transaction and return the data bytes of the
-/// instruction whose program id is the payment-channels program and whose
+/// instruction whose program id is the tabs program and whose
 /// discriminator (`data[0]`) is `OPEN_DISCRIMINATOR` (1).
 ///
 /// Decodes as a `VersionedTransaction` so it handles both legacy and v0
@@ -320,7 +320,7 @@ fn decode_recipients(preimage: &[u8]) -> Result<Vec<DistributionEntry>, JobError
 
 // ── Instruction builders ────────────────────────────────────────────────────
 
-/// `event_authority` PDA for the payment-channels program.
+/// `event_authority` PDA for the tabs program.
 pub fn event_authority() -> Pubkey {
     find_event_authority_pda(&default_program_id()).0
 }

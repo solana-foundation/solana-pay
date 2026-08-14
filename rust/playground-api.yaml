@@ -62,7 +62,7 @@ recipients:
 # settles and closes the channel.
 #
 # The canonical pay-kit `session()` adapter (and the JS playground client) opens
-# a payment-channel session with the client signing each voucher — the
+# a tab session with the client signing each voucher — the
 # operator only fee-pays/settles. `voucher_signer` defaults to `client`, which
 # matches that, so it's left unset here.
 session:
@@ -191,7 +191,7 @@ endpoints:
   #     # plan_created_at: ...
 
   # ===========================================================================
-  # SESSION — open a payment channel, stream metered deliveries, settle on
+  # SESSION — open a tab, stream metered deliveries, settle on
   # idle-close. TS: stream → session(usd('1.00'), { unitPrice: usd('0.0001') }).
   # Channel cap + close delay come from the top-level `session:` block above;
   # the per-delivery price is the metering dimension here.

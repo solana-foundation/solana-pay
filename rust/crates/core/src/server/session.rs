@@ -7,7 +7,7 @@
 //! # Pull-mode session flow
 //!
 //! ```text
-//! Client sends `open` with deterministic payment-channel fields
+//! Client sends `open` with deterministic tab fields
 //!   │
 //!   ▼
 //! Server validates the fields against the challenge and opens the channel
@@ -196,14 +196,14 @@ impl SessionOperatorRuntime {
         }
 
         let authorized_signer = params.authorized_signer.ok_or_else(|| {
-            Error::Mpp("payment-channel watermark missing authorized signer".to_string())
+            Error::Mpp("tab watermark missing authorized signer".to_string())
         })?;
         let voucher_signature = params.voucher_signature.as_deref().ok_or_else(|| {
-            Error::Mpp("payment-channel watermark missing voucher signature".to_string())
+            Error::Mpp("tab watermark missing voucher signature".to_string())
         })?;
         let signature = decode_voucher_signature(voucher_signature)?;
         let expires_at = params.voucher_expires_at.ok_or_else(|| {
-            Error::Mpp("payment-channel watermark missing voucher expiry".to_string())
+            Error::Mpp("tab watermark missing voucher expiry".to_string())
         })?;
         let instructions = pay_kit::mpp::program::payment_channels::build_settle_instructions(
             &params.channel_id,
@@ -231,12 +231,12 @@ impl SessionOperatorRuntime {
         let signature = handle
             .settle(params.channel_id.to_string(), instructions)
             .await
-            .map_err(|e| Error::Mpp(format!("payment-channel watermark settlement: {e}")))?;
+            .map_err(|e| Error::Mpp(format!("tab watermark settlement: {e}")))?;
         tracing::info!(
             channel_id,
             cumulative = params.settled,
             %signature,
-            "payment-channel watermark broadcast"
+            "tab watermark broadcast"
         );
         Ok(())
     }
@@ -353,18 +353,18 @@ impl SessionOperatorRuntime {
             return Ok(None);
         };
         let channel = solana_pubkey::Pubkey::from_str(channel_id)
-            .map_err(|e| Error::Mpp(format!("invalid payment channel: {e}")))?;
+            .map_err(|e| Error::Mpp(format!("invalid tab: {e}")))?;
         use pay_kit::mpp::program::payment_channels::generated::generated::accounts::Channel;
         use pay_kit::mpp::solana_rpc_client::nonblocking::rpc_client::RpcClient;
         use solana_commitment_config::CommitmentConfig;
         RpcClient::new(rpc_url)
             .get_account_with_commitment(&channel, CommitmentConfig::confirmed())
             .await
-            .map_err(|error| Error::Mpp(format!("failed to fetch payment channel: {error}")))?
+            .map_err(|error| Error::Mpp(format!("failed to fetch tab: {error}")))?
             .value
             .map(|account| {
                 Channel::from_bytes(&account.data)
-                    .map_err(|e| Error::Mpp(format!("failed to decode payment channel: {e}")))
+                    .map_err(|e| Error::Mpp(format!("failed to decode tab: {e}")))
             })
             .transpose()
     }
@@ -388,16 +388,16 @@ impl SessionOperatorRuntime {
             .map(|s| s.pubkey())
             .unwrap_or_else(|| signer.pubkey());
         let rpc_url = self.rpc_url.clone().ok_or_else(|| {
-            Error::Mpp("payment-channel settlement requires an RPC URL".to_string())
+            Error::Mpp("tab settlement requires an RPC URL".to_string())
         })?;
         let payer = params
             .payer
-            .ok_or_else(|| Error::Mpp("payment-channel settlement missing payer".to_string()))?;
+            .ok_or_else(|| Error::Mpp("tab settlement missing payer".to_string()))?;
         let mint = params
             .mint
-            .ok_or_else(|| Error::Mpp("payment-channel settlement missing mint".to_string()))?;
+            .ok_or_else(|| Error::Mpp("tab settlement missing mint".to_string()))?;
         let authorized_signer = params.authorized_signer.ok_or_else(|| {
-            Error::Mpp("payment-channel settlement missing authorized signer".to_string())
+            Error::Mpp("tab settlement missing authorized signer".to_string())
         })?;
         let token_program = spl_token_program();
 
@@ -418,7 +418,7 @@ impl SessionOperatorRuntime {
             (true, None) if params.settled == 0 => None,
             (true, None) => {
                 return Err(Error::Mpp(
-                    "payment-channel settlement missing highest voucher signature".to_string(),
+                    "tab settlement missing highest voucher signature".to_string(),
                 ));
             }
         };
@@ -481,8 +481,8 @@ impl SessionOperatorRuntime {
         let signature = handle
             .settle(channel_id, instructions)
             .await
-            .map_err(|e| Error::Mpp(format!("payment-channel settlement: {e}")))?;
-        wait_for_transaction_confirmed(&rpc_url, &signature, "payment-channel settlement").await?;
+            .map_err(|e| Error::Mpp(format!("tab settlement: {e}")))?;
+        wait_for_transaction_confirmed(&rpc_url, &signature, "tab settlement").await?;
         Ok(Some(signature))
     }
 }
@@ -710,7 +710,7 @@ impl SessionLifecycleRunloop {
                     tracing::warn!(
                         channel_id,
                         error,
-                        "failed to persist payment-channel lifecycle touch"
+                        "failed to persist tab lifecycle touch"
                     );
                 }
                 let _ = response.send(result);
@@ -794,7 +794,7 @@ impl SessionLifecycleRunloop {
             Err(error) => {
                 tracing::warn!(
                     %error,
-                    "failed to enumerate payment channels for lifecycle ownership reconciliation"
+                    "failed to enumerate tabs for lifecycle ownership reconciliation"
                 );
                 return;
             }
@@ -844,7 +844,7 @@ impl SessionLifecycleRunloop {
                 tracing::debug!(
                     channel_id = state.channel_id,
                     %error,
-                    "payment-channel lifecycle ownership changed during reconciliation"
+                    "tab lifecycle ownership changed during reconciliation"
                 );
             }
         }
@@ -872,7 +872,7 @@ impl SessionLifecycleRunloop {
         let states = match self.runtime.channel_store.list_channels().await {
             Ok(states) => states,
             Err(error) => {
-                tracing::warn!(%error, "failed to enumerate payment-channel lifecycle state");
+                tracing::warn!(%error, "failed to enumerate tab lifecycle state");
                 return;
             }
         };
@@ -913,10 +913,10 @@ impl SessionLifecycleRunloop {
             self.runtime.release_capacity(&channel_id);
             match close_result {
                 Ok(SessionCloseResult::Closed { settled }) => {
-                    tracing::info!(channel_id, settled, "operator auto-closed payment channel");
+                    tracing::info!(channel_id, settled, "operator auto-closed tab");
                 }
                 Ok(SessionCloseResult::AlreadyFinalized) => {
-                    tracing::debug!(channel_id, "payment channel already finalized");
+                    tracing::debug!(channel_id, "tab already finalized");
                 }
                 Err(error) => {
                     tracing::warn!(
@@ -928,7 +928,7 @@ impl SessionLifecycleRunloop {
                         tracing::warn!(
                             channel_id,
                             error = %touch_error,
-                            "failed to reschedule payment-channel close"
+                            "failed to reschedule tab close"
                         );
                     }
                 }
@@ -949,7 +949,7 @@ impl SessionLifecycleRunloop {
         let states = match self.runtime.channel_store.list_channels().await {
             Ok(states) => states,
             Err(error) => {
-                tracing::warn!(%error, "failed to enumerate active payment channels");
+                tracing::warn!(%error, "failed to enumerate active tabs");
                 self.next_settlement = Some(now + interval);
                 return;
             }
@@ -1045,7 +1045,7 @@ enum SessionCloseResult {
 /// Holds a [`SessionServer`] backed by an in-memory channel store.  For
 /// production, swap `MemoryChannelStore` with a persistent backend.
 ///
-/// Payment-channel sessions submit a client-signed open transaction that
+/// Tab sessions submit a client-signed open transaction that
 /// PayKit verifies against the challenge, broadcasts, and confirms.
 pub struct SessionMpp {
     server: Arc<SessionServer<Arc<dyn ChannelStore>>>,
@@ -1153,7 +1153,7 @@ impl SessionMpp {
     }
 
     /// Configure the operator signer used to co-sign client-provided
-    /// payment-channel open transactions and to submit close settlement txs.
+    /// tab open transactions and to submit close settlement txs.
     pub fn with_payment_channel_signer(self, signer: Arc<dyn SolanaSigner>) -> Self {
         if let Ok(mut payment_channel_signer) = self.payment_channel_signer.lock() {
             *payment_channel_signer = Some(signer);
@@ -1161,11 +1161,11 @@ impl SessionMpp {
         self
     }
 
-    /// Configure the signer that funds server-opened payment channels.
+    /// Configure the signer that funds server-opened tabs.
     ///
     /// When omitted, the settlement signer is reused for backwards
     /// compatibility. Server-opened client-voucher sessions normally set this
-    /// to a distinct funded payer because the payment-channel program rejects
+    /// to a distinct funded payer because the tab program rejects
     /// `payer == payee`.
     pub fn with_payment_channel_payer_signer(self, signer: Arc<dyn SolanaSigner>) -> Self {
         if let Ok(mut payment_channel_payer_signer) = self.payment_channel_payer_signer.lock() {
@@ -1393,7 +1393,7 @@ impl SessionMpp {
             && (state.sealed || state.close_requested_at.is_some())
         {
             return Err(Error::PaymentRejected(
-                "payment channel close is pending".to_string(),
+                "tab close is pending".to_string(),
             ));
         }
         Ok(())
@@ -1488,9 +1488,9 @@ impl SessionMpp {
 
     /// Process an `Authorization` header containing a [`SessionAction`].
     ///
-    /// For payment-channel `open` actions, the server either co-signs a
+    /// For tab `open` actions, the server either co-signs a
     /// client-provided open transaction or opens the channel itself from its
-    /// configured payment-channel signer, then stores the confirmed channel.
+    /// configured tab signer, then stores the confirmed channel.
     #[tracing::instrument(name = "session_process", skip_all)]
     pub async fn process(&self, auth_header: &str) -> Result<SessionOutcome> {
         let credential = parse_authorization(auth_header)
@@ -1732,7 +1732,7 @@ impl SessionMpp {
             })?;
         if state.sealed || state.close_requested_at.is_some() {
             return Err(Error::PaymentRejected(
-                "payment channel close is pending".to_string(),
+                "tab close is pending".to_string(),
             ));
         }
         // A record with no binding at all is not a mismatch: it either
@@ -1842,7 +1842,7 @@ fn spl_token_program() -> solana_pubkey::Pubkey {
 }
 
 /// Decode a client-built open transaction. Delegates to the shared
-/// payment-channels decoder, which accepts both legacy (pay Rust client) and v0
+/// tabs decoder, which accepts both legacy (pay Rust client) and v0
 /// versioned (canonical pay-kit JS client) wire formats.
 fn decode_base64_transaction(
     tx_base64: &str,

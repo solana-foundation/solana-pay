@@ -107,7 +107,7 @@ pub(crate) fn goose_provider_env(
         ),
         // Goose otherwise makes a second, hidden model request after each of
         // the first few turns to generate a session title. With a paid
-        // provider that request opens and settles its own payment channel.
+        // provider that request opens and settles its own tab.
         (
             GOOSE_DISABLE_SESSION_NAMING_ENV.to_string(),
             "true".to_string(),

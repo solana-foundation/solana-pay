@@ -27,7 +27,7 @@ use crate::token_metadata::{TokenMetadata, resolve_mints};
 pub const MEMO_PROGRAM: &str = "MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr";
 /// Original SPL memo program v1 (still observed on-chain).
 pub const MEMO_PROGRAM_V1: &str = "Memo1UhkJRfHyvLMcVucJwxXeuD728EqVDDwQDxFMNo";
-/// MPP payment-channels program. Re-exported from pay-kit so the receipt
+/// MPP tabs program. Re-exported from pay-kit so the receipt
 /// classifier always matches the deployed program id instead of drifting from a
 /// hand-copied constant.
 pub use pay_kit::core::payment_channels::PAYMENT_CHANNELS_PROGRAM_ID as PAYMENT_CHANNELS_PROGRAM;
@@ -480,7 +480,7 @@ pub fn build_receipt_skeleton(
     if transfers.is_empty() {
         // Some RPCs (e.g. Surfpool) return inner SPL transfers *unparsed*, so the
         // instruction walk finds nothing. Fall back to the net token-balance
-        // deltas the RPC always reports, so CPI-driven transfers — payment-channel
+        // deltas the RPC always reports, so CPI-driven transfers — tab
         // settle/distribute in particular — still surface instead of an empty receipt.
         transfers = extract_transfers_from_balances(rpc_value, stablecoins);
         balance_fallback_count = transfers.len();
@@ -1078,7 +1078,7 @@ fn extract_token_transfers(
 ///
 /// Used as a fallback when instruction-based extraction finds nothing — e.g.
 /// when the RPC returns inner SPL transfers unparsed (Surfpool does this for
-/// payment-channel settle/distribute CPIs). Balance deltas are always reported,
+/// tab settle/distribute CPIs). Balance deltas are always reported,
 /// so credits are paired against debits of the same mint instead of attributing
 /// every credit to one transaction-wide sender.
 fn extract_transfers_from_balances(
@@ -1858,7 +1858,7 @@ fn amount_from(raw: u128, sample: Option<&ReceiptTransfer>) -> Option<ReceiptAmo
     })
 }
 
-/// Heuristic channel discovery: scan the payment-channels instruction for an
+/// Heuristic channel discovery: scan the tabs instruction for an
 /// account that is not the fee-payer or a well-known program / sysvar.
 fn extract_session_channel(
     top: &[Value],

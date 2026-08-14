@@ -1,6 +1,6 @@
-//! Operator maintenance jobs for pay-kit payment-channel deployments.
+//! Operator maintenance jobs for pay-kit tab deployments.
 //!
-//! `close-channels` advances payment channels through closure and rent reclaim;
+//! `close-channels` advances tabs through closure and rent reclaim;
 //! `settle-sessions` reconciles Redis-backed MPP vouchers with on-chain
 //! watermarks. See the crate `README.md`.
 

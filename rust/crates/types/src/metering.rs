@@ -850,7 +850,7 @@ pub struct SessionSpec {
     /// effective timeout from `close_delay_ms`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub idle_timeout_options_seconds: Option<Vec<u32>>,
-    /// Idle delay before the operator closes and settles the payment channel.
+    /// Idle delay before the operator closes and settles the tab.
     ///
     /// Defaults to `600000` (ten minutes) when omitted. Set to `0` to disable
     /// automatic close.
@@ -863,7 +863,7 @@ pub struct SessionSpec {
     #[serde(default = "default_session_close_batch_interval_ms")]
     pub close_batch_interval_ms: u64,
     /// Interval between operator pushes of the latest accepted cumulative
-    /// watermark to the payment-channel program.
+    /// watermark to the tab program.
     ///
     /// This keeps an active channel open while bounding the amount represented
     /// only by an off-chain voucher. Defaults to `5000` when omitted. Set to
@@ -872,7 +872,7 @@ pub struct SessionSpec {
     #[serde(default = "default_session_settlement_interval_ms")]
     pub settlement_interval_ms: u64,
     /// Channel settlement splits. Session splits are percentage-only and are
-    /// converted to basis points for the payment channel distribution.
+    /// converted to basis points for the tab distribution.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub splits: Vec<SplitRule>,
 }
@@ -1198,7 +1198,7 @@ pub enum Scheme {
 }
 
 impl Scheme {
-    /// Whether this scheme settles through an on-chain payment channel.
+    /// Whether this scheme settles through an on-chain tab.
     ///
     /// Channel/session schemes commit a `distributionSplits` preimage that the
     /// program rejects when it contains duplicate recipients
@@ -2132,7 +2132,7 @@ fn validate_tier_splits(
 /// `challenge_generation_failed` 500 (charge) or an on-chain channel `open`
 /// rejection (session).
 ///
-/// - **Session** endpoints settle through a payment channel whose
+/// - **Session** endpoints settle through a tab whose
 ///   `distributionSplits` preimage rejects duplicate recipients
 ///   (draft-solana-session-00). Uniqueness key: the **recipient account**.
 /// - **Charge** endpoints emit one transfer leg per split and allow a recipient
@@ -2199,7 +2199,7 @@ fn validate_split_recipient_uniqueness(
                     errs.push(format!(
                         "endpoint `{path}`{label}: session payments require unique split \
                          recipients, but account `{account}` (recipient `{}`) appears more than \
-                         once — the on-chain payment channel rejects duplicate `distributionSplits` \
+                         once — the on-chain tab rejects duplicate `distributionSplits` \
                          recipients. Aggregate these into a single split.",
                         split.recipient
                     ));

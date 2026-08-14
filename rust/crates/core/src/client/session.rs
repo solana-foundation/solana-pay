@@ -1,6 +1,6 @@
 //! Session intent client — open channels, sign vouchers, close.
 //!
-//! A session keeps a pre-funded on-chain payment channel open across many API
+//! A session keeps a pre-funded on-chain tab open across many API
 //! calls. Each call consumes a small voucher increment instead of a full
 //! on-chain transaction, making high-frequency AI workloads cheap.
 //!
@@ -70,7 +70,7 @@ impl SessionHandle {
 
     /// Create a handle wrapping an already-opened channel.
     ///
-    /// `channel_id` is the on-chain payment-channel public key — obtained after
+    /// `channel_id` is the on-chain tab public key — obtained after
     /// broadcasting and confirming the open transaction.
     /// `signer` is the session key whose public key was passed as
     /// `authorized_signer` in the open transaction.
@@ -190,7 +190,7 @@ impl SessionHandle {
         })
     }
 
-    /// Build an `Authorization` header for a payment-channel `open` action.
+    /// Build an `Authorization` header for a tab `open` action.
     ///
     /// `open_slot` must come from the challenge's `recentSlot` and
     /// `transaction` must be the base64 open transaction built against the
@@ -253,7 +253,7 @@ impl SessionHandle {
 
 // ── Session open ─────────────────────────────────────────────────────────────
 
-/// Open a payment-channel session from a 402 challenge.
+/// Open a tab session from a 402 challenge.
 ///
 /// Builds the open transaction against the challenge's `recentBlockhash` and
 /// `recentSlot`, prompts for spend authorization, and returns the handle plus
@@ -410,7 +410,7 @@ pub fn open_payment_channel_session_header(
         channel = %open.channel_id,
         deposit,
         voucher_signer = ?voucher_signer,
-        "payment-channel session authorization header ready"
+        "tab session authorization header ready"
     );
 
     Ok((handle, auth_header))

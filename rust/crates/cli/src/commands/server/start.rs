@@ -1501,7 +1501,7 @@ impl StartCommand {
                         reserve_session_delivery(delivery_state.clone(), body.0)
                     }),
                 )
-                // Payment-channel settle-receipt poll. Payment-channel sessions
+                // Tab settle-receipt poll. Tab sessions
                 // settle out-of-band at idle-close, so (unlike x402) there's no
                 // per-request settlement header — clients poll this for the
                 // on-chain signature to build the receipt URL.
@@ -2640,10 +2640,10 @@ struct SessionDeliveryRequest {
     expires_at: Option<i64>,
 }
 
-/// Payment-channel settle-receipt poll
+/// Tab settle-receipt poll
 /// (`GET /__402/payment-channels/receipt/:channelId`): `{ settledSignature,
 /// finalized }` for a channel. Clients poll this until `settledSignature` is
-/// non-null to render the on-chain receipt URL (payment-channel sessions settle
+/// non-null to render the on-chain receipt URL (tab sessions settle
 /// out-of-band at idle-close, so there's no per-request header).
 fn session_receipt(state: AppState, channel_id: String) -> axum::response::Response {
     let signature = state

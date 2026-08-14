@@ -20,7 +20,7 @@ networks:
   sandbox:
     rpc_url: "https://402.surfnet.dev"
 
-# Owner of the treasury ATA the payment-channels program pays protocol fees to.
+# Owner of the treasury ATA the tabs program pays protocol fees to.
 # Mainnet value baked into the deployed program. Overridable per-network via
 # JOBS_TREASURY_OWNER for non-mainnet deployments.
 treasury_owner: "Cs2zdfUNonRdRGsiZUQQLdTxzxVvJZmgiX2mpLYKuEqP"

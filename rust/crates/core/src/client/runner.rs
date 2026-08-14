@@ -78,7 +78,7 @@ pub enum RunOutcome {
         resource_url: String,
     },
     /// The server returned 402 with an x402 `upto` (usage-metered) challenge —
-    /// authorize a ceiling via a payment channel; the operator settles the
+    /// authorize a ceiling via a tab; the operator settles the
     /// actual amount after serving.
     X402UptoChallenge {
         challenge: Box<x402::UptoChallenge>,
@@ -694,7 +694,7 @@ pub(crate) fn classify_402_with_preference(
         if is_solana_method {
             debug!(
                 resource = resource_url,
-                "Detected MPP payment-channel challenge (Solana)"
+                "Detected MPP tab challenge (Solana)"
             );
             return RunOutcome::SessionChallenge {
                 challenge: Box::new(challenge.clone()),

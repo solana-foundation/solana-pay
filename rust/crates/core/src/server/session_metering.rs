@@ -1,4 +1,4 @@
-//! Integer metering primitives for payment-channel sessions.
+//! Integer metering primitives for tab sessions.
 //!
 //! This module is intentionally pure: it has no HTTP, provider, clock, or
 //! voucher dependencies. The proxy can feed it provider-specific observations

@@ -271,7 +271,7 @@ pub fn parse_upto_accepts(
     pay_kit::x402::client::upto::parse_upto_accepts(headers, body)
 }
 
-/// Build a signed x402 `upto` payment: a payment-channel `open` authorization
+/// Build a signed x402 `upto` payment: a tab `open` authorization
 /// whose deposit is the authorized ceiling. The client signs only the open;
 /// the fee payer co-signs and broadcasts it, and the receiver authorizer signs
 /// settlement for the actual metered amount. Mirrors [`build_payment`] — same

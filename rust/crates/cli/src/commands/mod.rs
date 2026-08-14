@@ -628,7 +628,7 @@ fn handle_outcome(
             } else {
                 crate::components::print_notice(
                     crate::components::NoticeLevel::Info,
-                    "MPP payment channel required",
+                    "MPP tab required",
                     &format!("Spending limit: {cap_display}"),
                 );
             }

@@ -466,7 +466,7 @@ async fn push_session_full_flow() {
     // The final session wire makes the server the broadcaster of the client's
     // open transaction: `process_open` re-broadcasts the payload transaction
     // and verifies the resulting on-chain channel account. Surfpool cannot run
-    // the payment-channels program, so this test fronts the session server
+    // the tabs program, so this test fronts the session server
     // with a canned JSON-RPC endpoint (the same pattern as pay-kit's own
     // full-path open tests) while everything above it — pay's payment
     // middleware, the challenge binding, the real client-side opener,

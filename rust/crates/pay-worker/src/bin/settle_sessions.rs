@@ -1,4 +1,4 @@
-//! Reconcile durable MPP sessions with on-chain payment channels.
+//! Reconcile durable MPP sessions with on-chain tabs.
 //!
 //! Proxies persist each accepted cumulative voucher and a minute-bucketed idle
 //! deadline in Redis. This worker continuously pushes newer watermarks and
@@ -1540,7 +1540,7 @@ mod tests {
         state.open_slot = None;
         assert!(
             !channel_close_due(&state, 120_000),
-            "pull sessions do not have payment channels to close"
+            "pull sessions do not have tabs to close"
         );
     }
 
