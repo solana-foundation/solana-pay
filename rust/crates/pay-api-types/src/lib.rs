@@ -6,6 +6,8 @@ use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
 
+pub mod transfer_batch;
+
 /// Networks the service can route to.
 ///
 /// Aliases (`mainnet-beta`, `surfpool`, `localnet`) parse to the same variant

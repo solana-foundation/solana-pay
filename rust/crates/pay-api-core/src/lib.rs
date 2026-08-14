@@ -6,6 +6,7 @@ pub mod rpc;
 pub mod stablecoin;
 pub mod subscription_state;
 pub mod token_metadata;
+pub mod transfer_batch;
 
 pub use error::{Error, Result};
 pub use pay_api_types::{

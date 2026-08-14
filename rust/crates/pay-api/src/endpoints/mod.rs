@@ -5,3 +5,4 @@ pub mod redeem;
 pub mod send;
 pub mod stablecoin_balances;
 pub mod subscriptions;
+pub mod transfer_batches;
