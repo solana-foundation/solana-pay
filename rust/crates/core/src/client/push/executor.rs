@@ -121,6 +121,18 @@ pub enum PendingStatus {
     Failed(String),
 }
 
+/// One in-flight signature plus the expiry it was signed against, so a
+/// [`ChunkBroadcaster::poll_pending`] implementation can tell "RPC doesn't
+/// see it yet, still within its validity window" apart from "RPC doesn't see
+/// it and it can no longer land" — an unconfirmed signature past its
+/// `last_valid_block_height` must resolve to a terminal status instead of
+/// polling forever.
+#[derive(Debug, Clone, Copy)]
+pub struct PendingSignature {
+    pub signature: Signature,
+    pub last_valid_block_height: u64,
+}
+
 /// The pluggable transport [`PushExecutor`] drives. One implementation per
 /// fee-payer mode: [`DirectSolanaBroadcaster`] for self-funded runs,
 /// [`GaslessApiBroadcaster`] for gasless ones. Tests use a third,
@@ -143,7 +155,7 @@ pub trait ChunkBroadcaster {
     /// One batched status check for every currently-outstanding signature.
     /// Must return exactly one status per input signature, in the same
     /// order.
-    async fn poll_pending(&self, signatures: &[Signature]) -> Result<Vec<PendingStatus>>;
+    async fn poll_pending(&self, pending: &[PendingSignature]) -> Result<Vec<PendingStatus>>;
 }
 
 /// Tunables for [`PushExecutor::run`]'s bounded in-flight loop.
@@ -174,6 +186,7 @@ pub struct RunSummary {
 struct InFlightChunk {
     chunk_index: u32,
     signature: Signature,
+    last_valid_block_height: u64,
 }
 
 /// Drives stages 2-4 for a sequence of already-planned chunks (stage 1).
@@ -263,6 +276,7 @@ impl<'a, B: ChunkBroadcaster> PushExecutor<'a, B> {
                     in_flight.push(InFlightChunk {
                         chunk_index: signed.chunk_index,
                         signature,
+                        last_valid_block_height: signed.last_valid_block_height,
                     });
                 }
                 Ok(BroadcastOutcome::Settled(signature)) => {
@@ -311,8 +325,14 @@ impl<'a, B: ChunkBroadcaster> PushExecutor<'a, B> {
         if in_flight.is_empty() {
             return Ok(());
         }
-        let signatures: Vec<Signature> = in_flight.iter().map(|c| c.signature).collect();
-        let statuses = self.broadcaster.poll_pending(&signatures).await?;
+        let pending: Vec<PendingSignature> = in_flight
+            .iter()
+            .map(|c| PendingSignature {
+                signature: c.signature,
+                last_valid_block_height: c.last_valid_block_height,
+            })
+            .collect();
+        let statuses = self.broadcaster.poll_pending(&pending).await?;
         if statuses.len() != in_flight.len() {
             return Err(Error::Config(
                 "poll_pending returned a different number of statuses than signatures queried"
@@ -441,6 +461,39 @@ impl DirectSolanaBroadcaster {
             .cloned()
             .ok_or_else(|| Error::Config("RPC response is missing `result`".to_string()))
     }
+
+    async fn fetch_block_height(&self) -> Result<u64> {
+        let result = self
+            .call(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "getBlockHeight",
+                "params": [{ "commitment": "confirmed" }],
+            }))
+            .await?;
+        result
+            .as_u64()
+            .ok_or_else(|| Error::Config("malformed getBlockHeight response".to_string()))
+    }
+}
+
+/// What a `null` `getSignatureStatuses` entry means once the current
+/// confirmed block height is known: still within the signed blockhash's
+/// validity window (RPC just hasn't seen it, or hasn't indexed it, yet), or
+/// past it (the transaction can never land, on-chain or off — the loop that
+/// keeps polling this signature must stop, not spin forever).
+fn classify_missing_signature(
+    current_block_height: u64,
+    last_valid_block_height: u64,
+) -> PendingStatus {
+    if current_block_height > last_valid_block_height {
+        PendingStatus::Failed(format!(
+            "signature not found and its blockhash expired (current height \
+             {current_block_height} > last valid height {last_valid_block_height})"
+        ))
+    } else {
+        PendingStatus::StillPending
+    }
 }
 
 impl ChunkBroadcaster for DirectSolanaBroadcaster {
@@ -497,11 +550,12 @@ impl ChunkBroadcaster for DirectSolanaBroadcaster {
         Ok(BroadcastOutcome::Pending(signature))
     }
 
-    async fn poll_pending(&self, signatures: &[Signature]) -> Result<Vec<PendingStatus>> {
-        if signatures.is_empty() {
+    async fn poll_pending(&self, pending: &[PendingSignature]) -> Result<Vec<PendingStatus>> {
+        if pending.is_empty() {
             return Ok(Vec::new());
         }
-        let signature_strings: Vec<String> = signatures.iter().map(ToString::to_string).collect();
+        let signature_strings: Vec<String> =
+            pending.iter().map(|p| p.signature.to_string()).collect();
         let result = self
             .call(serde_json::json!({
                 "jsonrpc": "2.0",
@@ -514,11 +568,34 @@ impl ChunkBroadcaster for DirectSolanaBroadcaster {
             .get("value")
             .and_then(|v| v.as_array())
             .ok_or_else(|| Error::Config("malformed getSignatureStatuses response".to_string()))?;
+        if entries.len() != pending.len() {
+            return Err(Error::Config(
+                "getSignatureStatuses returned a different number of entries than signatures queried"
+                    .to_string(),
+            ));
+        }
+
+        // Fetched lazily and at most once per call: a `null` status entry
+        // needs the current block height to tell "still within its
+        // validity window" apart from "expired, and will never confirm" —
+        // most polls see no `null` entries at all and never pay for it.
+        let mut current_block_height: Option<u64> = None;
 
         let mut statuses = Vec::with_capacity(entries.len());
-        for entry in entries {
+        for (entry, pending_signature) in entries.iter().zip(pending) {
             if entry.is_null() {
-                statuses.push(PendingStatus::StillPending);
+                let height = match current_block_height {
+                    Some(height) => height,
+                    None => {
+                        let height = self.fetch_block_height().await?;
+                        current_block_height = Some(height);
+                        height
+                    }
+                };
+                statuses.push(classify_missing_signature(
+                    height,
+                    pending_signature.last_valid_block_height,
+                ));
                 continue;
             }
             let failed = entry.get("err").map(|err| !err.is_null()).unwrap_or(false);
@@ -697,7 +774,7 @@ impl ChunkBroadcaster for GaslessApiBroadcaster {
         Ok(BroadcastOutcome::Settled(signature))
     }
 
-    async fn poll_pending(&self, _signatures: &[Signature]) -> Result<Vec<PendingStatus>> {
+    async fn poll_pending(&self, _pending: &[PendingSignature]) -> Result<Vec<PendingStatus>> {
         // `broadcast` never returns `Pending` for this transport (pay-api's
         // response is always final), so the executor should never call
         // this. Fail loudly rather than silently reporting a wrong status
@@ -873,14 +950,14 @@ mod tests {
             Ok(BroadcastOutcome::Pending(signed.signature))
         }
 
-        async fn poll_pending(&self, signatures: &[Signature]) -> Result<Vec<PendingStatus>> {
+        async fn poll_pending(&self, pending: &[PendingSignature]) -> Result<Vec<PendingStatus>> {
             let mut counts = self.poll_counts.lock().unwrap();
             let mut max_batch_seen = self.max_batch_seen.lock().unwrap();
-            *max_batch_seen = (*max_batch_seen).max(signatures.len());
+            *max_batch_seen = (*max_batch_seen).max(pending.len());
 
-            let mut out = Vec::with_capacity(signatures.len());
-            for signature in signatures {
-                let count = counts.entry(*signature).or_insert(0);
+            let mut out = Vec::with_capacity(pending.len());
+            for p in pending {
+                let count = counts.entry(p.signature).or_insert(0);
                 *count += 1;
                 if *count >= self.confirm_after_polls {
                     out.push(PendingStatus::Confirmed);
@@ -1017,8 +1094,8 @@ mod tests {
             Err(Error::Config("simulated broadcast failure".to_string()))
         }
 
-        async fn poll_pending(&self, signatures: &[Signature]) -> Result<Vec<PendingStatus>> {
-            Ok(signatures
+        async fn poll_pending(&self, pending: &[PendingSignature]) -> Result<Vec<PendingStatus>> {
+            Ok(pending
                 .iter()
                 .map(|_| PendingStatus::StillPending)
                 .collect())
@@ -1056,5 +1133,29 @@ mod tests {
             super::super::journal::JournalEventKind::ChunkBroadcast { .. }
         )));
         drop_permit_off_runtime_thread(permit);
+    }
+
+    #[test]
+    fn missing_signature_within_validity_window_stays_pending() {
+        assert!(matches!(
+            classify_missing_signature(999, 1_000),
+            PendingStatus::StillPending
+        ));
+        // Still valid at the exact boundary height.
+        assert!(matches!(
+            classify_missing_signature(1_000, 1_000),
+            PendingStatus::StillPending
+        ));
+    }
+
+    #[test]
+    fn missing_signature_past_its_expiry_is_a_terminal_failure_not_still_pending() {
+        // This is the exact bug Greptile flagged: a `null` status entry
+        // must not be treated as `StillPending` forever once the signed
+        // blockhash can no longer land.
+        match classify_missing_signature(1_001, 1_000) {
+            PendingStatus::Failed(reason) => assert!(reason.contains("expired")),
+            other => panic!("expected a terminal Failed status, got {other:?}"),
+        }
     }
 }
