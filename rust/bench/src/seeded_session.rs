@@ -216,7 +216,16 @@ pub async fn build(
     // Challenges still carry a syntactically valid recent blockhash, but the
     // fixture never processes an open transaction or calls an RPC endpoint.
     let cache = BlockhashCache::new();
-    cache.set(Hash::new_unique().to_string(), u64::MAX, 42);
+    let fixture_blockhash = Hash::new_unique().to_string();
+    cache.set(fixture_blockhash.clone(), u64::MAX, 42);
+    let refresh_cache = cache.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(10));
+        loop {
+            interval.tick().await;
+            refresh_cache.set(fixture_blockhash.clone(), u64::MAX, 42);
+        }
+    });
     let store = Arc::new(ShardedMemoryChannelStore::with_capacity(channels));
     let session = Arc::new(
         SessionMpp::new_with_channel_store(config, FIXTURE_SECRET, store.clone())
