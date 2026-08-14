@@ -160,6 +160,10 @@ pub struct SessionCfg {
     /// client vouchers are verified through the regular gateway path.
     #[serde(default)]
     pub offline: bool,
+    /// Stable deterministic seed namespace shared by an offline fixture and
+    /// its distributed load-generator shards. Defaults to `run.name`.
+    #[serde(default)]
+    pub offline_namespace: Option<String>,
     /// Number of deterministic, confirmed channels to seed in the dedicated
     /// benchmark harness. This is only valid with `offline: true`; it never
     /// exposes a production state-injection endpoint.
@@ -196,6 +200,13 @@ fn default_weight() -> u32 {
 }
 
 impl RunConfig {
+    pub fn offline_namespace(&self) -> &str {
+        self.session
+            .as_ref()
+            .and_then(|session| session.offline_namespace.as_deref())
+            .unwrap_or(&self.run.name)
+    }
+
     pub fn from_yaml_path(path: &str) -> Result<Self> {
         let raw =
             std::fs::read_to_string(path).with_context(|| format!("reading config {path}"))?;
@@ -232,6 +243,21 @@ impl RunConfig {
             && session.offline_seeded_channels < self.load.users
         {
             bail!("session.offline_seeded_channels must cover every load user in offline mode");
+        }
+        if let Some(session) = &self.session
+            && session
+                .offline_namespace
+                .as_deref()
+                .is_some_and(str::is_empty)
+        {
+            bail!("session.offline_namespace must not be empty");
+        }
+        if self
+            .session
+            .as_ref()
+            .is_some_and(|session| !session.offline && session.offline_namespace.is_some())
+        {
+            bail!("session.offline_namespace requires session.offline: true");
         }
         if self
             .session

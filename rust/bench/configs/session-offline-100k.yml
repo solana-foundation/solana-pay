@@ -26,4 +26,5 @@ session:
   deposit_usdc: 1.0
   voucher_usdc: 0.000001
   offline: true
+  offline_namespace: session-offline-100k
   offline_seeded_channels: 100000

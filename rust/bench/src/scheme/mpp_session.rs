@@ -58,7 +58,7 @@ impl MppSession {
             deposit_base: (deposit_usdc * 1e6) as u64,
             voucher_base: (voucher_usdc * 1e6).max(1.0) as u64,
             offline,
-            offline_namespace: cfg.run.name.clone(),
+            offline_namespace: cfg.offline_namespace().to_string(),
             handles: Mutex::new(HashMap::new()),
         }
     }

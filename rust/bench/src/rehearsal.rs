@@ -387,7 +387,7 @@ async fn setup_offline_proxy(cfg: &RunConfig) -> Result<OfflineProxy> {
             rpc_url: None,
             ..Default::default()
         },
-        &cfg.run.name,
+        cfg.offline_namespace(),
         cfg.session
             .as_ref()
             .expect("validated session config")
@@ -532,6 +532,7 @@ mod tests {
                 voucher_usdc: 0.000001,
                 settle_onchain: false,
                 offline: true,
+                offline_namespace: None,
                 offline_seeded_channels: 1,
             }),
         }
