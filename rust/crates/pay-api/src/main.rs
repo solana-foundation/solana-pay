@@ -57,6 +57,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "/v1/subscriptions/cancel",
             post(endpoints::subscriptions::cancel_handler),
         )
+        .route(
+            "/api/v1/transfer-batches",
+            post(endpoints::transfer_batches::handler),
+        )
         .with_state(state)
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http());

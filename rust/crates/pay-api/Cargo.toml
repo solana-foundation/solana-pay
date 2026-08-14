@@ -13,6 +13,7 @@ pay-api-core = { path = "../pay-api-core" }
 pay-api-types = { path = "../pay-api-types" }
 
 axum = { workspace = true }
+chrono = { workspace = true }
 figment = { workspace = true, features = ["yaml"] }
 opentelemetry = { workspace = true }
 opentelemetry-otlp = { workspace = true }

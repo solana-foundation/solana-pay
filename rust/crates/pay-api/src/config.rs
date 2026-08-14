@@ -4,6 +4,7 @@ use figment::Figment;
 use figment::providers::{Env, Format, Yaml};
 use pay_api_core::StablecoinSpec;
 use pay_api_types::Network;
+use pay_api_types::transfer_batch::TransferNetwork;
 use serde::Deserialize;
 use url::Url;
 
@@ -44,6 +45,14 @@ pub struct Config {
     /// and signs payouts.
     #[serde(default)]
     pub redemption: RedemptionConfig,
+
+    /// `POST /api/v1/transfer-batches` gasless CSV batch-payout
+    /// configuration — `pay push`'s server side. Its own fee-payer block
+    /// rather than reusing `send.fee_payer`, since a dedicated sponsor
+    /// wallet for bulk payouts should be operable (and rate-limited)
+    /// independently of `/v1/send`'s hot wallet.
+    #[serde(default)]
+    pub push: PushConfig,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -119,6 +128,108 @@ impl Default for SendConfig {
             fee_refund_split: FeeRefundSplitConfig::default(),
         }
     }
+}
+
+/// `POST /api/v1/transfer-batches` config. See `pay-api-core`'s
+/// `transfer_batch` module docs for what each pricing/ceiling field feeds
+/// into and which of them are deliberate v1 simplifications (a static
+/// `usdPerSol` rather than a live oracle, a flat `ataRentLamports` rather
+/// than a live rent lookup).
+#[derive(Debug, Deserialize, Clone)]
+pub struct PushConfig {
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Per-network RPC URL. Keyed by the canonical MPP wire slug
+    /// (`mainnet` / `devnet` / `localnet`) rather than the legacy two-value
+    /// `Network` enum `send`/`redemption` use — see
+    /// `pay_api_types::transfer_batch::TransferNetwork`'s doc comment for
+    /// why those two enums are deliberately not unified.
+    #[serde(default)]
+    pub networks: HashMap<TransferNetwork, NetworkConfig>,
+
+    /// The wallet that signs as fee payer for every gasless chunk.
+    #[serde(default)]
+    pub fee_payer: FeePayerConfig,
+
+    #[serde(default = "default_push_compute_unit_price_micro_lamports")]
+    pub compute_unit_price_micro_lamports: u64,
+
+    #[serde(default = "default_push_compute_unit_limit")]
+    pub compute_unit_limit: u32,
+
+    /// Base SOL cost (2 signatures) a chunk transaction is expected to
+    /// cost, before any missing-ATA rent.
+    #[serde(default = "default_push_estimated_fee_lamports")]
+    pub estimated_fee_lamports: u64,
+
+    /// Flat per-missing-ATA rent-exemption estimate, in lamports. A live
+    /// `getMinimumBalanceForRentExemption` figure as of this writing for a
+    /// 165-byte SPL Token account.
+    #[serde(default = "default_push_ata_rent_lamports")]
+    pub ata_rent_lamports: u64,
+
+    /// Static, operator-refreshed SOL/USD price used to convert the
+    /// estimated fee into the batch's stablecoin for display in the 402
+    /// quote. Not a live oracle lookup — see the module docs.
+    #[serde(default = "default_push_usd_per_sol")]
+    pub usd_per_sol: f64,
+
+    /// How long a 402 quote's blockhash is expected to remain valid before
+    /// the caller should request a fresh one.
+    #[serde(default = "default_push_challenge_ttl_seconds")]
+    pub challenge_ttl_seconds: i64,
+
+    /// Wall-clock budget to wait for a submitted chunk's `confirmed`
+    /// commitment before `submit` gives up and returns a retryable error.
+    #[serde(default = "default_push_confirm_timeout_seconds")]
+    pub confirm_timeout_seconds: u64,
+}
+
+impl Default for PushConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            networks: HashMap::new(),
+            fee_payer: FeePayerConfig::default(),
+            compute_unit_price_micro_lamports: default_push_compute_unit_price_micro_lamports(),
+            compute_unit_limit: default_push_compute_unit_limit(),
+            estimated_fee_lamports: default_push_estimated_fee_lamports(),
+            ata_rent_lamports: default_push_ata_rent_lamports(),
+            usd_per_sol: default_push_usd_per_sol(),
+            challenge_ttl_seconds: default_push_challenge_ttl_seconds(),
+            confirm_timeout_seconds: default_push_confirm_timeout_seconds(),
+        }
+    }
+}
+
+fn default_push_compute_unit_price_micro_lamports() -> u64 {
+    10_000
+}
+
+fn default_push_compute_unit_limit() -> u32 {
+    400_000
+}
+
+fn default_push_estimated_fee_lamports() -> u64 {
+    // 5_000 lamports per ed25519 signature x 2 (sender + sponsor fee payer).
+    10_000
+}
+
+fn default_push_ata_rent_lamports() -> u64 {
+    2_039_280
+}
+
+fn default_push_usd_per_sol() -> f64 {
+    150.0
+}
+
+fn default_push_challenge_ttl_seconds() -> i64 {
+    120
+}
+
+fn default_push_confirm_timeout_seconds() -> u64 {
+    30
 }
 
 /// `/v1/subscriptions/*` config. The cancel handler returns a charge-intent
@@ -873,6 +984,58 @@ impl Config {
             if self.subscriptions.confirm_timeout_seconds == 0 {
                 return Err(ConfigError::Invalid(
                     "subscriptions.confirm_timeout_seconds must be greater than zero".into(),
+                ));
+            }
+        }
+        if self.push.enabled {
+            if self.push.networks.is_empty() {
+                return Err(ConfigError::Invalid(
+                    "push.networks must contain at least one entry when push.enabled is true"
+                        .into(),
+                ));
+            }
+            for (net, nc) in &self.push.networks {
+                if nc.rpc_url.trim().is_empty() {
+                    return Err(ConfigError::Invalid(format!(
+                        "push.networks.{}.rpc_url is empty",
+                        net.as_str()
+                    )));
+                }
+            }
+            if self
+                .push
+                .fee_payer
+                .key_name
+                .as_deref()
+                .unwrap_or_default()
+                .trim()
+                .is_empty()
+            {
+                return Err(ConfigError::Invalid(
+                    "push.fee_payer.key_name is required when push.enabled is true".into(),
+                ));
+            }
+            if self
+                .push
+                .fee_payer
+                .pubkey
+                .as_deref()
+                .unwrap_or_default()
+                .trim()
+                .is_empty()
+            {
+                return Err(ConfigError::Invalid(
+                    "push.fee_payer.pubkey is required when push.enabled is true".into(),
+                ));
+            }
+            if self.push.usd_per_sol <= 0.0 || !self.push.usd_per_sol.is_finite() {
+                return Err(ConfigError::Invalid(
+                    "push.usd_per_sol must be a positive finite number".into(),
+                ));
+            }
+            if self.push.confirm_timeout_seconds == 0 {
+                return Err(ConfigError::Invalid(
+                    "push.confirm_timeout_seconds must be greater than zero".into(),
                 ));
             }
         }
