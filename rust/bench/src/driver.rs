@@ -256,13 +256,7 @@ fn merge_series(into: &mut Vec<u64>, other: Vec<u64>) {
 /// Run indefinitely-producing sources for the measured window. Sources are
 /// partitioned by `user_index % workers`, which is deterministic and keeps a
 /// channel on exactly one worker and shard.
-pub async fn run(
-    sources: Vec<Box<dyn RequestSource>>,
-    http: reqwest::Client,
-    cfg: DriverConfig,
-) -> DriverReport {
-    let started = Instant::now();
-    let deadline = started + cfg.deadline;
+pub async fn run(sources: Vec<Box<dyn RequestSource>>, cfg: DriverConfig) -> DriverReport {
     let source_count = sources.len().max(1);
     let phase_denominator = sources
         .iter()
@@ -277,10 +271,29 @@ pub async fn run(
         partitions[worker].push(source);
     }
 
+    // reqwest clones share one connection pool. At high rates that turns the
+    // pool into a cross-runtime-thread synchronization point and left a 128
+    // thread Sunburst run using roughly eleven cores. Give each deterministic
+    // worker its own bounded pool instead. The aggregate idle-connection cap
+    // remains `pool_per_host`, so sharding the pool does not increase socket
+    // pressure.
+    let worker_pool_per_host = cfg.pool_per_host.div_ceil(worker_count).max(1);
+    let worker_clients: Vec<_> = (0..worker_count)
+        .map(|_| {
+            build_http(&DriverConfig {
+                pool_per_host: worker_pool_per_host,
+                ..cfg
+            })
+        })
+        .collect();
+    // Client/pool construction is setup, not part of the measured window.
+    let started = Instant::now();
+    let deadline = started + cfg.deadline;
     let permits = Arc::new(Semaphore::new(cfg.max_concurrency.max(1)));
     let max_in_flight = Arc::new(AtomicUsize::new(0));
     let worker_context = WorkerContext {
-        http,
+        // Replaced by each worker's independently-owned client below.
+        http: worker_clients[0].clone(),
         permits,
         max_in_flight: Arc::clone(&max_in_flight),
         cfg,
@@ -289,11 +302,13 @@ pub async fn run(
         phase_denominator,
     };
     let mut workers = tokio::task::JoinSet::new();
-    for sources in partitions {
+    for (sources, http) in partitions.into_iter().zip(worker_clients) {
         if sources.is_empty() {
             continue;
         }
-        workers.spawn(run_worker(sources, worker_context.clone()));
+        let mut context = worker_context.clone();
+        context.http = http;
+        workers.spawn(run_worker(sources, context));
     }
 
     let mut totals = LocalMetrics::new();
@@ -592,7 +607,6 @@ mod tests {
         };
         let report = run(
             vec![Box::new(source)],
-            reqwest::Client::new(),
             DriverConfig {
                 rps_per_user: 200.0,
                 max_concurrency: 1,
@@ -633,7 +647,6 @@ mod tests {
         };
         let report = run(
             vec![Box::new(source)],
-            reqwest::Client::new(),
             DriverConfig {
                 rps_per_user: 200.0,
                 max_concurrency: 1,
@@ -671,7 +684,6 @@ mod tests {
         };
         let report = run(
             vec![Box::new(source)],
-            reqwest::Client::new(),
             DriverConfig {
                 rps_per_user: 1_000.0,
                 max_concurrency: 1,
@@ -717,7 +729,6 @@ mod tests {
             Duration::from_secs(1),
             run(
                 sources,
-                reqwest::Client::new(),
                 DriverConfig {
                     rps_per_user: 1_000.0,
                     max_concurrency: 4,

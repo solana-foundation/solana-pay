@@ -198,8 +198,7 @@ pub async fn run_pipeline(p: PipelineParams<'_>) -> Result<ReportJson> {
         pool_per_host: load.max_concurrency.max(256),
         workers: load.workers,
     };
-    let http = driver::build_http(&dcfg);
-    let report = driver::run(sources, http, dcfg)
+    let report = driver::run(sources, dcfg)
         .instrument(tracing::info_span!("unleash"))
         .await;
     tracing::info!(
