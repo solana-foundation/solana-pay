@@ -88,6 +88,7 @@ struct WorkerContext {
     http: reqwest::Client,
     permits: Arc<Semaphore>,
     max_in_flight: Arc<AtomicUsize>,
+    worker_max_in_flight: usize,
     cfg: DriverConfig,
     started: Instant,
     deadline: Instant,
@@ -278,6 +279,7 @@ pub async fn run(sources: Vec<Box<dyn RequestSource>>, cfg: DriverConfig) -> Dri
     // remains `pool_per_host`, so sharding the pool does not increase socket
     // pressure.
     let worker_pool_per_host = cfg.pool_per_host.div_ceil(worker_count).max(1);
+    let worker_max_in_flight = cfg.max_concurrency.div_ceil(worker_count).max(1);
     let worker_clients: Vec<_> = (0..worker_count)
         .map(|_| {
             build_http(&DriverConfig {
@@ -296,6 +298,7 @@ pub async fn run(sources: Vec<Box<dyn RequestSource>>, cfg: DriverConfig) -> Dri
         http: worker_clients[0].clone(),
         permits,
         max_in_flight: Arc::clone(&max_in_flight),
+        worker_max_in_flight,
         cfg,
         started,
         deadline,
@@ -348,6 +351,7 @@ async fn run_worker(sources: Vec<Box<dyn RequestSource>>, context: WorkerContext
         http,
         permits,
         max_in_flight,
+        worker_max_in_flight,
         cfg,
         started,
         deadline,
@@ -377,7 +381,7 @@ async fn run_worker(sources: Vec<Box<dyn RequestSource>>, context: WorkerContext
     let mut metrics = LocalMetrics::new();
 
     while Instant::now() < deadline {
-        while Instant::now() < deadline && in_flight.len() < cfg.max_concurrency.max(1) {
+        while Instant::now() < deadline && in_flight.len() < worker_max_in_flight {
             let Some(Reverse((scheduled, slot))) = schedule.peek().copied() else {
                 break;
             };
