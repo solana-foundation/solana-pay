@@ -55,6 +55,11 @@ pub fn run<S: PaymentState>(
             .unwrap_or(8)
     });
     svc.threads = Some(cores);
+    let mut server_options = pingora::apps::HttpServerOptions::default();
+    server_options.h2c = true;
+    svc.app_logic_mut()
+        .expect("new Pingora service has app logic")
+        .server_options = Some(server_options);
     svc.add_tcp(bind);
     server.add_service(svc);
     tracing::info!(bind, threads = cores, "pingora gateway up (Http402Gate)");
@@ -86,6 +91,11 @@ pub fn run_with_shutdown<S: PaymentState>(
             .unwrap_or(8)
     });
     svc.threads = Some(cores);
+    let mut server_options = pingora::apps::HttpServerOptions::default();
+    server_options.h2c = true;
+    svc.app_logic_mut()
+        .expect("new Pingora service has app logic")
+        .server_options = Some(server_options);
     svc.add_tcp(bind);
     server.add_service(svc);
     tracing::info!(bind, threads = cores, "pingora gateway up (Http402Gate)");

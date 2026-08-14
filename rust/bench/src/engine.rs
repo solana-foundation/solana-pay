@@ -197,6 +197,7 @@ pub async fn run_pipeline(p: PipelineParams<'_>) -> Result<ReportJson> {
         // 256 vs 4096+ mismatch caused connect storms → backlog overflow).
         pool_per_host: load.max_concurrency.max(256),
         workers: load.workers,
+        http2_prior_knowledge: load.http2_prior_knowledge,
     };
     let report = driver::run(sources, dcfg)
         .instrument(tracing::info_span!("unleash"))

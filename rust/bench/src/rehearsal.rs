@@ -522,6 +522,7 @@ mod tests {
                 unleash_secs: 1,
                 max_concurrency: 1,
                 workers: 1,
+                http2_prior_knowledge: false,
                 shard_index: 0,
                 shard_count: 1,
             },

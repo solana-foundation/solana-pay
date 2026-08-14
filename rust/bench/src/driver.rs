@@ -22,6 +22,7 @@ pub struct DriverConfig {
     pub deadline: Duration,
     pub pool_per_host: usize,
     pub workers: usize,
+    pub http2_prior_knowledge: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -511,12 +512,14 @@ fn due_before(next: Instant, deadline: Instant, period: Duration) -> u64 {
 /// Build a tuned HTTP client for the load phase (keepalive pool, HTTP/2 where
 /// the server negotiates it).
 pub fn build_http(cfg: &DriverConfig) -> reqwest::Client {
-    reqwest::Client::builder()
+    let mut builder = reqwest::Client::builder()
         .pool_max_idle_per_host(cfg.pool_per_host)
         .pool_idle_timeout(Duration::from_secs(90))
-        .timeout(Duration::from_secs(30))
-        .build()
-        .expect("build http client")
+        .timeout(Duration::from_secs(30));
+    if cfg.http2_prior_knowledge {
+        builder = builder.http2_prior_knowledge().http2_adaptive_window(true);
+    }
+    builder.build().expect("build http client")
 }
 
 fn duration_us(duration: Duration) -> u64 {
@@ -604,6 +607,7 @@ mod tests {
                 deadline: Duration::from_millis(60),
                 pool_per_host: 1,
                 workers: 1,
+                http2_prior_knowledge: false,
             },
         )
         .await;
@@ -644,6 +648,7 @@ mod tests {
                 deadline: Duration::from_millis(60),
                 pool_per_host: 1,
                 workers: 1,
+                http2_prior_knowledge: false,
             },
         )
         .await;
@@ -681,6 +686,7 @@ mod tests {
                 deadline: Duration::from_millis(50),
                 pool_per_host: 1,
                 workers: 1,
+                http2_prior_knowledge: false,
             },
         )
         .await;
@@ -726,6 +732,7 @@ mod tests {
                     deadline: Duration::from_millis(20),
                     pool_per_host: 4,
                     workers: 4,
+                    http2_prior_knowledge: false,
                 },
             ),
         )

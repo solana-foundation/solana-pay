@@ -119,6 +119,10 @@ pub struct Load {
     /// user index, avoiding one Tokio task and interval per logical session.
     #[serde(default = "default_worker_count")]
     pub workers: usize,
+    /// Use HTTP/2 prior knowledge against the benchmark's h2c loopback gate.
+    /// This multiplexes requests without changing their HTTP/payment shape.
+    #[serde(default)]
+    pub http2_prior_knowledge: bool,
     /// Deterministic generator-fleet shard index, zero based.
     #[serde(default)]
     pub shard_index: usize,

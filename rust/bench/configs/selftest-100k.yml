@@ -15,6 +15,7 @@ load:
   unleash_secs: 60
   max_concurrency: 8192
   workers: 128
+  http2_prior_knowledge: true
 
 endpoints:
   - url: http://127.0.0.1:1/v1/free
