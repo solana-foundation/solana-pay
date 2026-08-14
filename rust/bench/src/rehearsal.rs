@@ -101,6 +101,9 @@ impl PaymentState for AppState {
     fn session_mpp(&self) -> Option<&SessionMpp> {
         self.session_mpp.as_deref()
     }
+    fn records_http_exchanges(&self) -> bool {
+        false
+    }
 }
 
 /// Bind a TCP listener with an explicit accept backlog (capped by the OS

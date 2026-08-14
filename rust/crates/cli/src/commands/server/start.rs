@@ -208,6 +208,9 @@ impl PaymentState for AppState {
     fn x402_upto(&self) -> Option<&pay_kit::x402::server::X402Upto> {
         self.x402_upto.as_ref()
     }
+    fn records_http_exchanges(&self) -> bool {
+        self.pdb.is_some()
+    }
     fn record_exchange(&self, exchange: pay_core::HttpExchange) {
         let Some(pdb) = &self.pdb else {
             return;
