@@ -24,10 +24,11 @@ use pay_kit::mpp::store::{
     ChannelLifecycle, ChannelState, ChannelStore, MemoryChannelStore, StoreError,
 };
 use pay_kit::mpp::{
-    Base64UrlJson, PaymentChallenge, SessionAction, SessionRequest, SessionVoucherSigner,
-    SignedVoucher, UsePayload, VoucherData, VoucherPayload, VoucherSignatureType,
-    parse_authorization,
+    Base64UrlJson, ChallengeEcho, PaymentChallenge, SessionAction, SessionRequest,
+    SessionVoucherSigner, SignedVoucher, UsePayload, VoucherData, VoucherPayload,
+    VoucherSignatureType, parse_authorization,
 };
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -42,6 +43,62 @@ use crate::{Error, Result};
 const INTENT: &str = "session";
 const METHOD: &str = "solana";
 const DEFAULT_REALM: &str = "MPP Session";
+
+const VERIFIED_CHALLENGE_CACHE_ENTRIES: usize = 8;
+
+thread_local! {
+    /// Challenge echoes rotate slowly compared with voucher traffic. Keep a
+    /// tiny worker-local cache so a valid echo is HMAC-checked and its embedded
+    /// session request decoded once per worker, rather than once per voucher.
+    /// Every echoed field and the binding secret are compared on a hit; an id
+    /// collision or altered echo therefore still takes the fail-closed path.
+    static VERIFIED_CHALLENGES: RefCell<Vec<VerifiedChallenge>> = const {
+        RefCell::new(Vec::new())
+    };
+}
+
+#[derive(Clone)]
+struct VerifiedChallenge {
+    binding_secret: String,
+    id: String,
+    realm: String,
+    method: String,
+    intent: String,
+    request: String,
+    expires: Option<String>,
+    digest: Option<String>,
+    opaque: Option<String>,
+    decoded: SessionRequest,
+}
+
+impl VerifiedChallenge {
+    fn matches(&self, binding_secret: &str, echo: &ChallengeEcho) -> bool {
+        self.binding_secret == binding_secret
+            && self.id == echo.id
+            && self.realm == echo.realm
+            && self.method == echo.method.as_str()
+            && self.intent == echo.intent.as_str()
+            && self.request == echo.request.raw()
+            && self.expires == echo.expires
+            && self.digest == echo.digest
+            && self.opaque.as_deref() == echo.opaque.as_ref().map(Base64UrlJson::raw)
+    }
+
+    fn new(binding_secret: &str, echo: &ChallengeEcho, decoded: SessionRequest) -> Self {
+        Self {
+            binding_secret: binding_secret.to_string(),
+            id: echo.id.clone(),
+            realm: echo.realm.clone(),
+            method: echo.method.as_str().to_string(),
+            intent: echo.intent.as_str().to_string(),
+            request: echo.request.raw().to_string(),
+            expires: echo.expires.clone(),
+            digest: echo.digest.clone(),
+            opaque: echo.opaque.as_ref().map(|value| value.raw().to_string()),
+            decoded,
+        }
+    }
+}
 
 /// Rejection message fragments for session errors that will never clear on
 /// retry: the channel, credential, or proof they name cannot become valid
@@ -1477,6 +1534,14 @@ impl SessionMpp {
         credential: &pay_kit::mpp::PaymentCredential,
     ) -> Result<SessionRequest> {
         let echo = &credential.challenge;
+        if let Some(request) = VERIFIED_CHALLENGES.with_borrow(|cache| {
+            cache
+                .iter()
+                .find(|cached| cached.matches(&self.challenge_binding_secret, echo))
+                .map(|cached| cached.decoded.clone())
+        }) {
+            return Ok(request);
+        }
         let challenge = PaymentChallenge {
             id: echo.id.clone(),
             realm: echo.realm.clone(),
@@ -1493,9 +1558,21 @@ impl SessionMpp {
                 terminal_errors::CHALLENGE_ECHO_MISMATCH.to_string(),
             ));
         }
-        echo.request
+        let request: SessionRequest = echo
+            .request
             .decode()
-            .map_err(|e| Error::Mpp(format!("Invalid session challenge request: {e}")))
+            .map_err(|e| Error::Mpp(format!("Invalid session challenge request: {e}")))?;
+        VERIFIED_CHALLENGES.with_borrow_mut(|cache| {
+            if cache.len() == VERIFIED_CHALLENGE_CACHE_ENTRIES {
+                cache.remove(0);
+            }
+            cache.push(VerifiedChallenge::new(
+                &self.challenge_binding_secret,
+                echo,
+                request.clone(),
+            ));
+        });
+        Ok(request)
     }
 
     /// Process an `Authorization` header containing a [`SessionAction`].
@@ -2126,6 +2203,31 @@ mod tests {
             .process(&auth_header)
             .await
             .expect_err("forged echo should error");
+        assert!(err.to_string().contains("did not issue"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn verified_challenge_cache_compares_the_complete_echo() {
+        let session = test_session_mpp();
+        let challenge = session.challenge(None).unwrap();
+
+        // Reach action decoding with a valid echo, which primes the cache.
+        let valid = PaymentCredential::new(
+            challenge.to_echo(),
+            serde_json::json!({ "action": "mystery" }),
+        );
+        let _ = session.process_credential(valid).await.unwrap_err();
+
+        // Reusing its valid id while altering any bound field must not hit the
+        // cache or bypass the HMAC comparison.
+        let mut altered_echo = challenge.to_echo();
+        altered_echo.realm.push_str("-altered");
+        let altered =
+            PaymentCredential::new(altered_echo, serde_json::json!({ "action": "close" }));
+        let err = session
+            .process_credential(altered)
+            .await
+            .expect_err("altered cached echo should error");
         assert!(err.to_string().contains("did not issue"), "got: {err}");
     }
 
