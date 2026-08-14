@@ -529,7 +529,6 @@ pub fn reduce_chunk_resume_action(
 ) -> ChunkResumeAction {
     let mut last_signed: Option<(String, String, u64)> = None;
     let mut confirmed = false;
-    let mut failed = false;
 
     for event in events {
         if event.kind.chunk_index() != Some(chunk_index) {
@@ -550,10 +549,18 @@ pub fn reduce_chunk_resume_action(
                     *last_valid_block_height,
                 ));
                 confirmed = false;
-                failed = false;
             }
             JournalEventKind::ChunkConfirmed { .. } => confirmed = true,
-            JournalEventKind::ChunkFailed { .. } => failed = true,
+            // A recorded failure never short-circuits straight to a fresh
+            // attempt: the chunk's deterministic signature was journaled
+            // before the broadcast that produced this failure (see the
+            // module docs' fsync-before-broadcast invariant), so the
+            // failure may describe a lost response to a submission that
+            // still landed. The mode-specific reconciliation below always
+            // re-checks that signature's real status before permitting a
+            // replacement transfer — a `ChunkFailed` event by itself proves
+            // nothing about whether the network ever saw the transaction.
+            JournalEventKind::ChunkFailed { .. } => {}
             JournalEventKind::ChunkBroadcast { .. } => {}
             _ => {}
         }
@@ -566,10 +573,6 @@ pub fn reduce_chunk_resume_action(
     let Some((signature, signed_transaction_base64, last_valid_block_height)) = last_signed else {
         return ChunkResumeAction::NeedsSigning;
     };
-
-    if failed {
-        return ChunkResumeAction::RetryAfterFailure;
-    }
 
     match fee_payer_mode {
         // pay-api owns the authoritative status for a gasless chunk; there
@@ -888,7 +891,62 @@ mod tests {
     }
 
     #[test]
-    fn explicit_failure_allows_retry_regardless_of_rpc() {
+    fn explicit_failure_still_reconciles_against_rpc_before_retrying() {
+        // A `ChunkFailed` event (e.g. a lost `sendTransaction` response)
+        // does not by itself prove the network never saw the transaction.
+        // An `Unknown` RPC answer must still block a fresh attempt, exactly
+        // as it would with no failure recorded at all.
+        let mut events = vec![signed_event(0, 1, 1_000)];
+        events.push(JournalEvent {
+            sequence: 2,
+            timestamp: Utc::now(),
+            kind: JournalEventKind::ChunkFailed {
+                chunk_index: 0,
+                reason: "lost sendTransaction response".into(),
+                retryable: true,
+            },
+        });
+        let rpc = FixedRpc {
+            status: RpcSignatureStatus::Unknown,
+            current_block_height: 0,
+        };
+        assert_eq!(
+            reduce_chunk_resume_action(0, &events, FeePayerMode::SelfFunded, &rpc),
+            ChunkResumeAction::StopUnknown {
+                signature: "sig-1".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn explicit_failure_is_confirmed_instead_of_retried_if_rpc_later_sees_it_landed() {
+        // The exact double-submission risk Greptile flagged: a failed
+        // broadcast attempt must not permit a fresh signature while RPC
+        // shows the original signed transaction already confirmed.
+        let mut events = vec![signed_event(0, 1, 1_000)];
+        events.push(JournalEvent {
+            sequence: 2,
+            timestamp: Utc::now(),
+            kind: JournalEventKind::ChunkFailed {
+                chunk_index: 0,
+                reason: "lost sendTransaction response".into(),
+                retryable: true,
+            },
+        });
+        let rpc = FixedRpc {
+            status: RpcSignatureStatus::Confirmed,
+            current_block_height: 999,
+        };
+        assert_eq!(
+            reduce_chunk_resume_action(0, &events, FeePayerMode::SelfFunded, &rpc),
+            ChunkResumeAction::RecordConfirmedThenSkip {
+                signature: "sig-1".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn explicit_failure_confirmed_on_chain_still_retries() {
         let mut events = vec![signed_event(0, 1, 1_000)];
         events.push(JournalEvent {
             sequence: 2,
@@ -900,7 +958,7 @@ mod tests {
             },
         });
         let rpc = FixedRpc {
-            status: RpcSignatureStatus::Unknown,
+            status: RpcSignatureStatus::Failed,
             current_block_height: 0,
         };
         assert_eq!(
