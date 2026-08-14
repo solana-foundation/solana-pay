@@ -25,7 +25,7 @@ use pay_kit::mpp::{PaymentCredential, format_authorization};
 
 use super::{
     BenchScheme, Endpoint, Load, PerUserFunding, PreparedRequest, RequestSource, ResolvedPrice,
-    UserCtx, UserSetup, build_request, www_authenticate,
+    UserCtx, UserSetup, build_request, validate_payment_transport, www_authenticate,
 };
 use crate::config::RunConfig;
 use crate::seeded_session;
@@ -127,6 +127,7 @@ impl BenchScheme for MppSession {
     }
 
     async fn provision_user(&self, ctx: &UserCtx) -> Result<UserSetup> {
+        validate_payment_transport(&ctx.endpoint.url)?;
         if self.offline {
             // The server owns a benchmark-only confirmed-state fixture. The
             // client still obtains and echoes a real signed challenge, then
@@ -243,6 +244,7 @@ impl BenchScheme for MppSession {
         ctx: &UserCtx,
         _setup: &UserSetup,
     ) -> Result<Box<dyn RequestSource>> {
+        validate_payment_transport(&ctx.endpoint.url)?;
         let handle = self
             .handle(ctx.index)
             .with_context(|| format!("no session handle for user {}", ctx.index))?;

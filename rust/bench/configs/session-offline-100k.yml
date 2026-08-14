@@ -1,0 +1,28 @@
+# One-million-voucher/s gate-only target. Hold for 60 seconds after the
+# generator and lower-rate ramps have passed.
+run:
+  name: session-offline-100k
+  scheme: mpp_session
+  network: fork
+  safety:
+    max_total_usdc: 0.0
+    max_total_sol: 0.0
+    require_confirmation: false
+
+load:
+  users: 100000
+  requests_per_sec_per_user: 10
+  unleash_secs: 60
+  max_concurrency: 32768
+  workers: 128
+
+endpoints:
+  - url: http://127.0.0.1:1/v1/charge
+    method: POST
+    body: "{}"
+
+session:
+  deposit_usdc: 1.0
+  voucher_usdc: 0.000001
+  offline: true
+  offline_seeded_channels: 100000

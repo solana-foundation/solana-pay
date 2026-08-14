@@ -1,0 +1,22 @@
+# Generator/Pingora free-path qualification. This must clear the paid target by
+# at least 25% before a gate-only result is attributed to the gate.
+run:
+  name: selftest-100k
+  scheme: self_test
+  network: fork
+  safety:
+    max_total_usdc: 0.0
+    max_total_sol: 0.0
+    require_confirmation: false
+
+load:
+  users: 100000
+  requests_per_sec_per_user: 12.5
+  unleash_secs: 60
+  max_concurrency: 32768
+  workers: 128
+
+endpoints:
+  - url: http://127.0.0.1:1/v1/free
+    method: GET
+    body: ""

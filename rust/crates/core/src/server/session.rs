@@ -30,6 +30,7 @@ use pay_kit::mpp::{
 };
 use std::collections::HashMap;
 use std::str::FromStr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::{mpsc, oneshot, watch};
@@ -97,7 +98,7 @@ struct SessionOperatorRuntime {
     rpc_url: Option<String>,
     payment_channel_signer: Arc<Mutex<Option<Arc<dyn SolanaSigner>>>>,
     payment_channel_payer_signer: Arc<Mutex<Option<Arc<dyn SolanaSigner>>>>,
-    committed_watermarks: Arc<Mutex<HashMap<String, u64>>>,
+    committed_watermarks: Arc<dashmap::DashMap<String, u64>>,
     reserved_capacity: Arc<Mutex<HashMap<String, u64>>>,
     delegated_voucher_lock: Arc<tokio::sync::Mutex<()>>,
     /// Channel id → on-chain settlement signature, recorded when the channel
@@ -127,11 +128,10 @@ impl SessionOperatorRuntime {
         }
     }
     fn record_committed_watermark(&self, session_id: impl Into<String>, cumulative: u64) {
-        if let Ok(mut watermarks) = self.committed_watermarks.lock() {
-            let session_id = session_id.into();
-            let entry = watermarks.entry(session_id).or_default();
-            *entry = (*entry).max(cumulative);
-        }
+        self.committed_watermarks
+            .entry(session_id.into())
+            .and_modify(|current| *current = (*current).max(cumulative))
+            .or_insert(cumulative);
     }
 
     fn record_settlement_signature(&self, channel_id: impl Into<String>, signature: String) {
@@ -513,6 +513,7 @@ impl Drop for DelegatedCapacityLease {
 #[derive(Clone)]
 struct SessionLifecycleHandle {
     tx: mpsc::UnboundedSender<SessionLifecycleCommand>,
+    touches_enabled: Arc<AtomicBool>,
 }
 
 impl SessionLifecycleHandle {
@@ -523,6 +524,9 @@ impl SessionLifecycleHandle {
     }
 
     async fn touch(&self, channel_id: String, touched_at_ms: u64) -> Result<Option<ChannelState>> {
+        if !self.touches_enabled.load(Ordering::Acquire) {
+            return Ok(None);
+        }
         self.touch_with_cancellation(channel_id, touched_at_ms, None)
             .await
     }
@@ -549,6 +553,9 @@ impl SessionLifecycleHandle {
     }
 
     fn touch_unconfirmed(&self, channel_id: String, touched_at_ms: u64) {
+        if !self.touches_enabled.load(Ordering::Acquire) {
+            return;
+        }
         let (response, _discarded) = oneshot::channel();
         self.send(SessionLifecycleCommand::Touch {
             channel_id,
@@ -1054,7 +1061,7 @@ pub struct SessionMpp {
     realm: String,
     payment_channel_signer: Arc<Mutex<Option<Arc<dyn SolanaSigner>>>>,
     payment_channel_payer_signer: Arc<Mutex<Option<Arc<dyn SolanaSigner>>>>,
-    committed_watermarks: Arc<Mutex<HashMap<String, u64>>>,
+    committed_watermarks: Arc<dashmap::DashMap<String, u64>>,
     lifecycle: SessionLifecycleHandle,
     operator_runtime: SessionOperatorRuntime,
 }
@@ -1089,7 +1096,7 @@ impl SessionMpp {
         let server = Arc::new(SessionServer::new(config, Arc::clone(&channel_store)));
         let payment_channel_signer = Arc::new(Mutex::new(None));
         let payment_channel_payer_signer = Arc::new(Mutex::new(None));
-        let committed_watermarks = Arc::new(Mutex::new(HashMap::new()));
+        let committed_watermarks = Arc::new(dashmap::DashMap::new());
         let reserved_capacity = Arc::new(Mutex::new(HashMap::new()));
         let delegated_voucher_lock = Arc::new(tokio::sync::Mutex::new(()));
         let settlement_signatures = Arc::new(Mutex::new(HashMap::new()));
@@ -1121,7 +1128,10 @@ impl SessionMpp {
             payment_channel_signer,
             payment_channel_payer_signer,
             committed_watermarks,
-            lifecycle: SessionLifecycleHandle { tx },
+            lifecycle: SessionLifecycleHandle {
+                tx,
+                touches_enabled: Arc::new(AtomicBool::new(false)),
+            },
             operator_runtime,
         }
     }
@@ -1224,6 +1234,9 @@ impl SessionMpp {
         let settlement_interval = (reconciliation == SessionLifecycleReconciliation::Embedded
             && !settlement_interval.is_zero())
         .then_some(settlement_interval);
+        self.lifecycle
+            .touches_enabled
+            .store(close_delay.is_some(), Ordering::Release);
         self.lifecycle.send(SessionLifecycleCommand::Configure {
             close_delay,
             close_batch_interval,
@@ -1411,9 +1424,8 @@ impl SessionMpp {
     /// Latest cumulative watermark accepted by this process for a session.
     pub fn committed_watermark(&self, session_id: &str) -> Option<u64> {
         self.committed_watermarks
-            .lock()
-            .ok()
-            .and_then(|watermarks| watermarks.get(session_id).copied())
+            .get(session_id)
+            .map(|watermark| *watermark)
     }
 
     /// On-chain settle signature for a finalized session channel, if recorded.
@@ -1948,6 +1960,37 @@ mod tests {
 
     fn test_session_signer() -> Box<dyn SolanaSigner> {
         test_keypair().1
+    }
+
+    #[tokio::test]
+    async fn disabled_lifecycle_touch_bypasses_the_runloop() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        drop(rx);
+        let handle = SessionLifecycleHandle {
+            tx,
+            touches_enabled: Arc::new(AtomicBool::new(false)),
+        };
+
+        assert!(
+            handle
+                .touch("channel".to_string(), 1)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        handle.touch_unconfirmed("channel".to_string(), 1);
+    }
+
+    #[test]
+    fn lifecycle_configuration_controls_the_touch_fast_path() {
+        let session = test_session_mpp();
+        assert!(!session.lifecycle.touches_enabled.load(Ordering::Acquire));
+
+        session.start_lifecycle_runloop(Duration::from_secs(10));
+        assert!(session.lifecycle.touches_enabled.load(Ordering::Acquire));
+
+        session.start_lifecycle_runloop(Duration::ZERO);
+        assert!(!session.lifecycle.touches_enabled.load(Ordering::Acquire));
     }
 
     /// Insert confirmed channel state directly — see [`test_channel_state`].
@@ -3009,11 +3052,7 @@ mod tests {
             .unwrap(),
             75
         );
-        session
-            .committed_watermarks
-            .lock()
-            .expect("watermark lock")
-            .clear();
+        session.committed_watermarks.clear();
         assert_eq!(
             tokio::time::timeout(
                 Duration::from_secs(2),

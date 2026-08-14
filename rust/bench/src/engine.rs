@@ -202,7 +202,8 @@ pub async fn run_pipeline(p: PipelineParams<'_>) -> Result<ReportJson> {
         completed = report.completed,
         ok = report.ok,
         fail = report.fail,
-        rps = report.rps_overall,
+        completed_rps = report.completed_rps,
+        accepted_rps = report.accepted_rps,
         elapsed_ms = report.wall.as_millis() as u64,
         "phase: unleash complete"
     );
@@ -242,9 +243,8 @@ pub async fn run_pipeline(p: PipelineParams<'_>) -> Result<ReportJson> {
     Ok(ReportJson::from_driver(
         &run_id,
         scheme.name(),
-        cfg.run.network.slug(),
+        cfg,
         ctxs.len(),
-        load.requests_per_sec_per_user,
         &report,
     ))
 }

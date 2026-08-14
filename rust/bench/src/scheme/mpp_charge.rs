@@ -13,7 +13,7 @@ use pay_kit::mpp::solana_rpc_client::rpc_client::RpcClient;
 
 use super::{
     BenchScheme, Endpoint, Load, PerUserFunding, PreparedRequest, RequestSource, ResolvedPrice,
-    UserCtx, UserSetup, build_request, www_authenticate,
+    UserCtx, UserSetup, build_request, validate_payment_transport, www_authenticate,
 };
 
 pub struct MppCharge;
@@ -113,6 +113,7 @@ impl BenchScheme for MppCharge {
         ctx: &UserCtx,
         _setup: &UserSetup,
     ) -> Result<Box<dyn RequestSource>> {
+        validate_payment_transport(&ctx.endpoint.url)?;
         Ok(Box::new(ChargeSource {
             index: ctx.index,
             keypair: ctx.wallet.keypair,

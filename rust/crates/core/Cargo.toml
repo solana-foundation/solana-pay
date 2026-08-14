@@ -61,6 +61,7 @@ rand = { workspace = true }
 uuid = { workspace = true }
 bs58 = { workspace = true }
 blake3 = { workspace = true }
+dashmap = "5.5"
 reqwest = { workspace = true, features = ["json"] }
 pay-keystore = { workspace = true }
 pay-kit = { workspace = true }

@@ -4,6 +4,8 @@
 //! [`MemoryChannelStore`] used by [`SessionMpp`]. It is deliberately confined
 //! to `pay-bench`: the production CLI exposes no state-import endpoint.
 
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -13,13 +15,181 @@ use pay_core::server::session::{SessionMpp, test_channel_state};
 use pay_kit::mpp::blockhash::BlockhashCache;
 use pay_kit::mpp::server::session::{SessionConfig, VoucherSigner};
 use pay_kit::mpp::solana_keychain::{SolanaSigner, memory::MemorySigner};
-use pay_kit::mpp::store::{ChannelStore, MemoryChannelStore};
+use pay_kit::mpp::store::{ChannelLifecycle, ChannelState, ChannelStore, StoreError};
 use sha2::{Digest, Sha256};
 use solana_hash::Hash;
 use solana_pubkey::Pubkey;
 
 const FIXTURE_SECRET: &str = "pay-bench-seeded-session-v1";
 const FIXTURE_DEPOSIT: u64 = 1_000_000_000;
+const STORE_SHARDS: usize = 256;
+
+/// Benchmark-local in-memory store with per-channel sharding.
+///
+/// PayKit's default memory store intentionally favors simplicity and serializes
+/// all channels behind one mutex. That makes it unsuitable for a many-channel
+/// capacity fixture: unrelated vouchers contend on the same lock. This keeps
+/// the exact `ChannelStore` contract while allowing independent channels to
+/// advance concurrently. It is not exposed by the production CLI.
+struct ShardedMemoryChannelStore {
+    data: dashmap::DashMap<String, ChannelState>,
+}
+
+impl ShardedMemoryChannelStore {
+    fn with_capacity(capacity: usize) -> Self {
+        Self {
+            data: dashmap::DashMap::with_capacity_and_shard_amount(capacity, STORE_SHARDS),
+        }
+    }
+
+    fn missing() -> StoreError {
+        StoreError::Internal("Channel not found".to_string())
+    }
+}
+
+impl ChannelStore for ShardedMemoryChannelStore {
+    fn list_channels(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<ChannelState>, StoreError>> + Send + '_>> {
+        let channels = self
+            .data
+            .iter()
+            .map(|entry| entry.value().clone())
+            .collect();
+        Box::pin(async move { Ok(channels) })
+    }
+
+    fn get_channel(
+        &self,
+        channel_id: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<ChannelState>, StoreError>> + Send + '_>> {
+        let state = self.data.get(channel_id).map(|entry| entry.value().clone());
+        Box::pin(async move { Ok(state) })
+    }
+
+    fn put_channel(
+        &self,
+        channel_id: &str,
+        state: ChannelState,
+    ) -> Pin<Box<dyn Future<Output = Result<(), StoreError>> + Send + '_>> {
+        use dashmap::mapref::entry::Entry;
+        let result = match self.data.entry(channel_id.to_string()) {
+            Entry::Vacant(entry) => {
+                entry.insert(state);
+                Ok(())
+            }
+            Entry::Occupied(_) => Err(StoreError::Internal(format!(
+                "Channel {channel_id} already exists"
+            ))),
+        };
+        Box::pin(async move { result })
+    }
+
+    fn delete_channel(
+        &self,
+        channel_id: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<(), StoreError>> + Send + '_>> {
+        self.data.remove(channel_id);
+        Box::pin(async { Ok(()) })
+    }
+
+    fn update_channel(
+        &self,
+        channel_id: &str,
+        updater: Box<dyn FnOnce(Option<ChannelState>) -> Result<ChannelState, StoreError> + Send>,
+    ) -> Pin<Box<dyn Future<Output = Result<ChannelState, StoreError>> + Send + '_>> {
+        use dashmap::mapref::entry::Entry;
+        let result = match self.data.entry(channel_id.to_string()) {
+            Entry::Occupied(mut entry) => updater(Some(entry.get().clone())).inspect(|state| {
+                entry.insert(state.clone());
+            }),
+            Entry::Vacant(entry) => updater(None).inspect(|state| {
+                entry.insert(state.clone());
+            }),
+        };
+        Box::pin(async move { result })
+    }
+
+    fn touch_channel_lifecycle(
+        &self,
+        channel_id: &str,
+        lifecycle: ChannelLifecycle,
+    ) -> Pin<Box<dyn Future<Output = Result<ChannelState, StoreError>> + Send + '_>> {
+        let result = self
+            .data
+            .get_mut(channel_id)
+            .ok_or_else(Self::missing)
+            .map(|mut state| {
+                let replace = !state.sealed
+                    && state.close_requested_at.is_none()
+                    && state
+                        .lifecycle
+                        .as_ref()
+                        .is_none_or(|current| lifecycle.close_after >= current.close_after);
+                if replace {
+                    state.lifecycle = Some(lifecycle);
+                }
+                state.clone()
+            });
+        Box::pin(async move { result })
+    }
+
+    fn advance_cumulative(
+        &self,
+        channel_id: &str,
+        expected: u64,
+        new: u64,
+    ) -> Pin<Box<dyn Future<Output = Result<bool, StoreError>> + Send + '_>> {
+        let result = self
+            .data
+            .get_mut(channel_id)
+            .ok_or_else(Self::missing)
+            .map(|mut state| {
+                if state.cumulative != expected {
+                    return false;
+                }
+                state.cumulative = new;
+                true
+            });
+        Box::pin(async move { result })
+    }
+
+    fn update_deposit(
+        &self,
+        channel_id: &str,
+        new_deposit: u64,
+    ) -> Pin<Box<dyn Future<Output = Result<(), StoreError>> + Send + '_>> {
+        let result = self
+            .data
+            .get_mut(channel_id)
+            .ok_or_else(Self::missing)
+            .map(|mut state| {
+                state.deposit = new_deposit;
+            });
+        Box::pin(async move { result })
+    }
+
+    fn mark_sealed(
+        &self,
+        channel_id: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<(), StoreError>> + Send + '_>> {
+        let result = self
+            .data
+            .get_mut(channel_id)
+            .ok_or_else(Self::missing)
+            .map(|mut state| {
+                state.sealed = true;
+            });
+        Box::pin(async move { result })
+    }
+
+    fn mark_finalized(
+        &self,
+        channel_id: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<(), StoreError>> + Send + '_>> {
+        self.mark_sealed(channel_id)
+    }
+}
 
 /// A normal server-side session manager seeded with deterministic confirmed
 /// channels. The load driver derives its own client handles from the same
@@ -47,7 +217,7 @@ pub async fn build(
     // fixture never processes an open transaction or calls an RPC endpoint.
     let cache = BlockhashCache::new();
     cache.set(Hash::new_unique().to_string(), u64::MAX, 42);
-    let store = Arc::new(MemoryChannelStore::new());
+    let store = Arc::new(ShardedMemoryChannelStore::with_capacity(channels));
     let session = Arc::new(
         SessionMpp::new_with_channel_store(config, FIXTURE_SECRET, store.clone())
             .with_blockhash_cache(cache),

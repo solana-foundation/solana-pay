@@ -12,7 +12,7 @@ pub mod x402;
 
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use solana_pubkey::Pubkey;
 
@@ -159,6 +159,29 @@ pub fn build_request(
     rb
 }
 
+/// Payment credentials are bearer-like until their cumulative watermark is
+/// consumed. Never send them over public cleartext transport; local loopback
+/// HTTP remains available for deterministic rehearsal and profiling.
+pub fn validate_payment_transport(url: &str) -> Result<()> {
+    let parsed = reqwest::Url::parse(url).with_context(|| format!("invalid endpoint URL {url}"))?;
+    if parsed.scheme() == "https" {
+        return Ok(());
+    }
+    let loopback = parsed.host_str().is_some_and(|host| {
+        let host = host.trim_start_matches('[').trim_end_matches(']');
+        host.eq_ignore_ascii_case("localhost")
+            || host
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|ip| ip.is_loopback())
+    });
+    if parsed.scheme() == "http" && loopback {
+        return Ok(());
+    }
+    bail!(
+        "refusing to send payment credentials to cleartext endpoint {url}; use HTTPS (HTTP is allowed only on loopback)"
+    )
+}
+
 /// Read `www-authenticate` from a response as a string. Parses from raw bytes,
 /// not `to_str()` — challenge descriptions may carry non-ASCII (e.g. an em-dash)
 /// that `HeaderValue::to_str()` rejects even though it's valid UTF-8.
@@ -167,4 +190,20 @@ pub fn www_authenticate(resp: &reqwest::Response) -> Option<String> {
         .get("www-authenticate")
         .and_then(|v| std::str::from_utf8(v.as_bytes()).ok())
         .map(str::to_string)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn payment_transport_requires_https_or_loopback() {
+        assert!(validate_payment_transport("https://provider.example/v1").is_ok());
+        assert!(validate_payment_transport("http://127.0.0.1:1402/v1").is_ok());
+        assert!(validate_payment_transport("http://[::1]:1402/v1").is_ok());
+        assert!(validate_payment_transport("http://localhost:1402/v1").is_ok());
+
+        let error = validate_payment_transport("http://213.239.141.29:1402/v1").unwrap_err();
+        assert!(error.to_string().contains("use HTTPS"));
+    }
 }

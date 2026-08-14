@@ -5,8 +5,10 @@
 //! a task or interval per user. Metrics are worker-local and merged after the
 //! run; no completion takes a global histogram or status-map lock.
 
-use std::collections::HashMap;
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use futures::future::BoxFuture;
@@ -27,6 +29,7 @@ pub struct DriverConfig {
 
 #[derive(Debug, Clone)]
 pub struct DriverReport {
+    pub target_rps: f64,
     pub scheduled: u64,
     pub dispatched: u64,
     pub completed: u64,
@@ -35,19 +38,29 @@ pub struct DriverReport {
     pub fail: u64,
     pub dropped: u64,
     pub wall: Duration,
-    pub rps_overall: f64,
-    pub p50_ms: f64,
-    pub p90_ms: f64,
-    pub p99_ms: f64,
-    pub p999_ms: f64,
-    pub max_ms: f64,
-    pub mean_ms: f64,
-    pub schedule_delay_p99_ms: f64,
-    pub end_to_end_p99_ms: f64,
+    pub drain: Duration,
+    pub completed_rps: f64,
+    pub accepted_rps: f64,
     pub signing_rps: f64,
+    pub service_latency_ms: LatencySummary,
+    pub signing_latency_ms: LatencySummary,
+    pub schedule_delay_ms: LatencySummary,
+    pub end_to_end_latency_ms: LatencySummary,
+    pub max_in_flight: usize,
     pub status_counts: HashMap<u16, u64>,
     pub error_counts: HashMap<String, u64>,
     pub rps_series: Vec<u64>,
+    pub accepted_rps_series: Vec<u64>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct LatencySummary {
+    pub p50: f64,
+    pub p90: f64,
+    pub p99: f64,
+    pub p999: f64,
+    pub max: f64,
+    pub mean: f64,
 }
 
 struct SourceState {
@@ -70,8 +83,20 @@ struct Completion {
 
 type InFlight = BoxFuture<'static, Completion>;
 
+#[derive(Clone)]
+struct WorkerContext {
+    http: reqwest::Client,
+    permits: Arc<Semaphore>,
+    max_in_flight: Arc<AtomicUsize>,
+    cfg: DriverConfig,
+    started: Instant,
+    deadline: Instant,
+    phase_denominator: u64,
+}
+
 struct LocalMetrics {
     service_us: Histogram<u64>,
+    signing_us: Histogram<u64>,
     schedule_delay_us: Histogram<u64>,
     end_to_end_us: Histogram<u64>,
     scheduled: u64,
@@ -81,18 +106,19 @@ struct LocalMetrics {
     ok: u64,
     fail: u64,
     dropped: u64,
-    signing: Duration,
     status: HashMap<u16, u64>,
     errors: HashMap<String, u64>,
     rps_series: Vec<u64>,
+    accepted_rps_series: Vec<u64>,
 }
 
 impl LocalMetrics {
     fn new() -> Self {
         Self {
-            service_us: Histogram::new(3).expect("valid histogram"),
-            schedule_delay_us: Histogram::new(3).expect("valid histogram"),
-            end_to_end_us: Histogram::new(3).expect("valid histogram"),
+            service_us: latency_histogram(),
+            signing_us: latency_histogram(),
+            schedule_delay_us: latency_histogram(),
+            end_to_end_us: latency_histogram(),
             scheduled: 0,
             dispatched: 0,
             completed: 0,
@@ -100,34 +126,35 @@ impl LocalMetrics {
             ok: 0,
             fail: 0,
             dropped: 0,
-            signing: Duration::ZERO,
             status: HashMap::new(),
             errors: HashMap::new(),
             rps_series: Vec::new(),
+            accepted_rps_series: Vec::new(),
         }
     }
 
     fn record(&mut self, completion: &Completion, started: Instant) {
-        self.signing += completion.signing;
+        self.signing_us
+            .saturating_record(duration_us(completion.signing));
         let schedule_delay = completion
             .dispatched
             .unwrap_or(completion.completed_at)
             .saturating_duration_since(completion.scheduled);
         self.schedule_delay_us
             .saturating_record(duration_us(schedule_delay));
-        self.end_to_end_us.saturating_record(duration_us(
-            completion
-                .completed_at
-                .saturating_duration_since(completion.scheduled),
-        ));
+        let end_to_end = completion
+            .completed_at
+            .saturating_duration_since(completion.scheduled);
+        self.end_to_end_us
+            .saturating_record(duration_us(end_to_end));
 
         if let Some(dispatched) = completion.dispatched {
             self.dispatched += 1;
-            self.service_us.saturating_record(duration_us(
-                completion
-                    .completed_at
-                    .saturating_duration_since(dispatched),
-            ));
+            let service = completion
+                .completed_at
+                .saturating_duration_since(dispatched);
+            debug_assert!(end_to_end >= service);
+            self.service_us.saturating_record(duration_us(service));
         } else {
             self.dropped += 1;
         }
@@ -138,6 +165,11 @@ impl LocalMetrics {
                 self.ok += 1;
                 if completion.logical_payment {
                     self.accepted += 1;
+                    record_series(
+                        &mut self.accepted_rps_series,
+                        completion.completed_at,
+                        started,
+                    );
                 }
             } else {
                 self.fail += 1;
@@ -149,20 +181,22 @@ impl LocalMetrics {
             *self.errors.entry(error.clone()).or_insert(0) += 1;
         }
         self.completed += 1;
-        let second = completion
-            .completed_at
-            .saturating_duration_since(started)
-            .as_secs() as usize;
-        if self.rps_series.len() <= second {
-            self.rps_series.resize(second + 1, 0);
-        }
-        self.rps_series[second] += 1;
+        record_series(&mut self.rps_series, completion.completed_at, started);
     }
 
     fn merge(&mut self, other: Self) {
-        let _ = self.service_us.add(&other.service_us);
-        let _ = self.schedule_delay_us.add(&other.schedule_delay_us);
-        let _ = self.end_to_end_us.add(&other.end_to_end_us);
+        self.service_us
+            .add(&other.service_us)
+            .expect("compatible service latency histograms");
+        self.signing_us
+            .add(&other.signing_us)
+            .expect("compatible signing latency histograms");
+        self.schedule_delay_us
+            .add(&other.schedule_delay_us)
+            .expect("compatible schedule latency histograms");
+        self.end_to_end_us
+            .add(&other.end_to_end_us)
+            .expect("compatible end-to-end latency histograms");
         self.scheduled += other.scheduled;
         self.dispatched += other.dispatched;
         self.completed += other.completed;
@@ -170,7 +204,6 @@ impl LocalMetrics {
         self.ok += other.ok;
         self.fail += other.fail;
         self.dropped += other.dropped;
-        self.signing += other.signing;
         for (status, count) in other.status {
             *self.status.entry(status).or_insert(0) += count;
         }
@@ -183,6 +216,40 @@ impl LocalMetrics {
         for (second, count) in other.rps_series.into_iter().enumerate() {
             self.rps_series[second] += count;
         }
+        merge_series(&mut self.accepted_rps_series, other.accepted_rps_series);
+    }
+}
+
+fn latency_histogram() -> Histogram<u64> {
+    Histogram::new_with_bounds(1, 60_000_000, 3).expect("valid latency histogram")
+}
+
+fn latency_summary(histogram: &Histogram<u64>) -> LatencySummary {
+    let to_ms = |value: u64| value as f64 / 1_000.0;
+    LatencySummary {
+        p50: to_ms(histogram.value_at_quantile(0.50)),
+        p90: to_ms(histogram.value_at_quantile(0.90)),
+        p99: to_ms(histogram.value_at_quantile(0.99)),
+        p999: to_ms(histogram.value_at_quantile(0.999)),
+        max: to_ms(histogram.max()),
+        mean: histogram.mean() / 1_000.0,
+    }
+}
+
+fn record_series(series: &mut Vec<u64>, completed_at: Instant, started: Instant) {
+    let second = completed_at.saturating_duration_since(started).as_secs() as usize;
+    if series.len() <= second {
+        series.resize(second + 1, 0);
+    }
+    series[second] += 1;
+}
+
+fn merge_series(into: &mut Vec<u64>, other: Vec<u64>) {
+    if into.len() < other.len() {
+        into.resize(other.len(), 0);
+    }
+    for (second, count) in other.into_iter().enumerate() {
+        into[second] += count;
     }
 }
 
@@ -197,6 +264,11 @@ pub async fn run(
     let started = Instant::now();
     let deadline = started + cfg.deadline;
     let source_count = sources.len().max(1);
+    let phase_denominator = sources
+        .iter()
+        .map(|source| u64::from(source.user_index()) + 1)
+        .max()
+        .unwrap_or(1);
     let worker_count = cfg.workers.clamp(1, source_count);
     let mut partitions: Vec<Vec<Box<dyn RequestSource>>> =
         (0..worker_count).map(|_| Vec::new()).collect();
@@ -206,29 +278,32 @@ pub async fn run(
     }
 
     let permits = Arc::new(Semaphore::new(cfg.max_concurrency.max(1)));
-    let mut workers = FuturesUnordered::new();
+    let max_in_flight = Arc::new(AtomicUsize::new(0));
+    let worker_context = WorkerContext {
+        http,
+        permits,
+        max_in_flight: Arc::clone(&max_in_flight),
+        cfg,
+        started,
+        deadline,
+        phase_denominator,
+    };
+    let mut workers = tokio::task::JoinSet::new();
     for sources in partitions {
         if sources.is_empty() {
             continue;
         }
-        workers.push(run_worker(
-            sources,
-            http.clone(),
-            Arc::clone(&permits),
-            cfg,
-            started,
-            deadline,
-            source_count,
-        ));
+        workers.spawn(run_worker(sources, worker_context.clone()));
     }
 
     let mut totals = LocalMetrics::new();
-    while let Some(metrics) = workers.next().await {
-        totals.merge(metrics);
+    while let Some(metrics) = workers.join_next().await {
+        totals.merge(metrics.expect("load worker panicked"));
     }
-    let wall = started.elapsed();
-    let to_ms = |value: u64| value as f64 / 1000.0;
+    let elapsed = started.elapsed();
+    let wall_secs = cfg.deadline.as_secs_f64().max(f64::MIN_POSITIVE);
     DriverReport {
+        target_rps: cfg.rps_per_user * source_count as f64,
         scheduled: totals.scheduled,
         dispatched: totals.dispatched,
         completed: totals.completed,
@@ -236,41 +311,51 @@ pub async fn run(
         ok: totals.ok,
         fail: totals.fail,
         dropped: totals.dropped,
-        wall,
-        rps_overall: totals.completed as f64 / wall.as_secs_f64().max(f64::MIN_POSITIVE),
-        p50_ms: to_ms(totals.service_us.value_at_quantile(0.50)),
-        p90_ms: to_ms(totals.service_us.value_at_quantile(0.90)),
-        p99_ms: to_ms(totals.service_us.value_at_quantile(0.99)),
-        p999_ms: to_ms(totals.service_us.value_at_quantile(0.999)),
-        max_ms: to_ms(totals.service_us.max()),
-        mean_ms: totals.service_us.mean() / 1000.0,
-        schedule_delay_p99_ms: to_ms(totals.schedule_delay_us.value_at_quantile(0.99)),
-        end_to_end_p99_ms: to_ms(totals.end_to_end_us.value_at_quantile(0.99)),
-        signing_rps: totals.dispatched as f64 / totals.signing.as_secs_f64().max(f64::MIN_POSITIVE),
+        wall: cfg.deadline,
+        drain: elapsed.saturating_sub(cfg.deadline),
+        completed_rps: totals.completed as f64 / wall_secs,
+        accepted_rps: totals.accepted as f64 / wall_secs,
+        signing_rps: totals.dispatched as f64 / wall_secs,
+        service_latency_ms: latency_summary(&totals.service_us),
+        signing_latency_ms: latency_summary(&totals.signing_us),
+        schedule_delay_ms: latency_summary(&totals.schedule_delay_us),
+        end_to_end_latency_ms: latency_summary(&totals.end_to_end_us),
+        max_in_flight: max_in_flight.load(Ordering::Relaxed),
         status_counts: totals.status,
         error_counts: totals.errors,
         rps_series: totals.rps_series,
+        accepted_rps_series: totals.accepted_rps_series,
     }
 }
 
-async fn run_worker(
-    sources: Vec<Box<dyn RequestSource>>,
-    http: reqwest::Client,
-    permits: Arc<Semaphore>,
-    cfg: DriverConfig,
-    started: Instant,
-    deadline: Instant,
-    source_count: usize,
-) -> LocalMetrics {
+async fn run_worker(sources: Vec<Box<dyn RequestSource>>, context: WorkerContext) -> LocalMetrics {
+    let WorkerContext {
+        http,
+        permits,
+        max_in_flight,
+        cfg,
+        started,
+        deadline,
+        phase_denominator,
+    } = context;
     let period = Duration::from_secs_f64(1.0 / cfg.rps_per_user.max(0.001));
     let mut slots: Vec<Option<SourceState>> = sources
         .into_iter()
         .map(|source| {
-            let phase = period.mul_f64(source.user_index() as f64 / source_count as f64);
+            let phase = period.mul_f64(f64::from(source.user_index()) / phase_denominator as f64);
             Some(SourceState {
                 source,
                 next_scheduled: started + phase,
             })
+        })
+        .collect();
+    let mut schedule: BinaryHeap<Reverse<(Instant, usize)>> = slots
+        .iter()
+        .enumerate()
+        .filter_map(|(slot, state)| {
+            state
+                .as_ref()
+                .map(|state| Reverse((state.next_scheduled, slot)))
         })
         .collect();
     let mut in_flight: FuturesUnordered<InFlight> = FuturesUnordered::new();
@@ -278,19 +363,18 @@ async fn run_worker(
 
     while Instant::now() < deadline {
         while Instant::now() < deadline && in_flight.len() < cfg.max_concurrency.max(1) {
-            let now = Instant::now();
-            let Some(slot) = slots.iter().position(|state| {
-                state
-                    .as_ref()
-                    .is_some_and(|state| state.next_scheduled <= now)
-            }) else {
+            let Some(Reverse((scheduled, slot))) = schedule.peek().copied() else {
                 break;
             };
+            if scheduled > Instant::now() {
+                break;
+            }
             let Ok(permit) = Arc::clone(&permits).try_acquire_owned() else {
                 break;
             };
+            schedule.pop();
             let mut state = slots[slot].take().expect("ready source slot");
-            let scheduled = state.next_scheduled;
+            debug_assert_eq!(scheduled, state.next_scheduled);
             state.next_scheduled += period;
             let next_scheduled = state.next_scheduled;
             metrics.scheduled += 1;
@@ -359,13 +443,21 @@ async fn run_worker(
                 }
                 .boxed(),
             );
+            let used = cfg
+                .max_concurrency
+                .max(1)
+                .saturating_sub(permits.available_permits());
+            max_in_flight.fetch_max(used, Ordering::Relaxed);
         }
 
-        let next = slots
-            .iter()
-            .filter_map(|state| state.as_ref().map(|state| state.next_scheduled))
-            .min()
-            .unwrap_or(deadline);
+        let next = if permits.available_permits() == 0 {
+            deadline
+        } else {
+            schedule
+                .peek()
+                .map(|Reverse((scheduled, _))| *scheduled)
+                .unwrap_or(deadline)
+        };
         if in_flight.is_empty() {
             tokio::time::sleep_until(tokio::time::Instant::from_std(next.min(deadline))).await;
         } else {
@@ -377,6 +469,7 @@ async fn run_worker(
                         source: completion.source,
                         next_scheduled: completion.next_scheduled,
                     });
+                    schedule.push(Reverse((completion.next_scheduled, slot)));
                 }
                 _ = tokio::time::sleep_until(tokio::time::Instant::from_std(next.min(deadline))) => {}
             }
@@ -390,8 +483,24 @@ async fn run_worker(
             source: completion.source,
             next_scheduled: completion.next_scheduled,
         });
+        schedule.push(Reverse((completion.next_scheduled, slot)));
+    }
+    for state in slots.into_iter().flatten() {
+        let deficit = due_before(state.next_scheduled, deadline, period);
+        metrics.scheduled = metrics.scheduled.saturating_add(deficit);
+        metrics.dropped = metrics.dropped.saturating_add(deficit);
     }
     metrics
+}
+
+fn due_before(next: Instant, deadline: Instant, period: Duration) -> u64 {
+    if next >= deadline {
+        return 0;
+    }
+    let remaining_nanos = deadline.duration_since(next).as_nanos();
+    let period_nanos = period.as_nanos().max(1);
+    let due = 1 + remaining_nanos.saturating_sub(1) / period_nanos;
+    due.min(u64::MAX as u128) as u64
 }
 
 /// Build a tuned HTTP client for the load phase (keepalive pool, HTTP/2 where
@@ -434,6 +543,8 @@ mod tests {
         url: String,
         logical_payment: bool,
         issued: Arc<AtomicU64>,
+        signing_delay: Duration,
+        signing_barrier: Option<Arc<std::sync::Barrier>>,
     }
 
     #[async_trait::async_trait]
@@ -444,6 +555,10 @@ mod tests {
 
         async fn next_request(&mut self) -> anyhow::Result<crate::scheme::PreparedRequest> {
             self.issued.fetch_add(1, Ordering::Relaxed);
+            if let Some(barrier) = self.signing_barrier.take() {
+                barrier.wait();
+            }
+            tokio::time::sleep(self.signing_delay).await;
             Ok(crate::scheme::PreparedRequest {
                 method: "GET".to_string(),
                 url: self.url.clone(),
@@ -472,6 +587,8 @@ mod tests {
             url: format!("http://{address}/"),
             logical_payment: true,
             issued: Arc::clone(&issued),
+            signing_delay: Duration::ZERO,
+            signing_barrier: None,
         };
         let report = run(
             vec![Box::new(source)],
@@ -491,6 +608,7 @@ mod tests {
         assert!(report.completed > 0);
         assert_eq!(report.accepted, report.ok);
         assert_eq!(report.fail, 0);
+        assert!(report.end_to_end_latency_ms.p99 >= report.service_latency_ms.p99);
     }
 
     #[tokio::test]
@@ -510,6 +628,8 @@ mod tests {
             url: format!("http://{address}/"),
             logical_payment: false,
             issued: Arc::new(AtomicU64::new(0)),
+            signing_delay: Duration::ZERO,
+            signing_barrier: None,
         };
         let report = run(
             vec![Box::new(source)],
@@ -527,5 +647,111 @@ mod tests {
 
         assert!(report.ok > 0);
         assert_eq!(report.accepted, 0);
+    }
+
+    #[tokio::test]
+    async fn records_unsent_open_loop_schedule_as_dropped() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().route("/", get(|| async { StatusCode::OK })),
+            )
+            .await
+            .unwrap();
+        });
+        let source = TestSource {
+            index: 0,
+            url: format!("http://{address}/"),
+            logical_payment: true,
+            issued: Arc::new(AtomicU64::new(0)),
+            signing_delay: Duration::from_millis(10),
+            signing_barrier: None,
+        };
+        let report = run(
+            vec![Box::new(source)],
+            reqwest::Client::new(),
+            DriverConfig {
+                rps_per_user: 1_000.0,
+                max_concurrency: 1,
+                deadline: Duration::from_millis(50),
+                pool_per_host: 1,
+                workers: 1,
+            },
+        )
+        .await;
+        server.abort();
+
+        assert_eq!(report.scheduled, 50);
+        assert_eq!(report.dropped, report.scheduled - report.dispatched);
+        assert!(report.schedule_delay_ms.p99 >= 1.0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn worker_partitions_execute_on_separate_runtime_tasks() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().route("/", get(|| async { StatusCode::OK })),
+            )
+            .await
+            .unwrap();
+        });
+        let barrier = Arc::new(std::sync::Barrier::new(4));
+        let sources: Vec<Box<dyn RequestSource>> = (0..4)
+            .map(|index| {
+                Box::new(TestSource {
+                    index,
+                    url: format!("http://{address}/"),
+                    logical_payment: false,
+                    issued: Arc::new(AtomicU64::new(0)),
+                    signing_delay: Duration::ZERO,
+                    signing_barrier: Some(Arc::clone(&barrier)),
+                }) as Box<dyn RequestSource>
+            })
+            .collect();
+        let report = tokio::time::timeout(
+            Duration::from_secs(1),
+            run(
+                sources,
+                reqwest::Client::new(),
+                DriverConfig {
+                    rps_per_user: 1_000.0,
+                    max_concurrency: 4,
+                    deadline: Duration::from_millis(20),
+                    pool_per_host: 4,
+                    workers: 4,
+                },
+            ),
+        )
+        .await
+        .expect("worker tasks did not run concurrently");
+        server.abort();
+
+        assert!(report.completed >= 4);
+    }
+
+    #[test]
+    fn due_count_excludes_the_deadline_boundary() {
+        let started = Instant::now();
+        assert_eq!(
+            due_before(
+                started,
+                started + Duration::from_millis(10),
+                Duration::from_millis(1),
+            ),
+            10
+        );
+        assert_eq!(
+            due_before(
+                started + Duration::from_millis(10),
+                started + Duration::from_millis(10),
+                Duration::from_millis(1),
+            ),
+            0
+        );
     }
 }

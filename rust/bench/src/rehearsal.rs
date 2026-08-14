@@ -39,6 +39,10 @@ routing:
   type: respond
 accounting: pooled
 endpoints:
+  - method: GET
+    path: "v1/free"
+    resource: "free"
+    description: "Unmetered direct-response generator control."
   - method: POST
     path: "v1/charge"
     resource: "charge"
@@ -274,7 +278,7 @@ async fn setup_fork_proxy(cfg: &RunConfig) -> Result<(Surfnet, String, String)> 
 fn rewrite_endpoints(cfg: &mut RunConfig, proxy_url: &str) {
     cfg.endpoints = match cfg.run.scheme {
         crate::config::Scheme::SelfTest => vec![Endpoint {
-            url: format!("{proxy_url}/__402/health"),
+            url: format!("{proxy_url}/v1/free"),
             method: "GET".into(),
             body: String::new(),
             weight: 1,
@@ -329,10 +333,14 @@ async fn drive(
 /// Run a full rehearsal of `cfg` against a local fork (proxy + driver in one
 /// process). Returns the report.
 pub async fn run(mut cfg: RunConfig) -> Result<ReportJson> {
-    if is_offline(&cfg) {
-        let proxy_url = setup_offline_proxy(&cfg).await?;
+    if is_no_chain(&cfg) {
+        let proxy_url = if is_offline(&cfg) {
+            setup_offline_proxy(&cfg).await?
+        } else {
+            setup_free_proxy().await?
+        };
         rewrite_endpoints(&mut cfg, &proxy_url.url);
-        return drive(&cfg, &wallet::NoopFunder, "offline".to_string()).await;
+        return drive(&cfg, &wallet::NoopFunder, "unused".to_string()).await;
     }
     let (surfnet, proxy_url, rpc_url) = setup_fork_proxy(&cfg).await?;
     rewrite_endpoints(&mut cfg, &proxy_url);
@@ -342,6 +350,21 @@ pub async fn run(mut cfg: RunConfig) -> Result<ReportJson> {
 
 fn is_offline(cfg: &RunConfig) -> bool {
     cfg.session.as_ref().map(|s| s.offline).unwrap_or(false)
+}
+
+fn is_no_chain(cfg: &RunConfig) -> bool {
+    is_offline(cfg) || cfg.run.scheme == crate::config::Scheme::SelfTest
+}
+
+async fn setup_free_proxy() -> Result<OfflineProxy> {
+    let api: ApiSpec =
+        serde_yml::from_str(GATE_ONLY_PROVIDER_SPEC).context("parse free-path provider")?;
+    start_local_pingora(AppState {
+        apis: Arc::new(vec![api]),
+        mpp: None,
+        session_mpp: None,
+    })
+    .await
 }
 
 /// Offline Pingora proxy: no fork. It uses the benchmark-only confirmed-state
@@ -376,6 +399,10 @@ async fn setup_offline_proxy(cfg: &RunConfig) -> Result<OfflineProxy> {
         mpp: None,
         session_mpp: Some(session_mpp.session),
     };
+    start_local_pingora(state).await
+}
+
+async fn start_local_pingora(state: AppState) -> Result<OfflineProxy> {
     let control_plane = serve(state.clone()).await?;
     let control_plane = control_plane
         .strip_prefix("http://")
@@ -423,8 +450,12 @@ async fn setup_offline_proxy(cfg: &RunConfig) -> Result<OfflineProxy> {
 /// Spin **only** the proxy and block — so it can be profiled in isolation while
 /// a separate `bench load` process drives it. Offline (no fork) when configured.
 pub async fn serve_proxy(cfg: RunConfig) -> Result<()> {
-    if is_offline(&cfg) {
-        let proxy_url = setup_offline_proxy(&cfg).await?;
+    if is_no_chain(&cfg) {
+        let proxy_url = if is_offline(&cfg) {
+            setup_offline_proxy(&cfg).await?
+        } else {
+            setup_free_proxy().await?
+        };
         println!(
             "\n  proxy_url = {}   (offline — no rpc needed)\n",
             proxy_url.url
@@ -433,7 +464,7 @@ pub async fn serve_proxy(cfg: RunConfig) -> Result<()> {
             "drive it:\n  bench load <config> --proxy {} --rpc unused\n",
             proxy_url.url
         );
-        tracing::info!(proxy_url = %proxy_url.url, "offline Pingora proxy serving (Ctrl-C to stop)");
+        tracing::info!(proxy_url = %proxy_url.url, "local Pingora proxy serving (Ctrl-C to stop)");
         tokio::signal::ctrl_c().await.ok();
         return Ok(());
     }
@@ -452,7 +483,7 @@ pub async fn serve_proxy(cfg: RunConfig) -> Result<()> {
 /// mode needs no fork/funding; otherwise funds users via cheatcode RPC.
 pub async fn load(mut cfg: RunConfig, proxy_url: String, rpc_url: String) -> Result<ReportJson> {
     rewrite_endpoints(&mut cfg, &proxy_url);
-    if is_offline(&cfg) {
+    if is_no_chain(&cfg) {
         return drive(&cfg, &wallet::NoopFunder, rpc_url).await;
     }
     let funder = wallet::ExternalForkFunder {
