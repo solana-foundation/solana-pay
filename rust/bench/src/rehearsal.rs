@@ -534,6 +534,7 @@ mod tests {
                 offline: true,
                 offline_namespace: None,
                 offline_seeded_channels: 1,
+                pre_sign_requests_per_user: 0,
             }),
         }
     }

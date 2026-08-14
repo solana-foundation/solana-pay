@@ -163,8 +163,9 @@ pub async fn run_pipeline(p: PipelineParams<'_>) -> Result<ReportJson> {
     );
 
     // ── 5. Build bounded per-user request sources ──────────────────────────
-    // Sources sign only when their worker dispatches a request. This keeps
-    // memory independent of the measured-window length.
+    // Sources normally sign only when their worker dispatches a request. An
+    // explicit offline capacity-isolation config may instead pre-sign a fixed,
+    // validated window so client signing does not compete with the proxy.
     let t_prepare = Instant::now();
     let prepared = stream::iter(ctxs.iter().zip(setups.iter()))
         .map(|(ctx, setup)| {

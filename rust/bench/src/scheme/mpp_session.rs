@@ -10,7 +10,7 @@
 //!     verify only on the server — this is what scales).
 //!   - **settle_and_close**: send the `close` Authorization → server batch-settles.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
 
 use anyhow::{Context, Result, bail};
@@ -39,6 +39,7 @@ pub struct MppSession {
     voucher_base: u64,
     offline: bool,
     offline_namespace: String,
+    pre_sign_requests_per_user: usize,
     /// Live channel handles, keyed by user index. `SessionHandle` is `Clone`
     /// (Arc inside), so we clone one out under the lock and `.await` on it —
     /// never holding the std mutex across an await.
@@ -53,12 +54,18 @@ impl MppSession {
             .map(|s| (s.deposit_usdc, s.voucher_usdc))
             .unwrap_or((1.0, 0.001));
         let offline = cfg.session.as_ref().map(|s| s.offline).unwrap_or(false);
+        let pre_sign_requests_per_user = cfg
+            .session
+            .as_ref()
+            .map(|session| session.pre_sign_requests_per_user)
+            .unwrap_or(0);
         // USDC-like 6 decimals for voucher accounting.
         Self {
             deposit_base: (deposit_usdc * 1e6) as u64,
             voucher_base: (voucher_usdc * 1e6).max(1.0) as u64,
             offline,
             offline_namespace: cfg.offline_namespace().to_string(),
+            pre_sign_requests_per_user,
             handles: Mutex::new(HashMap::new()),
         }
     }
@@ -248,6 +255,15 @@ impl BenchScheme for MppSession {
         let handle = self
             .handle(ctx.index)
             .with_context(|| format!("no session handle for user {}", ctx.index))?;
+        let mut presigned = VecDeque::with_capacity(self.pre_sign_requests_per_user);
+        for _ in 0..self.pre_sign_requests_per_user {
+            presigned.push_back(
+                handle
+                    .voucher_header(self.voucher_base)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("pre-sign voucher: {e}"))?,
+            );
+        }
         Ok(Box::new(SessionSource {
             index: ctx.index,
             handle,
@@ -256,6 +272,7 @@ impl BenchScheme for MppSession {
             url: ctx.endpoint.url.clone(),
             host_override: ctx.host_override.clone(),
             body: ctx.endpoint.body.clone(),
+            presigned: (self.pre_sign_requests_per_user > 0).then_some(presigned),
         }))
     }
 
@@ -300,6 +317,7 @@ struct SessionSource {
     url: String,
     host_override: Option<String>,
     body: String,
+    presigned: Option<VecDeque<String>>,
 }
 
 #[async_trait]
@@ -309,11 +327,16 @@ impl RequestSource for SessionSource {
     }
 
     async fn next_request(&mut self) -> Result<PreparedRequest> {
-        let auth = self
-            .handle
-            .voucher_header(self.voucher_base)
-            .await
-            .map_err(|e| anyhow::anyhow!("voucher_header: {e}"))?;
+        let auth = match &mut self.presigned {
+            Some(presigned) => presigned
+                .pop_front()
+                .context("pre-signed voucher window exhausted")?,
+            None => self
+                .handle
+                .voucher_header(self.voucher_base)
+                .await
+                .map_err(|e| anyhow::anyhow!("voucher_header: {e}"))?,
+        };
         let mut headers = vec![("authorization".to_string(), auth)];
         if let Some(host) = &self.host_override {
             headers.push(("host".to_string(), host.clone()));

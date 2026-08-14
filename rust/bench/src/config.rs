@@ -169,6 +169,12 @@ pub struct SessionCfg {
     /// exposes a production state-injection endpoint.
     #[serde(default)]
     pub offline_seeded_channels: usize,
+    /// Pre-sign this many vouchers per channel before the measured window.
+    /// Offline capacity-isolation runs use this to keep client signing from
+    /// consuming the same host CPU as the proxy under test. Zero keeps the
+    /// production-shaped on-demand signing path.
+    #[serde(default)]
+    pub pre_sign_requests_per_user: usize,
 }
 
 fn default_true() -> bool {
@@ -265,6 +271,20 @@ impl RunConfig {
             .is_some_and(|session| !session.offline && session.offline_seeded_channels != 0)
         {
             bail!("session.offline_seeded_channels requires session.offline: true");
+        }
+        if let Some(session) = &self.session
+            && session.pre_sign_requests_per_user > 0
+        {
+            if !session.offline {
+                bail!("session.pre_sign_requests_per_user requires session.offline: true");
+            }
+            let required = (self.load.requests_per_sec_per_user * self.load.unleash_secs as f64)
+                .ceil() as usize;
+            if session.pre_sign_requests_per_user < required {
+                bail!(
+                    "session.pre_sign_requests_per_user must be at least {required} for the configured load window"
+                );
+            }
         }
         Ok(())
     }

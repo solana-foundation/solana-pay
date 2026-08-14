@@ -114,9 +114,10 @@ pub trait BenchScheme: Send + Sync {
     /// On-chain (or registration) setup for one user. Charge: no-op.
     async fn provision_user(&self, ctx: &UserCtx) -> Result<UserSetup>;
 
-    /// Create the bounded request producer for one user. Implementations must
-    /// not pre-build the timed run; the driver asks for exactly one request
-    /// when the source is eligible to dispatch.
+    /// Create the bounded request producer for one user. The production-shaped
+    /// path signs only when the driver asks for an eligible request. Explicit
+    /// offline capacity-isolation configs may pre-sign a fixed, validated
+    /// number so client signing does not consume the proxy host during load.
     async fn request_source(
         &self,
         ctx: &UserCtx,
