@@ -254,8 +254,8 @@ fn merge_series(into: &mut Vec<u64>, other: Vec<u64>) {
 }
 
 /// Run indefinitely-producing sources for the measured window. Sources are
-/// partitioned by `user_index % workers`, which is deterministic and keeps a
-/// channel on exactly one worker and shard.
+/// partitioned by their deterministic shard-local order, keeping every channel
+/// on exactly one worker without aliasing fleet-shard and worker moduli.
 pub async fn run(sources: Vec<Box<dyn RequestSource>>, cfg: DriverConfig) -> DriverReport {
     let source_count = sources.len().max(1);
     let phase_denominator = sources
@@ -266,8 +266,13 @@ pub async fn run(sources: Vec<Box<dyn RequestSource>>, cfg: DriverConfig) -> Dri
     let worker_count = cfg.workers.clamp(1, source_count);
     let mut partitions: Vec<Vec<Box<dyn RequestSource>>> =
         (0..worker_count).map(|_| Vec::new()).collect();
-    for source in sources {
-        let worker = source.user_index() as usize % worker_count;
+    // The fleet shard already selected a strided subset of global user IDs.
+    // Modding those IDs again by a worker count that shares a factor with the
+    // shard count collapses work onto only a fraction of workers (for example,
+    // 8 fleet shards × 128 workers activated only 16 workers per process).
+    // The shard-local sequence is stable and distributes every shard evenly.
+    for (local_index, source) in sources.into_iter().enumerate() {
+        let worker = local_index % worker_count;
         partitions[worker].push(source);
     }
 
@@ -710,10 +715,12 @@ mod tests {
             .unwrap();
         });
         let barrier = Arc::new(std::sync::Barrier::new(4));
+        // Strided global IDs model one fleet shard. Assignment by global ID
+        // would collapse all four onto worker zero because 4 divides each ID.
         let sources: Vec<Box<dyn RequestSource>> = (0..4)
             .map(|index| {
                 Box::new(TestSource {
-                    index,
+                    index: index * 4,
                     url: format!("http://{address}/"),
                     logical_payment: false,
                     issued: Arc::new(AtomicU64::new(0)),
