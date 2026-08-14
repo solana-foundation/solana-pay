@@ -12,7 +12,7 @@ use anyhow::{Result, bail};
 use async_trait::async_trait;
 
 use super::{
-    BenchScheme, Endpoint, Load, PerUserFunding, PreparedRequest, ResolvedPrice, UserCtx, UserSetup,
+    BenchScheme, Endpoint, Load, PerUserFunding, RequestSource, ResolvedPrice, UserCtx, UserSetup,
 };
 
 pub struct X402Exact;
@@ -40,12 +40,11 @@ impl BenchScheme for X402Exact {
         Ok(UserSetup::default())
     }
 
-    async fn prepare(
+    async fn request_source(
         &self,
         _ctx: &UserCtx,
         _setup: &UserSetup,
-        _n: usize,
-    ) -> Result<Vec<PreparedRequest>> {
+    ) -> Result<Box<dyn RequestSource>> {
         bail!("x402_exact not implemented yet (M5): build_payment per request")
     }
 

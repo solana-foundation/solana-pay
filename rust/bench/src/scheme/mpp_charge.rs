@@ -12,8 +12,8 @@ use pay_kit::mpp::solana_keychain::memory::MemorySigner;
 use pay_kit::mpp::solana_rpc_client::rpc_client::RpcClient;
 
 use super::{
-    BenchScheme, Endpoint, Load, PerUserFunding, PreparedRequest, ResolvedPrice, UserCtx,
-    UserSetup, build_request, www_authenticate,
+    BenchScheme, Endpoint, Load, PerUserFunding, PreparedRequest, RequestSource, ResolvedPrice,
+    UserCtx, UserSetup, build_request, www_authenticate,
 };
 
 pub struct MppCharge;
@@ -108,56 +108,76 @@ impl BenchScheme for MppCharge {
         Ok(UserSetup::default())
     }
 
-    async fn prepare(
+    async fn request_source(
         &self,
         ctx: &UserCtx,
         _setup: &UserSetup,
-        n: usize,
-    ) -> Result<Vec<PreparedRequest>> {
-        let signer = MemorySigner::from_bytes(&ctx.wallet.keypair)
-            .map_err(|e| anyhow::anyhow!("signer from keypair: {e}"))?;
-        let rpc = RpcClient::new(ctx.rpc_url.clone());
-
-        let mut out = Vec::with_capacity(n);
-        for _ in 0..n {
-            // Each credential is single-use, so fetch a fresh challenge each time.
-            let resp = build_request(
-                &ctx.http,
-                &ctx.endpoint.method,
-                &ctx.endpoint.url,
-                &ctx.endpoint.body,
-                ctx.host_override.as_deref(),
-                &[],
-            )
-            .send()
-            .await
-            .context("prepare: challenge request failed")?;
-            if resp.status().as_u16() != 402 {
-                bail!("prepare: expected 402, got {}", resp.status());
-            }
-            let www = www_authenticate(&resp).context("prepare: no www-authenticate")?;
-            let challenge = pay_kit::mpp::parse_www_authenticate(&www)
-                .map_err(|e| anyhow::anyhow!("prepare: parse challenge: {e}"))?;
-            let auth = pay_kit::mpp::client::build_credential_header(&signer, &rpc, &challenge)
-                .await
-                .map_err(|e| anyhow::anyhow!("prepare: build credential: {e}"))?;
-
-            let mut headers = vec![("authorization".to_string(), auth)];
-            if let Some(host) = &ctx.host_override {
-                headers.push(("host".to_string(), host.clone()));
-            }
-            out.push(PreparedRequest {
-                method: ctx.endpoint.method.clone(),
-                url: ctx.endpoint.url.clone(),
-                headers,
-                body: ctx.endpoint.body.clone(),
-            });
-        }
-        Ok(out)
+    ) -> Result<Box<dyn RequestSource>> {
+        Ok(Box::new(ChargeSource {
+            index: ctx.index,
+            keypair: ctx.wallet.keypair,
+            rpc_url: ctx.rpc_url.clone(),
+            endpoint: ctx.endpoint.clone(),
+            http: ctx.http.clone(),
+            host_override: ctx.host_override.clone(),
+        }))
     }
 
     async fn settle_and_close(&self, _ctx: &UserCtx, _setup: &UserSetup) -> Result<()> {
         // Nothing to settle for charge; the engine sweeps residual funds.
         Ok(())
+    }
+}
+
+struct ChargeSource {
+    index: u32,
+    keypair: [u8; 64],
+    rpc_url: String,
+    endpoint: Endpoint,
+    http: reqwest::Client,
+    host_override: Option<String>,
+}
+
+#[async_trait]
+impl RequestSource for ChargeSource {
+    fn user_index(&self) -> u32 {
+        self.index
+    }
+
+    async fn next_request(&mut self) -> Result<PreparedRequest> {
+        let resp = build_request(
+            &self.http,
+            &self.endpoint.method,
+            &self.endpoint.url,
+            &self.endpoint.body,
+            self.host_override.as_deref(),
+            &[],
+        )
+        .send()
+        .await
+        .context("charge: challenge request failed")?;
+        if resp.status().as_u16() != 402 {
+            bail!("charge: expected 402, got {}", resp.status());
+        }
+        let www = www_authenticate(&resp).context("charge: no www-authenticate")?;
+        let challenge = pay_kit::mpp::parse_www_authenticate(&www)
+            .map_err(|e| anyhow::anyhow!("charge: parse challenge: {e}"))?;
+        let signer = MemorySigner::from_bytes(&self.keypair)
+            .map_err(|e| anyhow::anyhow!("signer from keypair: {e}"))?;
+        let rpc = RpcClient::new(self.rpc_url.clone());
+        let auth = pay_kit::mpp::client::build_credential_header(&signer, &rpc, &challenge)
+            .await
+            .map_err(|e| anyhow::anyhow!("charge: build credential: {e}"))?;
+        let mut headers = vec![("authorization".to_string(), auth)];
+        if let Some(host) = &self.host_override {
+            headers.push(("host".to_string(), host.clone()));
+        }
+        Ok(PreparedRequest {
+            method: self.endpoint.method.clone(),
+            url: self.endpoint.url.clone(),
+            headers,
+            body: self.endpoint.body.clone(),
+            logical_payment: true,
+        })
     }
 }

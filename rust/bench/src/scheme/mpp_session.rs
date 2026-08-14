@@ -24,8 +24,8 @@ use pay_kit::mpp::solana_keychain::memory::MemorySigner;
 use pay_kit::mpp::{PaymentCredential, format_authorization};
 
 use super::{
-    BenchScheme, Endpoint, Load, PerUserFunding, PreparedRequest, ResolvedPrice, UserCtx,
-    UserSetup, build_request, www_authenticate,
+    BenchScheme, Endpoint, Load, PerUserFunding, PreparedRequest, RequestSource, ResolvedPrice,
+    UserCtx, UserSetup, build_request, www_authenticate,
 };
 use crate::config::RunConfig;
 use crate::wallet;
@@ -201,35 +201,23 @@ impl BenchScheme for MppSession {
         })
     }
 
-    async fn prepare(
+    async fn request_source(
         &self,
         ctx: &UserCtx,
         _setup: &UserSetup,
-        n: usize,
-    ) -> Result<Vec<PreparedRequest>> {
+    ) -> Result<Box<dyn RequestSource>> {
         let handle = self
             .handle(ctx.index)
             .with_context(|| format!("no session handle for user {}", ctx.index))?;
-        let mut out = Vec::with_capacity(n);
-        for _ in 0..n {
-            // Each call advances the cumulative watermark by voucher_base; fired
-            // in order by the driver, the server sees strictly increasing vouchers.
-            let auth = handle
-                .voucher_header(self.voucher_base)
-                .await
-                .map_err(|e| anyhow::anyhow!("voucher_header: {e}"))?;
-            let mut headers = vec![("authorization".to_string(), auth)];
-            if let Some(host) = &ctx.host_override {
-                headers.push(("host".to_string(), host.clone()));
-            }
-            out.push(PreparedRequest {
-                method: ctx.endpoint.method.clone(),
-                url: ctx.endpoint.url.clone(),
-                headers,
-                body: ctx.endpoint.body.clone(),
-            });
-        }
-        Ok(out)
+        Ok(Box::new(SessionSource {
+            index: ctx.index,
+            handle,
+            voucher_base: self.voucher_base,
+            method: ctx.endpoint.method.clone(),
+            url: ctx.endpoint.url.clone(),
+            host_override: ctx.host_override.clone(),
+            body: ctx.endpoint.body.clone(),
+        }))
     }
 
     async fn settle_and_close(&self, ctx: &UserCtx, _setup: &UserSetup) -> Result<()> {
@@ -255,5 +243,41 @@ impl BenchScheme for MppSession {
             tracing::warn!(index = ctx.index, status = %resp.status(), "session close not accepted");
         }
         Ok(())
+    }
+}
+
+struct SessionSource {
+    index: u32,
+    handle: SessionHandle,
+    voucher_base: u64,
+    method: String,
+    url: String,
+    host_override: Option<String>,
+    body: String,
+}
+
+#[async_trait]
+impl RequestSource for SessionSource {
+    fn user_index(&self) -> u32 {
+        self.index
+    }
+
+    async fn next_request(&mut self) -> Result<PreparedRequest> {
+        let auth = self
+            .handle
+            .voucher_header(self.voucher_base)
+            .await
+            .map_err(|e| anyhow::anyhow!("voucher_header: {e}"))?;
+        let mut headers = vec![("authorization".to_string(), auth)];
+        if let Some(host) = &self.host_override {
+            headers.push(("host".to_string(), host.clone()));
+        }
+        Ok(PreparedRequest {
+            method: self.method.clone(),
+            url: self.url.clone(),
+            headers,
+            body: self.body.clone(),
+            logical_payment: true,
+        })
     }
 }

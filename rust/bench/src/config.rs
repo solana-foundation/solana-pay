@@ -115,6 +115,16 @@ pub struct Load {
     /// Cap on in-flight requests across all users.
     #[serde(default = "default_max_concurrency")]
     pub max_concurrency: usize,
+    /// Fixed generator workers. Channels are deterministically assigned by
+    /// user index, avoiding one Tokio task and interval per logical session.
+    #[serde(default = "default_worker_count")]
+    pub workers: usize,
+    /// Deterministic generator-fleet shard index, zero based.
+    #[serde(default)]
+    pub shard_index: usize,
+    /// Total generator-fleet shards. Each channel is assigned to exactly one.
+    #[serde(default = "default_shard_count")]
+    pub shard_count: usize,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -161,6 +171,12 @@ fn default_unleash_secs() -> u64 {
 fn default_max_concurrency() -> usize {
     2048
 }
+fn default_worker_count() -> usize {
+    32
+}
+fn default_shard_count() -> usize {
+    1
+}
 fn default_method() -> String {
     "POST".into()
 }
@@ -187,6 +203,12 @@ impl RunConfig {
         }
         if self.load.requests_per_sec_per_user <= 0.0 {
             bail!("load.requests_per_sec_per_user must be > 0");
+        }
+        if self.load.workers == 0 {
+            bail!("load.workers must be > 0");
+        }
+        if self.load.shard_count == 0 || self.load.shard_index >= self.load.shard_count {
+            bail!("load.shard_index must be less than non-zero load.shard_count");
         }
         if self.endpoints.is_empty() {
             bail!("at least one endpoint is required");

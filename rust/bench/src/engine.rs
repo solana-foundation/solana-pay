@@ -2,6 +2,7 @@
 //! settle+sweep, journalled at every transition. Scheme- and funder-agnostic;
 //! the rehearsal (fork) and mainnet paths share this code.
 
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
@@ -13,7 +14,7 @@ use crate::config::RunConfig;
 use crate::driver::{self, DriverConfig};
 use crate::journal::{Journal, Status, UserRecord};
 use crate::report::ReportJson;
-use crate::scheme::{BenchScheme, PreparedRequest, UserCtx, UserSetup};
+use crate::scheme::{BenchScheme, UserCtx, UserSetup};
 use crate::wallet::{self, Funder};
 
 /// Concurrency for the on-chain provisioning + off-chain prepare phases.
@@ -91,6 +92,7 @@ pub async fn run_pipeline(p: PipelineParams<'_>) -> Result<ReportJson> {
         .pool_max_idle_per_host(64)
         .build()?;
     let ctxs: Vec<UserCtx> = (0..load.users as u32)
+        .filter(|index| *index as usize % load.shard_count == load.shard_index)
         .map(|i| UserCtx {
             index: i,
             wallet: wallet::derive_user(&p.funder_seed, p.wallet_set_id, i),
@@ -121,17 +123,18 @@ pub async fn run_pipeline(p: PipelineParams<'_>) -> Result<ReportJson> {
             .instrument(tracing::info_span!("provision", index = ctx.index))
         })
         .buffer_unordered(PROVISION_CONCURRENCY)
-        .collect()
+        .collect::<Vec<_>>()
         .await;
 
     prov.sort_by_key(|(i, _)| *i);
+    let ctx_by_index: HashMap<u32, &UserCtx> = ctxs.iter().map(|ctx| (ctx.index, ctx)).collect();
     let mut setups: Vec<UserSetup> = Vec::with_capacity(ctxs.len());
     for (idx, res) in prov {
         match res {
             Ok(setup) => {
                 p.journal.upsert_user(UserRecord {
                     index: idx,
-                    pubkey: ctxs[idx as usize].wallet.pubkey.to_string(),
+                    pubkey: ctx_by_index[&idx].wallet.pubkey.to_string(),
                     ata: setup.ata.clone(),
                     channel_id: setup.channel_id.clone(),
                     open_sig: setup.open_sig.clone(),
@@ -155,29 +158,28 @@ pub async fn run_pipeline(p: PipelineParams<'_>) -> Result<ReportJson> {
         "phase: provisioned"
     );
 
-    // ── 5. Prepare: pre-build each user's request buffer (off-chain) ────────
-    let n = (load.requests_per_sec_per_user * load.unleash_secs as f64).ceil() as usize + 4;
+    // ── 5. Build bounded per-user request sources ──────────────────────────
+    // Sources sign only when their worker dispatches a request. This keeps
+    // memory independent of the measured-window length.
     let t_prepare = Instant::now();
-    let prepared: Vec<Result<Vec<PreparedRequest>>> = stream::iter(ctxs.iter().zip(setups.iter()))
+    let prepared = stream::iter(ctxs.iter().zip(setups.iter()))
         .map(|(ctx, setup)| {
             scheme
-                .prepare(ctx, setup, n)
-                .instrument(tracing::info_span!("prepare", index = ctx.index))
+                .request_source(ctx, setup)
+                .instrument(tracing::info_span!("request_source", index = ctx.index))
         })
         .buffer_unordered(PREPARE_CONCURRENCY)
-        .collect()
+        .collect::<Vec<_>>()
         .await;
-    let mut buffers: Vec<Vec<PreparedRequest>> = Vec::with_capacity(prepared.len());
+    let mut sources = Vec::with_capacity(prepared.len());
     for r in prepared {
-        buffers.push(r.context("preparing request buffer")?);
+        sources.push(r.context("building request source")?);
     }
     p.journal.set_status(Status::Prepared)?;
-    let total_prepared: usize = buffers.iter().map(Vec::len).sum();
     tracing::info!(
-        total_prepared,
-        per_user = n,
+        sources = sources.len(),
         elapsed_ms = t_prepare.elapsed().as_millis() as u64,
-        "phase: prepared request buffers"
+        "phase: bounded request sources ready"
     );
 
     // ── 6. Unleash (measured) ───────────────────────────────────────────────
@@ -190,9 +192,10 @@ pub async fn run_pipeline(p: PipelineParams<'_>) -> Result<ReportJson> {
         // connection instead of churning loopback ephemeral ports (the prior
         // 256 vs 4096+ mismatch caused connect storms → backlog overflow).
         pool_per_host: load.max_concurrency.max(256),
+        workers: load.workers,
     };
     let http = driver::build_http(&dcfg);
-    let report = driver::run(buffers, http, dcfg)
+    let report = driver::run(sources, http, dcfg)
         .instrument(tracing::info_span!("unleash"))
         .await;
     tracing::info!(
@@ -240,7 +243,7 @@ pub async fn run_pipeline(p: PipelineParams<'_>) -> Result<ReportJson> {
         &run_id,
         scheme.name(),
         cfg.run.network.slug(),
-        load.users,
+        ctxs.len(),
         load.requests_per_sec_per_user,
         &report,
     ))

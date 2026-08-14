@@ -71,6 +71,18 @@ pub struct PreparedRequest {
     pub url: String,
     pub headers: Vec<(String, String)>,
     pub body: String,
+    /// Only a fresh voucher accepted with a successful response is a logical
+    /// payment. Free generator-ceiling traffic must never affect this count.
+    pub logical_payment: bool,
+}
+
+/// Bounded, per-channel request producer. Sources are owned by one load
+/// worker, which preserves voucher ordering by keeping at most one request
+/// from a source in flight.
+#[async_trait]
+pub trait RequestSource: Send {
+    fn user_index(&self) -> u32;
+    async fn next_request(&mut self) -> Result<PreparedRequest>;
 }
 
 /// Result of firing one prepared request. (The driver records into its own
@@ -102,13 +114,14 @@ pub trait BenchScheme: Send + Sync {
     /// On-chain (or registration) setup for one user. Charge: no-op.
     async fn provision_user(&self, ctx: &UserCtx) -> Result<UserSetup>;
 
-    /// Build `n` ready-to-fire requests for one user (off-chain signing).
-    async fn prepare(
+    /// Create the bounded request producer for one user. Implementations must
+    /// not pre-build the timed run; the driver asks for exactly one request
+    /// when the source is eligible to dispatch.
+    async fn request_source(
         &self,
         ctx: &UserCtx,
         setup: &UserSetup,
-        n: usize,
-    ) -> Result<Vec<PreparedRequest>>;
+    ) -> Result<Box<dyn RequestSource>>;
 
     /// Settle + close for one user. Charge: no-op (engine sweeps funds).
     async fn settle_and_close(&self, ctx: &UserCtx, setup: &UserSetup) -> Result<()>;

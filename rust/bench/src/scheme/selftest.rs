@@ -11,7 +11,8 @@ use anyhow::Result;
 use async_trait::async_trait;
 
 use super::{
-    BenchScheme, Endpoint, Load, PerUserFunding, PreparedRequest, ResolvedPrice, UserCtx, UserSetup,
+    BenchScheme, Endpoint, Load, PerUserFunding, PreparedRequest, RequestSource, ResolvedPrice,
+    UserCtx, UserSetup,
 };
 
 pub struct SelfTest;
@@ -47,27 +48,50 @@ impl BenchScheme for SelfTest {
         Ok(UserSetup::default())
     }
 
-    async fn prepare(
+    async fn request_source(
         &self,
         ctx: &UserCtx,
         _setup: &UserSetup,
-        n: usize,
-    ) -> Result<Vec<PreparedRequest>> {
+    ) -> Result<Box<dyn RequestSource>> {
         let mut headers = Vec::new();
         if let Some(host) = &ctx.host_override {
             headers.push(("host".to_string(), host.clone()));
         }
-        // All requests are identical plain GETs — cheap to pre-build in bulk.
-        let req = PreparedRequest {
+        Ok(Box::new(SelfTestSource {
+            index: ctx.index,
             method: ctx.endpoint.method.clone(),
             url: ctx.endpoint.url.clone(),
             headers,
             body: ctx.endpoint.body.clone(),
-        };
-        Ok(vec![req; n])
+        }))
     }
 
     async fn settle_and_close(&self, _ctx: &UserCtx, _setup: &UserSetup) -> Result<()> {
         Ok(())
+    }
+}
+
+struct SelfTestSource {
+    index: u32,
+    method: String,
+    url: String,
+    headers: Vec<(String, String)>,
+    body: String,
+}
+
+#[async_trait]
+impl RequestSource for SelfTestSource {
+    fn user_index(&self) -> u32 {
+        self.index
+    }
+
+    async fn next_request(&mut self) -> Result<PreparedRequest> {
+        Ok(PreparedRequest {
+            method: self.method.clone(),
+            url: self.url.clone(),
+            headers: self.headers.clone(),
+            body: self.body.clone(),
+            logical_payment: false,
+        })
     }
 }
