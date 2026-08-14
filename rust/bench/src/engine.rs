@@ -10,7 +10,7 @@ use futures::stream::{self, StreamExt};
 use solana_pubkey::Pubkey;
 use tracing::Instrument;
 
-use crate::config::RunConfig;
+use crate::config::{RunConfig, Scheme};
 use crate::driver::{self, DriverConfig};
 use crate::journal::{Journal, Status, UserRecord};
 use crate::report::ReportJson;
@@ -49,6 +49,8 @@ pub async fn run_pipeline(p: PipelineParams<'_>) -> Result<ReportJson> {
     let scheme = p.scheme;
     let funder = p.funder;
     let run_id = p.journal.state().run_id.clone();
+    let no_chain = cfg.run.scheme == Scheme::SelfTest
+        || cfg.session.as_ref().is_some_and(|session| session.offline);
 
     // ── 1. Resolve price from a 402 probe ───────────────────────────────────
     let probe = reqwest::Client::builder()
@@ -132,17 +134,19 @@ pub async fn run_pipeline(p: PipelineParams<'_>) -> Result<ReportJson> {
     for (idx, res) in prov {
         match res {
             Ok(setup) => {
-                p.journal.upsert_user(UserRecord {
-                    index: idx,
-                    pubkey: ctx_by_index[&idx].wallet.pubkey.to_string(),
-                    ata: setup.ata.clone(),
-                    channel_id: setup.channel_id.clone(),
-                    open_sig: setup.open_sig.clone(),
-                    token_base: per.token_base,
-                    sol_lamports: per.sol_lamports,
-                    funded: true,
-                    swept: false,
-                })?;
+                if !no_chain {
+                    p.journal.upsert_user(UserRecord {
+                        index: idx,
+                        pubkey: ctx_by_index[&idx].wallet.pubkey.to_string(),
+                        ata: setup.ata.clone(),
+                        channel_id: setup.channel_id.clone(),
+                        open_sig: setup.open_sig.clone(),
+                        token_base: per.token_base,
+                        sol_lamports: per.sol_lamports,
+                        funded: true,
+                        swept: false,
+                    })?;
+                }
                 setups.push(setup);
             }
             Err(e) => {
@@ -211,26 +215,28 @@ pub async fn run_pipeline(p: PipelineParams<'_>) -> Result<ReportJson> {
     // ── 7. Settle + sweep ───────────────────────────────────────────────────
     p.journal.set_status(Status::Settling)?;
     let t_settle = Instant::now();
-    for (ctx, setup) in ctxs.iter().zip(setups.iter()) {
-        scheme
-            .settle_and_close(ctx, setup)
-            .await
-            .with_context(|| format!("settling user {}", ctx.index))?;
-    }
-    for ctx in &ctxs {
-        funder
-            .sweep(&ctx.wallet, mint_pk.as_ref())
-            .await
-            .with_context(|| format!("sweeping user {}", ctx.index))?;
-        if let Some(rec) = p
-            .journal
-            .state()
-            .users
-            .iter()
-            .find(|u| u.index == ctx.index)
-            .cloned()
-        {
-            p.journal.upsert_user(UserRecord { swept: true, ..rec })?;
+    if !no_chain {
+        for (ctx, setup) in ctxs.iter().zip(setups.iter()) {
+            scheme
+                .settle_and_close(ctx, setup)
+                .await
+                .with_context(|| format!("settling user {}", ctx.index))?;
+        }
+        for ctx in &ctxs {
+            funder
+                .sweep(&ctx.wallet, mint_pk.as_ref())
+                .await
+                .with_context(|| format!("sweeping user {}", ctx.index))?;
+            if let Some(rec) = p
+                .journal
+                .state()
+                .users
+                .iter()
+                .find(|u| u.index == ctx.index)
+                .cloned()
+            {
+                p.journal.upsert_user(UserRecord { swept: true, ..rec })?;
+            }
         }
     }
     p.journal.set_status(Status::Swept)?;
