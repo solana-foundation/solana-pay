@@ -28,6 +28,7 @@ use super::{
     UserCtx, UserSetup, build_request, www_authenticate,
 };
 use crate::config::RunConfig;
+use crate::seeded_session;
 use crate::wallet;
 
 /// SOL funded per user: a payment-channel open needs rent plus a fee margin.
@@ -37,6 +38,7 @@ pub struct MppSession {
     deposit_base: u64,
     voucher_base: u64,
     offline: bool,
+    offline_namespace: String,
     /// Live channel handles, keyed by user index. `SessionHandle` is `Clone`
     /// (Arc inside), so we clone one out under the lock and `.await` on it —
     /// never holding the std mutex across an await.
@@ -56,6 +58,7 @@ impl MppSession {
             deposit_base: (deposit_usdc * 1e6) as u64,
             voucher_base: (voucher_usdc * 1e6).max(1.0) as u64,
             offline,
+            offline_namespace: cfg.run.name.clone(),
             handles: Mutex::new(HashMap::new()),
         }
     }
@@ -124,6 +127,40 @@ impl BenchScheme for MppSession {
     }
 
     async fn provision_user(&self, ctx: &UserCtx) -> Result<UserSetup> {
+        if self.offline {
+            // The server owns a benchmark-only confirmed-state fixture. The
+            // client still obtains and echoes a real signed challenge, then
+            // signs normal vouchers; no open bypass exists in Pay's CLI.
+            let resp = build_request(
+                &ctx.http,
+                &ctx.endpoint.method,
+                &ctx.endpoint.url,
+                &ctx.endpoint.body,
+                ctx.host_override.as_deref(),
+                &[],
+            )
+            .send()
+            .await
+            .context("offline provision: challenge request failed")?;
+            if resp.status().as_u16() != 402 {
+                bail!("offline provision: expected 402, got {}", resp.status());
+            }
+            let www = www_authenticate(&resp).context("offline provision: no session challenge")?;
+            let (challenge, _) = SessionHandle::parse_challenge(&www)
+                .context("offline provision: invalid challenge")?;
+            let material = seeded_session::handle_for_challenge(
+                &self.offline_namespace,
+                ctx.index,
+                challenge,
+            )?;
+            let channel_id = material.channel_id().await;
+            self.handles.lock().unwrap().insert(ctx.index, material);
+            return Ok(UserSetup {
+                channel_id: Some(channel_id),
+                open_sig: None,
+                ata: None,
+            });
+        }
         // 1. Fresh session 402 → challenge + request (operator, cap).
         let resp = build_request(
             &ctx.http,

@@ -5,6 +5,7 @@
 //! same engine code.
 
 use std::sync::Arc;
+use tokio::sync::watch;
 
 use anyhow::{Context, Result};
 use axum::routing::any;
@@ -23,9 +24,34 @@ use crate::engine::{self, PipelineParams};
 use crate::journal::{self, Journal};
 use crate::report::ReportJson;
 use crate::scheme;
+use crate::seeded_session;
 use crate::wallet::{self, ForkFunder};
 
 const PROVIDER_SPEC: &str = include_str!("../configs/bench-provider.yml");
+const GATE_ONLY_PROVIDER_SPEC: &str = r#"
+name: bench
+subdomain: bench
+title: "Bench Gate-Only API"
+description: "Minimal MPP-session verifier fixture."
+category: ai_ml
+version: v1
+routing:
+  type: respond
+accounting: pooled
+endpoints:
+  - method: POST
+    path: "v1/charge"
+    resource: "charge"
+    description: "Flat rate per request."
+    metering:
+      schemes: [mpp-session]
+      dimensions:
+        - direction: usage
+          unit: requests
+          scale: 1
+          tiers:
+            - price_usd: 0.001
+"#;
 
 /// Strip the query string (e.g. `?api-key=…`) before logging a datasource URL.
 fn redact(url: &str) -> &str {
@@ -34,11 +60,31 @@ fn redact(url: &str) -> &str {
 const HOST_HEADER: &str = "bench.localhost";
 const CHARGE_PATH: &str = "v1/charge";
 
+fn local_usdc_currency() -> Result<String> {
+    pay_kit::mpp::resolve_stablecoin_mint("USDC", Some("localnet"))
+        .map(str::to_string)
+        .context("resolve local USDC mint")
+}
+
 #[derive(Clone)]
 struct AppState {
     apis: Arc<Vec<ApiSpec>>,
     mpp: Option<Mpp>,
     session_mpp: Option<Arc<SessionMpp>>,
+}
+
+/// Handles for the two benchmark-only listeners. The public listener is the
+/// production `Http402Gate`; the axum listener is only its internal control
+/// plane for free/discovery paths. Dropping this shuts the Pingora process down.
+struct OfflineProxy {
+    url: String,
+    shutdown: watch::Sender<bool>,
+}
+
+impl Drop for OfflineProxy {
+    fn drop(&mut self) {
+        let _ = self.shutdown.send(true);
+    }
 }
 
 impl PaymentState for AppState {
@@ -103,6 +149,7 @@ fn build_state(
 ) -> Result<AppState> {
     match scheme {
         Scheme::MppSession => {
+            let currency = local_usdc_currency()?;
             // With an operator signer, session closes can settle on-chain
             // through the batched worker. Without one, the benchmark still
             // exercises open and voucher verification but does not settle.
@@ -112,10 +159,10 @@ fn build_state(
                     recipient: recipient.to_string(),
                     amount: 1_000,
                     suggested_deposit: Some(1_000_000_000),
-                    // PayKit resolves this canonical symbol to the
-                    // corresponding settlement mint when building the
-                    // challenge.
-                    currency: "USDC".to_string(),
+                    // The gate dispatches by the exact canonical challenge
+                    // currency, which is the settlement mint rather than the
+                    // human-friendly USDC symbol.
+                    currency,
                     decimals: 6,
                     network: "localnet".to_string(),
                     voucher_signer: VoucherSigner::Client,
@@ -282,6 +329,11 @@ async fn drive(
 /// Run a full rehearsal of `cfg` against a local fork (proxy + driver in one
 /// process). Returns the report.
 pub async fn run(mut cfg: RunConfig) -> Result<ReportJson> {
+    if is_offline(&cfg) {
+        let proxy_url = setup_offline_proxy(&cfg).await?;
+        rewrite_endpoints(&mut cfg, &proxy_url.url);
+        return drive(&cfg, &wallet::NoopFunder, "offline".to_string()).await;
+    }
     let (surfnet, proxy_url, rpc_url) = setup_fork_proxy(&cfg).await?;
     rewrite_endpoints(&mut cfg, &proxy_url);
     let funder = ForkFunder { surfnet: &surfnet };
@@ -292,44 +344,96 @@ fn is_offline(cfg: &RunConfig) -> bool {
     cfg.session.as_ref().map(|s| s.offline).unwrap_or(false)
 }
 
-/// Offline axum proxy: no fork. Current PayKit still requires a verifiable
-/// payment-channel open, so this path is kept for the forthcoming synthetic
-/// verification fixture rather than reported as a production-session run.
-async fn setup_offline_proxy() -> Result<String> {
+/// Offline Pingora proxy: no fork. It uses the benchmark-only confirmed-state
+/// fixture and must never be reported as an open-channel or network benchmark.
+async fn setup_offline_proxy(cfg: &RunConfig) -> Result<OfflineProxy> {
     let operator = Keypair::new().pubkey().to_string();
     let recipient = Keypair::new().pubkey().to_string();
-    let api: ApiSpec = serde_yml::from_str(PROVIDER_SPEC).context("parse rehearsal provider")?;
-    let session_mpp = SessionMpp::new(
+    let api: ApiSpec =
+        serde_yml::from_str(GATE_ONLY_PROVIDER_SPEC).context("parse gate-only provider")?;
+    let session_mpp = seeded_session::build(
         SessionConfig {
             operator,
             recipient,
             amount: 1_000,
             suggested_deposit: Some(1_000_000_000),
-            currency: "USDC".to_string(),
+            currency: local_usdc_currency()?,
             decimals: 6,
             network: "localnet".to_string(),
             voucher_signer: VoucherSigner::Client,
             rpc_url: None,
             ..Default::default()
         },
-        "bench-session-secret",
-    );
+        &cfg.run.name,
+        cfg.session
+            .as_ref()
+            .expect("validated session config")
+            .offline_seeded_channels,
+    )
+    .await?;
     let state = AppState {
         apis: Arc::new(vec![api]),
         mpp: None,
-        session_mpp: Some(Arc::new(session_mpp)),
+        session_mpp: Some(session_mpp.session),
     };
-    serve(state).await
+    let control_plane = serve(state.clone()).await?;
+    let control_plane = control_plane
+        .strip_prefix("http://")
+        .context("offline control-plane URL must use http")?
+        .to_string();
+
+    // Pingora currently accepts a bind address rather than an already-bound
+    // socket. Reserve a loopback port immediately before starting it; this is
+    // benchmark-local and never exposes the fixture on a public interface.
+    let listener =
+        std::net::TcpListener::bind("127.0.0.1:0").context("reserve offline Pingora listener")?;
+    let bind = listener
+        .local_addr()
+        .context("read offline Pingora listener address")?
+        .to_string();
+    drop(listener);
+    let (shutdown, receiver) = watch::channel(false);
+    let gate_bind = bind.clone();
+    std::thread::Builder::new()
+        .name("pay-bench-pingora".to_string())
+        .spawn(move || {
+            if let Err(error) =
+                pay_proxy::run_with_shutdown(state, &gate_bind, control_plane, None, receiver)
+            {
+                tracing::error!(%error, "offline Pingora gate stopped unexpectedly");
+            }
+        })
+        .context("start offline Pingora gate")?;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        if tokio::net::TcpStream::connect(&bind).await.is_ok() {
+            break;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            anyhow::bail!("offline Pingora gate did not bind {bind} within five seconds");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    Ok(OfflineProxy {
+        url: format!("http://{bind}"),
+        shutdown,
+    })
 }
 
 /// Spin **only** the proxy and block — so it can be profiled in isolation while
 /// a separate `bench load` process drives it. Offline (no fork) when configured.
 pub async fn serve_proxy(cfg: RunConfig) -> Result<()> {
     if is_offline(&cfg) {
-        let proxy_url = setup_offline_proxy().await?;
-        println!("\n  proxy_url = {proxy_url}   (offline — no rpc needed)\n");
-        println!("drive it:\n  bench load <config> --proxy {proxy_url} --rpc unused\n");
-        tracing::info!(%proxy_url, "offline axum proxy serving (Ctrl-C to stop)");
+        let proxy_url = setup_offline_proxy(&cfg).await?;
+        println!(
+            "\n  proxy_url = {}   (offline — no rpc needed)\n",
+            proxy_url.url
+        );
+        println!(
+            "drive it:\n  bench load <config> --proxy {} --rpc unused\n",
+            proxy_url.url
+        );
+        tracing::info!(proxy_url = %proxy_url.url, "offline Pingora proxy serving (Ctrl-C to stop)");
         tokio::signal::ctrl_c().await.ok();
         return Ok(());
     }
@@ -355,4 +459,79 @@ pub async fn load(mut cfg: RunConfig, proxy_url: String, rpc_url: String) -> Res
         rpc_url: rpc_url.clone(),
     };
     drive(&cfg, &funder, rpc_url).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{FunderCfg, Load, RunMeta, Safety, SessionCfg};
+    use crate::scheme::www_authenticate;
+    use pay_core::client::session::SessionHandle;
+
+    fn offline_config() -> RunConfig {
+        RunConfig {
+            run: RunMeta {
+                name: "offline-http-equivalence".to_string(),
+                scheme: Scheme::MppSession,
+                network: Network::Fork,
+                rpc_url_env: None,
+                rpc_url: None,
+                mint: None,
+                funder: FunderCfg::default(),
+                safety: Safety {
+                    max_total_usdc: 0.0,
+                    max_total_sol: 0.0,
+                    require_confirmation: false,
+                },
+            },
+            load: Load {
+                users: 1,
+                requests_per_sec_per_user: 1.0,
+                prepare_secs: 0,
+                unleash_secs: 1,
+                max_concurrency: 1,
+                workers: 1,
+                shard_index: 0,
+                shard_count: 1,
+            },
+            endpoints: vec![],
+            session: Some(SessionCfg {
+                deposit_usdc: 1.0,
+                voucher_usdc: 0.000001,
+                settle_onchain: false,
+                offline: true,
+                offline_seeded_channels: 1,
+            }),
+        }
+    }
+
+    #[tokio::test]
+    async fn seeded_fixture_voucher_passes_the_http_gate() {
+        let cfg = offline_config();
+        let proxy = setup_offline_proxy(&cfg).await.unwrap();
+        let client = reqwest::Client::new();
+        let challenge = client
+            .post(format!("{}/v1/charge", proxy.url))
+            .header("host", HOST_HEADER)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(challenge.status(), reqwest::StatusCode::PAYMENT_REQUIRED);
+        let header = www_authenticate(&challenge).unwrap();
+        let (challenge, _) = SessionHandle::parse_challenge(&header).unwrap();
+        let request: pay_kit::mpp::SessionRequest = challenge.request.decode().unwrap();
+        assert_eq!(request.currency, local_usdc_currency().unwrap());
+        let handle = seeded_session::handle_for_challenge(&cfg.run.name, 0, challenge).unwrap();
+        let voucher = handle.voucher_header(1).await.unwrap();
+        let response = client
+            .post(format!("{}/v1/charge", proxy.url))
+            .header("host", HOST_HEADER)
+            .header("authorization", voucher)
+            .send()
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = response.text().await.unwrap();
+        assert!(status.is_success(), "status {status}: {body}");
+    }
 }

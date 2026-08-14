@@ -16,6 +16,7 @@ pay-types = { path = "crates/types" }
 pay-keystore = { path = "crates/keystore" }
 pay-mcp = { path = "crates/mcp" }
 pay-pdb = { path = "crates/pdb" }
+pay-proxy = { path = "crates/proxy" }
 
 # CLI
 clap = { version = "4", features = ["derive", "wrap_help"] }

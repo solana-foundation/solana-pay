@@ -151,12 +151,16 @@ pub struct SessionCfg {
     /// stand-in (settlement is a no-op).
     #[serde(default)]
     pub settle_onchain: bool,
-    /// Pure off-chain mode (no surfpool/fork): opens are recorded with a dummy
-    /// signature and vouchers verified off-chain (`rpc_url=None`). Isolates the
-    /// serving + voucher-verify path and removes the provisioning bottleneck —
-    /// used for the axum-vs-Pingora gate comparison at high concurrency.
+    /// Pure off-chain benchmark mode (no surfpool/fork): deterministic,
+    /// confirmed channel state is seeded in the `pay-bench` process and normal
+    /// client vouchers are verified through the regular gateway path.
     #[serde(default)]
     pub offline: bool,
+    /// Number of deterministic, confirmed channels to seed in the dedicated
+    /// benchmark harness. This is only valid with `offline: true`; it never
+    /// exposes a production state-injection endpoint.
+    #[serde(default)]
+    pub offline_seeded_channels: usize,
 }
 
 fn default_true() -> bool {
@@ -219,11 +223,18 @@ impl RunConfig {
         if self.run.scheme == Scheme::MppSession && self.session.is_none() {
             bail!("scheme `mpp_session` requires a `session:` block");
         }
-        if self.session.as_ref().is_some_and(|session| session.offline) {
-            bail!(
-                "session.offline is unsupported by current PayKit: session opens require a \
-                 verifiable payment-channel transaction; use a JIT fork with rpc_url_env instead"
-            );
+        if let Some(session) = &self.session
+            && session.offline
+            && session.offline_seeded_channels < self.load.users
+        {
+            bail!("session.offline_seeded_channels must cover every load user in offline mode");
+        }
+        if self
+            .session
+            .as_ref()
+            .is_some_and(|session| !session.offline && session.offline_seeded_channels != 0)
+        {
+            bail!("session.offline_seeded_channels requires session.offline: true");
         }
         Ok(())
     }

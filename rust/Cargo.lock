@@ -6640,6 +6640,7 @@ dependencies = [
  "opentelemetry-semantic-conventions 0.31.0",
  "opentelemetry_sdk 0.31.0",
  "pay-core",
+ "pay-proxy",
  "pay-types",
  "pyroscope",
  "pyroscope_pprofrs",

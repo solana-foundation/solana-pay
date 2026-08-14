@@ -19,6 +19,7 @@ mod observability;
 mod rehearsal;
 mod report;
 mod scheme;
+mod seeded_session;
 mod wallet;
 
 use anyhow::{Context, Result, bail};

@@ -55,6 +55,14 @@ for any high-concurrency generator or proxy run.
 | `recover <id> \| --all` | Resume settle+sweep for an interrupted run. |
 | `estimate <cfg>` | Validate a config and print parsed settings. |
 
+## Seeded session verifier fixture
+
+`configs/session-offline-seeded.yml` is a benchmark-only, local fixture for
+the voucher data plane. It seeds deterministic confirmed channel state inside
+the `pay-bench` process, then runs ordinary client-signed voucher headers
+through `SessionMpp::process`. It has no production state-import route and must
+not be used as evidence of open-channel, Redis, TLS, or network capacity.
+
 ## Config
 
 ```yaml
