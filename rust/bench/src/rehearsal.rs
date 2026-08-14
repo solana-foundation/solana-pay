@@ -359,11 +359,14 @@ fn is_no_chain(cfg: &RunConfig) -> bool {
 async fn setup_free_proxy() -> Result<OfflineProxy> {
     let api: ApiSpec =
         serde_yml::from_str(GATE_ONLY_PROVIDER_SPEC).context("parse free-path provider")?;
-    start_local_pingora(AppState {
-        apis: Arc::new(vec![api]),
-        mpp: None,
-        session_mpp: None,
-    })
+    start_local_pingora(
+        AppState {
+            apis: Arc::new(vec![api]),
+            mpp: None,
+            session_mpp: None,
+        },
+        None,
+    )
     .await
 }
 
@@ -399,10 +402,13 @@ async fn setup_offline_proxy(cfg: &RunConfig) -> Result<OfflineProxy> {
         mpp: None,
         session_mpp: Some(session_mpp.session),
     };
-    start_local_pingora(state).await
+    start_local_pingora(state, cfg.load.proxy_workers).await
 }
 
-async fn start_local_pingora(state: AppState) -> Result<OfflineProxy> {
+async fn start_local_pingora(
+    state: AppState,
+    proxy_workers: Option<usize>,
+) -> Result<OfflineProxy> {
     let control_plane = serve(state.clone()).await?;
     let control_plane = control_plane
         .strip_prefix("http://")
@@ -424,9 +430,13 @@ async fn start_local_pingora(state: AppState) -> Result<OfflineProxy> {
     std::thread::Builder::new()
         .name("pay-bench-pingora".to_string())
         .spawn(move || {
-            if let Err(error) =
-                pay_proxy::run_with_shutdown(state, &gate_bind, control_plane, None, receiver)
-            {
+            if let Err(error) = pay_proxy::run_with_shutdown(
+                state,
+                &gate_bind,
+                control_plane,
+                proxy_workers,
+                receiver,
+            ) {
                 tracing::error!(%error, "offline Pingora gate stopped unexpectedly");
             }
         })
@@ -523,6 +533,7 @@ mod tests {
                 max_concurrency: 1,
                 workers: 1,
                 http2_prior_knowledge: false,
+                proxy_workers: None,
                 shard_index: 0,
                 shard_count: 1,
             },

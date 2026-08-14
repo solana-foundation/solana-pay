@@ -123,6 +123,10 @@ pub struct Load {
     /// This multiplexes requests without changing their HTTP/payment shape.
     #[serde(default)]
     pub http2_prior_knowledge: bool,
+    /// Pingora data-plane workers for an embedded benchmark proxy. `None`
+    /// keeps the production default (all available logical CPUs).
+    #[serde(default)]
+    pub proxy_workers: Option<usize>,
     /// Deterministic generator-fleet shard index, zero based.
     #[serde(default)]
     pub shard_index: usize,
@@ -231,6 +235,9 @@ impl RunConfig {
         }
         if self.load.workers == 0 {
             bail!("load.workers must be > 0");
+        }
+        if self.load.proxy_workers == Some(0) {
+            bail!("load.proxy_workers must be > 0 when set");
         }
         if self.load.shard_count == 0 || self.load.shard_index >= self.load.shard_count {
             bail!("load.shard_index must be less than non-zero load.shard_count");
