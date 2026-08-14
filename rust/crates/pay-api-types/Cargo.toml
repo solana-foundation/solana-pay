@@ -8,6 +8,7 @@ license.workspace = true
 path = "src/lib.rs"
 
 [dependencies]
+schemars = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
 
