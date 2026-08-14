@@ -258,6 +258,13 @@ impl BenchScheme for MppSession {
     }
 
     async fn settle_and_close(&self, ctx: &UserCtx, _setup: &UserSetup) -> Result<()> {
+        // Seeded offline fixtures do not own real channels or a settlement
+        // signer.  Closing them after the measured window adds an unbounded
+        // serial HTTP tail (and can outlive the synthetic challenge) without
+        // exercising a production path.
+        if self.offline {
+            return Ok(());
+        }
         let Some(handle) = self.handle(ctx.index) else {
             return Ok(());
         };
