@@ -375,10 +375,19 @@ impl<S: PaymentState> PaymentGate<S> {
         // endpoint. Detect a session credential up front so we can resolve the
         // endpoint by path — otherwise the method mismatch 404s before the
         // session handler ever runs.
-        let is_session_credential = req
+        // Decode a Payment credential once. Endpoint routing needs its intent,
+        // and the session verifier consumes the same parsed value below.
+        // Previously the paid session path decoded the base64url JSON three
+        // times per voucher (path fallback, intent dispatch, verification).
+        let payment_credential = req
             .authorization
-            .and_then(|a| parse_authorization(a).ok())
-            .is_some_and(|c| c.challenge.intent.as_str() == "session");
+            .filter(is_payment_authorization)
+            .map(parse_authorization);
+        let is_session_credential = payment_credential.as_ref().is_some_and(|result| {
+            result
+                .as_ref()
+                .is_ok_and(|c| c.challenge.intent.as_str() == "session")
+        });
         let exact_match = metering::find_endpoint(api, match_method, path);
         let endpoint = exact_match.or_else(|| {
             // Browsers often GET a POST-only paid endpoint via a payment link;
@@ -433,8 +442,8 @@ impl<S: PaymentState> PaymentGate<S> {
         // (e.g. Claude Code's ANTHROPIC_AUTH_TOKEN) and must fall through to
         // the 402 challenge, not 400. A `Payment` credential that then fails
         // to parse is a genuine client error (400).
-        if let Some(auth) = req.authorization.filter(is_payment_authorization) {
-            match parse_authorization(auth) {
+        if let Some(parsed) = payment_credential {
+            match parsed {
                 Ok(cred) => {
                     let intent = cred.challenge.intent.as_str();
                     if intent == "session"
@@ -450,7 +459,7 @@ impl<S: PaymentState> PaymentGate<S> {
                         return session_authorized(
                             session_mpps[index],
                             session_handles.get(index).cloned(),
-                            auth,
+                            cred,
                             meter,
                             req,
                             subdomain,
@@ -459,6 +468,9 @@ impl<S: PaymentState> PaymentGate<S> {
                         .await;
                     }
                     if intent == "charge" && accepted.contains(&Scheme::MppCharge) {
+                        let auth = req
+                            .authorization
+                            .expect("parsed Payment credential has an Authorization header");
                         let description = endpoint.and_then(|e| e.description.as_deref());
                         let resource = endpoint.and_then(|e| e.resource.as_deref());
                         return self
@@ -1685,13 +1697,13 @@ fn session_receipt_annotation(network: &str, reference: String) -> ReceiptAnnota
 async fn session_authorized(
     sm: &SessionMpp,
     handle: Option<Arc<SessionMpp>>,
-    auth: &str,
+    credential: PaymentCredential,
     meter: &pay_types::metering::Metering,
     req: &GateRequest<'_>,
     subdomain: &str,
     path: &str,
 ) -> GateDecision {
-    match sm.process(auth).await {
+    match sm.process_credential(credential).await {
         Ok(SessionOutcome::Active { state, signature }) => {
             if sm.voucher_signer() == pay_kit::mpp::SessionVoucherSigner::Client {
                 let mut response = GateResponse::json(

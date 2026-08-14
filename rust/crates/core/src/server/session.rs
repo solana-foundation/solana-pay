@@ -1508,6 +1508,19 @@ impl SessionMpp {
         let credential = parse_authorization(auth_header)
             .map_err(|e| Error::Mpp(format!("Invalid authorization header: {e}")))?;
 
+        self.process_credential(credential).await
+    }
+
+    /// Process an already-parsed session credential.
+    ///
+    /// HTTP adapters commonly need the decoded intent and currency to route a
+    /// credential before verification. Accepting that parsed value here avoids
+    /// decoding the same base64url JSON again on the hot voucher path.
+    #[tracing::instrument(name = "session_process_credential", skip_all)]
+    pub async fn process_credential(
+        &self,
+        credential: pay_kit::mpp::PaymentCredential,
+    ) -> Result<SessionOutcome> {
         if credential.challenge.intent.as_str() != INTENT {
             return Err(Error::Mpp(format!(
                 "Expected '{}' intent, got '{}'",
