@@ -1,0 +1,280 @@
+---
+- name: Provision a high-throughput Pay proxy
+  hosts: pay_proxies
+  become: true
+  gather_facts: true
+
+  vars:
+    pay_git_repo: "https://github.com/solana-foundation/pay.git"
+    pay_git_ref: "84146398de61f2f49c521c1b3d404e0fb8972541"
+    pay_rust_toolchain: "nightly-2026-08-14"
+    pay_rustflags: "-C target-cpu=native"
+    pay_require_avx512_ifma: true
+    pay_min_logical_cpus: 128
+    pay_service_user: "pay-proxy"
+    pay_source_dir: "/opt/pay/src"
+    pay_target_dir: "/opt/pay/target"
+    pay_cargo_home: "/opt/pay/cargo"
+    pay_rustup_home: "/opt/pay/rustup"
+    pay_rustup_target: "x86_64-unknown-linux-gnu"
+    pay_rustup_init_sha256: "4acc9acc76d5079515b46346a485974457b5a79893cfb01112423c89aeb5aa10"
+    pay_install_dir: "/opt/pay/bin"
+    pay_config_dir: "/etc/pay-proxy"
+    pay_proxy_port: 1402
+    pay_proxy_bind: "0.0.0.0:{{ pay_proxy_port }}"
+    pay_proxy_env_file: ""
+    pay_proxy_nofile: 524288
+
+  environment:
+    CARGO_HOME: "{{ pay_cargo_home }}"
+    CARGO_TARGET_DIR: "{{ pay_target_dir }}"
+    RUSTUP_HOME: "{{ pay_rustup_home }}"
+    RUSTFLAGS: "{{ pay_rustflags }}"
+    PATH: "{{ pay_cargo_home }}/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+  pre_tasks:
+    - name: Validate the target and required inputs
+      ansible.builtin.assert:
+        that:
+          - ansible_distribution == "Ubuntu"
+          - ansible_architecture in ["x86_64", "amd64"]
+          - ansible_processor_vcpus | int >= pay_min_logical_cpus | int
+          - pay_git_ref | length == 40
+          - pay_proxy_env_file | length > 0
+        fail_msg: >-
+          This playbook requires x86_64 Ubuntu with at least
+          {{ pay_min_logical_cpus }} logical CPUs, an immutable 40-character
+          pay_git_ref, and -e pay_proxy_env_file=/secure/path/proxy.env.
+
+    - name: Read CPU flags
+      ansible.builtin.command: awk -F ':' '/^flags/{print $2; exit}' /proc/cpuinfo
+      register: pay_cpu_flags
+      changed_when: false
+
+    - name: Require AVX-512 IFMA when requested
+      ansible.builtin.assert:
+        that:
+          - "'avx512ifma' in pay_cpu_flags.stdout.split()"
+        fail_msg: >-
+          This CPU does not advertise avx512ifma. Set
+          pay_require_avx512_ifma=false for a portable build; it will not
+          reproduce the measured high-throughput backend.
+      when: pay_require_avx512_ifma | bool
+
+    - name: Check the controller-side secret file
+      become: false
+      delegate_to: localhost
+      ansible.builtin.stat:
+        path: "{{ pay_proxy_env_file }}"
+      register: pay_proxy_env_source
+
+    - name: Require the controller-side secret file
+      ansible.builtin.assert:
+        that:
+          - pay_proxy_env_source.stat.isreg | default(false)
+          - pay_proxy_env_source.stat.mode in ["0400", "0600"]
+        fail_msg: >-
+          The controller file {{ pay_proxy_env_file }} must exist, be a regular
+          file, and have mode 0400 or 0600.
+
+  tasks:
+    - name: Install build dependencies
+      ansible.builtin.apt:
+        name:
+          - binutils
+          - build-essential
+          - ca-certificates
+          - clang
+          - cmake
+          - curl
+          - git
+          - libssl-dev
+          - pkg-config
+        state: present
+        update_cache: true
+        cache_valid_time: 3600
+
+    - name: Create the service account
+      ansible.builtin.user:
+        name: "{{ pay_service_user }}"
+        system: true
+        create_home: true
+        home: "/var/lib/{{ pay_service_user }}"
+        shell: /usr/sbin/nologin
+
+    - name: Create Pay directories
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        state: directory
+        owner: "{{ item.owner }}"
+        group: "{{ item.group }}"
+        mode: "{{ item.mode }}"
+      loop:
+        - { path: "/opt/pay", owner: "{{ pay_service_user }}", group: "{{ pay_service_user }}", mode: "0755" }
+        - { path: "{{ pay_source_dir }}", owner: "{{ pay_service_user }}", group: "{{ pay_service_user }}", mode: "0755" }
+        - { path: "{{ pay_target_dir }}", owner: "{{ pay_service_user }}", group: "{{ pay_service_user }}", mode: "0755" }
+        - { path: "{{ pay_cargo_home }}", owner: "{{ pay_service_user }}", group: "{{ pay_service_user }}", mode: "0755" }
+        - { path: "{{ pay_rustup_home }}", owner: "{{ pay_service_user }}", group: "{{ pay_service_user }}", mode: "0755" }
+        - { path: "{{ pay_install_dir }}", owner: "root", group: "root", mode: "0755" }
+        - { path: "{{ pay_config_dir }}", owner: "root", group: "{{ pay_service_user }}", mode: "0750" }
+        - { path: "/usr/local/src", owner: "root", group: "root", mode: "0755" }
+
+    - name: Install rustup
+      ansible.builtin.get_url:
+        url: >-
+          https://static.rust-lang.org/rustup/dist/{{ pay_rustup_target }}/rustup-init
+        checksum: "sha256:{{ pay_rustup_init_sha256 }}"
+        dest: /usr/local/src/rustup-init
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Initialize rustup for the service account
+      become: true
+      become_user: "{{ pay_service_user }}"
+      ansible.builtin.command:
+        cmd: /usr/local/src/rustup-init -y --no-modify-path --profile minimal
+      args:
+        creates: "{{ pay_cargo_home }}/bin/rustup"
+
+    - name: Install the pinned Rust toolchain
+      become: true
+      become_user: "{{ pay_service_user }}"
+      ansible.builtin.command:
+        cmd: >-
+          {{ pay_cargo_home }}/bin/rustup toolchain install
+          {{ pay_rust_toolchain }} --profile minimal
+      register: pay_rustup_install
+      changed_when: >-
+        'unchanged' not in (pay_rustup_install.stdout + pay_rustup_install.stderr)
+
+    - name: Check out the immutable Pay revision
+      become: true
+      become_user: "{{ pay_service_user }}"
+      ansible.builtin.git:
+        repo: "{{ pay_git_repo }}"
+        dest: "{{ pay_source_dir }}"
+        version: "{{ pay_git_ref }}"
+        update: true
+        force: false
+
+    - name: Read the checked-out Pay revision
+      become: true
+      become_user: "{{ pay_service_user }}"
+      ansible.builtin.command: git rev-parse HEAD
+      args:
+        chdir: "{{ pay_source_dir }}"
+      register: pay_checked_out_ref
+      changed_when: false
+
+    - name: Verify the checked-out Pay revision
+      ansible.builtin.assert:
+        that:
+          - pay_checked_out_ref.stdout == pay_git_ref
+        fail_msg: >-
+          Expected Pay {{ pay_git_ref }}, but git checked out
+          {{ pay_checked_out_ref.stdout }}.
+
+    - name: Build the proxy and benchmark harness
+      become: true
+      become_user: "{{ pay_service_user }}"
+      ansible.builtin.command:
+        cmd: >-
+          {{ pay_cargo_home }}/bin/cargo +{{ pay_rust_toolchain }}
+          build --release --locked -p pay -p pay-bench
+        chdir: "{{ pay_source_dir }}/rust"
+      register: pay_build
+      changed_when: "'Finished' in pay_build.stderr and '0.00s' not in pay_build.stderr"
+
+    - name: Verify the build contains AVX-512 IFMA instructions
+      ansible.builtin.shell: |
+        set -euo pipefail
+        objdump -d "{{ pay_target_dir }}/release/pay" \
+          | awk '/vpmadd52/{found=1} END{exit !found}'
+      args:
+        executable: /bin/bash
+      changed_when: false
+      when: pay_require_avx512_ifma | bool
+
+    - name: Install the release binaries
+      ansible.builtin.copy:
+        src: "{{ pay_target_dir }}/release/{{ item }}"
+        dest: "{{ pay_install_dir }}/{{ item }}"
+        remote_src: true
+        owner: root
+        group: root
+        mode: "0755"
+      loop:
+        - pay
+        - pay-bench
+      notify: Restart pay-proxy
+
+    - name: Install kernel and socket tuning
+      ansible.builtin.template:
+        src: templates/99-pay-proxy.conf.j2
+        dest: /etc/sysctl.d/99-pay-proxy.conf
+        owner: root
+        group: root
+        mode: "0644"
+      notify: Apply sysctl tuning
+
+    - name: Install the proxy paywall
+      ansible.builtin.copy:
+        src: files/paywall.yml
+        dest: "{{ pay_config_dir }}/paywall.yml"
+        owner: root
+        group: "{{ pay_service_user }}"
+        mode: "0640"
+      notify: Restart pay-proxy
+
+    - name: Install the secret environment file
+      ansible.builtin.copy:
+        src: "{{ pay_proxy_env_file }}"
+        dest: "{{ pay_config_dir }}/proxy.env"
+        owner: root
+        group: "{{ pay_service_user }}"
+        mode: "0640"
+      no_log: true
+      notify: Restart pay-proxy
+
+    - name: Install the systemd service
+      ansible.builtin.template:
+        src: templates/pay-proxy.service.j2
+        dest: /etc/systemd/system/pay-proxy.service
+        owner: root
+        group: root
+        mode: "0644"
+      notify: Restart pay-proxy
+
+    - name: Flush configuration handlers
+      ansible.builtin.meta: flush_handlers
+
+    - name: Enable and start the proxy
+      ansible.builtin.systemd_service:
+        name: pay-proxy
+        enabled: true
+        state: started
+        daemon_reload: true
+
+    - name: Verify the paid endpoint returns a challenge
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:{{ pay_proxy_port }}/api/v1/compute"
+        method: GET
+        status_code: 402
+        return_content: false
+      register: pay_challenge
+      retries: 12
+      delay: 1
+      until: pay_challenge.status == 402
+
+  handlers:
+    - name: Apply sysctl tuning
+      ansible.builtin.command: sysctl --system
+      changed_when: true
+
+    - name: Restart pay-proxy
+      ansible.builtin.systemd_service:
+        name: pay-proxy
+        state: restarted
+        enabled: true
+        daemon_reload: true

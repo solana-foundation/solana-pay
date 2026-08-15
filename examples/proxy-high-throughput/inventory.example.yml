@@ -1,0 +1,14 @@
+---
+all:
+  children:
+    pay_proxies:
+      hosts:
+        proxy-1:
+          ansible_host: 203.0.113.10
+          ansible_user: ubuntu
+  vars:
+    # This is the exact Pay revision used for the retained Sunburst IFMA run.
+    # Change it only to another reviewed, immutable commit SHA.
+    pay_git_ref: "84146398de61f2f49c521c1b3d404e0fb8972541"
+    pay_rust_toolchain: "nightly-2026-08-14"
+    pay_proxy_env_file: "{{ inventory_dir }}/proxy.env"
