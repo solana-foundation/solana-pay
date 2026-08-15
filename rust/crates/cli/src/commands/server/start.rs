@@ -1047,6 +1047,7 @@ impl StartCommand {
                         min_voucher_delta: sess.min_voucher_delta,
                         voucher_signer,
                         operator_signing_key: None,
+                        fee_payer_signer: fee_payer_signer.clone(),
                         idle_timeout_options_seconds: sess.idle_timeout_options_seconds.clone(),
                         idle_timeout_seconds,
                         grace_period_seconds:
@@ -2888,12 +2889,7 @@ async fn gateway_verify(
                         // Pull the underlying Receipt out for the legacy
                         // PDB logging path that still operates on the
                         // intent-agnostic shape.
-                        let receipt = match &kind {
-                            pay_kit::mpp::ReceiptKind::Charge(r) => r.clone(),
-                            // The charge verify path never produces a
-                            // Subscription kind; this arm is unreachable.
-                            pay_kit::mpp::ReceiptKind::Subscription { base, .. } => base.clone(),
-                        };
+                        let receipt = kind.base().clone();
 
                         // Log successful payment to PDB
                         if let Some(pdb) = pdb {

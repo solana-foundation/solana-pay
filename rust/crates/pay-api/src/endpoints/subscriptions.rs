@@ -33,7 +33,6 @@ use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use pay_api_core::{Error, Stablecoin};
 use pay_api_types::Network;
-use pay_kit::mpp::ReceiptKind;
 use pay_kit::mpp::program::subscriptions::{
     INSTRUCTION_CANCEL_SUBSCRIPTION, SUBSCRIPTIONS_PROGRAM_ID,
 };
@@ -286,22 +285,15 @@ async fn verify_and_broadcast(
         "subscription cancel confirmed"
     );
 
-    // Wrap the charge receipt in `ReceiptKind::Charge` for the on-the-wire
-    // `Payment-Receipt` header; the JSON response body still surfaces the
-    // base receipt for clients that don't parse headers.
-    let kind = ReceiptKind::Charge(charge_receipt);
-    let receipt_header =
-        pay_kit::mpp::format_receipt(&kind).map_err(|_| ApiError(Error::PaymentChallenge))?;
-    let receipt = match kind {
-        ReceiptKind::Charge(r) => r,
-        ReceiptKind::Subscription { base, .. } => base,
-    };
+    let receipt_header = charge_receipt
+        .to_header()
+        .map_err(|_| ApiError(Error::PaymentChallenge))?;
 
     let mut response = (
         StatusCode::OK,
         Json(CancelReceiptResponse {
             signature: signature.to_string(),
-            receipt,
+            receipt: charge_receipt,
             subscription_pda: resolved.subscription_pda.to_string(),
         }),
     )
