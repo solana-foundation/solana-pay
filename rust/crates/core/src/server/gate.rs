@@ -20,8 +20,8 @@ use http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, header};
 use pay_kit::mpp::server::{ChargeOptions, VerificationError};
 use pay_kit::mpp::{
     ChargeRequest, PAYMENT_RECEIPT_HEADER, PaymentCredential, Receipt, ReceiptKind,
-    base64url_encode, format_receipt, format_www_authenticate, format_www_authenticate_many,
-    parse_authorization,
+    SessionReceiptExtensions, SessionReceiptIntent, base64url_encode, format_receipt,
+    format_www_authenticate, format_www_authenticate_many, parse_authorization,
 };
 use pay_kit::x402::PAYMENT_RESPONSE_HEADER;
 use pay_kit::x402::server::{ExactOptions, VerifiedUptoOpen, X402, X402BatchSettlement, X402Upto};
@@ -157,22 +157,24 @@ pub fn delegated_session_receipt_annotation(
     amount: u64,
     cumulative: u64,
     authorized: u64,
+    idle_timeout_seconds: u32,
 ) -> Result<ReceiptAnnotation, String> {
-    let mut receipt = serde_json::to_value(Receipt::success("solana", channel_id, ""))
-        .map_err(|error| format!("failed to serialize MPP session receipt: {error}"))?;
+    let mut receipt = serde_json::to_value(ReceiptKind::Session {
+        base: Receipt::success("solana", channel_id, ""),
+        extensions: SessionReceiptExtensions {
+            intent: SessionReceiptIntent::Session,
+            accepted_cumulative: cumulative,
+            spent: cumulative,
+            idle_timeout_seconds,
+            tx_hash: None,
+            refunded: None,
+        },
+    })
+    .map_err(|error| format!("failed to serialize MPP session receipt: {error}"))?;
     let fields = receipt
         .as_object_mut()
         .ok_or_else(|| "MPP session receipt did not serialize as an object".to_string())?;
-    fields.insert("intent".to_string(), serde_json::json!("session"));
     fields.insert("amount".to_string(), serde_json::json!(amount.to_string()));
-    fields.insert(
-        "acceptedCumulative".to_string(),
-        serde_json::json!(cumulative.to_string()),
-    );
-    fields.insert(
-        "spent".to_string(),
-        serde_json::json!(cumulative.to_string()),
-    );
     fields.insert(
         "authorized".to_string(),
         serde_json::json!(authorized.to_string()),
@@ -239,7 +241,7 @@ pub async fn settle_delegated_session(
         return Ok(None);
     }
 
-    let cumulative = pending
+    let acceptance = pending
         .handle
         .authorize_delegated_usage(&pending.channel_id, actual.base_units)
         .await
@@ -247,7 +249,7 @@ pub async fn settle_delegated_session(
     tracing::info!(
         channel = %pending.channel_id,
         amount = actual.base_units,
-        cumulative,
+        cumulative = acceptance.cumulative,
         usd = actual.usd,
         "delegated MPP session voucher accepted"
     );
@@ -259,8 +261,9 @@ pub async fn settle_delegated_session(
         pending.handle.currency(),
         &pending.channel_id,
         actual.base_units,
-        cumulative,
+        acceptance.cumulative,
         authorized,
+        acceptance.idle_timeout_seconds,
     )
     .map(Some)
 }

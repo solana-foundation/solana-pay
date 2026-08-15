@@ -1406,6 +1406,7 @@ mod tests {
             1,
             1,
             100_000,
+            300,
         )
         .unwrap();
         let headers = annotation
@@ -1424,6 +1425,7 @@ mod tests {
         assert_eq!(decoded.decoded["amount"], "1");
         assert_eq!(decoded.decoded["acceptedCumulative"], "1");
         assert_eq!(decoded.decoded["spent"], "1");
+        assert_eq!(decoded.decoded["idleTimeoutSeconds"], 300);
         assert_eq!(decoded.decoded["remaining"], "99999");
         assert!(headers.iter().any(|(name, value)| {
             name == "payment-receipt-url"

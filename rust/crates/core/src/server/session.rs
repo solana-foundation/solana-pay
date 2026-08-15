@@ -183,6 +183,13 @@ pub enum SessionOutcome {
     },
 }
 
+/// State needed to emit a canonical receipt after delegated usage is accepted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DelegatedUsageAuthorization {
+    pub cumulative: u64,
+    pub idle_timeout_seconds: u32,
+}
+
 #[derive(Clone)]
 struct SessionOperatorRuntime {
     server: Arc<SessionServer<Arc<dyn ChannelStore>>>,
@@ -1370,7 +1377,11 @@ impl SessionMpp {
 
     /// Meter a successful response and persist an operator-signed cumulative
     /// voucher before releasing that response to the client.
-    pub async fn authorize_delegated_usage(&self, channel_id: &str, amount: u64) -> Result<u64> {
+    pub async fn authorize_delegated_usage(
+        &self,
+        channel_id: &str,
+        amount: u64,
+    ) -> Result<DelegatedUsageAuthorization> {
         if self.voucher_signer() != SessionVoucherSigner::Operator {
             return Err(Error::Mpp(
                 "session does not delegate voucher authority to the operator".to_string(),
@@ -1382,7 +1393,7 @@ impl SessionMpp {
         // The durable store is authoritative. Reading it on every delegated
         // authorization also lets a restarted or different gateway replica
         // continue from a watermark advanced by another process.
-        let current = self
+        let state = self
             .operator_runtime
             .channel_store
             .get_channel(channel_id)
@@ -1392,11 +1403,21 @@ impl SessionMpp {
                     "failed to restore delegated session channel {channel_id}: {error}"
                 ))
             })?
-            .ok_or_else(|| Error::Mpp(format!("unknown delegated session channel: {channel_id}")))?
-            .cumulative;
+            .ok_or_else(|| {
+                Error::Mpp(format!("unknown delegated session channel: {channel_id}"))
+            })?;
+        let current = state.cumulative;
+        let idle_timeout_seconds = state.idle_timeout_seconds.ok_or_else(|| {
+            Error::Mpp(format!(
+                "delegated session channel {channel_id} is missing its negotiated idle timeout"
+            ))
+        })?;
         self.record_committed_watermark(channel_id.to_string(), current);
         if amount == 0 {
-            return Ok(current);
+            return Ok(DelegatedUsageAuthorization {
+                cumulative: current,
+                idle_timeout_seconds,
+            });
         }
         let cumulative = current
             .checked_add(amount)
@@ -1447,7 +1468,10 @@ impl SessionMpp {
         );
         self.record_committed_watermark(channel_id.to_string(), accepted.cumulative);
         self.touch_channel(channel_id.to_string()).await?;
-        Ok(accepted.cumulative)
+        Ok(DelegatedUsageAuthorization {
+            cumulative: accepted.cumulative,
+            idle_timeout_seconds,
+        })
     }
 
     pub async fn reserve_delegated_capacity(
@@ -3235,16 +3259,15 @@ mod tests {
         )
         .await;
 
-        assert_eq!(
-            tokio::time::timeout(
-                Duration::from_secs(2),
-                session.authorize_delegated_usage(&channel, 75),
-            )
-            .await
-            .expect("first delegated voucher timed out")
-            .unwrap(),
-            75
-        );
+        let first = tokio::time::timeout(
+            Duration::from_secs(2),
+            session.authorize_delegated_usage(&channel, 75),
+        )
+        .await
+        .expect("first delegated voucher timed out")
+        .unwrap();
+        assert_eq!(first.cumulative, 75);
+        assert_eq!(first.idle_timeout_seconds, 300);
         session.committed_watermarks.clear();
         assert_eq!(
             tokio::time::timeout(
@@ -3253,7 +3276,8 @@ mod tests {
             )
             .await
             .expect("second delegated voucher timed out")
-            .unwrap(),
+            .unwrap()
+            .cumulative,
             100
         );
 
