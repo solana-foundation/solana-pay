@@ -2267,7 +2267,7 @@ mod tests {
         for index in 0..=VERIFIED_CHALLENGE_CACHE_ENTRIES {
             let challenge = PaymentChallenge::with_challenge_binding_secret(
                 "test-secret",
-                "test-realm",
+                format!("test-realm-{index}"),
                 METHOD,
                 INTENT,
                 request.clone(),
