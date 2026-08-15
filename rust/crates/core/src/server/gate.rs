@@ -454,7 +454,7 @@ impl<S: PaymentState> PaymentGate<S> {
                             .decode::<pay_kit::mpp::SessionRequest>()
                         && let Some(index) = session_mpps
                             .iter()
-                            .position(|session| session.currency() == request.currency)
+                            .position(|session| session.accepts_currency(&request.currency))
                     {
                         return session_authorized(
                             session_mpps[index],

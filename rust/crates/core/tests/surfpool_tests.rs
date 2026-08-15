@@ -553,6 +553,7 @@ async fn push_session_full_flow() {
             async move {
                 use base64::Engine as _;
                 let result = match body["method"].as_str().unwrap_or_default() {
+                    "getSlot" => serde_json::json!(challenged_slot + 1),
                     "sendTransaction" => serde_json::json!(
                         pay_kit::mpp::program::payment_channels::decode_transaction(
                             body["params"][0].as_str().unwrap()

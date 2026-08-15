@@ -1169,6 +1169,15 @@ impl SessionMpp {
         &self.session_config.currency
     }
 
+    /// Whether a challenge currency identifies this session backend's mint.
+    pub fn accepts_currency(&self, currency: &str) -> bool {
+        let network = Some(self.session_config.network.as_str());
+        pay_kit::mpp::protocol::solana::resolve_stablecoin_mint(
+            &self.session_config.currency,
+            network,
+        ) == pay_kit::mpp::protocol::solana::resolve_stablecoin_mint(currency, network)
+    }
+
     /// Create from a [`SessionConfig`] and an HMAC secret key.
     pub fn new(config: SessionConfig, challenge_binding_secret: impl Into<String>) -> Self {
         Self::new_with_channel_store(
@@ -2106,6 +2115,19 @@ mod tests {
 
         session.start_lifecycle_runloop(Duration::ZERO);
         assert!(!session.lifecycle.touches_enabled.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn session_backend_accepts_its_normalized_challenge_mint() {
+        let mut config = test_session_config();
+        config.currency = "USDC".to_string();
+        let session =
+            SessionMpp::new(config, "test-secret").with_blockhash_cache(test_blockhash_cache());
+        let challenge = session.challenge(None).unwrap();
+        let request: SessionRequest = challenge.request.decode().unwrap();
+
+        assert_ne!(session.currency(), request.currency);
+        assert!(session.accepts_currency(&request.currency));
     }
 
     /// Insert confirmed channel state directly — see [`test_channel_state`].
