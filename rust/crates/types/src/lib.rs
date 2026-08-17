@@ -14,7 +14,7 @@ pub mod splits;
 pub mod stablecoin_mints {
     pub use pay_kit::core::mints::{
         CASH_MAINNET, PYUSD_DEVNET, PYUSD_MAINNET, PYUSD_TESTNET, USDC_DEVNET, USDC_MAINNET,
-        USDC_TESTNET, USDG_MAINNET, USDPT_MAINNET, USDT_MAINNET,
+        USDC_TESTNET, USDG_DEVNET, USDG_MAINNET, USDG_TESTNET, USDPT_MAINNET, USDT_MAINNET,
     };
 }
 
@@ -81,7 +81,11 @@ impl Stablecoin {
                 _ => stablecoin_mints::PYUSD_MAINNET,
             },
             Self::Cash => stablecoin_mints::CASH_MAINNET,
-            Self::Usdg => stablecoin_mints::USDG_MAINNET,
+            Self::Usdg => match network {
+                Some("devnet") => stablecoin_mints::USDG_DEVNET,
+                Some("testnet") => stablecoin_mints::USDG_TESTNET,
+                _ => stablecoin_mints::USDG_MAINNET,
+            },
             Self::Usdpt => stablecoin_mints::USDPT_MAINNET,
         }
     }
@@ -96,7 +100,7 @@ impl Stablecoin {
             stablecoin_mints::USDT_MAINNET => Some(Self::Usdt),
             stablecoin_mints::PYUSD_MAINNET | stablecoin_mints::PYUSD_DEVNET => Some(Self::Pyusd),
             stablecoin_mints::CASH_MAINNET => Some(Self::Cash),
-            stablecoin_mints::USDG_MAINNET => Some(Self::Usdg),
+            stablecoin_mints::USDG_MAINNET | stablecoin_mints::USDG_DEVNET => Some(Self::Usdg),
             stablecoin_mints::USDPT_MAINNET => Some(Self::Usdpt),
             _ => None,
         }
@@ -211,6 +215,14 @@ mod tests {
         );
         assert_eq!(
             Stablecoin::from_mint(stablecoin_mints::USDG_MAINNET),
+            Some(Stablecoin::Usdg)
+        );
+        assert_eq!(
+            Stablecoin::Usdg.mint(Some("devnet")),
+            stablecoin_mints::USDG_DEVNET
+        );
+        assert_eq!(
+            Stablecoin::from_mint(stablecoin_mints::USDG_DEVNET),
             Some(Stablecoin::Usdg)
         );
     }
