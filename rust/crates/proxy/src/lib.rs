@@ -36,6 +36,37 @@ pub fn run<S: PaymentState>(
     control_plane: String,
     threads: Option<usize>,
 ) -> anyhow::Result<()> {
+    run_inner(state, bind, control_plane, threads, None)
+}
+
+/// Run the gateway with a native TLS listener.
+///
+/// The certificate must cover the host clients connect to (a DNS name or IP
+/// SAN). HTTP/2 is advertised through ALPN; HTTP/1.1 remains available.
+pub fn run_tls<S: PaymentState>(
+    state: S,
+    bind: &str,
+    control_plane: String,
+    threads: Option<usize>,
+    cert_path: &str,
+    key_path: &str,
+) -> anyhow::Result<()> {
+    run_inner(
+        state,
+        bind,
+        control_plane,
+        threads,
+        Some((cert_path, key_path)),
+    )
+}
+
+fn run_inner<S: PaymentState>(
+    state: S,
+    bind: &str,
+    control_plane: String,
+    threads: Option<usize>,
+    tls: Option<(&str, &str)>,
+) -> anyhow::Result<()> {
     // rustls 0.23 requires a process-default CryptoProvider. The dependency tree
     // enables BOTH ring (pingora) and aws-lc-rs (reqwest), so rustls can't pick
     // one automatically and pingora's TLS init panics. Install ring (what
@@ -56,13 +87,25 @@ pub fn run<S: PaymentState>(
     });
     svc.threads = Some(cores);
     let mut server_options = pingora::apps::HttpServerOptions::default();
-    server_options.h2c = true;
+    server_options.h2c = tls.is_none();
     svc.app_logic_mut()
         .expect("new Pingora service has app logic")
         .server_options = Some(server_options);
-    svc.add_tcp(bind);
+    if let Some((cert_path, key_path)) = tls {
+        let mut settings = pingora::listeners::tls::TlsSettings::intermediate(cert_path, key_path)
+            .map_err(|error| anyhow::anyhow!("pingora TLS config: {error}"))?;
+        settings.enable_h2();
+        svc.add_tls_with_settings(bind, None, settings);
+    } else {
+        svc.add_tcp(bind);
+    }
     server.add_service(svc);
-    tracing::info!(bind, threads = cores, "pingora gateway up (Http402Gate)");
+    tracing::info!(
+        bind,
+        threads = cores,
+        tls = tls.is_some(),
+        "pingora gateway up (Http402Gate)"
+    );
     server.run_forever();
 }
 

@@ -114,6 +114,14 @@ pub struct StartCommand {
     #[arg(long, default_value_t = default_bind())]
     pub bind: String,
 
+    /// PEM certificate chain for native TLS termination.
+    #[arg(long, value_name = "PATH", requires = "tls_key")]
+    pub tls_cert: Option<String>,
+
+    /// PEM private key for native TLS termination.
+    #[arg(long, value_name = "PATH", requires = "tls_cert")]
+    pub tls_key: Option<String>,
+
     /// Recipient wallet address for payments.
     #[arg(long)]
     pub recipient: Option<String>,
@@ -586,6 +594,32 @@ impl StartCommand {
         account_override: Option<&str>,
         sandbox: bool,
     ) -> pay_core::Result<()> {
+        let tls_paths = match (self.tls_cert.as_deref(), self.tls_key.as_deref()) {
+            (Some(cert), Some(key)) => {
+                let cert = shellexpand::tilde(cert).into_owned();
+                let key = shellexpand::tilde(key).into_owned();
+                for (label, path) in [("TLS certificate", &cert), ("TLS private key", &key)] {
+                    let metadata = std::fs::metadata(path).map_err(|error| {
+                        pay_core::Error::Config(format!("failed to read {label} {path}: {error}"))
+                    })?;
+                    if !metadata.is_file() {
+                        return Err(pay_core::Error::Config(format!(
+                            "{label} is not a regular file: {path}"
+                        )));
+                    }
+                    std::fs::File::open(path).map_err(|error| {
+                        pay_core::Error::Config(format!("failed to read {label} {path}: {error}"))
+                    })?;
+                }
+                Some((cert, key))
+            }
+            (None, None) => None,
+            _ => {
+                return Err(pay_core::Error::Config(
+                    "--tls-cert and --tls-key must be provided together".to_string(),
+                ));
+            }
+        };
         let debugger = self.debugger || sandbox;
         let expanded = shellexpand::tilde(&self.paywall);
         let contents = std::fs::read_to_string(expanded.as_ref()).map_err(|e| {
@@ -1661,7 +1695,8 @@ impl StartCommand {
                 pay_core::Error::Config(format!("control-plane local_addr: {e}"))
             })?;
             let display_addr = self.bind.replace("0.0.0.0", "127.0.0.1");
-            let url = format!("http://{}", display_addr);
+            let scheme = if tls_paths.is_some() { "https" } else { "http" };
+            let url = format!("{scheme}://{display_addr}");
             if debugger {
                 eprintln!(
                     "  {} {}",
@@ -1725,8 +1760,18 @@ impl StartCommand {
         // the main thread, now that `block_on` has returned.
         let (internal_addr, gate_state) = gateway;
         let cores = std::thread::available_parallelism().map(|n| n.get()).ok();
-        pay_proxy::run(gate_state, &self.bind, internal_addr.to_string(), cores)
-            .map_err(|e| pay_core::Error::Config(format!("gateway: {e}")))
+        match tls_paths {
+            Some((cert, key)) => pay_proxy::run_tls(
+                gate_state,
+                &self.bind,
+                internal_addr.to_string(),
+                cores,
+                &cert,
+                &key,
+            ),
+            None => pay_proxy::run(gate_state, &self.bind, internal_addr.to_string(), cores),
+        }
+        .map_err(|e| pay_core::Error::Config(format!("gateway: {e}")))
     }
 }
 

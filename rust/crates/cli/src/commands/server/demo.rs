@@ -54,6 +54,8 @@ impl DemoCommand {
         let cmd = StartCommand {
             paywall: paywall_path.to_string_lossy().into_owned(),
             bind: self.bind,
+            tls_cert: None,
+            tls_key: None,
             recipient: self.recipient,
             currency: self.currency,
             rpc_url,
