@@ -28,6 +28,7 @@ const CHANNEL_ACCOUNT_SIZE: usize = 256;
 const CHANNEL_STATUS_OFFSET: usize = 3;
 const CHANNEL_STATUS_OPEN: u8 = 0;
 const CHANNEL_STATUS_SEALED: u8 = 1;
+const CHANNEL_STATUS_DISTRIBUTED: u8 = 2;
 
 struct RecoverableChannel {
     address: Pubkey,
@@ -221,21 +222,25 @@ async fn recover_without_gateway_state(
     let rpc = FixtureRpc::new(rpc_url.to_string(), execution);
 
     if !open.is_empty() {
-        let (blockhash, _) = rpc.latest_blockhash().await?;
-        let mut transactions = Vec::with_capacity(open.len());
-        for channel in &open {
-            let instruction =
-                pay_worker::channel::build_settle_and_seal_ix(&channel.address, &channel.payee);
-            let transaction = signed_transaction(funder, vec![instruction], blockhash).await?;
-            transactions.push((channel.index, channel.address, transaction));
+        // Sign only one concurrency window per blockhash. A full high-scale
+        // recovery outlives Solana's blockhash validity window.
+        for batch in open.chunks(concurrency) {
+            let (blockhash, _) = rpc.latest_blockhash().await?;
+            let mut transactions = Vec::with_capacity(batch.len());
+            for channel in batch {
+                let instruction =
+                    pay_worker::channel::build_settle_and_seal_ix(&channel.address, &channel.payee);
+                let transaction = signed_transaction(funder, vec![instruction], blockhash).await?;
+                transactions.push((channel.index, channel.address, transaction));
+            }
+            submit_transactions(
+                &rpc,
+                transactions,
+                concurrency,
+                "zero-voucher settle-and-seal batch",
+            )
+            .await?;
         }
-        submit_transactions(
-            &rpc,
-            transactions,
-            concurrency,
-            "zero-voucher settle-and-seal",
-        )
-        .await?;
         wait_until_absent(
             &discovery,
             rpc_url,
@@ -264,23 +269,32 @@ async fn recover_without_gateway_state(
             recipients: Vec::new(),
         };
         let treasury = recovery_treasury_owner(config.run.network)?;
-        let (blockhash, _) = rpc.latest_blockhash().await?;
-        let mut transactions = Vec::with_capacity(sealed.len());
-        for channel in &sealed {
-            let decoded = pay_worker::channel::DecodedChannel {
-                address: channel.address,
-                channel: channel.channel.clone(),
-            };
-            let (instruction, _) = pay_worker::channel::build_distribute_ix(
-                &decoded,
-                &treasury,
-                &token_program,
-                &empty_preimage,
-            );
-            let transaction = signed_transaction(funder, vec![instruction], blockhash).await?;
-            transactions.push((channel.index, channel.address, transaction));
+        // Distribution can be just as large as settlement, so refresh here too.
+        for batch in sealed.chunks(concurrency) {
+            let (blockhash, _) = rpc.latest_blockhash().await?;
+            let mut transactions = Vec::with_capacity(batch.len());
+            for channel in batch {
+                let decoded = pay_worker::channel::DecodedChannel {
+                    address: channel.address,
+                    channel: channel.channel.clone(),
+                };
+                let (instruction, _) = pay_worker::channel::build_distribute_ix(
+                    &decoded,
+                    &treasury,
+                    &token_program,
+                    &empty_preimage,
+                );
+                let transaction = signed_transaction(funder, vec![instruction], blockhash).await?;
+                transactions.push((channel.index, channel.address, transaction));
+            }
+            submit_transactions(
+                &rpc,
+                transactions,
+                concurrency,
+                "empty-plan distribute batch",
+            )
+            .await?;
         }
-        submit_transactions(&rpc, transactions, concurrency, "empty-plan distribute").await?;
         wait_until_absent(
             &discovery,
             rpc_url,
@@ -291,20 +305,69 @@ async fn recover_without_gateway_state(
         .await?;
     }
 
+    let distributed =
+        discover_fixture_channels(&discovery, rpc_url, CHANNEL_STATUS_DISTRIBUTED, expected)
+            .await?;
+    validate_zero_voucher_channels(distributed.iter(), funder)?;
+    if !distributed.is_empty() {
+        let current_slot = discovery.get_slot(rpc_url).await?;
+        let locked = distributed
+            .iter()
+            .filter(|channel| {
+                current_slot
+                    < channel
+                        .channel
+                        .open_slot
+                        .saturating_add(pay_kit::core::payment_channels::OPEN_SLOT_WINDOW)
+                        .saturating_add(1)
+            })
+            .count();
+        ensure!(
+            locked == 0,
+            "direct recovery distributed deposits but rent reclaim is not unlocked for {locked} fixture channels yet; rerun after the open-slot window"
+        );
+
+        for batch in distributed.chunks(concurrency) {
+            let (blockhash, _) = rpc.latest_blockhash().await?;
+            let mut transactions = Vec::with_capacity(batch.len());
+            for channel in batch {
+                let rent_payer = from_address(&channel.channel.rent_payer);
+                let instruction =
+                    pay_worker::channel::build_reclaim_ix(&channel.address, &rent_payer);
+                let transaction = signed_transaction(funder, vec![instruction], blockhash).await?;
+                transactions.push((channel.index, channel.address, transaction));
+            }
+            submit_transactions(
+                &rpc,
+                transactions,
+                concurrency,
+                "distributed rent-reclaim batch",
+            )
+            .await?;
+        }
+    }
+
     let remaining_open =
         discover_fixture_channels(&discovery, rpc_url, CHANNEL_STATUS_OPEN, expected).await?;
     let remaining_sealed =
         discover_fixture_channels(&discovery, rpc_url, CHANNEL_STATUS_SEALED, expected).await?;
+    let remaining_distributed =
+        discover_fixture_channels(&discovery, rpc_url, CHANNEL_STATUS_DISTRIBUTED, expected)
+            .await?;
     ensure!(
-        remaining_open.is_empty() && remaining_sealed.is_empty(),
-        "direct recovery incomplete: {} open and {} sealed fixture channels remain",
+        remaining_open.is_empty()
+            && remaining_sealed.is_empty()
+            && remaining_distributed.is_empty(),
+        "direct recovery incomplete: {} open, {} sealed, and {} distributed fixture channels remain",
         remaining_open.len(),
-        remaining_sealed.len()
+        remaining_sealed.len(),
+        remaining_distributed.len()
     );
     println!(
-        "direct recovery complete: {} channels settled and {} deposits distributed",
+        "direct recovery complete: {} channels settled, {} deposits distributed, and {} channel rents reclaimed",
         open.len(),
-        sealed.len()
+        sealed.len(),
+        distributed.len()
     );
     Ok(())
 }
