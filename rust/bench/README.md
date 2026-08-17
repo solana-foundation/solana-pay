@@ -93,46 +93,42 @@ session: { deposit_usdc: 0.10, voucher_usdc: 0.0001, close_after_run: true } # m
 
 ## Reusable devnet fixture
 
-Use one of the versioned 100,000-wallet allocation plans:
-`configs/devnet-fixture-100k.yml` for devnet USDC or
-`configs/devnet-fixture-100k-usdtest.yml` for devnet-only USDtest (Token-2022).
-A stable
-`--id` is part of the wallet derivation namespace, so the same funder and ID
-always recover the same 100,000 addresses. `setup` is resumable: it reconciles
+Versioned wallet allocation plans provision deterministic public-cluster
+cohorts. A stable `--id` is the wallet derivation namespace, so the same funder
+and ID always recover the same addresses. `setup` is resumable: it reconciles
 each target ATA to its configured balance before transferring only the missing
 amount. The journal stores no private keys or RPC URL.
+
+The USDtest session load runs against the retained `devnet-100k-usdg` cohort:
+
+- `configs/devnet-fixture-100k-usdg.yml` (`--id devnet-100k-usdg`) funds SOL and
+  devnet USDG for the 100,000-wallet cohort.
+- `configs/devnet-fixture-100-usdtest.yml` and
+  `configs/devnet-fixture-100k-usdtest.yml` both set
+  `wallet_set_id: devnet-100k-usdg`, so they add devnet-only USDtest
+  (Token-2022) accounts to that same funded cohort under their own lifecycle
+  journals — the first bounds a 100-wallet smoke, the second covers all 100,000.
+- `configs/devnet-fixture-100k.yml` (`--id devnet-100k`) is a separate USDC
+  cohort for USDC benchmarks, not the base for the USDtest session below.
+
+`configs/session-devnet.yml` and `configs/session-devnet-smoke-10.yml` set
+`tls_ca_cert_env: BENCH_TLS_CA_CERT`, so the gate's CA must be exported before
+any `run` — without it, config validation fails before load starts.
 
 ```sh
 export BENCH_DEVNET_RPC_URL='https://…'
 export BENCH_FUNDER_KEYPAIR='[solana keypair bytes]'
+# Private CA for the HTTPS gate; required by every session-devnet* run below.
+export BENCH_TLS_CA_CERT='/path/to/benchmark-ca.pem'
 
-# Review the caps in the YAML, then provision once.
+# Review the caps in the YAML, then fund SOL + USDG on the retained cohort.
 cargo run -p pay-bench --release -- setup \
-  bench/configs/devnet-fixture-100k.yml --id devnet-100k --yes
-
-# A real load run reuses the funded, deterministic wallet set and leaves
-# cleanup to the explicit teardown command.
-cargo run -p pay-bench --release -- run bench/configs/session-devnet.yml \
-  --fixture-id devnet-100k-usdtest --yes
-
-# After all load runs are finished, return every token balance and close each
-# ATA to reclaim its rent to the funder.
-cargo run -p pay-bench --release -- teardown devnet-100k \
-  --config bench/configs/devnet-fixture-100k.yml --yes
+  bench/configs/devnet-fixture-100k-usdg.yml --id devnet-100k-usdg --yes
 ```
 
-The USDtest fixture has its own setup journal but deliberately derives the
-already-provisioned `devnet-100k-usdg` wallet cohort. This adds the new token
-accounts without creating another 100,000 wallet addresses:
-
-```sh
-cargo run -p pay-bench --release -- setup \
-  bench/configs/devnet-fixture-100k-usdtest.yml --id devnet-100k-usdtest --yes
-```
-
-Before provisioning all 100,000 token accounts, validate the real devnet path
-with the bounded 100-wallet plan. It derives the same first 100 wallets and
-uses an independent journal:
+Validate the real devnet path on the bounded 100-wallet plan before provisioning
+all 100,000 token accounts. It adds USDtest to the first 100 retained wallets
+under its own journal:
 
 ```sh
 cargo run -p pay-bench --release -- setup \
@@ -143,10 +139,34 @@ cargo run -p pay-bench --release -- run bench/configs/session-devnet.yml \
   --fixture-id devnet-100-usdtest --yes
 ```
 
-The plan performs one idempotently reconciled transaction per derived wallet;
-it is intentionally restart-safe rather than relying on a one-off bulk-
-transfer script. Add USDT only with the actual devnet mint you fund: PayKit
-intentionally never maps a devnet symbol to the mainnet USDT mint.
+Once the bounded run is clean, add USDtest to the full cohort and run against it.
+Raise `session-devnet.yml`'s `load.users` only between clean runs; it must not
+exceed the wallet count in the selected `--fixture-id`:
+
+```sh
+cargo run -p pay-bench --release -- setup \
+  bench/configs/devnet-fixture-100k-usdtest.yml --id devnet-100k-usdtest --yes
+cargo run -p pay-bench --release -- run bench/configs/session-devnet.yml \
+  --fixture-id devnet-100k-usdtest --yes
+```
+
+After all runs, return every token balance and close each ATA to reclaim its
+rent to the funder. Tear the USDtest journals down first, then the retained
+cohort that holds the SOL and USDG:
+
+```sh
+cargo run -p pay-bench --release -- teardown devnet-100-usdtest \
+  --config bench/configs/devnet-fixture-100-usdtest.yml --yes
+cargo run -p pay-bench --release -- teardown devnet-100k-usdtest \
+  --config bench/configs/devnet-fixture-100k-usdtest.yml --yes
+cargo run -p pay-bench --release -- teardown devnet-100k-usdg \
+  --config bench/configs/devnet-fixture-100k-usdg.yml --yes
+```
+
+Each plan performs one idempotently reconciled transaction per derived wallet;
+it is intentionally restart-safe rather than relying on a one-off bulk-transfer
+script. Add USDT only with the actual devnet mint you fund: PayKit intentionally
+never maps a devnet symbol to the mainnet USDT mint.
 
 ## Pipeline
 
