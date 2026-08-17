@@ -35,6 +35,10 @@ use crate::wallet;
 /// SOL funded per user: a payment-channel open needs rent plus a fee margin.
 const PER_USER_SOL_LAMPORTS: u64 = 25_000_000;
 
+pub(crate) fn voucher_base_units(voucher_usdc: f64) -> u64 {
+    (voucher_usdc * 1e6).max(1.0) as u64
+}
+
 pub struct MppSession {
     deposit_base: u64,
     voucher_base: u64,
@@ -69,7 +73,7 @@ impl MppSession {
         // USDC-like 6 decimals for voucher accounting.
         Self {
             deposit_base: (deposit_usdc * 1e6) as u64,
-            voucher_base: (voucher_usdc * 1e6).max(1.0) as u64,
+            voucher_base: voucher_base_units(voucher_usdc),
             offline,
             offline_namespace: cfg.offline_namespace().to_string(),
             pre_sign_requests_per_user,

@@ -378,13 +378,17 @@ async fn setup_free_proxy() -> Result<OfflineProxy> {
 async fn setup_offline_proxy(cfg: &RunConfig) -> Result<OfflineProxy> {
     let operator = Keypair::new().pubkey().to_string();
     let recipient = Keypair::new().pubkey().to_string();
+    let session_cfg = cfg
+        .session
+        .as_ref()
+        .context("offline session rehearsal requires a session config")?;
     let api: ApiSpec =
         serde_yml::from_str(GATE_ONLY_PROVIDER_SPEC).context("parse gate-only provider")?;
     let session_mpp = seeded_session::build(
         SessionConfig {
             operator,
             recipient,
-            amount: 1_000,
+            amount: scheme::mpp_session::voucher_base_units(session_cfg.voucher_usdc),
             suggested_deposit: Some(1_000_000_000),
             currency: local_usdc_currency()?,
             decimals: 6,
@@ -394,10 +398,7 @@ async fn setup_offline_proxy(cfg: &RunConfig) -> Result<OfflineProxy> {
             ..Default::default()
         },
         cfg.offline_namespace(),
-        cfg.session
-            .as_ref()
-            .expect("validated session config")
-            .offline_seeded_channels,
+        session_cfg.offline_seeded_channels,
     )
     .await?;
     let state = AppState {
