@@ -282,8 +282,16 @@ impl RunConfig {
             bail!("at least one endpoint is required");
         }
         self.tls_ca_certificate()?;
-        if self.run.safety.max_total_usdc < 0.0 || self.run.safety.max_total_sol < 0.0 {
-            bail!("safety caps must be >= 0");
+        for (label, cap) in [
+            ("max_total_usdc", self.run.safety.max_total_usdc),
+            ("max_total_sol", self.run.safety.max_total_sol),
+        ] {
+            // Reject `.nan`/`.inf`: a non-finite cap silently disables the
+            // `total > cap` guard in `enforce_caps` (all IEEE-754 comparisons
+            // with NaN are false), letting a real-money run exceed its budget.
+            if !(cap.is_finite() && cap >= 0.0) {
+                bail!("safety.{label} must be a finite number >= 0");
+            }
         }
         if self.run.scheme == Scheme::MppSession && self.session.is_none() {
             bail!("scheme `mpp_session` requires a `session:` block");
@@ -351,5 +359,38 @@ impl RunConfig {
             "network `{:?}` needs rpc_url or rpc_url_env",
             self.run.network
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn selftest_config() -> RunConfig {
+        serde_yml::from_str(include_str!("../configs/selftest-10k.yml")).unwrap()
+    }
+
+    #[test]
+    fn selftest_config_validates() {
+        selftest_config().validate().unwrap();
+    }
+
+    #[test]
+    fn non_finite_safety_caps_are_rejected() {
+        for cap in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let mut cfg = selftest_config();
+            cfg.run.safety.max_total_usdc = cap;
+            assert!(
+                cfg.validate().is_err(),
+                "max_total_usdc={cap} must be rejected"
+            );
+
+            let mut cfg = selftest_config();
+            cfg.run.safety.max_total_sol = cap;
+            assert!(
+                cfg.validate().is_err(),
+                "max_total_sol={cap} must be rejected"
+            );
+        }
     }
 }

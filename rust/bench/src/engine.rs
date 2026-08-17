@@ -267,20 +267,70 @@ pub async fn run_pipeline(p: PipelineParams<'_>) -> Result<ReportJson> {
     ))
 }
 
+/// True only when `estimate` is definitively at or below `cap`. Any NaN makes
+/// `partial_cmp` return `None`, which we treat as "not within cap" so callers
+/// fail closed rather than comparing a non-finite value away.
+fn within_cap(estimate: f64, cap: f64) -> bool {
+    matches!(
+        estimate.partial_cmp(&cap),
+        Some(std::cmp::Ordering::Less | std::cmp::Ordering::Equal)
+    )
+}
+
 /// Reject a run whose estimated spend exceeds the configured hard caps.
 fn enforce_caps(cfg: &RunConfig, total_sol: f64, total_token: f64) -> Result<()> {
     let s = &cfg.run.safety;
-    if total_sol > s.max_total_sol {
+    // Fail closed on non-finite values: `partial_cmp` returns `None` for any
+    // NaN, which `within_cap` treats as "over budget" so a NaN cap or estimate
+    // rejects the run instead of being compared away. Config validation already
+    // rejects non-finite caps; this is defense in depth.
+    if !within_cap(total_sol, s.max_total_sol) {
         bail!(
             "estimated SOL {total_sol:.4} exceeds cap max_total_sol={:.4}",
             s.max_total_sol
         );
     }
-    if total_token > s.max_total_usdc {
+    if !within_cap(total_token, s.max_total_usdc) {
         bail!(
             "estimated token spend {total_token:.4} exceeds cap max_total_usdc={:.4}",
             s.max_total_usdc
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config_with_caps(sol: f64, usdc: f64) -> RunConfig {
+        let mut cfg: RunConfig =
+            serde_yml::from_str(include_str!("../configs/selftest-10k.yml")).unwrap();
+        cfg.run.safety.max_total_sol = sol;
+        cfg.run.safety.max_total_usdc = usdc;
+        cfg
+    }
+
+    #[test]
+    fn enforce_caps_accepts_within_budget() {
+        let cfg = config_with_caps(1.0, 1.0);
+        enforce_caps(&cfg, 0.5, 0.5).unwrap();
+    }
+
+    #[test]
+    fn enforce_caps_rejects_over_budget() {
+        let cfg = config_with_caps(1.0, 1.0);
+        assert!(enforce_caps(&cfg, 2.0, 0.5).is_err());
+        assert!(enforce_caps(&cfg, 0.5, 2.0).is_err());
+    }
+
+    #[test]
+    fn enforce_caps_fails_closed_on_non_finite() {
+        // A NaN cap must never wave a spend through, even if config validation
+        // is bypassed. `!(x <= NaN)` is true, so the run is rejected.
+        assert!(enforce_caps(&config_with_caps(f64::NAN, 1.0), 1.0, 0.5).is_err());
+        assert!(enforce_caps(&config_with_caps(1.0, f64::NAN), 0.5, 1.0).is_err());
+        // A NaN estimate is likewise rejected rather than compared away.
+        assert!(enforce_caps(&config_with_caps(1.0, 1.0), f64::NAN, 0.5).is_err());
+    }
 }
