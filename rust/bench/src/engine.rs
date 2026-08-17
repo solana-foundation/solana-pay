@@ -19,6 +19,10 @@ use crate::wallet::{self, Funder};
 
 /// Concurrency for the off-chain request-source preparation phase.
 const PREPARE_CONCURRENCY: usize = 32;
+/// Amortize the atomic full-state journal write for large fixture runs. A
+/// crash can lose at most this many completion markers; session recovery is
+/// idempotent and reconciles those users from chain state.
+const JOURNAL_CHECKPOINT_USERS: usize = 1_024;
 
 pub struct PipelineParams<'a> {
     pub config: &'a RunConfig,
@@ -131,11 +135,12 @@ pub async fn run_pipeline(p: PipelineParams<'_>) -> Result<ReportJson> {
         .buffer_unordered(load.provision_concurrency);
     let ctx_by_index: HashMap<u32, &UserCtx> = ctxs.iter().map(|ctx| (ctx.index, ctx)).collect();
     let mut provisioned: Vec<(u32, UserSetup)> = Vec::with_capacity(ctxs.len());
+    let mut provision_checkpoint = Vec::with_capacity(JOURNAL_CHECKPOINT_USERS);
     while let Some((idx, res)) = provisioning.next().await {
         match res {
             Ok(setup) => {
                 if !no_chain {
-                    p.journal.upsert_user(UserRecord {
+                    provision_checkpoint.push(UserRecord {
                         index: idx,
                         pubkey: ctx_by_index[&idx].wallet.pubkey.to_string(),
                         ata: setup.ata.clone(),
@@ -145,15 +150,26 @@ pub async fn run_pipeline(p: PipelineParams<'_>) -> Result<ReportJson> {
                         sol_lamports: per.sol_lamports,
                         funded: true,
                         swept: false,
-                    })?;
+                    });
+                    if provision_checkpoint.len() == JOURNAL_CHECKPOINT_USERS {
+                        p.journal.upsert_users(provision_checkpoint.drain(..))?;
+                    }
                 }
                 provisioned.push((idx, setup));
             }
             Err(e) => {
-                p.journal.set_status(Status::Failed)?;
+                if !provision_checkpoint.is_empty() {
+                    p.journal.upsert_users(provision_checkpoint.drain(..))?;
+                }
+                // Keep the journal outstanding: the open request may have
+                // reached chain even when its HTTP response failed, and prior
+                // users are definitely funded. Recovery must reconcile it.
                 return Err(e).with_context(|| format!("provisioning user {idx} failed"));
             }
         }
+    }
+    if !provision_checkpoint.is_empty() {
+        p.journal.upsert_users(provision_checkpoint.drain(..))?;
     }
     provisioned.sort_by_key(|(idx, _)| *idx);
     let setups: Vec<UserSetup> = provisioned.into_iter().map(|(_, setup)| setup).collect();
@@ -220,27 +236,51 @@ pub async fn run_pipeline(p: PipelineParams<'_>) -> Result<ReportJson> {
     p.journal.set_status(Status::Settling)?;
     let t_settle = Instant::now();
     if !no_chain {
-        for (ctx, setup) in ctxs.iter().zip(setups.iter()) {
-            scheme
-                .settle_and_close(ctx, setup)
-                .await
-                .with_context(|| format!("settling user {}", ctx.index))?;
-        }
-        for ctx in &ctxs {
-            funder
-                .sweep(&ctx.wallet, mint_pk.as_ref())
-                .await
-                .with_context(|| format!("sweeping user {}", ctx.index))?;
-            if let Some(rec) = p
-                .journal
-                .state()
-                .users
-                .iter()
-                .find(|u| u.index == ctx.index)
-                .cloned()
-            {
-                p.journal.upsert_user(UserRecord { swept: true, ..rec })?;
+        let mut settlement = stream::iter(ctxs.iter().zip(setups.iter()))
+            .map(|(ctx, setup)| async move {
+                let result: Result<()> = async {
+                    scheme
+                        .settle_and_close(ctx, setup)
+                        .await
+                        .with_context(|| format!("settling user {}", ctx.index))?;
+                    funder
+                        .sweep(&ctx.wallet, mint_pk.as_ref())
+                        .await
+                        .with_context(|| format!("sweeping user {}", ctx.index))?;
+                    Ok(())
+                }
+                .await;
+                (ctx.index, result)
+            })
+            .buffer_unordered(load.settlement_concurrency);
+        let mut swept_checkpoint = Vec::with_capacity(JOURNAL_CHECKPOINT_USERS);
+        let mut failure_count = 0usize;
+        let mut failure_samples = Vec::new();
+        while let Some((index, result)) = settlement.next().await {
+            match result {
+                Ok(()) => {
+                    swept_checkpoint.push(index);
+                    if swept_checkpoint.len() == JOURNAL_CHECKPOINT_USERS {
+                        p.journal.mark_users_swept(&swept_checkpoint)?;
+                        swept_checkpoint.clear();
+                    }
+                }
+                Err(error) => {
+                    failure_count += 1;
+                    if failure_samples.len() < 20 {
+                        failure_samples.push(format!("user {index}: {error:#}"));
+                    }
+                }
             }
+        }
+        if !swept_checkpoint.is_empty() {
+            p.journal.mark_users_swept(&swept_checkpoint)?;
+        }
+        if failure_count > 0 {
+            bail!(
+                "{failure_count} settlement/sweep operations failed; first failures:\n{}",
+                failure_samples.join("\n")
+            );
         }
     }
     p.journal.set_status(Status::Swept)?;

@@ -6,6 +6,7 @@
 //! [`crate::wallet`]) is enough to re-derive every wallet and sweep funds back
 //! to the funder. `scan_incomplete` surfaces any run that still holds funds.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -216,6 +217,7 @@ pub struct RunState {
 pub struct Journal {
     path: PathBuf,
     state: RunState,
+    user_positions: HashMap<u32, usize>,
 }
 
 impl Journal {
@@ -252,6 +254,7 @@ impl Journal {
         let journal = Self {
             path: Self::path_for(&run_id)?,
             state,
+            user_positions: HashMap::new(),
         };
         journal.save()?;
         Ok(journal)
@@ -264,7 +267,17 @@ impl Journal {
             .with_context(|| format!("reading journal {}", path.display()))?;
         let state: RunState = serde_json::from_str(&raw)
             .with_context(|| format!("parsing journal {}", path.display()))?;
-        Ok(Self { path, state })
+        let user_positions = state
+            .users
+            .iter()
+            .enumerate()
+            .map(|(position, user)| (user.index, position))
+            .collect();
+        Ok(Self {
+            path,
+            state,
+            user_positions,
+        })
     }
 
     pub fn state(&self) -> &RunState {
@@ -276,11 +289,33 @@ impl Journal {
         self.save()
     }
 
-    /// Insert or replace a user record (keyed on `index`) and persist.
-    pub fn upsert_user(&mut self, rec: UserRecord) -> Result<()> {
-        match self.state.users.iter_mut().find(|u| u.index == rec.index) {
-            Some(existing) => *existing = rec,
-            None => self.state.users.push(rec),
+    /// Insert or replace user records and persist them as one checkpoint.
+    pub fn upsert_users(&mut self, records: impl IntoIterator<Item = UserRecord>) -> Result<()> {
+        self.update_users(records);
+        self.save()
+    }
+
+    fn update_users(&mut self, records: impl IntoIterator<Item = UserRecord>) {
+        for rec in records {
+            if let Some(position) = self.user_positions.get(&rec.index).copied() {
+                self.state.users[position] = rec;
+            } else {
+                let position = self.state.users.len();
+                self.user_positions.insert(rec.index, position);
+                self.state.users.push(rec);
+            }
+        }
+    }
+
+    /// Mark a completed lifecycle batch as swept and persist one checkpoint.
+    pub fn mark_users_swept(&mut self, indices: &[u32]) -> Result<()> {
+        for index in indices {
+            let position = self
+                .user_positions
+                .get(index)
+                .copied()
+                .with_context(|| format!("journal has no user {index}"))?;
+            self.state.users[position].swept = true;
         }
         self.save()
     }
@@ -351,7 +386,7 @@ fn _is_path(_: &Path) {}
 
 #[cfg(test)]
 mod tests {
-    use super::FixtureState;
+    use super::{FixtureState, Journal, Network, Scheme, UserRecord};
 
     #[test]
     fn legacy_fixture_journal_defaults_pending_transactions() {
@@ -373,5 +408,40 @@ mod tests {
         let state: FixtureState = serde_json::from_str(raw).unwrap();
         assert!(state.pending.is_empty());
         assert!(state.wallet_set_id.is_none());
+    }
+
+    #[test]
+    fn batched_user_updates_replace_by_index() {
+        let mut journal = Journal {
+            path: std::path::PathBuf::from("unused"),
+            state: super::RunState {
+                run_id: "test".into(),
+                name: "test".into(),
+                scheme: Scheme::MppSession,
+                network: Network::Devnet,
+                funder_pubkey: "funder".into(),
+                status: super::Status::Planning,
+                created_at: "now".into(),
+                updated_at: "now".into(),
+                users: Vec::new(),
+            },
+            user_positions: std::collections::HashMap::new(),
+        };
+        let first = UserRecord {
+            index: 7,
+            funded: true,
+            ..UserRecord::default()
+        };
+        let replacement = UserRecord {
+            index: 7,
+            funded: true,
+            swept: true,
+            ..UserRecord::default()
+        };
+
+        journal.update_users([first, replacement]);
+
+        assert_eq!(journal.state.users.len(), 1);
+        assert!(journal.state.users[0].swept);
     }
 }

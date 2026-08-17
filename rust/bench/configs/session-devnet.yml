@@ -25,6 +25,11 @@ load:
   prepare_secs: 5
   unleash_secs: 15
   max_concurrency: 512
+  # The split-host 1k stage validated this bound for confirmed channel opens.
+  provision_concurrency: 1000
+  # Close requests wait for confirmed on-chain settlement. Bound them
+  # independently from request traffic so cleanup scales without RPC storms.
+  settlement_concurrency: 128
 
 endpoints:
   - url: http://127.0.0.1:1402/api/v1/compute

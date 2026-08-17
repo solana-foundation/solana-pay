@@ -84,6 +84,8 @@ load:
   prepare_secs: 30            # window to pre-build the request buffer
   unleash_secs: 60            # measured window
   max_concurrency: 2048
+  provision_concurrency: 1000 # on-chain channel opens
+  settlement_concurrency: 128 # on-chain closes + wallet sweeps
 endpoints:
   - { url: "https://<proxy>/v1/charge", method: POST, body: "{}" }
 session: { deposit_usdc: 0.10, voucher_usdc: 0.0001, close_after_run: true } # mpp_session only
@@ -149,6 +151,12 @@ cargo run -p pay-bench --release -- setup \
 cargo run -p pay-bench --release -- run bench/configs/session-devnet.yml \
   --fixture-id devnet-100k-usdtest --yes
 ```
+
+Provision and settlement progress is checkpointed in batches of 1,024 users.
+The journal uses an in-memory index for constant-time updates, so a 100,000-user
+run does not rewrite the full journal once per user. If a process exits between
+checkpoints, `recover-sessions` reconciles the bounded uncheckpointed tail from
+on-chain state before the next stage.
 
 After all runs, return every token balance and close each ATA to reclaim its
 rent to the funder. Tear the USDtest journals down first, then the retained

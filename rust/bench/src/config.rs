@@ -127,6 +127,12 @@ pub struct Load {
     /// lifecycle benchmarks normally set this much higher than the default.
     #[serde(default = "default_provision_concurrency")]
     pub provision_concurrency: usize,
+    /// Maximum concurrent per-user close and sweep operations after the
+    /// measured window. Keep this independently bounded: session close waits
+    /// for an on-chain transaction, while provisioning and request traffic
+    /// have different capacity limits.
+    #[serde(default = "default_settlement_concurrency")]
+    pub settlement_concurrency: usize,
     /// Fixed generator workers. Channels are deterministically assigned by
     /// user index, avoiding one Tokio task and interval per logical session.
     #[serde(default = "default_worker_count")]
@@ -212,6 +218,9 @@ fn default_max_concurrency() -> usize {
 fn default_provision_concurrency() -> usize {
     16
 }
+fn default_settlement_concurrency() -> usize {
+    16
+}
 fn default_worker_count() -> usize {
     32
 }
@@ -282,6 +291,9 @@ impl RunConfig {
         }
         if self.load.provision_concurrency == 0 {
             bail!("load.provision_concurrency must be > 0");
+        }
+        if self.load.settlement_concurrency == 0 {
+            bail!("load.settlement_concurrency must be > 0");
         }
         if self.load.proxy_workers == Some(0) {
             bail!("load.proxy_workers must be > 0 when set");
@@ -411,5 +423,13 @@ mod tests {
         cfg.load.provision_concurrency = 0;
         let error = cfg.validate().unwrap_err();
         assert!(error.to_string().contains("provision_concurrency"));
+    }
+
+    #[test]
+    fn zero_settlement_concurrency_is_rejected() {
+        let mut cfg = selftest_config();
+        cfg.load.settlement_concurrency = 0;
+        let error = cfg.validate().unwrap_err();
+        assert!(error.to_string().contains("settlement_concurrency"));
     }
 }
