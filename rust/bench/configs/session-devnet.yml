@@ -7,7 +7,11 @@ run:
   network: devnet
   rpc_url_env: BENCH_DEVNET_RPC_URL
   mint: 6MJyWHwFpPsaTEuYarEz49ngtsSKPYn6yHqtJUW2a9St
-  tls_ca_cert_env: BENCH_TLS_CA_CERT
+  # TLS is optional. The gate serves plaintext on 127.0.0.1:1402 for a
+  # co-located or SSH-tunnelled run. To reach a remote gate, start it with a
+  # cert (`pay server start --tls-cert --tls-key`), point the endpoint below at
+  # `https://<host>:1402/...`, and uncomment tls_ca_cert_env to trust its CA.
+  # tls_ca_cert_env: BENCH_TLS_CA_CERT
   funder:
     keypair_env: BENCH_FUNDER_KEYPAIR
   safety:
@@ -23,7 +27,7 @@ load:
   max_concurrency: 512
 
 endpoints:
-  - url: https://213.239.141.29/api/v1/compute
+  - url: http://127.0.0.1:1402/api/v1/compute
     method: GET
     body: ""
 
