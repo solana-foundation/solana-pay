@@ -19,7 +19,7 @@ use solana_pubkey::Pubkey;
 use solana_signature::Signature;
 use solana_transaction::Transaction;
 
-use crate::config::{RunConfig, Scheme};
+use crate::config::{Network, RunConfig, Scheme};
 use crate::fixture_rpc::{ExecutionConfig, FixtureRpc};
 use crate::scheme::{build_request, validate_payment_transport, www_authenticate};
 use crate::wallet::{self, Wallet};
@@ -263,7 +263,7 @@ async fn recover_without_gateway_state(
             preimage_bytes: 0u32.to_le_bytes().to_vec(),
             recipients: Vec::new(),
         };
-        let treasury = pay_kit::mpp::program::payment_channels::treasury_owner();
+        let treasury = recovery_treasury_owner(config.run.network)?;
         let (blockhash, _) = rpc.latest_blockhash().await?;
         let mut transactions = Vec::with_capacity(sealed.len());
         for channel in &sealed {
@@ -307,6 +307,17 @@ async fn recover_without_gateway_state(
         sealed.len()
     );
     Ok(())
+}
+
+fn recovery_treasury_owner(network: Network) -> Result<Pubkey> {
+    match network {
+        Network::Mainnet => Ok(pay_kit::mpp::program::payment_channels::treasury_owner()),
+        // The devnet program is compiled with its cluster-specific treasury;
+        // PayKit's legacy no-argument helper returns the mainnet constant.
+        Network::Devnet => Pubkey::from_str("4zTeC5mVqWLruDexgU2mV66p9t5vCA9JyiZqdGDUspap")
+            .context("invalid built-in devnet treasury owner"),
+        Network::Fork => bail!("direct public-cluster recovery does not support fork networks"),
+    }
 }
 
 fn validate_zero_voucher_channels<'a>(
