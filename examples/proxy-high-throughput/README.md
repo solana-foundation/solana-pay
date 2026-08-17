@@ -15,7 +15,7 @@ size- and packet-bounded settlement worker. This is the production flow being
 benchmarked, not a stream of per-request devnet transactions.
 
 The default sample inventory pins native-TLS Pay
-`7d66df17dcdb327f5abfa5a762d5bc78e884d5eb` and Rust
+`dc2593f763812dea3996a7f506d452ea4a3fd083` and Rust
 `nightly-2026-08-14`. The TLS commit descends from the source used for the
 retained AVX-512 IFMA measurements. Do not replace it with a moving branch when
 collecting benchmark evidence.
@@ -130,7 +130,7 @@ path.
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `pay_git_ref` | `7d66df17…` | Immutable Pay commit with the validated native TLS listener. |
+| `pay_git_ref` | `dc2593f7…` | Immutable Pay commit with the validated native TLS listener and benchmark CA support. |
 | `pay_rust_toolchain` | `nightly-2026-08-14` | Compiler that enabled curve25519-dalek's AVX-512 IFMA backend. |
 | `pay_rustup_init_sha256` | `4acc9acc…` | Pins the x86_64 rustup bootstrap binary downloaded from `static.rust-lang.org`. |
 | `pay_rustflags` | `-C target-cpu=native` | Selects the native Zen 5 instruction set. The binary is not portable to older CPUs. |

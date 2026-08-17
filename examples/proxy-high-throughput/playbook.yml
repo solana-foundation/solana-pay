@@ -6,7 +6,7 @@
 
   vars:
     pay_git_repo: "https://github.com/solana-foundation/pay.git"
-    pay_git_ref: "7d66df17dcdb327f5abfa5a762d5bc78e884d5eb"
+    pay_git_ref: "dc2593f763812dea3996a7f506d452ea4a3fd083"
     pay_rust_toolchain: "nightly-2026-08-14"
     pay_rustflags: "-C target-cpu=native"
     pay_require_avx512_ifma: true
