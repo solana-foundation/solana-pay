@@ -1,0 +1,15 @@
+{
+  "name": "USDtest",
+  "symbol": "USDtest",
+  "description": "Devnet-only test dollar for Solana payment-channel integration and load testing.",
+  "image": "https://solana.communities.buzz.xyz/media/c92b6aadeee6574a38cc1e0e9aaa498424a3c602fece8a30c211372821466104.png",
+  "properties": {
+    "category": "image",
+    "files": [
+      {
+        "uri": "https://solana.communities.buzz.xyz/media/c92b6aadeee6574a38cc1e0e9aaa498424a3c602fece8a30c211372821466104.png",
+        "type": "image/png"
+      }
+    ]
+  }
+}
