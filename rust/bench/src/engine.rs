@@ -53,9 +53,12 @@ pub async fn run_pipeline(p: PipelineParams<'_>) -> Result<ReportJson> {
         || cfg.session.as_ref().is_some_and(|session| session.offline);
 
     // ── 1. Resolve price from a 402 probe ───────────────────────────────────
-    let probe = reqwest::Client::builder()
-        .timeout(Duration::from_secs(20))
-        .build()?;
+    let tls_ca_certificate = cfg.tls_ca_certificate()?;
+    let mut probe_builder = reqwest::Client::builder().timeout(Duration::from_secs(20));
+    if let Some(certificate) = tls_ca_certificate.clone() {
+        probe_builder = probe_builder.add_root_certificate(certificate);
+    }
+    let probe = probe_builder.build()?;
     let price = scheme
         .resolve(&probe, endpoint, p.host_override.as_deref())
         .await
@@ -89,10 +92,13 @@ pub async fn run_pipeline(p: PipelineParams<'_>) -> Result<ReportJson> {
     };
 
     // ── 3. Build per-user contexts (deterministic wallets) ──────────────────
-    let prep_http = reqwest::Client::builder()
+    let mut prep_builder = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
-        .pool_max_idle_per_host(64)
-        .build()?;
+        .pool_max_idle_per_host(64);
+    if let Some(certificate) = tls_ca_certificate.clone() {
+        prep_builder = prep_builder.add_root_certificate(certificate);
+    }
+    let prep_http = prep_builder.build()?;
     let ctxs: Vec<UserCtx> = (0..load.users as u32)
         .filter(|index| *index as usize % load.shard_count == load.shard_index)
         .map(|i| UserCtx {
@@ -199,6 +205,7 @@ pub async fn run_pipeline(p: PipelineParams<'_>) -> Result<ReportJson> {
         pool_per_host: load.max_concurrency.max(256),
         workers: load.workers,
         http2_prior_knowledge: load.http2_prior_knowledge,
+        tls_ca_certificate,
     };
     let report = driver::run(sources, dcfg)
         .instrument(tracing::info_span!("unleash"))

@@ -71,6 +71,13 @@ pub struct RunMeta {
     /// …an explicit URL. Ignored for `network: fork` (surfpool supplies it).
     #[serde(default)]
     pub rpc_url: Option<String>,
+    /// Env var containing the path to a private benchmark CA certificate.
+    #[serde(default)]
+    pub tls_ca_cert_env: Option<String>,
+    /// Explicit PEM path for a private benchmark CA. Prefer
+    /// `tls_ca_cert_env` in shared configs.
+    #[serde(default)]
+    pub tls_ca_cert: Option<String>,
     /// Charge/voucher currency. `None` ⇒ native SOL; `Some(mint)` ⇒ SPL token.
     #[serde(default)]
     pub mint: Option<String>,
@@ -226,6 +233,31 @@ impl RunConfig {
         Ok(cfg)
     }
 
+    /// Load the optional benchmark CA once, before any HTTP clients are built.
+    pub fn tls_ca_certificate(&self) -> Result<Option<reqwest::Certificate>> {
+        let path = if let Some(path) = self.run.tls_ca_cert.as_deref() {
+            Some(path.to_string())
+        } else if let Some(var) = self.run.tls_ca_cert_env.as_deref() {
+            Some(
+                std::env::var(var)
+                    .with_context(|| format!("tls_ca_cert_env `{var}` is not set"))?,
+            )
+        } else {
+            None
+        };
+        let Some(path) = path else {
+            return Ok(None);
+        };
+        if path.trim().is_empty() {
+            bail!("run.tls_ca_cert must not be empty");
+        }
+        let pem = std::fs::read(&path)
+            .with_context(|| format!("reading benchmark TLS CA certificate {path}"))?;
+        let certificate = reqwest::Certificate::from_pem(&pem)
+            .with_context(|| format!("parsing benchmark TLS CA certificate {path}"))?;
+        Ok(Some(certificate))
+    }
+
     pub fn validate(&self) -> Result<()> {
         if self.load.users == 0 {
             bail!("load.users must be > 0");
@@ -245,6 +277,7 @@ impl RunConfig {
         if self.endpoints.is_empty() {
             bail!("at least one endpoint is required");
         }
+        self.tls_ca_certificate()?;
         if self.run.safety.max_total_usdc < 0.0 || self.run.safety.max_total_sol < 0.0 {
             bail!("safety caps must be >= 0");
         }

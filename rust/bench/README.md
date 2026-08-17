@@ -71,6 +71,7 @@ run:
   scheme: mpp_charge          # mpp_charge | mpp_session | x402_exact
   network: fork               # fork | mainnet | devnet
   rpc_url: "https://…"        # fork datasource, or mainnet RPC (prefer rpc_url_env)
+  tls_ca_cert_env: BENCH_TLS_CA_CERT # optional env var containing private CA path
   funder: { keypair_env: BENCH_FUNDER_KEYPAIR }
   safety:
     max_total_usdc: 100.0     # hard caps, enforced pre-flight
@@ -111,7 +112,7 @@ cargo run -p pay-bench --release -- setup \
 # A real load run reuses the funded, deterministic wallet set and leaves
 # cleanup to the explicit teardown command.
 cargo run -p pay-bench --release -- run bench/configs/session-devnet.yml \
-  --fixture-id devnet-100k --yes
+  --fixture-id devnet-100k-usdg --yes
 
 # After all load runs are finished, return every token balance and close each
 # ATA to reclaim its rent to the funder.

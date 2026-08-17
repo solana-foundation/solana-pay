@@ -15,7 +15,7 @@ use hdrhistogram::Histogram;
 
 use crate::scheme::{RequestSource, build_request};
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct DriverConfig {
     pub rps_per_user: f64,
     pub max_concurrency: usize,
@@ -23,6 +23,7 @@ pub struct DriverConfig {
     pub pool_per_host: usize,
     pub workers: usize,
     pub http2_prior_knowledge: bool,
+    pub tls_ca_certificate: Option<reqwest::Certificate>,
 }
 
 #[derive(Debug, Clone)]
@@ -288,7 +289,7 @@ pub async fn run(sources: Vec<Box<dyn RequestSource>>, cfg: DriverConfig) -> Dri
         .map(|_| {
             build_http(&DriverConfig {
                 pool_per_host: worker_pool_per_host,
-                ..cfg
+                ..cfg.clone()
             })
         })
         .collect();
@@ -299,7 +300,7 @@ pub async fn run(sources: Vec<Box<dyn RequestSource>>, cfg: DriverConfig) -> Dri
         // Replaced by each worker's independently-owned client below.
         http: worker_clients[0].clone(),
         worker_max_in_flight,
-        cfg,
+        cfg: cfg.clone(),
         started,
         deadline,
         phase_denominator,
@@ -524,6 +525,9 @@ pub fn build_http(cfg: &DriverConfig) -> reqwest::Client {
     if cfg.http2_prior_knowledge {
         builder = builder.http2_prior_knowledge().http2_adaptive_window(true);
     }
+    if let Some(certificate) = cfg.tls_ca_certificate.clone() {
+        builder = builder.add_root_certificate(certificate);
+    }
     builder.build().expect("build http client")
 }
 
@@ -558,7 +562,7 @@ mod tests {
         logical_payment: bool,
         issued: Arc<AtomicU64>,
         signing_delay: Duration,
-        signing_barrier: Option<Arc<std::sync::Barrier>>,
+        signing_barrier: Option<Arc<tokio::sync::Barrier>>,
     }
 
     #[async_trait::async_trait]
@@ -570,7 +574,7 @@ mod tests {
         async fn next_request(&mut self) -> anyhow::Result<crate::scheme::PreparedRequest> {
             self.issued.fetch_add(1, Ordering::Relaxed);
             if let Some(barrier) = self.signing_barrier.take() {
-                barrier.wait();
+                barrier.wait().await;
             }
             tokio::time::sleep(self.signing_delay).await;
             Ok(crate::scheme::PreparedRequest {
@@ -613,6 +617,7 @@ mod tests {
                 pool_per_host: 1,
                 workers: 1,
                 http2_prior_knowledge: false,
+                tls_ca_certificate: None,
             },
         )
         .await;
@@ -654,6 +659,7 @@ mod tests {
                 pool_per_host: 1,
                 workers: 1,
                 http2_prior_knowledge: false,
+                tls_ca_certificate: None,
             },
         )
         .await;
@@ -692,6 +698,7 @@ mod tests {
                 pool_per_host: 1,
                 workers: 1,
                 http2_prior_knowledge: false,
+                tls_ca_certificate: None,
             },
         )
         .await;
@@ -714,7 +721,7 @@ mod tests {
             .await
             .unwrap();
         });
-        let barrier = Arc::new(std::sync::Barrier::new(4));
+        let barrier = Arc::new(tokio::sync::Barrier::new(4));
         // Strided global IDs model one fleet shard. Assignment by global ID
         // would collapse all four onto worker zero because 4 divides each ID.
         let sources: Vec<Box<dyn RequestSource>> = (0..4)
@@ -740,6 +747,7 @@ mod tests {
                     pool_per_host: 4,
                     workers: 4,
                     http2_prior_knowledge: false,
+                    tls_ca_certificate: None,
                 },
             ),
         )

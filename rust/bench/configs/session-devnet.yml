@@ -1,4 +1,4 @@
-# Start this at a small user count after `devnet-fixture-100k.yml` is ready.
+# Start this at a small user count after `devnet-fixture-100k-usdg.yml` is ready.
 # Increase `load.users` only after the previous run is clean; it must not
 # exceed the number of wallets in the selected --fixture-id.
 run:
@@ -6,7 +6,8 @@ run:
   scheme: mpp_session
   network: devnet
   rpc_url_env: BENCH_DEVNET_RPC_URL
-  mint: 4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU
+  mint: 4F6PM96JJxngmHnZLBh9n58RH4aTVNWvDs2nuwrT5BP7
+  tls_ca_cert_env: BENCH_TLS_CA_CERT
   funder:
     keypair_env: BENCH_FUNDER_KEYPAIR
   safety:

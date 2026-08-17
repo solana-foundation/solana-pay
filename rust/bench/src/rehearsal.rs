@@ -520,6 +520,8 @@ mod tests {
                 network: Network::Fork,
                 rpc_url_env: None,
                 rpc_url: None,
+                tls_ca_cert_env: None,
+                tls_ca_cert: None,
                 mint: None,
                 funder: FunderCfg::default(),
                 safety: Safety {
