@@ -308,7 +308,13 @@ async fn recover_without_gateway_state(
     let distributed =
         discover_fixture_channels(&discovery, rpc_url, CHANNEL_STATUS_DISTRIBUTED, expected)
             .await?;
-    validate_zero_voucher_channels(distributed.iter(), funder)?;
+    for channel in &distributed {
+        validate_rent_reclaim_destination(
+            channel.address,
+            from_address(&channel.channel.rent_payer),
+            funder.pubkey,
+        )?;
+    }
     if !distributed.is_empty() {
         let current_slot = discovery.get_slot(rpc_url).await?;
         let locked = distributed
@@ -408,6 +414,21 @@ fn validate_zero_voucher_channels<'a>(
             channel.address
         );
     }
+    Ok(())
+}
+
+/// Reclaiming an already-distributed channel cannot alter its settlement or
+/// payout. It only closes the terminal PDA and returns rent to the address
+/// recorded on-chain, so non-zero voucher watermarks are valid here.
+fn validate_rent_reclaim_destination(
+    channel: Pubkey,
+    rent_payer: Pubkey,
+    expected_rent_payer: Pubkey,
+) -> Result<()> {
+    ensure!(
+        rent_payer == expected_rent_payer,
+        "refusing rent reclaim: channel {channel} returns rent to {rent_payer}, not the configured funder {expected_rent_payer}"
+    );
     Ok(())
 }
 
@@ -547,4 +568,26 @@ async fn close_channel(
     let status = response.status();
     let body = response.bytes().await.context("reading recovery close")?;
     crate::scheme::mpp_session::validate_close_response(status, &body)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rent_reclaim_accepts_configured_funder() {
+        let funder = Pubkey::new_unique();
+        validate_rent_reclaim_destination(Pubkey::new_unique(), funder, funder).unwrap();
+    }
+
+    #[test]
+    fn rent_reclaim_rejects_another_destination() {
+        let error = validate_rent_reclaim_destination(
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("refusing rent reclaim"));
+    }
 }
