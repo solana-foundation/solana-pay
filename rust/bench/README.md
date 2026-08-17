@@ -85,7 +85,7 @@ load:
   max_concurrency: 2048
 endpoints:
   - { url: "https://<proxy>/v1/charge", method: POST, body: "{}" }
-session: { deposit_usdc: 0.10, voucher_usdc: 0.0001 }   # mpp_session only
+session: { deposit_usdc: 0.10, voucher_usdc: 0.0001, close_after_run: true } # mpp_session only
 ```
 
 > **Secrets:** prefer `rpc_url_env` / `funder.keypair_env` over inlining an

@@ -166,6 +166,10 @@ pub struct SessionCfg {
     /// stand-in (settlement is a no-op).
     #[serde(default)]
     pub settle_onchain: bool,
+    /// Request an immediate channel close after the measured window. Disable
+    /// this when validating the server's periodic settlement lifecycle.
+    #[serde(default = "default_true")]
+    pub close_after_run: bool,
     /// Pure off-chain benchmark mode (no surfpool/fork): deterministic,
     /// confirmed channel state is seeded in the `pay-bench` process and normal
     /// client vouchers are verified through the regular gateway path.

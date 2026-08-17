@@ -40,6 +40,7 @@ pub struct MppSession {
     offline: bool,
     offline_namespace: String,
     pre_sign_requests_per_user: usize,
+    close_after_run: bool,
     /// Live channel handles, keyed by user index. `SessionHandle` is `Clone`
     /// (Arc inside), so we clone one out under the lock and `.await` on it —
     /// never holding the std mutex across an await.
@@ -59,6 +60,11 @@ impl MppSession {
             .as_ref()
             .map(|session| session.pre_sign_requests_per_user)
             .unwrap_or(0);
+        let close_after_run = cfg
+            .session
+            .as_ref()
+            .map(|session| session.close_after_run)
+            .unwrap_or(true);
         // USDC-like 6 decimals for voucher accounting.
         Self {
             deposit_base: (deposit_usdc * 1e6) as u64,
@@ -66,6 +72,7 @@ impl MppSession {
             offline,
             offline_namespace: cfg.offline_namespace().to_string(),
             pre_sign_requests_per_user,
+            close_after_run,
             handles: Mutex::new(HashMap::new()),
         }
     }
@@ -291,7 +298,7 @@ impl BenchScheme for MppSession {
         // signer.  Closing them after the measured window adds an unbounded
         // serial HTTP tail (and can outlive the synthetic challenge) without
         // exercising a production path.
-        if self.offline {
+        if self.offline || !self.close_after_run {
             return Ok(());
         }
         let Some(handle) = self.handle(ctx.index) else {

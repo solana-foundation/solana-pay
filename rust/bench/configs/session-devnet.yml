@@ -31,3 +31,6 @@ session:
   deposit_usdc: 0.01
   voucher_usdc: 0.000001
   settle_onchain: false
+  # Leave channels active so the proxy's five-minute lifecycle performs the
+  # settlement; teardown remains an explicit operation after the experiment.
+  close_after_run: false

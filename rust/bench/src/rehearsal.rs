@@ -547,6 +547,7 @@ mod tests {
                 deposit_usdc: 1.0,
                 voucher_usdc: 0.000001,
                 settle_onchain: false,
+                close_after_run: true,
                 offline: true,
                 offline_namespace: None,
                 offline_seeded_channels: 1,
