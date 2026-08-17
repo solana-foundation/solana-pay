@@ -1006,7 +1006,7 @@ fn decimal_to_base(value: &str, decimals: u8) -> Result<u64> {
 
 #[cfg(test)]
 mod tests {
-    use super::{SetupConfig, decimal_to_base};
+    use super::{RunConfig, SetupConfig, decimal_to_base};
 
     #[test]
     fn decimal_amounts_are_exact() {
@@ -1033,13 +1033,27 @@ mod tests {
 
     #[test]
     fn bundled_devnet_usdtest_fixture_reuses_retained_wallet_set() {
-        let config: SetupConfig =
-            serde_yml::from_str(include_str!("../configs/devnet-fixture-100k-usdtest.yml"))
-                .unwrap();
-        config.validate().unwrap();
-        assert_eq!(
-            config.setup.wallet_set_id.as_deref(),
-            Some("devnet-100k-usdg")
-        );
+        for raw in [
+            include_str!("../configs/devnet-fixture-100-usdtest.yml"),
+            include_str!("../configs/devnet-fixture-100k-usdtest.yml"),
+        ] {
+            let config: SetupConfig = serde_yml::from_str(raw).unwrap();
+            config.validate().unwrap();
+            assert_eq!(
+                config.setup.wallet_set_id.as_deref(),
+                Some("devnet-100k-usdg")
+            );
+        }
+    }
+
+    #[test]
+    fn bundled_devnet_usdtest_runs_close_every_channel() {
+        for raw in [
+            include_str!("../configs/session-devnet-smoke-10.yml"),
+            include_str!("../configs/session-devnet.yml"),
+        ] {
+            let config: RunConfig = serde_yml::from_str(raw).unwrap();
+            assert!(config.session.unwrap().close_after_run);
+        }
     }
 }

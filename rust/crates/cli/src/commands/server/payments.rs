@@ -88,6 +88,20 @@ pub(crate) fn resolve_currency(currency: &str, network: &str) -> (String, u8) {
     (currency.to_string(), 6)
 }
 
+pub(crate) fn resolve_currency_checked(
+    currency: &str,
+    network: &str,
+) -> pay_core::Result<(String, u8)> {
+    let currency = currency.trim();
+    if currency.eq_ignore_ascii_case("SOL") {
+        return Ok(("sol".to_string(), 9));
+    }
+    let mint = pay_kit::mpp::protocol::solana::try_resolve_stablecoin_mint(currency, Some(network))
+        .map_err(|error| pay_core::Error::Config(error.to_string()))?
+        .unwrap_or(currency);
+    Ok((mint.to_string(), 6))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct StableTokenAccountRequirement {
     pub(crate) label: String,
@@ -347,7 +361,9 @@ pub(crate) fn stable_token_account_requirements(
 ) -> pay_core::Result<Vec<StableTokenAccountRequirement>> {
     let mut requirements = Vec::new();
     for (label, mint, _decimals) in currency_configs {
-        if Stablecoin::parse_symbol(label).is_none() && Stablecoin::from_mint(mint).is_none() {
+        if Stablecoin::parse_symbol(label).is_none()
+            && !pay_kit::mpp::protocol::solana::is_known_stablecoin_mint(mint)
+        {
             continue;
         }
 

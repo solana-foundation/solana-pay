@@ -1,8 +1,7 @@
-# Start this at a small user count after `devnet-fixture-100k-usdtest.yml` is ready.
-# Increase `load.users` only after the previous run is clean; it must not
-# exceed the number of wallets in the selected --fixture-id.
+# First live USDtest stage. Reuses the first ten wallets from the bounded
+# 100-wallet fixture and closes every channel before returning.
 run:
-  name: session-devnet
+  name: session-devnet-smoke-10
   scheme: mpp_session
   network: devnet
   rpc_url_env: BENCH_DEVNET_RPC_URL
@@ -11,16 +10,16 @@ run:
   funder:
     keypair_env: BENCH_FUNDER_KEYPAIR
   safety:
-    max_total_usdc: 1000.0
-    max_total_sol: 1000.0
+    max_total_usdc: 0.1
+    max_total_sol: 0.25
     require_confirmation: true
 
 load:
-  users: 100
+  users: 10
   requests_per_sec_per_user: 5
   prepare_secs: 5
   unleash_secs: 15
-  max_concurrency: 512
+  max_concurrency: 64
 
 endpoints:
   - url: https://213.239.141.29/api/v1/compute
@@ -31,5 +30,4 @@ session:
   deposit_usdc: 0.01
   voucher_usdc: 0.000001
   settle_onchain: false
-  # Cooperatively close and settle every channel before fixture teardown.
   close_after_run: true

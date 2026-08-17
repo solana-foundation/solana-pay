@@ -130,6 +130,19 @@ cargo run -p pay-bench --release -- setup \
   bench/configs/devnet-fixture-100k-usdtest.yml --id devnet-100k-usdtest --yes
 ```
 
+Before provisioning all 100,000 token accounts, validate the real devnet path
+with the bounded 100-wallet plan. It derives the same first 100 wallets and
+uses an independent journal:
+
+```sh
+cargo run -p pay-bench --release -- setup \
+  bench/configs/devnet-fixture-100-usdtest.yml --id devnet-100-usdtest --yes
+cargo run -p pay-bench --release -- run bench/configs/session-devnet-smoke-10.yml \
+  --fixture-id devnet-100-usdtest --yes
+cargo run -p pay-bench --release -- run bench/configs/session-devnet.yml \
+  --fixture-id devnet-100-usdtest --yes
+```
+
 The plan performs one idempotently reconciled transaction per derived wallet;
 it is intentionally restart-safe rather than relying on a one-off bulk-
 transfer script. Add USDT only with the actual devnet mint you fund: PayKit

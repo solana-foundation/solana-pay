@@ -18,7 +18,7 @@ use pay_types::metering::{ApiSpec, OperatorConfig, RoutingConfig, SignerConfig};
 use tokio::time::{Duration, Instant};
 
 use super::payments::{
-    self, PayoutRecipientTarget, lamports_to_sol, resolve_currency,
+    self, PayoutRecipientTarget, lamports_to_sol, resolve_currency_checked,
     should_use_auto_fee_payer_signer, stable_token_account_requirements, surfpool_funding_targets,
 };
 use crate::components::{PAY_SH_TAGLINE, render_pay_banner, solana_explorer_cluster_query};
@@ -288,11 +288,13 @@ fn ensure_session_currencies_usd_pegged(
     currency_configs: &[(String, String, u8)],
 ) -> pay_core::Result<()> {
     for (symbol, mint, _decimals) in currency_configs {
-        if Stablecoin::parse_symbol(symbol).is_none() && Stablecoin::from_mint(mint).is_none() {
+        if Stablecoin::parse_symbol(symbol).is_none()
+            && !pay_kit::mpp::protocol::solana::is_known_stablecoin_mint(mint)
+        {
             return Err(pay_core::Error::Config(format!(
                 "session currency `{symbol}` is not a recognized USD-pegged stablecoin: \
                  session prices are USD amounts settled 1:1 in token base units, so a \
-                 non-pegged asset would be mispriced; use {}",
+                 non-pegged asset would be mispriced; use {}, or USDtest on devnet",
                 Stablecoin::SYMBOL_LIST
             )));
         }
@@ -934,10 +936,11 @@ impl StartCommand {
             let currency_configs: Vec<_> = currencies
                 .iter()
                 .map(|currency| {
-                    let (mpp_currency, decimals) = resolve_currency(currency, network.slug());
-                    (currency.clone(), mpp_currency, decimals)
+                    let (mpp_currency, decimals) =
+                        resolve_currency_checked(currency, network.slug())?;
+                    Ok((currency.clone(), mpp_currency, decimals))
                 })
-                .collect();
+                .collect::<pay_core::Result<_>>()?;
             let operator_pubkey = fee_payer_signer
                 .as_ref()
                 .map(|signer| signer.pubkey().to_string());
@@ -3029,8 +3032,8 @@ fn gateway_charge_challenges(
 mod tests {
     use super::payments::{
         PayoutRecipientTarget, create_associated_token_account_idempotent_ix, resolve_currency,
-        should_use_auto_fee_payer_signer, stable_token_account_requirements,
-        surfpool_funding_targets, surfpool_prep_notice_body,
+        resolve_currency_checked, should_use_auto_fee_payer_signer,
+        stable_token_account_requirements, surfpool_funding_targets, surfpool_prep_notice_body,
     };
     use super::{
         build_pdb_config, default_bind, delegated_session_channel_payout,
@@ -3234,15 +3237,16 @@ currencies:
             resolve_currency("USDC", "localnet"),
             resolve_currency("PYUSD", "localnet"),
             resolve_currency("SOL", "localnet"),
+            resolve_currency_checked("USDtest", "devnet").unwrap(),
         ]
         .into_iter()
-        .zip(["USDC", "PYUSD", "SOL"])
+        .zip(["USDC", "PYUSD", "SOL", "USDtest"])
         .map(|((mint, decimals), label)| (label.to_string(), mint, decimals))
         .collect::<Vec<_>>();
 
-        let requirements = stable_token_account_requirements(&configs, "localnet").unwrap();
+        let requirements = stable_token_account_requirements(&configs, "devnet").unwrap();
 
-        assert_eq!(requirements.len(), 2);
+        assert_eq!(requirements.len(), 3);
         assert!(requirements.iter().any(|req| {
             req.label == "USDC"
                 && req.mint == pay_types::Stablecoin::Usdc.mint(Some("localnet"))
@@ -3251,6 +3255,11 @@ currencies:
         assert!(requirements.iter().any(|req| {
             req.label == "PYUSD"
                 && req.mint == pay_types::Stablecoin::Pyusd.mint(Some("localnet"))
+                && req.token_program == pay_kit::mpp::protocol::solana::programs::TOKEN_2022_PROGRAM
+        }));
+        assert!(requirements.iter().any(|req| {
+            req.label == "USDtest"
+                && req.mint == pay_types::stablecoin_mints::USDTEST_DEVNET
                 && req.token_program == pay_kit::mpp::protocol::solana::programs::TOKEN_2022_PROGRAM
         }));
     }
@@ -3550,11 +3559,22 @@ endpoints:
     }
 
     #[test]
+    fn resolve_currency_enforces_usdtest_devnet_only() {
+        assert_eq!(
+            resolve_currency_checked("USDtest", "devnet").unwrap(),
+            (pay_types::stablecoin_mints::USDTEST_DEVNET.to_string(), 6)
+        );
+        let error = resolve_currency_checked("USDtest", "mainnet").unwrap_err();
+        assert!(error.to_string().contains("USDtest is devnet-only"));
+    }
+
+    #[test]
     fn session_currencies_require_usd_pegged_stablecoins() {
         // Stablecoin symbols and recognized stablecoin mints pass.
         let pegged: Vec<(String, String, u8)> = vec![
             resolve_currency_config("USDC", "mainnet"),
             resolve_currency_config("usdt", "mainnet"),
+            resolve_currency_config("USDtest", "devnet"),
             (
                 pay_types::stablecoin_mints::PYUSD_MAINNET.to_string(),
                 pay_types::stablecoin_mints::PYUSD_MAINNET.to_string(),
@@ -3580,7 +3600,7 @@ endpoints:
     }
 
     fn resolve_currency_config(symbol: &str, network: &str) -> (String, String, u8) {
-        let (mint, decimals) = resolve_currency(symbol, network);
+        let (mint, decimals) = resolve_currency_checked(symbol, network).unwrap();
         (symbol.to_string(), mint, decimals)
     }
 

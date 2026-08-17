@@ -9,6 +9,9 @@
 #   PAY_RPC_URL            a devnet Solana RPC URL
 #   PAY_SESSION_SECRET     stable random hex secret; preserves session tokens
 #                           across service restarts
+#   PAY_SETTLEMENT_KEYPAIR_PATH
+#                           path to the recipient's devnet keypair; it settles
+#                           and distributes closed channels but sponsors no opens
 name: pay-bench-devnet
 subdomain: pay-bench-devnet
 title: "Pay Bench Devnet"
@@ -22,20 +25,24 @@ routing:
 accounting: pooled
 
 operator:
+  signer:
+    backend: file
+    path: "${PAY_SETTLEMENT_KEYPAIR_PATH}"
   recipient: "${PAY_PAYMENT_RECIPIENT}"
   currencies:
-    usd: ["USDC"]
+    usd: ["USDtest"]
   network: devnet
   rpc_url: "${PAY_RPC_URL}"
-  # The client funds and opens the channel, so this gate does not require an
-  # operator signing key for the smoke endpoint.
+  # Clients still fund and open channels. The signer is used only to settle
+  # and distribute them when the benchmark sends cooperative close requests.
   fee_payer: false
   challenge_binding_secret: "${PAY_SESSION_SECRET}"
 
 session:
   cap_usdc: 0.01
   min_voucher_delta: 1
-  # Do not spend operator fees closing channels during a gateway smoke test.
+  # The benchmark closes explicitly after each run; background lifecycle and
+  # watermark writes stay disabled so they do not distort the measured window.
   close_delay_ms: 0
   settlement_interval_ms: 0
 
