@@ -22,6 +22,7 @@ use pay_kit::mpp::client::{
 };
 use pay_kit::mpp::solana_keychain::memory::MemorySigner;
 use pay_kit::mpp::{PaymentCredential, format_authorization};
+use reqwest::StatusCode;
 
 use super::{
     BenchScheme, Endpoint, Load, PerUserFunding, PreparedRequest, RequestSource, ResolvedPrice,
@@ -80,6 +81,36 @@ impl MppSession {
     fn handle(&self, index: u32) -> Option<SessionHandle> {
         self.handles.lock().unwrap().get(&index).cloned()
     }
+}
+
+fn validate_open_response(status: StatusCode, body: &[u8], expected_channel: &str) -> Result<()> {
+    if status != StatusCode::PAYMENT_REQUIRED {
+        bail!("provision: expected 402 after open, got {status}");
+    }
+
+    let payload: serde_json::Value =
+        serde_json::from_slice(body).context("provision: 402 after open was not valid JSON")?;
+    let error = payload
+        .get("error")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("missing error code");
+    if error != "session_voucher_required" {
+        let message = payload
+            .get("message")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("no server message");
+        bail!("provision: channel open was rejected ({error}): {message}");
+    }
+
+    let channel_id = payload
+        .get("channelId")
+        .and_then(serde_json::Value::as_str)
+        .context("provision: successful open response omitted channelId")?;
+    anyhow::ensure!(
+        channel_id == expected_channel,
+        "provision: server opened channel {channel_id}, expected {expected_channel}"
+    );
+    Ok(())
 }
 
 #[async_trait]
@@ -241,9 +272,12 @@ impl BenchScheme for MppSession {
         .send()
         .await
         .context("provision: open request failed")?;
-        if resp.status().as_u16() != 402 {
-            bail!("provision: expected 402 after open, got {}", resp.status());
-        }
+        let status = resp.status();
+        let body = resp
+            .bytes()
+            .await
+            .context("provision: failed to read open response")?;
+        validate_open_response(status, &body, &channel_id)?;
 
         self.handles.lock().unwrap().insert(ctx.index, handle);
         Ok(UserSetup {
@@ -365,5 +399,60 @@ impl RequestSource for SessionSource {
             body: self.body.clone(),
             logical_payment: true,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn accepts_voucher_challenge_for_expected_open_channel() {
+        validate_open_response(
+            StatusCode::PAYMENT_REQUIRED,
+            br#"{"error":"session_voucher_required","channelId":"channel-a"}"#,
+            "channel-a",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn rejects_verification_failure_rechallenge() {
+        let error = validate_open_response(
+            StatusCode::PAYMENT_REQUIRED,
+            br#"{"error":"verification_failed","message":"Session open failed: program error 0x38"}"#,
+            "channel-a",
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("verification_failed"));
+        assert!(error.to_string().contains("program error 0x38"));
+    }
+
+    #[test]
+    fn rejects_success_marker_for_another_channel() {
+        let error = validate_open_response(
+            StatusCode::PAYMENT_REQUIRED,
+            br#"{"error":"session_voucher_required","channelId":"channel-b"}"#,
+            "channel-a",
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("channel-b"));
+        assert!(error.to_string().contains("channel-a"));
+    }
+
+    #[test]
+    fn rejects_non_402_and_malformed_402() {
+        assert!(
+            validate_open_response(StatusCode::OK, b"{}", "channel-a")
+                .unwrap_err()
+                .to_string()
+                .contains("expected 402")
+        );
+        assert!(
+            validate_open_response(StatusCode::PAYMENT_REQUIRED, b"not json", "channel-a")
+                .unwrap_err()
+                .to_string()
+                .contains("not valid JSON")
+        );
     }
 }
