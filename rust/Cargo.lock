@@ -6634,6 +6634,7 @@ dependencies = [
  "pay-core",
  "pay-proxy",
  "pay-types",
+ "pay-worker",
  "pyroscope",
  "pyroscope_pprofrs",
  "rand 0.8.6",

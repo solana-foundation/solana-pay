@@ -15,6 +15,7 @@ path = "src/main.rs"
 [dependencies]
 pay-core = { workspace = true, features = ["server", "otel"] }
 pay-api-core = { path = "../crates/pay-api-core" }
+pay-worker = { path = "../crates/pay-worker" }
 pay-proxy = { workspace = true }
 pay-types = { workspace = true }
 pay-kit = { workspace = true }

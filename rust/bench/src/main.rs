@@ -118,6 +118,10 @@ enum Cmd {
         /// Confirm that this command may submit channel-close transactions.
         #[arg(long)]
         yes: bool,
+        /// Bypass a lost gateway store and settle channels with zero vouchers.
+        /// Safe only when the measured load phase never started.
+        #[arg(long)]
+        assume_no_vouchers: bool,
     },
     /// Validate a config and print the parsed settings.
     Estimate { config: String },
@@ -212,7 +216,8 @@ async fn run(cmd: Cmd) -> Result<()> {
             config,
             fixture_id,
             yes,
-        } => session_recovery::recover(&config, &fixture_id, yes).await,
+            assume_no_vouchers,
+        } => session_recovery::recover(&config, &fixture_id, yes, assume_no_vouchers).await,
         Cmd::Serve { config } => {
             let cfg = RunConfig::from_yaml_path(&config)?;
             rehearsal::serve_proxy(cfg).await
