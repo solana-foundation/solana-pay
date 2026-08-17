@@ -43,6 +43,12 @@ struct PreparedUser {
     instructions: Vec<Instruction>,
 }
 
+struct PreparedTransaction {
+    signature: Signature,
+    transaction: Transaction,
+    user_index: usize,
+}
+
 #[derive(Clone, Copy)]
 struct SetupWindow<'a> {
     rpc: &'a FixtureRpc,
@@ -60,6 +66,7 @@ struct TeardownWindow<'a> {
     seed: &'a [u8; 32],
     wallet_set_id: &'a str,
     assets: &'a [FixtureAsset],
+    sweep_sol: bool,
 }
 
 /// A standalone YAML file purpose-built for setup/teardown. It is deliberately
@@ -293,6 +300,7 @@ pub async fn setup(config_path: &str, id: Option<&str>, yes: bool) -> Result<()>
             },
         };
         prepared.sort_by_key(|item| item.index);
+        let mut transactions = Vec::with_capacity(prepared.len());
         for item in prepared {
             if cancellation.is_cancelled() {
                 signal_task.abort();
@@ -300,7 +308,7 @@ pub async fn setup(config_path: &str, id: Option<&str>, yes: bool) -> Result<()>
                     "fixture setup cancelled before window submission; rerun to resume from user {window_start}"
                 );
             }
-            let result = send_transaction(
+            let result = prepare_transaction(
                 &rpc,
                 &funder,
                 None,
@@ -309,12 +317,27 @@ pub async fn setup(config_path: &str, id: Option<&str>, yes: bool) -> Result<()>
                 "setup",
                 item.index,
             )
-            .await
-            .with_context(|| format!("setting up user {}", item.index));
-            if let Err(error) = result {
-                signal_task.abort();
-                return Err(error);
+            .await;
+            match result {
+                Ok(Some(transaction)) => transactions.push(transaction),
+                Ok(None) => {}
+                Err(error) => {
+                    signal_task.abort();
+                    return Err(error).with_context(|| format!("setting up user {}", item.index));
+                }
             }
+        }
+        if let Err(error) = submit_transaction_window(
+            &rpc,
+            &mut journal,
+            transactions,
+            config.execution.submit_concurrency,
+            "setup",
+        )
+        .await
+        {
+            signal_task.abort();
+            return Err(error);
         }
         journal.checkpoint(window_end)?;
         if cancellation.is_cancelled() {
@@ -425,6 +448,7 @@ pub async fn teardown(setup_id: &str, config_path: &str, yes: bool) -> Result<()
                     seed: &seed,
                     wallet_set_id: &wallet_set_id,
                     assets: &teardown_assets,
+                    sweep_sol: journal.state().sol_lamports_per_user > 0,
                 },
                 window_start,
                 window_end,
@@ -438,6 +462,7 @@ pub async fn teardown(setup_id: &str, config_path: &str, yes: bool) -> Result<()
             },
         };
         prepared.sort_by_key(|item| item.index);
+        let mut transactions = Vec::with_capacity(prepared.len());
         for item in prepared {
             if cancellation.is_cancelled() {
                 signal_task.abort();
@@ -445,7 +470,7 @@ pub async fn teardown(setup_id: &str, config_path: &str, yes: bool) -> Result<()
                     "fixture teardown cancelled before window submission; rerun to resume from user {window_start}"
                 );
             }
-            let result = send_transaction(
+            let result = prepare_transaction(
                 &rpc,
                 &funder,
                 Some(&item.wallet),
@@ -454,12 +479,27 @@ pub async fn teardown(setup_id: &str, config_path: &str, yes: bool) -> Result<()
                 "teardown",
                 item.index,
             )
-            .await
-            .with_context(|| format!("tearing down user {}", item.index));
-            if let Err(error) = result {
-                signal_task.abort();
-                return Err(error);
+            .await;
+            match result {
+                Ok(Some(transaction)) => transactions.push(transaction),
+                Ok(None) => {}
+                Err(error) => {
+                    signal_task.abort();
+                    return Err(error).with_context(|| format!("tearing down user {}", item.index));
+                }
             }
+        }
+        if let Err(error) = submit_transaction_window(
+            &rpc,
+            &mut journal,
+            transactions,
+            config.execution.submit_concurrency,
+            "teardown",
+        )
+        .await
+        {
+            signal_task.abort();
+            return Err(error);
         }
         journal.checkpoint(window_end)?;
         if cancellation.is_cancelled() {
@@ -787,8 +827,14 @@ async fn prepare_teardown_window(
         .map(move |index| {
             let user = derive_user(window.seed, window.wallet_set_id, index as u32);
             async move {
-                let instructions =
-                    prepare_teardown_user(window.rpc, window.funder, &user, window.assets).await?;
+                let instructions = prepare_teardown_user(
+                    window.rpc,
+                    window.funder,
+                    &user,
+                    window.assets,
+                    window.sweep_sol,
+                )
+                .await?;
                 Ok::<_, anyhow::Error>(PreparedUser {
                     index,
                     wallet: user,
@@ -806,6 +852,7 @@ async fn prepare_teardown_user(
     funder: &Wallet,
     user: &Wallet,
     assets: &[FixtureAsset],
+    sweep_sol: bool,
 ) -> Result<Vec<Instruction>> {
     let mut instructions = Vec::new();
     for asset in assets {
@@ -842,13 +889,15 @@ async fn prepare_teardown_user(
             .map_err(|error| anyhow::anyhow!("building {} ATA close: {error}", asset.label))?,
         );
     }
-    let sol = rpc_balance(rpc, &user.pubkey).await?;
-    if sol > 0 {
-        instructions.push(system_instruction::transfer(
-            &user.pubkey,
-            &funder.pubkey,
-            sol,
-        ));
+    if sweep_sol {
+        let sol = rpc_balance(rpc, &user.pubkey).await?;
+        if sol > 0 {
+            instructions.push(system_instruction::transfer(
+                &user.pubkey,
+                &funder.pubkey,
+                sol,
+            ));
+        }
     }
     Ok(instructions)
 }
@@ -929,8 +978,33 @@ async fn send_transaction(
     operation: &str,
     user_index: usize,
 ) -> Result<()> {
-    if instructions.is_empty() {
+    let Some(transaction) = prepare_transaction(
+        rpc,
+        fee_payer,
+        additional_signer,
+        instructions,
+        journal,
+        operation,
+        user_index,
+    )
+    .await?
+    else {
         return Ok(());
+    };
+    submit_transaction_window(rpc, journal, vec![transaction], 1, operation).await
+}
+
+async fn prepare_transaction(
+    rpc: &FixtureRpc,
+    fee_payer: &Wallet,
+    additional_signer: Option<&Wallet>,
+    instructions: Vec<Instruction>,
+    journal: &mut FixtureJournal,
+    operation: &str,
+    user_index: usize,
+) -> Result<Option<PreparedTransaction>> {
+    if instructions.is_empty() {
+        return Ok(None);
     }
     let (blockhash, last_valid_block_height) = rpc
         .latest_blockhash()
@@ -955,10 +1029,47 @@ async fn send_transaction(
         user_index,
         last_valid_block_height,
     })?;
-    rpc.submit_and_confirm(&transaction)
-        .await
-        .context("broadcasting fixture transaction")?;
-    journal.clear_pending(&signature.to_string())?;
+    Ok(Some(PreparedTransaction {
+        signature,
+        transaction,
+        user_index,
+    }))
+}
+
+async fn submit_transaction_window(
+    rpc: &FixtureRpc,
+    journal: &mut FixtureJournal,
+    transactions: Vec<PreparedTransaction>,
+    concurrency: usize,
+    operation: &str,
+) -> Result<()> {
+    debug_assert!(
+        concurrency > 0,
+        "fixture concurrency is validated at config load"
+    );
+    let results = futures::stream::iter(transactions)
+        .map(|prepared| async move {
+            let result = rpc
+                .submit_and_confirm(&prepared.transaction)
+                .await
+                .context("broadcasting fixture transaction");
+            (prepared, result)
+        })
+        .buffer_unordered(concurrency)
+        .collect::<Vec<_>>()
+        .await;
+    let mut first_error = None;
+    for (prepared, result) in results {
+        match result {
+            Ok(_) => journal.clear_pending(&prepared.signature.to_string())?,
+            Err(error) => {
+                first_error.get_or_insert((prepared.user_index, error));
+            }
+        }
+    }
+    if let Some((user_index, error)) = first_error {
+        bail!("{operation} transaction for user {user_index} failed: {error:#}");
+    }
     Ok(())
 }
 
@@ -1094,6 +1205,15 @@ mod tests {
                 Some("devnet-100k-usdg")
             );
         }
+        let full: SetupConfig =
+            serde_yml::from_str(include_str!("../configs/devnet-fixture-100k-usdtest.yml"))
+                .unwrap();
+        assert_eq!(full.setup.sol_lamports_per_user, 0);
+        assert_eq!(full.execution.submit_concurrency, 32);
+        assert_eq!(
+            decimal_to_base(&full.assets[0].amount_per_user, full.assets[0].decimals).unwrap(),
+            10_000_000
+        );
     }
 
     #[test]

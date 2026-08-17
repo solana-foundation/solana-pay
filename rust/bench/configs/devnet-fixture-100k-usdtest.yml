@@ -9,16 +9,17 @@ setup:
   funder:
     keypair_env: BENCH_FUNDER_KEYPAIR
   users: 100000
-  # These wallets already carry the SOL allocation from the retained fixture.
-  sol_lamports_per_user: 5000000
-  max_total_sol: 1000.0
+  # SOL remains owned by the retained USDG fixture; this overlay only creates
+  # the USDtest Token-2022 accounts and therefore must not sweep wallet SOL.
+  sol_lamports_per_user: 0
+  max_total_sol: 250.0
 
 execution:
-  window_users: 32
-  reconcile_concurrency: 8
-  submit_concurrency: 1
-  rpc_requests_per_second: 20
-  rpc_burst: 5
+  window_users: 64
+  reconcile_concurrency: 32
+  submit_concurrency: 32
+  rpc_requests_per_second: 100
+  rpc_burst: 32
   request_timeout_seconds: 15
   confirmation_timeout_seconds: 90
   max_attempts: 8
@@ -27,10 +28,10 @@ execution:
   jitter_ratio: 0.20
 
 assets:
-  # Devnet-only USDtest, Token-2022. 0.01 x 100,000 requires 1,000 USDtest.
+  # Devnet-only USDtest, Token-2022. 10 x 100,000 requires 1,000,000 USDtest.
   - label: USDtest
     mint: 6MJyWHwFpPsaTEuYarEz49ngtsSKPYn6yHqtJUW2a9St
     token_program: TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb
     decimals: 6
-    amount_per_user: "0.01"
-    max_total_amount: "1000"
+    amount_per_user: "10"
+    max_total_amount: "1000000"
