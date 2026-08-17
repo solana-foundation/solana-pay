@@ -10,6 +10,6 @@ all:
   vars:
     # This is the native-TLS Pay revision validated for the Sunburst proxy.
     # Change it only to another reviewed, immutable commit SHA.
-    pay_git_ref: "f5414d3faaa895d2e76e387f4ea7ca3ab7902e02"
+    pay_git_ref: "5ae1a9976de892a9790edc70ed83b8da21d28380"
     pay_rust_toolchain: "nightly-2026-08-14"
     pay_proxy_env_file: "{{ inventory_dir }}/proxy.env"

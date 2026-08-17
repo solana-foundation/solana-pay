@@ -130,7 +130,7 @@ path.
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `pay_git_ref` | `f5414d3f…` | Immutable Pay commit with the validated native TLS listener, benchmark CA support, and strict session-open checks. |
+| `pay_git_ref` | `5ae1a997…` | Immutable Pay commit with the validated native TLS listener, USDtest fixture, benchmark CA support, and strict session-open checks. |
 | `pay_rust_toolchain` | `nightly-2026-08-14` | Compiler that enabled curve25519-dalek's AVX-512 IFMA backend. |
 | `pay_rustup_init_sha256` | `4acc9acc…` | Pins the x86_64 rustup bootstrap binary downloaded from `static.rust-lang.org`. |
 | `pay_rustflags` | `-C target-cpu=native` | Selects the native Zen 5 instruction set. The binary is not portable to older CPUs. |
