@@ -16,6 +16,7 @@
 //! Server records channel state; the client signs vouchers for that channel
 //! ```
 //!
+use pay_kit::core::tx_pipeline::{TxPipeline, TxPipelineError};
 use pay_kit::mpp::blockhash::BlockhashCache;
 use pay_kit::mpp::server::session::{SealParams, SessionConfig, SessionOpenContext, SessionServer};
 use pay_kit::mpp::settlement::worker::{RpcBroadcaster, SettlementConfig, SettlementHandle, spawn};
@@ -213,6 +214,13 @@ struct SessionOperatorRuntime {
 }
 
 impl SessionOperatorRuntime {
+    async fn transaction_pipeline(&self) -> Result<TxPipeline> {
+        self.server
+            .transaction_pipeline()
+            .await
+            .map_err(|error| Error::Mpp(format!("payment-channel RPC pipeline: {error}")))
+    }
+
     fn reserve_capacity(&self, channel_id: &str, amount: u64) -> bool {
         let Ok(mut reservations) = self.reserved_capacity.lock() else {
             return false;
@@ -273,9 +281,10 @@ impl SessionOperatorRuntime {
             // close retains its existing no-op behavior for these instances.
             return Ok(());
         };
-        let Some(rpc_url) = self.rpc_url.clone() else {
+        if self.rpc_url.is_none() {
             return Ok(());
-        };
+        }
+        let tx_pipeline = self.transaction_pipeline().await?;
         let params = self
             .server
             .seal_params(channel_id)
@@ -321,10 +330,11 @@ impl SessionOperatorRuntime {
             .settlement_worker
             .get_or_init(|| {
                 let signer = Arc::clone(&signer);
+                let tx_pipeline = tx_pipeline.clone();
                 async move {
                     spawn(
                         SettlementConfig::new(operator, signer),
-                        Arc::new(RpcBroadcaster::new(rpc_url)),
+                        Arc::new(RpcBroadcaster::with_pipeline(tx_pipeline)),
                     )
                 }
             })
@@ -429,18 +439,19 @@ impl SessionOperatorRuntime {
     }
 
     async fn channel_is_tombstoned_on_chain(&self, channel_id: &str) -> bool {
-        let Some(rpc_url) = self.rpc_url.clone() else {
+        if self.rpc_url.is_none() {
             return false;
-        };
+        }
         let Ok(channel) = solana_pubkey::Pubkey::from_str(channel_id) else {
             return false;
         };
-
-        use pay_kit::mpp::solana_rpc_client::nonblocking::rpc_client::RpcClient;
-        RpcClient::new(rpc_url)
-            .get_account(&channel)
+        let Ok(pipeline) = self.transaction_pipeline().await else {
+            return false;
+        };
+        pipeline
+            .read_account_data(channel, None)
             .await
-            .map(|account| account.data.as_slice() == [2])
+            .map(|account| account.is_some_and(|data| data.as_slice() == [2]))
             .unwrap_or(false)
     }
 
@@ -450,21 +461,19 @@ impl SessionOperatorRuntime {
     ) -> Result<
         Option<pay_kit::mpp::program::payment_channels::generated::generated::accounts::Channel>,
     > {
-        let Some(rpc_url) = self.rpc_url.clone() else {
+        if self.rpc_url.is_none() {
             return Ok(None);
-        };
+        }
         let channel = solana_pubkey::Pubkey::from_str(channel_id)
             .map_err(|e| Error::Mpp(format!("invalid payment channel: {e}")))?;
         use pay_kit::mpp::program::payment_channels::generated::generated::accounts::Channel;
-        use pay_kit::mpp::solana_rpc_client::nonblocking::rpc_client::RpcClient;
-        use solana_commitment_config::CommitmentConfig;
-        RpcClient::new(rpc_url)
-            .get_account_with_commitment(&channel, CommitmentConfig::confirmed())
+        let pipeline = self.transaction_pipeline().await?;
+        pipeline
+            .read_account_data(channel, None)
             .await
             .map_err(|error| Error::Mpp(format!("failed to fetch payment channel: {error}")))?
-            .value
-            .map(|account| {
-                Channel::from_bytes(&account.data)
+            .map(|data| {
+                Channel::from_bytes(&data)
                     .map_err(|e| Error::Mpp(format!("failed to decode payment channel: {e}")))
             })
             .transpose()
@@ -488,9 +497,7 @@ impl SessionOperatorRuntime {
             .payment_channel_payer_signer()
             .map(|s| s.pubkey())
             .unwrap_or_else(|| signer.pubkey());
-        let rpc_url = self.rpc_url.clone().ok_or_else(|| {
-            Error::Mpp("payment-channel settlement requires an RPC URL".to_string())
-        })?;
+        let tx_pipeline = self.transaction_pipeline().await?;
         let payer = params
             .payer
             .ok_or_else(|| Error::Mpp("payment-channel settlement missing payer".to_string()))?;
@@ -577,11 +584,11 @@ impl SessionOperatorRuntime {
             .settlement_worker
             .get_or_init(|| {
                 let signer = Arc::clone(&signer);
-                let rpc_url = rpc_url.clone();
+                let tx_pipeline = tx_pipeline.clone();
                 async move {
                     spawn(
                         SettlementConfig::new(operator, signer),
-                        Arc::new(RpcBroadcaster::new(rpc_url)),
+                        Arc::new(RpcBroadcaster::with_pipeline(tx_pipeline)),
                     )
                 }
             })
@@ -590,7 +597,21 @@ impl SessionOperatorRuntime {
             .settle(channel_id, instructions)
             .await
             .map_err(|e| Error::Mpp(format!("payment-channel settlement: {e}")))?;
-        wait_for_transaction_confirmed(&rpc_url, &signature, "payment-channel settlement").await?;
+        let parsed_signature = solana_signature::Signature::from_str(&signature)
+            .map_err(|error| Error::Mpp(format!("invalid settlement signature: {error}")))?;
+        match tx_pipeline.confirm(parsed_signature).await {
+            Ok(_) => {}
+            Err(TxPipelineError::TransactionFailed { reason, .. }) => {
+                return Err(Error::Mpp(format!(
+                    "payment-channel settlement transaction failed: {reason}"
+                )));
+            }
+            Err(error) => {
+                return Err(Error::Mpp(format!(
+                    "payment-channel settlement was not confirmed: {error}"
+                )));
+            }
+        }
         Ok(Some(signature))
     }
 }
@@ -2032,44 +2053,6 @@ fn decode_voucher_signature(signature: &str) -> Result<[u8; 64]> {
     bytes
         .try_into()
         .map_err(|_| Error::Mpp("voucher signature is not 64 bytes".to_string()))
-}
-
-/// Wait for a previously broadcast transaction to succeed at confirmed
-/// commitment before allowing durable state to advance.
-async fn wait_for_transaction_confirmed(
-    rpc_url: &str,
-    signature: &str,
-    context: &'static str,
-) -> Result<()> {
-    use pay_kit::mpp::solana_rpc_client::nonblocking::rpc_client::RpcClient;
-    use solana_commitment_config::CommitmentConfig;
-
-    let signature = solana_signature::Signature::from_str(signature)
-        .map_err(|e| Error::Mpp(format!("invalid {context} signature: {e}")))?;
-    let rpc = RpcClient::new(rpc_url.to_string());
-    let deadline = Instant::now() + Duration::from_secs(30);
-    let mut last_status_error = None;
-    while Instant::now() < deadline {
-        match rpc
-            .get_signature_status_with_commitment(&signature, CommitmentConfig::confirmed())
-            .await
-        {
-            Ok(Some(Ok(()))) => return Ok(()),
-            Ok(Some(Err(error))) => {
-                return Err(Error::Mpp(format!("{context} transaction failed: {error}")));
-            }
-            Ok(None) => {}
-            Err(error) => last_status_error = Some(error.to_string()),
-        }
-        tokio::time::sleep(Duration::from_millis(400)).await;
-    }
-
-    let detail = last_status_error
-        .map(|error| format!("; last status error: {error}"))
-        .unwrap_or_default();
-    Err(Error::Mpp(format!(
-        "{context} transaction was not confirmed before timeout{detail}"
-    )))
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────────

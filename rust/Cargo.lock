@@ -8386,7 +8386,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -11145,7 +11145,7 @@ dependencies = [
 [[package]]
 name = "solana-pay-kit"
 version = "0.6.0"
-source = "git+https://github.com/solana-foundation/pay-kit.git?rev=2a7ca5917e394bee4b3de3a802c42e1daf3b88ab#2a7ca5917e394bee4b3de3a802c42e1daf3b88ab"
+source = "git+https://github.com/solana-foundation/pay-kit.git?rev=bcefabe93cb74b391442cbe074b8d701a0f7c235#bcefabe93cb74b391442cbe074b8d701a0f7c235"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -11170,6 +11170,7 @@ dependencies = [
  "serde_json",
  "serde_json_canonicalizer",
  "sha2 0.10.9",
+ "solana-account-decoder-client-types 4.0.0",
  "solana-account-info 3.1.1",
  "solana-address 2.5.0",
  "solana-client 4.0.0",

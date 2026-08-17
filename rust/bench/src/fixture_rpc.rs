@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
+use pay_kit::core::tx_pipeline::{TxPipeline, TxPipelineConfig};
 use pay_kit::mpp::solana_rpc_client::nonblocking::rpc_client::RpcClient;
 use solana_commitment_config::CommitmentConfig;
 use solana_hash::Hash;
@@ -145,6 +146,7 @@ impl RateLimiter {
 /// Shared async client with bounded requests and conservative retry policy.
 pub struct FixtureRpc {
     client: Arc<RpcClient>,
+    tx_pipeline: TxPipeline,
     limiter: RateLimiter,
     in_flight: Semaphore,
     config: ExecutionConfig,
@@ -152,8 +154,24 @@ pub struct FixtureRpc {
 
 impl FixtureRpc {
     pub fn new(url: String, config: ExecutionConfig) -> Self {
+        let tx_pipeline = TxPipeline::new(
+            url.clone(),
+            TxPipelineConfig {
+                max_send_concurrency: config.submit_concurrency,
+                submission_max_attempts: config.max_attempts,
+                submission_initial_backoff: Duration::from_millis(config.initial_backoff_ms),
+                submission_max_backoff: Duration::from_millis(config.max_backoff_ms),
+                send_interval: Duration::from_secs_f64(
+                    1.0 / f64::from(config.rpc_requests_per_second),
+                ),
+                confirmation_timeout: Duration::from_secs(config.confirmation_timeout_seconds),
+                account_read_retries: config.max_attempts.saturating_sub(1),
+                ..TxPipelineConfig::default()
+            },
+        );
         Self {
             client: Arc::new(RpcClient::new(url)),
+            tx_pipeline,
             limiter: RateLimiter::new(config.rpc_requests_per_second, config.rpc_burst),
             in_flight: Semaphore::new(config.reconcile_concurrency.max(config.submit_concurrency)),
             config,
@@ -294,48 +312,12 @@ impl FixtureRpc {
     }
 
     pub async fn submit_and_confirm(&self, transaction: &Transaction) -> Result<Signature> {
-        let signature = transaction
-            .signatures
-            .first()
-            .copied()
-            .context("fixture transaction has no fee-payer signature")?;
-        let transaction = transaction.clone();
-        let client = Arc::clone(&self.client);
-        let sent = self
-            .call("sendTransaction", move || {
-                let client = Arc::clone(&client);
-                let transaction = transaction.clone();
-                async move {
-                    client
-                        .send_transaction(&transaction)
-                        .await
-                        .map_err(|error| anyhow!(error))
-                }
-            })
-            .await;
-        if let Err(error) = sent {
-            if self.signature_status(signature).await?.is_some() {
-                return Ok(signature);
-            }
-            return Err(error).context("submitting fixture transaction");
-        }
-
-        let deadline =
-            Instant::now() + Duration::from_secs(self.config.confirmation_timeout_seconds);
-        loop {
-            if let Some(status) = self.signature_status(signature).await? {
-                if let Some(error) = status.err {
-                    return Err(anyhow!("transaction {signature} failed: {error:?}"));
-                }
-                return Ok(signature);
-            }
-            if Instant::now() >= deadline {
-                return Err(anyhow!(
-                    "transaction {signature} confirmation timed out; rerun will resolve it before rebuilding"
-                ));
-            }
-            tokio::time::sleep(Duration::from_millis(500)).await;
-        }
+        self.tx_pipeline
+            .submit_verified(transaction)
+            .await
+            .map(|confirmed| confirmed.signature)
+            .map_err(anyhow::Error::new)
+            .context("submitting and confirming fixture transaction")
     }
 
     pub async fn signature_status(
