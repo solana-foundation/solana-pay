@@ -234,11 +234,6 @@ pub async fn setup(config_path: &str, id: Option<&str>, yes: bool) -> Result<()>
         journal.state().phase != FixturePhase::TearingDown,
         "fixture `{setup_id}` is being torn down; finish teardown before setting it up again"
     );
-    if journal.state().phase == FixturePhase::Ready {
-        println!("fixture `{setup_id}` is already ready; use teardown when the load test is done");
-        return Ok(());
-    }
-
     resolve_pending(&rpc, &mut journal).await?;
     let ata_rent = rpc_minimum_ata_rent(&rpc).await?;
     let minimum_sol = enforce_sol_cap(&config, assets.len(), ata_rent)?;
@@ -256,8 +251,11 @@ pub async fn setup(config_path: &str, id: Option<&str>, yes: bool) -> Result<()>
     )
     .await?;
 
+    let start = setup_resume_index(journal.state().phase, journal.state().next_user);
     journal.set_phase(FixturePhase::SettingUp)?;
-    let start = journal.state().next_user;
+    if start != journal.state().next_user {
+        journal.checkpoint(start)?;
+    }
     let cancellation = CancellationToken::new();
     let signal_cancel = cancellation.clone();
     let signal_task = tokio::spawn(async move {
@@ -351,6 +349,14 @@ pub async fn setup(config_path: &str, id: Option<&str>, yes: bool) -> Result<()>
         assets.len()
     );
     Ok(())
+}
+
+fn setup_resume_index(phase: FixturePhase, next_user: usize) -> usize {
+    if phase == FixturePhase::Ready {
+        0
+    } else {
+        next_user
+    }
 }
 
 /// Reclaim every fixture balance and close every derived ATA to return rent to
@@ -1044,7 +1050,7 @@ fn decimal_to_base(value: &str, decimals: u8) -> Result<u64> {
 
 #[cfg(test)]
 mod tests {
-    use super::{RunConfig, SetupConfig, decimal_to_base};
+    use super::{FixturePhase, RunConfig, SetupConfig, decimal_to_base, setup_resume_index};
 
     #[test]
     fn decimal_amounts_are_exact() {
@@ -1053,6 +1059,12 @@ mod tests {
         assert_eq!(decimal_to_base("2", 6).unwrap(), 2_000_000);
         assert!(decimal_to_base("0.0000001", 6).is_err());
         assert!(decimal_to_base("-1", 6).is_err());
+    }
+
+    #[test]
+    fn ready_fixture_reconciles_every_wallet_again() {
+        assert_eq!(setup_resume_index(FixturePhase::Ready, 100), 0);
+        assert_eq!(setup_resume_index(FixturePhase::SettingUp, 37), 37);
     }
 
     #[test]
