@@ -13,6 +13,7 @@ Environment=RUST_LOG=info,pay_core=warn,hyper=warn,reqwest=warn,tower=warn
 ExecStart={{ pay_install_dir }}/pay server start {{ pay_config_dir }}/paywall.yml --bind {{ pay_proxy_bind }} --tls-cert {{ pay_tls_cert }} --tls-key {{ pay_tls_key }} --no-register
 Restart=on-failure
 RestartSec=2
+TimeoutStopSec=310
 LimitNOFILE={{ pay_proxy_nofile }}
 TasksMax=infinity
 CPUAccounting=true

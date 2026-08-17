@@ -41,8 +41,8 @@ the gate baseline.
 - An AVX-512 IFMA-capable CPU to reproduce the fast crypto backend.
 - TCP port 443 allowed by the host firewall/security group.
 - A Solana RPC URL, recipient address, and funded operator keypair. The sample
-  paywall says `devnet`; change `operator.network` and the RPC together when
-  targeting another deployment of the payment-channel program.
+  paywall uses devnet USDG; change the currency, `operator.network`, and RPC
+  together when targeting another deployment of the payment-channel program.
 
 The playbook creates a private benchmark CA and an IP-SAN server certificate,
 then terminates TLS directly in Pingora. The CA private key remains root-only
@@ -86,8 +86,9 @@ ansible pay_proxies -b -m command -a 'systemctl status pay-proxy --no-pager'
 ansible pay_proxies -b -m command -a 'journalctl -u pay-proxy -n 100 --no-pager'
 ```
 
-Install the fetched CA certificate in each controlled generator's OS trust
-store before running `pay-bench`; do not disable certificate verification.
+Set `run.tls_ca_cert_env` in the generator config to an environment variable
+whose value is the fetched CA certificate path before running `pay-bench`; do
+not disable certificate verification or alter process-wide trust.
 
 Confirm the deployed source, compiler, and IFMA instructions before attaching
 results to a commit:

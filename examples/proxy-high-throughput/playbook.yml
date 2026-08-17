@@ -266,6 +266,8 @@
     - name: Build the proxy and benchmark harness
       become: true
       become_user: "{{ pay_service_user }}"
+      environment:
+        PAY_PDB_ALLOW_PLACEHOLDER: "1"
       ansible.builtin.command:
         cmd: >-
           {{ pay_cargo_home }}/bin/cargo +{{ pay_rust_toolchain }}
@@ -286,15 +288,15 @@
 
     - name: Install the release binaries
       ansible.builtin.copy:
-        src: "{{ pay_target_dir }}/release/{{ item }}"
-        dest: "{{ pay_install_dir }}/{{ item }}"
+        src: "{{ pay_target_dir }}/release/{{ item.src }}"
+        dest: "{{ pay_install_dir }}/{{ item.dest }}"
         remote_src: true
         owner: root
         group: root
         mode: "0755"
       loop:
-        - pay
-        - pay-bench
+        - { src: "pay", dest: "pay" }
+        - { src: "bench", dest: "pay-bench" }
       notify: Restart pay-proxy
 
     - name: Install kernel and socket tuning

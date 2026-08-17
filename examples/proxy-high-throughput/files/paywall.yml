@@ -15,7 +15,7 @@ accounting: pooled
 operator:
   recipient: "${PAY_PAYMENT_RECIPIENT}"
   currencies:
-    usd: ["USDC"]
+    usd: ["USDG"]
   network: devnet
   rpc_url: "${PAY_RPC_URL}"
   fee_payer: true
