@@ -6,6 +6,8 @@
 //! re-derives the same wallets, returns their tokens, and closes their ATAs so
 //! the funder recovers rent.
 
+use std::fs::OpenOptions;
+use std::io::{BufWriter, Write};
 use std::str::FromStr;
 use std::time::Instant;
 
@@ -201,6 +203,65 @@ impl SetupConfig {
             })
             .collect()
     }
+}
+
+/// Export deterministic fixture recipients in the input shape accepted by
+/// `pay fanout`. The configured amount remains text, avoiding floating-point
+/// conversion at the CSV boundary.
+pub fn export_fanout(
+    config_path: &str,
+    setup_id: &str,
+    start: usize,
+    output_path: &str,
+) -> Result<()> {
+    validate_setup_id(setup_id)?;
+    let config = SetupConfig::from_yaml_path(config_path)?;
+    ensure!(
+        config.assets.len() == 1,
+        "fanout export requires exactly one configured asset, found {}",
+        config.assets.len()
+    );
+    ensure!(
+        start < config.setup.users,
+        "--start {start} must be less than setup.users ({})",
+        config.setup.users
+    );
+    let funder = load_funder(&config.setup.funder, config.setup.network)?;
+    let wallet_set_id = config.setup.wallet_set_id.as_deref().unwrap_or(setup_id);
+    let file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(output_path)
+        .with_context(|| format!("creating fanout CSV {output_path}"))?;
+    write_fanout_csv(
+        BufWriter::new(file),
+        &funder.seed(),
+        wallet_set_id,
+        start,
+        config.setup.users,
+        &config.assets[0].amount_per_user,
+    )?;
+    println!(
+        "exported {} recipients to {output_path}",
+        config.setup.users - start
+    );
+    Ok(())
+}
+
+fn write_fanout_csv(
+    mut output: impl Write,
+    seed: &[u8; 32],
+    wallet_set_id: &str,
+    start: usize,
+    end: usize,
+    amount: &str,
+) -> Result<()> {
+    writeln!(output, "recipient,amount").context("writing fanout CSV header")?;
+    for index in start..end {
+        let recipient = derive_user(seed, wallet_set_id, index as u32).pubkey;
+        writeln!(output, "{recipient},{amount}").context("writing fanout CSV row")?;
+    }
+    output.flush().context("flushing fanout CSV")
 }
 
 /// Create or resume a deterministic fixture set.

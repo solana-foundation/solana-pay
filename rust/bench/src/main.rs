@@ -74,6 +74,21 @@ enum Cmd {
         #[arg(long)]
         yes: bool,
     },
+    /// Export deterministic fixture recipients as a `pay fanout` CSV without
+    /// exposing any derived private keys.
+    ExportFanout {
+        config: String,
+        /// Fixture ID used as the derivation namespace unless the config
+        /// declares `setup.wallet_set_id`.
+        #[arg(long)]
+        id: String,
+        /// First zero-based wallet index to include.
+        #[arg(long, default_value_t = 0)]
+        start: usize,
+        /// Destination CSV. Refuses to overwrite an existing file.
+        #[arg(long)]
+        output: String,
+    },
     /// Transfer fixture balances home and close all derived token accounts.
     Teardown {
         setup_id: String,
@@ -169,6 +184,12 @@ async fn run(cmd: Cmd) -> Result<()> {
             yes,
         } => run_real(&config, fixture_id.as_deref(), yes).await,
         Cmd::Setup { config, id, yes } => fixtures::setup(&config, id.as_deref(), yes).await,
+        Cmd::ExportFanout {
+            config,
+            id,
+            start,
+            output,
+        } => fixtures::export_fanout(&config, &id, start, &output),
         Cmd::Teardown {
             setup_id,
             config,
