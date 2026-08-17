@@ -281,8 +281,11 @@ impl FixtureRpc {
         self.call("getLatestBlockhash", move || {
             let client = Arc::clone(&client);
             async move {
+                // Public RPC URLs are commonly load-balanced across nodes. A
+                // confirmed blockhash returned by one backend can still be
+                // unknown to the backend that receives the transaction.
                 client
-                    .get_latest_blockhash_with_commitment(CommitmentConfig::confirmed())
+                    .get_latest_blockhash_with_commitment(CommitmentConfig::finalized())
                     .await
                     .map_err(|error| anyhow!(error))
             }
@@ -359,7 +362,7 @@ impl FixtureRpc {
             let client = Arc::clone(&client);
             async move {
                 client
-                    .get_block_height_with_commitment(CommitmentConfig::confirmed())
+                    .get_block_height_with_commitment(CommitmentConfig::finalized())
                     .await
                     .map_err(|error| anyhow!(error))
             }

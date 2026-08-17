@@ -244,11 +244,19 @@ pub async fn setup(config_path: &str, id: Option<&str>, yes: bool) -> Result<()>
     let minimum_sol = enforce_sol_cap(&config, assets.len(), ata_rent)?;
     verify_funder_sol_balance(&rpc, &funder, minimum_sol).await?;
     ensure_funder_atas(&rpc, &funder, &assets, &mut journal, "setup", usize::MAX).await?;
-    verify_funder_balances(&rpc, &funder, &assets, config.setup.users).await?;
-
-    journal.set_phase(FixturePhase::SettingUp)?;
     let seed = funder.seed();
     let wallet_set_id = config.setup.wallet_set_id.as_deref().unwrap_or(&setup_id);
+    verify_funder_balances(
+        &rpc,
+        &funder,
+        &assets,
+        config.setup.users,
+        &seed,
+        wallet_set_id,
+    )
+    .await?;
+
+    journal.set_phase(FixturePhase::SettingUp)?;
     let start = journal.state().next_user;
     let cancellation = CancellationToken::new();
     let signal_cancel = cancellation.clone();
@@ -636,19 +644,42 @@ async fn verify_funder_balances(
     funder: &Wallet,
     assets: &[FixtureAsset],
     users: usize,
+    seed: &[u8; 32],
+    wallet_set_id: &str,
 ) -> Result<()> {
     for asset in assets {
         let ata = associated_token_address(&funder.pubkey, asset)?;
         let available = token_balance(rpc, &ata).await?.context(
             "funder ATA missing after idempotent creation; check the configured token program",
         )?;
-        let needed = asset
-            .amount_base
-            .checked_mul(users as u64)
-            .context("asset funding total overflow")?;
+        let addresses = (0..users)
+            .map(|index| {
+                let user = derive_user(seed, wallet_set_id, index as u32);
+                associated_token_address(&user.pubkey, asset)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let mut needed = 0u64;
+        for chunk in addresses.chunks(100) {
+            let accounts = rpc
+                .accounts(chunk)
+                .await
+                .with_context(|| format!("fetching existing {} fixture balances", asset.label))?;
+            for account in accounts {
+                let current = token_amount(account.as_ref())?;
+                ensure!(
+                    current <= asset.amount_base,
+                    "derived wallet already has {current} {} base units (fixture target is {}); refuse to mix funds",
+                    asset.label,
+                    asset.amount_base
+                );
+                needed = needed
+                    .checked_add(asset.amount_base - current)
+                    .context("asset funding total overflow")?;
+            }
+        }
         ensure!(
             available >= needed,
-            "funder {} ATA has {available} base units; fixture needs {needed}. Fund it before setup.",
+            "funder {} ATA has {available} base units; fixture needs {needed} more. Fund it before setup.",
             asset.label
         );
     }
@@ -868,11 +899,18 @@ async fn token_balance(rpc: &FixtureRpc, address: &Pubkey) -> Result<Option<u64>
         .into_iter()
         .next()
         .flatten();
+    match account.as_ref() {
+        Some(account) => token_amount(Some(account)).map(Some),
+        None => Ok(None),
+    }
+}
+
+fn token_amount(account: Option<&solana_account::Account>) -> Result<u64> {
     match account {
         Some(account) => StateWithExtensions::<TokenAccount>::unpack(&account.data)
-            .map(|account| Some(account.base.amount))
+            .map(|account| account.base.amount)
             .context("decoding token account"),
-        None => Ok(None),
+        None => Ok(0),
     }
 }
 

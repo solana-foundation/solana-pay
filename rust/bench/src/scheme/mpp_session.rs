@@ -113,6 +113,22 @@ fn validate_open_response(status: StatusCode, body: &[u8], expected_channel: &st
     Ok(())
 }
 
+fn validate_close_response(status: StatusCode, body: &[u8]) -> Result<()> {
+    if status.is_success() {
+        return Ok(());
+    }
+    let message = serde_json::from_slice::<serde_json::Value>(body)
+        .ok()
+        .and_then(|payload| {
+            payload
+                .get("message")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        })
+        .unwrap_or_else(|| String::from_utf8_lossy(body).into_owned());
+    bail!("session close was rejected with {status}: {message}")
+}
+
 #[async_trait]
 impl BenchScheme for MppSession {
     fn name(&self) -> &'static str {
@@ -353,10 +369,9 @@ impl BenchScheme for MppSession {
         .send()
         .await
         .context("close request failed")?;
-        if !resp.status().is_success() {
-            tracing::warn!(index = ctx.index, status = %resp.status(), "session close not accepted");
-        }
-        Ok(())
+        let status = resp.status();
+        let body = resp.bytes().await.context("reading close response")?;
+        validate_close_response(status, &body)
     }
 }
 
@@ -454,5 +469,17 @@ mod tests {
                 .to_string()
                 .contains("not valid JSON")
         );
+    }
+
+    #[test]
+    fn rejects_failed_close_with_server_message() {
+        let error = validate_close_response(
+            StatusCode::PAYMENT_REQUIRED,
+            br#"{"message":"payment-channel settlement: custom program error: 0x35"}"#,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("402 Payment Required"));
+        assert!(error.to_string().contains("custom program error: 0x35"));
+        validate_close_response(StatusCode::OK, b"").unwrap();
     }
 }

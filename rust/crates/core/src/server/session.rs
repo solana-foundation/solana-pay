@@ -195,6 +195,7 @@ struct SessionOperatorRuntime {
     server: Arc<SessionServer<Arc<dyn ChannelStore>>>,
     channel_store: Arc<dyn ChannelStore>,
     rpc_url: Option<String>,
+    token_program: String,
     payment_channel_signer: Arc<Mutex<Option<Arc<dyn SolanaSigner>>>>,
     payment_channel_payer_signer: Arc<Mutex<Option<Arc<dyn SolanaSigner>>>>,
     committed_watermarks: Arc<dashmap::DashMap<String, u64>>,
@@ -498,7 +499,13 @@ impl SessionOperatorRuntime {
         let authorized_signer = params.authorized_signer.ok_or_else(|| {
             Error::Mpp("payment-channel settlement missing authorized signer".to_string())
         })?;
-        let token_program = spl_token_program();
+        let token_program =
+            solana_pubkey::Pubkey::from_str(&self.token_program).map_err(|error| {
+                Error::Mpp(format!(
+                    "invalid payment-channel token program {}: {error}",
+                    self.token_program
+                ))
+            })?;
 
         // A periodic watermark push may have landed immediately before this
         // close. Reusing that same cumulative voucher in `settle_and_seal`
@@ -1212,6 +1219,16 @@ impl SessionMpp {
             server: Arc::clone(&server),
             channel_store,
             rpc_url: session_config.rpc_url.clone(),
+            token_program: session_config
+                .token_program
+                .map(|address| address.to_string())
+                .unwrap_or_else(|| {
+                    pay_kit::mpp::protocol::solana::default_token_program_for_currency(
+                        &session_config.currency,
+                        Some(&session_config.network),
+                    )
+                    .to_string()
+                }),
             payment_channel_signer: Arc::clone(&payment_channel_signer),
             payment_channel_payer_signer: Arc::clone(&payment_channel_payer_signer),
             committed_watermarks: Arc::clone(&committed_watermarks),
@@ -1995,12 +2012,6 @@ fn open_transaction_signature(tx_base64: &str) -> Option<String> {
         .map(|signature| signature.to_string())
 }
 
-fn spl_token_program() -> solana_pubkey::Pubkey {
-    use pay_kit::mpp::protocol::solana::programs;
-    use std::str::FromStr;
-    solana_pubkey::Pubkey::from_str(programs::TOKEN_PROGRAM).expect("valid SPL token program id")
-}
-
 /// Decode a client-built open transaction. Delegates to the shared
 /// payment-channels decoder, which accepts both legacy (pay Rust client) and v0
 /// versioned (canonical pay-kit JS client) wire formats.
@@ -2093,6 +2104,25 @@ mod tests {
     fn test_session_mpp() -> SessionMpp {
         SessionMpp::new(test_session_config(), "test-secret")
             .with_blockhash_cache(test_blockhash_cache())
+    }
+
+    #[test]
+    fn usdtest_settlement_uses_token_2022() {
+        use pay_kit::mpp::protocol::solana::programs;
+
+        let session = SessionMpp::new(
+            SessionConfig {
+                currency: "USDtest".to_string(),
+                network: "devnet".to_string(),
+                token_program: None,
+                ..test_session_config()
+            },
+            "test-secret",
+        );
+        assert_eq!(
+            session.operator_runtime.token_program,
+            programs::TOKEN_2022_PROGRAM
+        );
     }
 
     fn test_keypair() -> (ed25519_dalek::SigningKey, Box<dyn SolanaSigner>) {
