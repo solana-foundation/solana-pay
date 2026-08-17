@@ -48,7 +48,7 @@ struct SetupWindow<'a> {
     rpc: &'a FixtureRpc,
     funder: &'a Wallet,
     seed: &'a [u8; 32],
-    setup_id: &'a str,
+    wallet_set_id: &'a str,
     sol_lamports: u64,
     assets: &'a [FixtureAsset],
 }
@@ -58,7 +58,7 @@ struct TeardownWindow<'a> {
     rpc: &'a FixtureRpc,
     funder: &'a Wallet,
     seed: &'a [u8; 32],
-    setup_id: &'a str,
+    wallet_set_id: &'a str,
     assets: &'a [FixtureAsset],
 }
 
@@ -78,6 +78,11 @@ pub struct SetupConfig {
 #[serde(deny_unknown_fields)]
 pub struct SetupMeta {
     pub name: String,
+    /// Optional derivation namespace shared with another fixture. This lets a
+    /// new asset reuse an existing deterministic wallet cohort while keeping
+    /// its own independent setup/teardown journal.
+    #[serde(default)]
+    pub wallet_set_id: Option<String>,
     pub network: Network,
     #[serde(default)]
     pub rpc_url_env: Option<String>,
@@ -119,6 +124,9 @@ impl SetupConfig {
 
     fn validate(&self) -> Result<()> {
         ensure!(self.setup.users > 0, "setup.users must be > 0");
+        if let Some(id) = &self.setup.wallet_set_id {
+            validate_setup_id(id).context("invalid setup.wallet_set_id")?;
+        }
         ensure!(
             self.setup.max_total_sol.is_finite() && self.setup.max_total_sol >= 0.0,
             "setup.max_total_sol must be a finite number >= 0"
@@ -203,6 +211,7 @@ pub async fn setup(config_path: &str, id: Option<&str>, yes: bool) -> Result<()>
         let now = chrono::Utc::now().to_rfc3339();
         FixtureJournal::create(FixtureState {
             setup_id: setup_id.clone(),
+            wallet_set_id: config.setup.wallet_set_id.clone(),
             name: config.setup.name.clone(),
             network: config.setup.network,
             funder_pubkey: funder.pubkey.to_string(),
@@ -239,6 +248,7 @@ pub async fn setup(config_path: &str, id: Option<&str>, yes: bool) -> Result<()>
 
     journal.set_phase(FixturePhase::SettingUp)?;
     let seed = funder.seed();
+    let wallet_set_id = config.setup.wallet_set_id.as_deref().unwrap_or(&setup_id);
     let start = journal.state().next_user;
     let cancellation = CancellationToken::new();
     let signal_cancel = cancellation.clone();
@@ -261,7 +271,7 @@ pub async fn setup(config_path: &str, id: Option<&str>, yes: bool) -> Result<()>
                     rpc: &rpc,
                     funder: &funder,
                     seed: &seed,
-                    setup_id: &setup_id,
+                    wallet_set_id,
                     sol_lamports: config.setup.sol_lamports_per_user,
                     assets: &assets,
                 },
@@ -372,6 +382,11 @@ pub async fn teardown(setup_id: &str, config_path: &str, yes: bool) -> Result<()
         journal.checkpoint(0)?;
     }
     let seed = funder.seed();
+    let wallet_set_id = journal
+        .state()
+        .wallet_set_id
+        .clone()
+        .unwrap_or_else(|| setup_id.to_string());
     let start = journal.state().next_user.min(journal.state().users);
     let cancellation = CancellationToken::new();
     let signal_cancel = cancellation.clone();
@@ -394,7 +409,7 @@ pub async fn teardown(setup_id: &str, config_path: &str, yes: bool) -> Result<()
                     rpc: &rpc,
                     funder: &funder,
                     seed: &seed,
-                    setup_id,
+                    wallet_set_id: &wallet_set_id,
                     assets: &teardown_assets,
                 },
                 window_start,
@@ -466,7 +481,7 @@ pub async fn teardown(setup_id: &str, config_path: &str, yes: bool) -> Result<()
 /// Ensure a load run points at a completed fixture made by the same funder and
 /// network. The fixture amounts remain deliberately independent from the load
 /// config: the session challenge determines the actual required deposit.
-pub fn validate_ready_fixture(setup_id: &str, run: &RunConfig, funder: &Wallet) -> Result<()> {
+pub fn validate_ready_fixture(setup_id: &str, run: &RunConfig, funder: &Wallet) -> Result<String> {
     let fixture = FixtureJournal::load(setup_id)?;
     ensure!(
         fixture.state().phase == FixturePhase::Ready,
@@ -488,7 +503,11 @@ pub fn validate_ready_fixture(setup_id: &str, run: &RunConfig, funder: &Wallet) 
         fixture.state().users,
         run.load.users
     );
-    Ok(())
+    Ok(fixture
+        .state()
+        .wallet_set_id
+        .clone()
+        .unwrap_or_else(|| setup_id.to_string()))
 }
 
 fn require_confirmation(yes: bool, operation: &str) -> Result<()> {
@@ -527,6 +546,10 @@ fn ensure_same_fixture(
     ensure!(
         state.name == config.setup.name,
         "existing fixture name does not match config"
+    );
+    ensure!(
+        state.wallet_set_id == config.setup.wallet_set_id,
+        "existing fixture wallet set does not match config"
     );
     ensure!(
         state.network == config.setup.network,
@@ -640,7 +663,7 @@ async fn prepare_setup_window(
 ) -> Result<Vec<PreparedUser>> {
     let prepared = futures::stream::iter(start..end)
         .map(move |index| {
-            let user = derive_user(window.seed, window.setup_id, index as u32);
+            let user = derive_user(window.seed, window.wallet_set_id, index as u32);
             async move {
                 let instructions = prepare_setup_user(
                     window.rpc,
@@ -725,7 +748,7 @@ async fn prepare_teardown_window(
 ) -> Result<Vec<PreparedUser>> {
     futures::stream::iter(start..end)
         .map(move |index| {
-            let user = derive_user(window.seed, window.setup_id, index as u32);
+            let user = derive_user(window.seed, window.wallet_set_id, index as u32);
             async move {
                 let instructions =
                     prepare_teardown_user(window.rpc, window.funder, &user, window.assets).await?;
@@ -1006,5 +1029,17 @@ mod tests {
         let config: SetupConfig =
             serde_yml::from_str(include_str!("../configs/devnet-fixture-100k-usdg.yml")).unwrap();
         config.validate().unwrap();
+    }
+
+    #[test]
+    fn bundled_devnet_usdtest_fixture_reuses_retained_wallet_set() {
+        let config: SetupConfig =
+            serde_yml::from_str(include_str!("../configs/devnet-fixture-100k-usdtest.yml"))
+                .unwrap();
+        config.validate().unwrap();
+        assert_eq!(
+            config.setup.wallet_set_id.as_deref(),
+            Some("devnet-100k-usdg")
+        );
     }
 }

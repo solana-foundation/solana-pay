@@ -15,6 +15,7 @@ pub mod stablecoin_mints {
     pub use pay_kit::core::mints::{
         CASH_MAINNET, PYUSD_DEVNET, PYUSD_MAINNET, PYUSD_TESTNET, USDC_DEVNET, USDC_MAINNET,
         USDC_TESTNET, USDG_DEVNET, USDG_MAINNET, USDG_TESTNET, USDPT_MAINNET, USDT_MAINNET,
+        USDTEST_DEVNET,
     };
 }
 

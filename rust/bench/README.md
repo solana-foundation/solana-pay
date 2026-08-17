@@ -95,7 +95,8 @@ session: { deposit_usdc: 0.10, voucher_usdc: 0.0001, close_after_run: true } # m
 
 Use one of the versioned 100,000-wallet allocation plans:
 `configs/devnet-fixture-100k.yml` for devnet USDC or
-`configs/devnet-fixture-100k-usdg.yml` for devnet USDG (Token-2022). A stable
+`configs/devnet-fixture-100k-usdtest.yml` for devnet-only USDtest (Token-2022).
+A stable
 `--id` is part of the wallet derivation namespace, so the same funder and ID
 always recover the same 100,000 addresses. `setup` is resumable: it reconciles
 each target ATA to its configured balance before transferring only the missing
@@ -112,7 +113,7 @@ cargo run -p pay-bench --release -- setup \
 # A real load run reuses the funded, deterministic wallet set and leaves
 # cleanup to the explicit teardown command.
 cargo run -p pay-bench --release -- run bench/configs/session-devnet.yml \
-  --fixture-id devnet-100k-usdg --yes
+  --fixture-id devnet-100k-usdtest --yes
 
 # After all load runs are finished, return every token balance and close each
 # ATA to reclaim its rent to the funder.
@@ -120,12 +121,13 @@ cargo run -p pay-bench --release -- teardown devnet-100k \
   --config bench/configs/devnet-fixture-100k.yml --yes
 ```
 
-For USDG, use a distinct setup ID so its derived wallets cannot collide with
-the USDC fixture:
+The USDtest fixture has its own setup journal but deliberately derives the
+already-provisioned `devnet-100k-usdg` wallet cohort. This adds the new token
+accounts without creating another 100,000 wallet addresses:
 
 ```sh
 cargo run -p pay-bench --release -- setup \
-  bench/configs/devnet-fixture-100k-usdg.yml --id devnet-100k-usdg --yes
+  bench/configs/devnet-fixture-100k-usdtest.yml --id devnet-100k-usdtest --yes
 ```
 
 The plan performs one idempotently reconciled transaction per derived wallet;

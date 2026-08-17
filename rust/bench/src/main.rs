@@ -219,9 +219,9 @@ async fn run_real(config: &str, fixture_id: Option<&str>, yes: bool) -> Result<(
         funder: funder_wallet.clone(),
     };
     let fixture_funder = wallet::FixtureFunder;
-    if let Some(id) = fixture_id {
-        fixtures::validate_ready_fixture(id, &cfg, &funder_wallet)?;
-    }
+    let wallet_set_id = fixture_id
+        .map(|id| fixtures::validate_ready_fixture(id, &cfg, &funder_wallet))
+        .transpose()?;
     let funder: &dyn wallet::Funder = if fixture_id.is_some() {
         &fixture_funder
     } else {
@@ -243,7 +243,7 @@ async fn run_real(config: &str, fixture_id: Option<&str>, yes: bool) -> Result<(
         scheme: scheme.as_ref(),
         funder,
         funder_seed: funder_wallet.seed(),
-        wallet_set_id: fixture_id.unwrap_or(&run_id),
+        wallet_set_id: wallet_set_id.as_deref().unwrap_or(&run_id),
         rpc_url,
         host_override: None,
         journal: &mut jrnl,

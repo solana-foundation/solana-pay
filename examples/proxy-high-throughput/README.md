@@ -41,7 +41,7 @@ the gate baseline.
 - An AVX-512 IFMA-capable CPU to reproduce the fast crypto backend.
 - TCP port 443 allowed by the host firewall/security group.
 - A Solana RPC URL, recipient address, and funded operator keypair. The sample
-  paywall uses devnet USDG; change the currency, `operator.network`, and RPC
+  paywall uses devnet-only USDtest; change the currency, `operator.network`, and RPC
   together when targeting another deployment of the payment-channel program.
 
 The playbook creates a private benchmark CA and an IP-SAN server certificate,

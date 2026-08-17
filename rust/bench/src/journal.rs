@@ -15,10 +15,13 @@ use crate::config::{Network, Scheme};
 
 /// Durable state for an independently reusable fixture set. Unlike a load-run
 /// journal, this contains only public derivation metadata and progress; every
-/// wallet key remains recoverable from the funder seed and `setup_id`.
+/// wallet key remains recoverable from the funder seed and `wallet_set_id` (or
+/// the fixture's `setup_id` for legacy journals).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FixtureState {
     pub setup_id: String,
+    #[serde(default)]
+    pub wallet_set_id: Option<String>,
     pub name: String,
     pub network: Network,
     pub funder_pubkey: String,
@@ -369,5 +372,6 @@ mod tests {
         "#;
         let state: FixtureState = serde_json::from_str(raw).unwrap();
         assert!(state.pending.is_empty());
+        assert!(state.wallet_set_id.is_none());
     }
 }
