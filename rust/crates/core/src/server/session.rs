@@ -195,6 +195,7 @@ struct SessionOperatorRuntime {
     server: Arc<SessionServer<Arc<dyn ChannelStore>>>,
     channel_store: Arc<dyn ChannelStore>,
     rpc_url: Option<String>,
+    network: String,
     token_program: String,
     payment_channel_signer: Arc<Mutex<Option<Arc<dyn SolanaSigner>>>>,
     payment_channel_payer_signer: Arc<Mutex<Option<Arc<dyn SolanaSigner>>>>,
@@ -506,6 +507,7 @@ impl SessionOperatorRuntime {
                     self.token_program
                 ))
             })?;
+        let treasury = payment_channel_treasury_owner(&self.network)?;
 
         // A periodic watermark push may have landed immediately before this
         // close. Reusing that same cumulative voucher in `settle_and_seal`
@@ -560,7 +562,7 @@ impl SessionOperatorRuntime {
                 // signer — it's a non-signer account here, so they can differ.
                 &rent_payer,
                 &params.recipient,
-                &pay_kit::mpp::program::payment_channels::treasury_owner(),
+                &treasury,
                 &mint,
                 &recipients,
                 &token_program,
@@ -1219,6 +1221,7 @@ impl SessionMpp {
             server: Arc::clone(&server),
             channel_store,
             rpc_url: session_config.rpc_url.clone(),
+            network: session_config.network.clone(),
             token_program: session_config
                 .token_program
                 .map(|address| address.to_string())
@@ -2012,6 +2015,16 @@ fn open_transaction_signature(tx_base64: &str) -> Option<String> {
         .map(|signature| signature.to_string())
 }
 
+fn payment_channel_treasury_owner(network: &str) -> Result<solana_pubkey::Pubkey> {
+    const DEVNET_TREASURY_OWNER: &str = "4zTeC5mVqWLruDexgU2mV66p9t5vCA9JyiZqdGDUspap";
+
+    if network == "devnet" {
+        return solana_pubkey::Pubkey::from_str(DEVNET_TREASURY_OWNER)
+            .map_err(|error| Error::Mpp(format!("invalid devnet treasury owner: {error}")));
+    }
+    Ok(pay_kit::mpp::program::payment_channels::treasury_owner())
+}
+
 /// Decode a client-built open transaction. Delegates to the shared
 /// payment-channels decoder, which accepts both legacy (pay Rust client) and v0
 /// versioned (canonical pay-kit JS client) wire formats.
@@ -2122,6 +2135,12 @@ mod tests {
         assert_eq!(
             session.operator_runtime.token_program,
             programs::TOKEN_2022_PROGRAM
+        );
+        assert_eq!(
+            payment_channel_treasury_owner(&session.operator_runtime.network)
+                .unwrap()
+                .to_string(),
+            "4zTeC5mVqWLruDexgU2mV66p9t5vCA9JyiZqdGDUspap"
         );
     }
 
