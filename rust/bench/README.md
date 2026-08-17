@@ -84,8 +84,8 @@ load:
   prepare_secs: 30            # window to pre-build the request buffer
   unleash_secs: 60            # measured window
   max_concurrency: 2048
-  provision_concurrency: 1000 # on-chain channel opens
-  settlement_concurrency: 128 # on-chain closes + wallet sweeps
+  provision_concurrency: 128  # on-chain channel opens
+  settlement_concurrency: 64  # on-chain closes + wallet sweeps
 endpoints:
   - { url: "https://<proxy>/v1/charge", method: POST, body: "{}" }
 session: { deposit_usdc: 0.10, voucher_usdc: 0.0001, close_after_run: true } # mpp_session only
