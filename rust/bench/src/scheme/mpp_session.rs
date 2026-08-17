@@ -113,7 +113,7 @@ fn validate_open_response(status: StatusCode, body: &[u8], expected_channel: &st
     Ok(())
 }
 
-fn validate_close_response(status: StatusCode, body: &[u8]) -> Result<()> {
+pub(crate) fn validate_close_response(status: StatusCode, body: &[u8]) -> Result<()> {
     if status.is_success() {
         return Ok(());
     }

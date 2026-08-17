@@ -17,9 +17,7 @@ use crate::report::ReportJson;
 use crate::scheme::{BenchScheme, UserCtx, UserSetup};
 use crate::wallet::{self, Funder};
 
-/// Concurrency for the on-chain provisioning + off-chain prepare phases.
-/// (Deliberately modest for M1; M3 tunes this against RPC limits.)
-const PROVISION_CONCURRENCY: usize = 16;
+/// Concurrency for the off-chain request-source preparation phase.
 const PREPARE_CONCURRENCY: usize = 32;
 
 pub struct PipelineParams<'a> {
@@ -115,7 +113,7 @@ pub async fn run_pipeline(p: PipelineParams<'_>) -> Result<ReportJson> {
     // ── 4. Provision: fund each wallet, then scheme-specific on-chain setup ──
     p.journal.set_status(Status::Provisioning)?;
     let t_provision = Instant::now();
-    let mut prov: Vec<(u32, Result<UserSetup>)> = stream::iter(ctxs.iter())
+    let mut provisioning = stream::iter(ctxs.iter())
         .map(|ctx| {
             async move {
                 let token = mint_pk.as_ref().map(|m| (m, per.token_base));
@@ -130,15 +128,10 @@ pub async fn run_pipeline(p: PipelineParams<'_>) -> Result<ReportJson> {
             }
             .instrument(tracing::info_span!("provision", index = ctx.index))
         })
-        .buffer_unordered(PROVISION_CONCURRENCY)
-        .collect::<Vec<_>>()
-        .await;
-
-    prov.sort_by_key(|(i, _)| *i);
+        .buffer_unordered(load.provision_concurrency);
     let ctx_by_index: HashMap<u32, &UserCtx> = ctxs.iter().map(|ctx| (ctx.index, ctx)).collect();
-    let mut setups: Vec<UserSetup> = Vec::with_capacity(ctxs.len());
-    let mut provisioning_error = None;
-    for (idx, res) in prov {
+    let mut provisioned: Vec<(u32, UserSetup)> = Vec::with_capacity(ctxs.len());
+    while let Some((idx, res)) = provisioning.next().await {
         match res {
             Ok(setup) => {
                 if !no_chain {
@@ -154,17 +147,16 @@ pub async fn run_pipeline(p: PipelineParams<'_>) -> Result<ReportJson> {
                         swept: false,
                     })?;
                 }
-                setups.push(setup);
+                provisioned.push((idx, setup));
             }
             Err(e) => {
-                provisioning_error.get_or_insert((idx, e));
+                p.journal.set_status(Status::Failed)?;
+                return Err(e).with_context(|| format!("provisioning user {idx} failed"));
             }
         }
     }
-    if let Some((idx, error)) = provisioning_error {
-        p.journal.set_status(Status::Failed)?;
-        bail!("provisioning user {idx} failed: {error:#}");
-    }
+    provisioned.sort_by_key(|(idx, _)| *idx);
+    let setups: Vec<UserSetup> = provisioned.into_iter().map(|(_, setup)| setup).collect();
     p.journal.set_status(Status::Provisioned)?;
     tracing::info!(
         users = ctxs.len(),

@@ -536,6 +536,7 @@ mod tests {
                 prepare_secs: 0,
                 unleash_secs: 1,
                 max_concurrency: 1,
+                provision_concurrency: 1,
                 workers: 1,
                 http2_prior_knowledge: false,
                 proxy_workers: None,

@@ -6630,6 +6630,7 @@ dependencies = [
  "opentelemetry-otlp",
  "opentelemetry-semantic-conventions 0.31.0",
  "opentelemetry_sdk 0.31.0",
+ "pay-api-core",
  "pay-core",
  "pay-proxy",
  "pay-types",
@@ -8384,7 +8385,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -11143,7 +11144,7 @@ dependencies = [
 [[package]]
 name = "solana-pay-kit"
 version = "0.6.0"
-source = "git+https://github.com/solana-foundation/pay-kit.git?rev=3076229b6fef198fbc7f5264c70858d3cffcf287#3076229b6fef198fbc7f5264c70858d3cffcf287"
+source = "git+https://github.com/solana-foundation/pay-kit.git?rev=485458c4d5b1d1e33db09351875d0cd9fd555203#485458c4d5b1d1e33db09351875d0cd9fd555203"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -15805,7 +15806,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.48.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

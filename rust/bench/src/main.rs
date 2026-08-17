@@ -20,6 +20,7 @@ mod rehearsal;
 mod report;
 mod scheme;
 mod seeded_session;
+mod session_recovery;
 mod wallet;
 
 use anyhow::{Context, Result, bail};
@@ -107,6 +108,16 @@ enum Cmd {
         run_id: Option<String>,
         #[arg(long)]
         all: bool,
+    },
+    /// Discover and close live fixture sessions left by an interrupted run.
+    RecoverSessions {
+        config: String,
+        /// Reusable fixture whose deterministic wallets opened the channels.
+        #[arg(long)]
+        fixture_id: String,
+        /// Confirm that this command may submit channel-close transactions.
+        #[arg(long)]
+        yes: bool,
     },
     /// Validate a config and print the parsed settings.
     Estimate { config: String },
@@ -197,6 +208,11 @@ async fn run(cmd: Cmd) -> Result<()> {
         } => fixtures::teardown(&setup_id, &config, yes).await,
         Cmd::ListRuns => list_runs(),
         Cmd::Recover { run_id, all } => recover(run_id, all).await,
+        Cmd::RecoverSessions {
+            config,
+            fixture_id,
+            yes,
+        } => session_recovery::recover(&config, &fixture_id, yes).await,
         Cmd::Serve { config } => {
             let cfg = RunConfig::from_yaml_path(&config)?;
             rehearsal::serve_proxy(cfg).await

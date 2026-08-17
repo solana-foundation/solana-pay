@@ -122,6 +122,11 @@ pub struct Load {
     /// Cap on in-flight requests across all users.
     #[serde(default = "default_max_concurrency")]
     pub max_concurrency: usize,
+    /// Maximum concurrent per-user funding and scheme provisioning operations.
+    /// Session opens each submit and confirm an on-chain transaction, so live
+    /// lifecycle benchmarks normally set this much higher than the default.
+    #[serde(default = "default_provision_concurrency")]
+    pub provision_concurrency: usize,
     /// Fixed generator workers. Channels are deterministically assigned by
     /// user index, avoiding one Tokio task and interval per logical session.
     #[serde(default = "default_worker_count")]
@@ -204,6 +209,9 @@ fn default_unleash_secs() -> u64 {
 fn default_max_concurrency() -> usize {
     2048
 }
+fn default_provision_concurrency() -> usize {
+    16
+}
 fn default_worker_count() -> usize {
     32
 }
@@ -271,6 +279,9 @@ impl RunConfig {
         }
         if self.load.workers == 0 {
             bail!("load.workers must be > 0");
+        }
+        if self.load.provision_concurrency == 0 {
+            bail!("load.provision_concurrency must be > 0");
         }
         if self.load.proxy_workers == Some(0) {
             bail!("load.proxy_workers must be > 0 when set");
@@ -392,5 +403,13 @@ mod tests {
                 "max_total_sol={cap} must be rejected"
             );
         }
+    }
+
+    #[test]
+    fn zero_provision_concurrency_is_rejected() {
+        let mut cfg = selftest_config();
+        cfg.load.provision_concurrency = 0;
+        let error = cfg.validate().unwrap_err();
+        assert!(error.to_string().contains("provision_concurrency"));
     }
 }
