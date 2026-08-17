@@ -907,14 +907,19 @@ fn filter_discovery(
 /// attaching tokens that the proxy won't honor anyway. Removes:
 ///
 /// - `components.securitySchemes` (OpenAPI 3) — drops the bucket entirely.
-/// - `security:` arrays at the root and on every operation (OpenAPI 3).
+/// - Non-empty `security:` arrays at the root and on every operation
+///   (OpenAPI 3). An EMPTY `security: []` is preserved: it references no
+///   scheme, so the misleading-credentials rationale above does not apply —
+///   it is the spec's explicit "no authorization required" marker, and
+///   discovery scanners (e.g. x402scan) read it as "expect a 200 here, not a
+///   402 challenge" when deciding which routes to probe for payment.
 /// - `auth:` block (Google Discovery) at the root.
 /// - `scopes:` array on every Discovery method, recursively through nested
 ///   resources.
 pub fn strip_upstream_auth(doc: &mut Value) {
     if let Some(obj) = doc.as_object_mut() {
         // OpenAPI 3 root-level security and securitySchemes bucket.
-        obj.remove("security");
+        remove_scheme_referencing_security(obj);
         if let Some(components) = obj.get_mut("components").and_then(|v| v.as_object_mut()) {
             components.remove("securitySchemes");
             if components.is_empty() {
@@ -933,7 +938,7 @@ pub fn strip_upstream_auth(doc: &mut Value) {
             };
             for &method in HTTP_METHODS {
                 if let Some(op) = item_obj.get_mut(method).and_then(|v| v.as_object_mut()) {
-                    op.remove("security");
+                    remove_scheme_referencing_security(op);
                 }
             }
         }
@@ -949,6 +954,22 @@ pub fn strip_upstream_auth(doc: &mut Value) {
                 mobj.remove("scopes");
             }
         }
+    }
+}
+
+/// Remove a `security` entry unless it is the explicit no-auth marker.
+///
+/// Only an empty array survives: a non-empty array references schemes whose
+/// `securitySchemes` bucket is stripped, so keeping it would leave dangling
+/// references, and anything that is not an array is malformed and is dropped
+/// the way it always was.
+fn remove_scheme_referencing_security(obj: &mut Map<String, Value>) {
+    let keep = obj
+        .get("security")
+        .and_then(Value::as_array)
+        .is_some_and(|schemes| schemes.is_empty());
+    if !keep {
+        obj.remove("security");
     }
 }
 
@@ -1910,6 +1931,48 @@ mod tests {
         let comp = doc["components"].as_object().unwrap();
         assert!(!comp.contains_key("securitySchemes"));
         assert!(comp.contains_key("schemas"));
+    }
+
+    #[test]
+    fn strip_auth_preserves_the_explicit_no_auth_marker() {
+        let mut doc = json!({
+            "openapi": "3.0.0",
+            "security": [],
+            "paths": {
+                "/health": {
+                    "get": {
+                        "summary": "liveness",
+                        "security": []
+                    }
+                },
+                "/v1/x": {
+                    "post": {
+                        "summary": "x",
+                        "security": [{"oauth2": ["scope.b"]}]
+                    }
+                }
+            },
+            "components": {
+                "securitySchemes": {
+                    "oauth2": {"type": "oauth2", "flows": {}}
+                }
+            }
+        });
+        strip_upstream_auth(&mut doc);
+
+        // The empty arrays are the spec's explicit "no authorization required"
+        // marker and reference no scheme — they survive, root and operation.
+        assert_eq!(doc["security"], json!([]));
+        assert_eq!(doc["paths"]["/health"]["get"]["security"], json!([]));
+        // A scheme-referencing array is stripped exactly as before, along with
+        // the bucket it referenced.
+        assert!(
+            !doc["paths"]["/v1/x"]["post"]
+                .as_object()
+                .unwrap()
+                .contains_key("security")
+        );
+        assert!(!doc.as_object().unwrap().contains_key("components"));
     }
 
     #[test]
