@@ -57,6 +57,7 @@ ed25519-dalek = { workspace = true }
 rand = { workspace = true }
 bs58 = { workspace = true }
 chrono = { workspace = true }
+futures-util = "0.3"
 dialoguer = { workspace = true }
 indicatif = { workspace = true }
 ratatui = { workspace = true }

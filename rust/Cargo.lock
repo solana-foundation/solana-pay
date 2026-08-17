@@ -6477,6 +6477,7 @@ dependencies = [
  "crossterm",
  "dialoguer",
  "ed25519-dalek 2.2.0",
+ "futures-util",
  "glob",
  "indicatif 0.17.11",
  "opentelemetry 0.31.0",

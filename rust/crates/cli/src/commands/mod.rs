@@ -9,6 +9,7 @@ pub mod claude;
 pub mod codex;
 pub mod curl;
 pub mod docs;
+pub mod fanout;
 pub mod fetch;
 pub mod goose;
 pub mod help;
@@ -74,6 +75,8 @@ pub enum Command {
     /// Send stablecoins to a recipient address.
     #[command(alias = "push")]
     Send(send::SendCommand),
+    /// Send a CSV stablecoin payout to many recipients concurrently.
+    Fanout(fanout::FanoutCommand),
     /// Generate a keypair, store it, and fund your account.
     Setup(setup::SetupCommand),
     /// Import funds from Venmo, PayPal, or a mobile wallet.
@@ -164,6 +167,7 @@ impl Command {
             | Command::Goose(_)
             | Command::Qodercli(_)
             | Command::Send(_)
+            | Command::Fanout(_)
             | Command::Topup(_) => true,
             Command::Setup(_)
             | Command::Account { .. }
@@ -199,6 +203,7 @@ impl Command {
             | Command::Catalog { .. }
             | Command::Install(_)
             | Command::Send(_)
+            | Command::Fanout(_)
             | Command::Setup(_)
             | Command::Topup(_)
             | Command::Server { .. }
@@ -258,6 +263,7 @@ impl Command {
             Command::Send(cmd) => {
                 return cmd.run(network_override, account_override, verbose);
             }
+            Command::Fanout(cmd) => return cmd.run(account_override, verbose),
             Command::Setup(cmd) => return cmd.run(),
             Command::Topup(cmd) => return cmd.run(),
             Command::Server { command } => {

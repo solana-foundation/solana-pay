@@ -251,6 +251,7 @@ fn main() {
                 | Command::Catalog { .. }
                 | Command::Install(_)
                 | Command::Send(_)
+                | Command::Fanout(_)
                 | Command::Claude(_)
                 | Command::Codex(_)
                 | Command::Goose(_)

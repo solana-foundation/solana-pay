@@ -54,7 +54,7 @@
 //! limiter is needed for either.
 
 use std::str::FromStr;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use solana_hash::Hash;
 use solana_pubkey::Pubkey;
@@ -430,6 +430,7 @@ pub struct DirectSolanaBroadcaster {
     http: reqwest::Client,
     rpc_url: String,
     fee_payer: Pubkey,
+    blockhash_cache: tokio::sync::Mutex<Option<(PreparedChunkContext, Instant)>>,
 }
 
 impl DirectSolanaBroadcaster {
@@ -438,6 +439,7 @@ impl DirectSolanaBroadcaster {
             http: reqwest::Client::new(),
             rpc_url,
             fee_payer,
+            blockhash_cache: tokio::sync::Mutex::new(None),
         }
     }
 
@@ -498,6 +500,12 @@ fn classify_missing_signature(
 
 impl ChunkBroadcaster for DirectSolanaBroadcaster {
     async fn prepare(&self, _chunk: &PlannedChunk) -> Result<PreparedChunkContext> {
+        let mut cache = self.blockhash_cache.lock().await;
+        if let Some((prepared, fetched_at)) = *cache
+            && fetched_at.elapsed() < Duration::from_secs(5)
+        {
+            return Ok(prepared);
+        }
         let result = self
             .call(serde_json::json!({
                 "jsonrpc": "2.0",
@@ -517,11 +525,13 @@ impl ChunkBroadcaster for DirectSolanaBroadcaster {
         let blockhash = Hash::from_str(blockhash_str).map_err(|_| {
             Error::Config("getLatestBlockhash returned a malformed blockhash".to_string())
         })?;
-        Ok(PreparedChunkContext {
+        let prepared = PreparedChunkContext {
             fee_payer: self.fee_payer,
             blockhash,
             last_valid_block_height,
-        })
+        };
+        *cache = Some((prepared, Instant::now()));
+        Ok(prepared)
     }
 
     async fn broadcast(&self, signed: &SignedChunk) -> Result<BroadcastOutcome> {
