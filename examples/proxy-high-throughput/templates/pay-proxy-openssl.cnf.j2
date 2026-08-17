@@ -1,0 +1,16 @@
+[req]
+distinguished_name = req_distinguished_name
+
+[req_distinguished_name]
+
+[ca_cert]
+basicConstraints = critical,CA:TRUE,pathlen:0
+keyUsage = critical,keyCertSign,cRLSign
+subjectKeyIdentifier = hash
+authorityKeyIdentifier = keyid:always
+
+[server_cert]
+subjectAltName = IP:{{ pay_proxy_public_ip }}
+basicConstraints = critical,CA:FALSE
+keyUsage = critical,digitalSignature,keyEncipherment
+extendedKeyUsage = serverAuth

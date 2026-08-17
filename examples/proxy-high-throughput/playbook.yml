@@ -6,7 +6,7 @@
 
   vars:
     pay_git_repo: "https://github.com/solana-foundation/pay.git"
-    pay_git_ref: "84146398de61f2f49c521c1b3d404e0fb8972541"
+    pay_git_ref: "7d66df17dcdb327f5abfa5a762d5bc78e884d5eb"
     pay_rust_toolchain: "nightly-2026-08-14"
     pay_rustflags: "-C target-cpu=native"
     pay_require_avx512_ifma: true
@@ -20,7 +20,13 @@
     pay_rustup_init_sha256: "4acc9acc76d5079515b46346a485974457b5a79893cfb01112423c89aeb5aa10"
     pay_install_dir: "/opt/pay/bin"
     pay_config_dir: "/etc/pay-proxy"
-    pay_proxy_port: 1402
+    pay_tls_dir: "{{ pay_config_dir }}/tls"
+    pay_tls_ca_cert: "{{ pay_tls_dir }}/ca.crt"
+    pay_tls_ca_key: "{{ pay_tls_dir }}/ca.key"
+    pay_tls_cert: "{{ pay_tls_dir }}/server.crt"
+    pay_tls_key: "{{ pay_tls_dir }}/server.key"
+    pay_proxy_public_ip: "{{ ansible_host }}"
+    pay_proxy_port: 443
     pay_proxy_bind: "0.0.0.0:{{ pay_proxy_port }}"
     pay_proxy_env_file: ""
     pay_proxy_nofile: 524288
@@ -41,10 +47,12 @@
           - ansible_processor_vcpus | int >= pay_min_logical_cpus | int
           - pay_git_ref | length == 40
           - pay_proxy_env_file | length > 0
+          - pay_proxy_public_ip is match('^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$')
         fail_msg: >-
           This playbook requires x86_64 Ubuntu with at least
           {{ pay_min_logical_cpus }} logical CPUs, an immutable 40-character
-          pay_git_ref, and -e pay_proxy_env_file=/secure/path/proxy.env.
+          pay_git_ref, a literal pay_proxy_public_ip, and
+          -e pay_proxy_env_file=/secure/path/proxy.env.
 
     - name: Read CPU flags
       ansible.builtin.command: awk -F ':' '/^flags/{print $2; exit}' /proc/cpuinfo
@@ -89,6 +97,7 @@
           - curl
           - git
           - libssl-dev
+          - openssl
           - pkg-config
         state: present
         update_cache: true
@@ -117,7 +126,86 @@
         - { path: "{{ pay_rustup_home }}", owner: "{{ pay_service_user }}", group: "{{ pay_service_user }}", mode: "0755" }
         - { path: "{{ pay_install_dir }}", owner: "root", group: "root", mode: "0755" }
         - { path: "{{ pay_config_dir }}", owner: "root", group: "{{ pay_service_user }}", mode: "0750" }
+        - { path: "{{ pay_tls_dir }}", owner: "root", group: "{{ pay_service_user }}", mode: "0750" }
         - { path: "/usr/local/src", owner: "root", group: "root", mode: "0755" }
+
+    - name: Install the TLS certificate profile
+      ansible.builtin.template:
+        src: templates/pay-proxy-openssl.cnf.j2
+        dest: "{{ pay_tls_dir }}/openssl.cnf"
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: Generate the benchmark CA private key
+      ansible.builtin.command:
+        cmd: >-
+          openssl genpkey -algorithm RSA
+          -pkeyopt rsa_keygen_bits:3072 -out {{ pay_tls_ca_key }}
+        creates: "{{ pay_tls_ca_key }}"
+
+    - name: Generate the benchmark CA certificate
+      ansible.builtin.command:
+        cmd: >-
+          openssl req -x509 -new -sha256 -days 3650
+          -key {{ pay_tls_ca_key }} -out {{ pay_tls_ca_cert }}
+          -config {{ pay_tls_dir }}/openssl.cnf -extensions ca_cert
+          -subj /CN=Pay-benchmark-CA
+        creates: "{{ pay_tls_ca_cert }}"
+
+    - name: Generate the proxy TLS private key
+      ansible.builtin.command:
+        cmd: >-
+          openssl genpkey -algorithm RSA
+          -pkeyopt rsa_keygen_bits:3072 -out {{ pay_tls_key }}
+        creates: "{{ pay_tls_key }}"
+
+    - name: Generate the proxy TLS certificate request
+      ansible.builtin.command:
+        cmd: >-
+          openssl req -new -sha256 -key {{ pay_tls_key }}
+          -out {{ pay_tls_dir }}/server.csr
+          -subj /CN={{ pay_proxy_public_ip }}
+        creates: "{{ pay_tls_dir }}/server.csr"
+
+    - name: Sign the proxy TLS certificate
+      ansible.builtin.command:
+        cmd: >-
+          openssl x509 -req -sha256 -days 825
+          -in {{ pay_tls_dir }}/server.csr
+          -CA {{ pay_tls_ca_cert }} -CAkey {{ pay_tls_ca_key }} -CAcreateserial
+          -extfile {{ pay_tls_dir }}/openssl.cnf -extensions server_cert
+          -out {{ pay_tls_cert }}
+        creates: "{{ pay_tls_cert }}"
+
+    - name: Restrict TLS private keys and expose certificates
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        owner: root
+        group: "{{ item.group }}"
+        mode: "{{ item.mode }}"
+      loop:
+        - { path: "{{ pay_tls_ca_key }}", group: "root", mode: "0600" }
+        - { path: "{{ pay_tls_key }}", group: "{{ pay_service_user }}", mode: "0640" }
+        - { path: "{{ pay_tls_ca_cert }}", group: "root", mode: "0644" }
+        - { path: "{{ pay_tls_cert }}", group: "{{ pay_service_user }}", mode: "0640" }
+
+    - name: Verify the proxy TLS certificate chain
+      ansible.builtin.command: >-
+        openssl verify -CAfile {{ pay_tls_ca_cert }} {{ pay_tls_cert }}
+      changed_when: false
+
+    - name: Verify the proxy TLS certificate covers the public IP
+      ansible.builtin.command: >-
+        openssl x509 -in {{ pay_tls_cert }} -noout
+        -checkip {{ pay_proxy_public_ip }}
+      changed_when: false
+
+    - name: Fetch the benchmark CA certificate for load generators
+      ansible.builtin.fetch:
+        src: "{{ pay_tls_ca_cert }}"
+        dest: "{{ playbook_dir }}/artifacts/{{ inventory_hostname }}-ca.crt"
+        flat: true
 
     - name: Install rustup
       ansible.builtin.get_url:
@@ -258,10 +346,11 @@
 
     - name: Verify the paid endpoint returns a challenge
       ansible.builtin.uri:
-        url: "http://127.0.0.1:{{ pay_proxy_port }}/api/v1/compute"
+        url: "https://{{ pay_proxy_public_ip }}:{{ pay_proxy_port }}/api/v1/compute"
         method: GET
         status_code: 402
         return_content: false
+        ca_path: "{{ pay_tls_ca_cert }}"
       register: pay_challenge
       retries: 12
       delay: 1

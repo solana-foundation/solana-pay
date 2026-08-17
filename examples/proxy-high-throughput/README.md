@@ -4,7 +4,7 @@ This example provisions one x86_64 Ubuntu host as a headless Pay proxy with a
 single `GET /api/v1/compute` endpoint gated by MPP sessions. It builds Pay with
 the exact nightly/toolchain shape used by the Sunburst experiment, applies
 conservative socket tuning, installs a hardened systemd unit, and verifies that
-the endpoint returns an HTTP 402 payment challenge.
+the native Pingora TLS endpoint returns an HTTP 402 payment challenge.
 
 The hot request path is off-chain. The existing session `ChannelStore`
 atomically replaces each channel's cumulative watermark with the newest valid
@@ -14,10 +14,11 @@ recorded on-chain, and sends the remaining latest watermarks through PayKit's
 size- and packet-bounded settlement worker. This is the production flow being
 benchmarked, not a stream of per-request devnet transactions.
 
-The default sample inventory pins Pay `84146398de61f2f49c521c1b3d404e0fb8972541`
-and Rust `nightly-2026-08-14`, the exact source/toolchain pair used for the
-retained AVX-512 IFMA server measurements. Do not replace the commit with a
-moving branch when collecting benchmark evidence.
+The default sample inventory pins native-TLS Pay
+`7d66df17dcdb327f5abfa5a762d5bc78e884d5eb` and Rust
+`nightly-2026-08-14`. The TLS commit descends from the source used for the
+retained AVX-512 IFMA measurements. Do not replace it with a moving branch when
+collecting benchmark evidence.
 
 ## What this does not claim
 
@@ -38,14 +39,17 @@ the gate baseline.
 - An x86_64 Ubuntu host reachable over SSH with passwordless sudo.
 - At least 128 logical CPUs for the recorded one-million-per-second CPU budget.
 - An AVX-512 IFMA-capable CPU to reproduce the fast crypto backend.
-- TCP port 1402 allowed by the host firewall/security group.
+- TCP port 443 allowed by the host firewall/security group.
 - A Solana RPC URL, recipient address, and funded operator keypair. The sample
   paywall says `devnet`; change `operator.network` and the RPC together when
   targeting another deployment of the payment-channel program.
 
-TLS and firewall policy are deliberately outside this playbook. For anything
-beyond an isolated benchmark network, terminate TLS at a load balancer and
-restrict port 1402 to the intended clients.
+The playbook creates a private benchmark CA and an IP-SAN server certificate,
+then terminates TLS directly in Pingora. The CA private key remains root-only
+on the proxy. Its public certificate is fetched to
+`artifacts/<inventory-host>-ca.crt` for installation on controlled load
+generators. Replace this private CA with your normal certificate process for a
+public service.
 
 ## Deploy
 
@@ -56,7 +60,7 @@ cp proxy.env.example proxy.env
 chmod 600 proxy.env
 ```
 
-Edit `inventory.yml` with the target host. Fill all four values in
+Edit `inventory.yml` with the target host and its literal public IP. Fill all four values in
 `proxy.env`; the file is ignored by git and is copied with mode 0640. Then run:
 
 ```sh
@@ -71,14 +75,19 @@ functional deployment that will not be compared with the retained result.
 
 ## Verify
 
-The playbook's final task requires the local endpoint to return HTTP 402. From
-the controller, confirm the public route and its payment challenge:
+The playbook's final task validates the generated chain and IP SAN, then
+requires the HTTPS endpoint to return HTTP 402. From the controller, confirm
+the public route and its payment challenge:
 
 ```sh
-curl -sS -D - -o /dev/null http://HOST:1402/api/v1/compute
+curl --cacert artifacts/proxy-1-ca.crt -sS -D - -o /dev/null \
+  https://203.0.113.10/api/v1/compute
 ansible pay_proxies -b -m command -a 'systemctl status pay-proxy --no-pager'
 ansible pay_proxies -b -m command -a 'journalctl -u pay-proxy -n 100 --no-pager'
 ```
+
+Install the fetched CA certificate in each controlled generator's OS trust
+store before running `pay-bench`; do not disable certificate verification.
 
 Confirm the deployed source, compiler, and IFMA instructions before attaching
 results to a commit:
@@ -120,14 +129,15 @@ path.
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `pay_git_ref` | `84146398…` | Immutable Pay commit used by the retained experiment. |
+| `pay_git_ref` | `7d66df17…` | Immutable Pay commit with the validated native TLS listener. |
 | `pay_rust_toolchain` | `nightly-2026-08-14` | Compiler that enabled curve25519-dalek's AVX-512 IFMA backend. |
 | `pay_rustup_init_sha256` | `4acc9acc…` | Pins the x86_64 rustup bootstrap binary downloaded from `static.rust-lang.org`. |
 | `pay_rustflags` | `-C target-cpu=native` | Selects the native Zen 5 instruction set. The binary is not portable to older CPUs. |
 | `pay_require_avx512_ifma` | `true` | Fails before build if the target CPU lacks IFMA and after build if the binary lacks `vpmadd52`. |
 | `pay_min_logical_cpus` | `128` | Rejects undersized hosts for the recorded one-million-per-second target. |
-| `pay_proxy_port` | `1402` | Port used by the listener and local health check. |
-| `pay_proxy_bind` | `0.0.0.0:1402` | Public listener address. |
+| `pay_proxy_public_ip` | `ansible_host` | Literal IP placed in the certificate SAN and used by the health check. |
+| `pay_proxy_port` | `443` | Port used by the native TLS listener and health check. |
+| `pay_proxy_bind` | `0.0.0.0:443` | Public TLS listener address. |
 | `pay_proxy_env_file` | empty | Controller-local secret file; must be supplied or set in inventory. |
 
 The sample paywall's session lifecycle values are deliberately explicit:

@@ -22,7 +22,7 @@ load:
   max_concurrency: 512
 
 endpoints:
-  - url: http://213.239.141.29:1402/api/v1/compute
+  - url: https://213.239.141.29/api/v1/compute
     method: GET
     body: ""
 

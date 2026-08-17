@@ -6,9 +6,10 @@ all:
         proxy-1:
           ansible_host: 203.0.113.10
           ansible_user: ubuntu
+          pay_proxy_public_ip: 203.0.113.10
   vars:
-    # This is the exact Pay revision used for the retained Sunburst IFMA run.
+    # This is the native-TLS Pay revision validated for the Sunburst proxy.
     # Change it only to another reviewed, immutable commit SHA.
-    pay_git_ref: "84146398de61f2f49c521c1b3d404e0fb8972541"
+    pay_git_ref: "7d66df17dcdb327f5abfa5a762d5bc78e884d5eb"
     pay_rust_toolchain: "nightly-2026-08-14"
     pay_proxy_env_file: "{{ inventory_dir }}/proxy.env"
