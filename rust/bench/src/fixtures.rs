@@ -11,6 +11,7 @@ use std::time::Instant;
 
 use anyhow::{Context, Result, bail, ensure};
 use futures::{StreamExt, TryStreamExt};
+use pay_kit::mpp::protocol::solana::check_transaction_packet_size;
 use pay_kit::mpp::solana_keychain::{SolanaSigner, memory::MemorySigner};
 use serde::Deserialize;
 use solana_instruction::Instruction;
@@ -36,6 +37,11 @@ use crate::wallet::{Wallet, derive_user, load_funder};
 /// transaction. Actual fees are RPC-controlled, so this is a preflight floor,
 /// not a fee quote.
 const SETUP_FEE_ALLOWANCE_LAMPORTS: u64 = 10_000;
+
+/// Missing-ATA creation dominates setup compute. Four users stay below the
+/// default Solana compute ceiling while still cutting transaction count 4x;
+/// the packet-size check below is the final wire-size guard.
+const MAX_SETUP_USERS_PER_TRANSACTION: usize = 4;
 
 struct PreparedUser {
     index: usize,
@@ -300,33 +306,29 @@ pub async fn setup(config_path: &str, id: Option<&str>, yes: bool) -> Result<()>
             },
         };
         prepared.sort_by_key(|item| item.index);
-        let mut transactions = Vec::with_capacity(prepared.len());
-        for item in prepared {
-            if cancellation.is_cancelled() {
-                signal_task.abort();
-                bail!(
-                    "fixture setup cancelled before window submission; rerun to resume from user {window_start}"
-                );
-            }
-            let result = prepare_transaction(
-                &rpc,
-                &funder,
-                None,
-                item.instructions,
-                &mut journal,
-                "setup",
-                item.index,
-            )
-            .await;
-            match result {
-                Ok(Some(transaction)) => transactions.push(transaction),
-                Ok(None) => {}
-                Err(error) => {
-                    signal_task.abort();
-                    return Err(error).with_context(|| format!("setting up user {}", item.index));
-                }
-            }
+        if cancellation.is_cancelled() {
+            signal_task.abort();
+            bail!(
+                "fixture setup cancelled before window submission; rerun to resume from user {window_start}"
+            );
         }
+        let transactions = match prepare_setup_transactions(
+            &rpc,
+            &funder,
+            prepared,
+            &mut journal,
+            "setup",
+        )
+        .await
+        {
+            Ok(transactions) => transactions,
+            Err(error) => {
+                signal_task.abort();
+                return Err(error).with_context(|| {
+                    format!("preparing setup window {window_start}..{window_end}")
+                });
+            }
+        };
         if let Err(error) = submit_transaction_window(
             &rpc,
             &mut journal,
@@ -969,6 +971,84 @@ fn token_amount(account: Option<&solana_account::Account>) -> Result<u64> {
     }
 }
 
+async fn prepare_setup_transactions(
+    rpc: &FixtureRpc,
+    fee_payer: &Wallet,
+    prepared: Vec<PreparedUser>,
+    journal: &mut FixtureJournal,
+    operation: &str,
+) -> Result<Vec<PreparedTransaction>> {
+    let batches = pack_setup_instruction_batches(prepared, &fee_payer.pubkey)?;
+    if batches.is_empty() {
+        return Ok(Vec::new());
+    }
+    let (blockhash, last_valid_block_height) = rpc
+        .latest_blockhash()
+        .await
+        .context("fetching setup window blockhash")?;
+    let mut transactions = Vec::with_capacity(batches.len());
+    for (user_index, instructions) in batches {
+        let transaction = prepare_transaction_with_blockhash(
+            fee_payer,
+            None,
+            instructions,
+            journal,
+            operation,
+            user_index,
+            blockhash,
+            last_valid_block_height,
+        )
+        .await?
+        .context("non-empty setup instruction batch produced no transaction")?;
+        transactions.push(transaction);
+    }
+    Ok(transactions)
+}
+
+fn pack_setup_instruction_batches(
+    prepared: Vec<PreparedUser>,
+    fee_payer: &Pubkey,
+) -> Result<Vec<(usize, Vec<Instruction>)>> {
+    let mut batches = Vec::new();
+    let mut current_index = 0usize;
+    let mut current_users = 0usize;
+    let mut current_instructions = Vec::new();
+
+    for item in prepared {
+        if item.instructions.is_empty() {
+            continue;
+        }
+        let mut candidate = current_instructions.clone();
+        candidate.extend(item.instructions.iter().cloned());
+        let candidate_tx = Transaction::new_unsigned(Message::new(&candidate, Some(fee_payer)));
+        let candidate_fits = current_users < MAX_SETUP_USERS_PER_TRANSACTION
+            && check_transaction_packet_size(&candidate_tx).is_ok();
+
+        if current_users > 0 && !candidate_fits {
+            batches.push((current_index, std::mem::take(&mut current_instructions)));
+            current_users = 0;
+        }
+        if current_users == 0 {
+            current_index = item.index;
+        }
+        current_instructions.extend(item.instructions);
+        current_users += 1;
+
+        let transaction =
+            Transaction::new_unsigned(Message::new(&current_instructions, Some(fee_payer)));
+        check_transaction_packet_size(&transaction).map_err(|error| {
+            anyhow::anyhow!(
+                "setup instructions for user {} exceed the Solana transaction packet limit: {error}",
+                item.index
+            )
+        })?;
+    }
+    if current_users > 0 {
+        batches.push((current_index, current_instructions));
+    }
+    Ok(batches)
+}
+
 async fn send_transaction(
     rpc: &FixtureRpc,
     fee_payer: &Wallet,
@@ -1010,6 +1090,33 @@ async fn prepare_transaction(
         .latest_blockhash()
         .await
         .context("fetching recent blockhash")?;
+    prepare_transaction_with_blockhash(
+        fee_payer,
+        additional_signer,
+        instructions,
+        journal,
+        operation,
+        user_index,
+        blockhash,
+        last_valid_block_height,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn prepare_transaction_with_blockhash(
+    fee_payer: &Wallet,
+    additional_signer: Option<&Wallet>,
+    instructions: Vec<Instruction>,
+    journal: &mut FixtureJournal,
+    operation: &str,
+    user_index: usize,
+    blockhash: solana_hash::Hash,
+    last_valid_block_height: u64,
+) -> Result<Option<PreparedTransaction>> {
+    if instructions.is_empty() {
+        return Ok(None);
+    }
     let message = Message::new_with_blockhash(&instructions, Some(&fee_payer.pubkey), &blockhash);
     let mut transaction = Transaction::new_unsigned(message);
     sign_transaction(&mut transaction, fee_payer).await?;
@@ -1214,6 +1321,45 @@ mod tests {
             decimal_to_base(&full.assets[0].amount_per_user, full.assets[0].decimals).unwrap(),
             10_000_000
         );
+    }
+
+    #[test]
+    fn usdtest_setup_packs_multiple_missing_atas_per_transaction() {
+        let config: SetupConfig =
+            serde_yml::from_str(include_str!("../configs/devnet-fixture-100k-usdtest.yml"))
+                .unwrap();
+        let asset = config.journal_assets().unwrap().remove(0);
+        let funder = crate::wallet::derive_user(&[7; 32], "batch-funder", 0);
+        let funder_ata = super::associated_token_address(&funder.pubkey, &asset).unwrap();
+        let prepared = (0..64)
+            .map(|index| {
+                let user = crate::wallet::derive_user(&[9; 32], "batch-users", index);
+                let user_ata = super::associated_token_address(&user.pubkey, &asset).unwrap();
+                let instructions = vec![
+                    super::create_ata_ix(&funder.pubkey, &user.pubkey, &asset).unwrap(),
+                    spl_token_2022_interface::instruction::transfer_checked(
+                        &super::token_program(&asset).unwrap(),
+                        &funder_ata,
+                        &super::mint(&asset).unwrap(),
+                        &user_ata,
+                        &funder.pubkey,
+                        &[],
+                        asset.amount_base,
+                        asset.decimals,
+                    )
+                    .unwrap(),
+                ];
+                super::PreparedUser {
+                    index: index as usize,
+                    wallet: user,
+                    instructions,
+                }
+            })
+            .collect();
+
+        let batches = super::pack_setup_instruction_batches(prepared, &funder.pubkey).unwrap();
+        assert!(batches.len() < 64);
+        assert!(batches.len() >= 16);
     }
 
     #[test]
