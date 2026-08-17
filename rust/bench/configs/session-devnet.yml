@@ -11,8 +11,8 @@ run:
   funder:
     keypair_env: BENCH_FUNDER_KEYPAIR
   safety:
-    max_total_usdc: 1000.0
-    max_total_sol: 1000.0
+    max_total_usdc: 1.0
+    max_total_sol: 2.5
     require_confirmation: true
 
 load:

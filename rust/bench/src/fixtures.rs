@@ -1054,6 +1054,8 @@ mod tests {
         ] {
             let config: RunConfig = serde_yml::from_str(raw).unwrap();
             assert!(config.session.unwrap().close_after_run);
+            assert!(config.run.safety.max_total_usdc <= 1.0);
+            assert!(config.run.safety.max_total_sol <= 2.5);
         }
     }
 }
