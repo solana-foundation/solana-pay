@@ -137,6 +137,7 @@ pub async fn run_pipeline(p: PipelineParams<'_>) -> Result<ReportJson> {
     prov.sort_by_key(|(i, _)| *i);
     let ctx_by_index: HashMap<u32, &UserCtx> = ctxs.iter().map(|ctx| (ctx.index, ctx)).collect();
     let mut setups: Vec<UserSetup> = Vec::with_capacity(ctxs.len());
+    let mut provisioning_error = None;
     for (idx, res) in prov {
         match res {
             Ok(setup) => {
@@ -156,10 +157,13 @@ pub async fn run_pipeline(p: PipelineParams<'_>) -> Result<ReportJson> {
                 setups.push(setup);
             }
             Err(e) => {
-                p.journal.set_status(Status::Failed)?;
-                bail!("provisioning user {idx} failed: {e:#}");
+                provisioning_error.get_or_insert((idx, e));
             }
         }
+    }
+    if let Some((idx, error)) = provisioning_error {
+        p.journal.set_status(Status::Failed)?;
+        bail!("provisioning user {idx} failed: {error:#}");
     }
     p.journal.set_status(Status::Provisioned)?;
     tracing::info!(
