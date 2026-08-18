@@ -41,8 +41,10 @@ wallets to be provisioned with devnet SOL and USDtest before `pay-bench run`.
 For the Ubuntu benchmark host, install
 `deploy/pay-bench-devnet.service` as `/etc/systemd/system/pay-bench-devnet.service`
 and place the four environment values in `/etc/pay-bench/devnet.env` with
-mode `0600`. The unit raises `LimitNOFILE` to `262144`, which is a prerequisite
-for any high-concurrency generator or proxy run.
+mode `0600`. Install the server certificate and private key at
+`/etc/pay-bench/tls/server.crt` and `/etc/pay-bench/tls/server.key`; the unit
+will not start without native TLS. It raises `LimitNOFILE` to `262144`, which
+is a prerequisite for any high-concurrency generator or proxy run.
 
 ## Commands
 
