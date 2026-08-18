@@ -399,6 +399,34 @@ mod tests {
     }
 
     #[test]
+    fn million_rps_devnet_plans_parse_and_fit_their_deposits() {
+        for raw in [
+            include_str!("../configs/session-devnet-100k-1m-rehearsal.yml"),
+            include_str!("../configs/session-devnet-100k-1m-20m.yml"),
+        ] {
+            let config: RunConfig = serde_yml::from_str(raw).unwrap();
+            assert_eq!(config.load.users, 100_000);
+            assert_eq!(config.load.requests_per_sec_per_user, 10.0);
+            assert_eq!(config.session.as_ref().unwrap().deposit_usdc, 0.02);
+
+            let required_per_channel = config.load.requests_per_sec_per_user
+                * config.load.unleash_secs as f64
+                * config.session.as_ref().unwrap().voucher_usdc;
+            assert!(required_per_channel <= config.session.as_ref().unwrap().deposit_usdc);
+        }
+    }
+
+    #[test]
+    fn lifecycle_gateway_uses_five_minute_settlement_without_idle_close() {
+        let api: pay_types::metering::ApiSpec =
+            serde_yml::from_str(include_str!("../configs/devnet-pingora-lifecycle.yml")).unwrap();
+        let session = api.session.unwrap();
+        assert_eq!(session.cap_usdc, 0.02);
+        assert_eq!(session.close_delay_ms, 0);
+        assert_eq!(session.settlement_interval_ms, 300_000);
+    }
+
+    #[test]
     fn non_finite_safety_caps_are_rejected() {
         for cap in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
             let mut cfg = selftest_config();

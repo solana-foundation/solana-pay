@@ -1,0 +1,48 @@
+# Devnet gate for the integrated 100k-user periodic-settlement benchmark.
+# Request-path lifecycle touches remain disabled; the embedded worker claims
+# locally active channels at each settlement boundary.
+name: pay-bench-devnet-lifecycle
+subdomain: pay-bench-devnet
+title: "Pay Bench Devnet Lifecycle"
+description: "Devnet MPP-session endpoint with five-minute watermark settlement."
+category: ai_ml
+version: v1
+
+routing:
+  type: respond
+
+accounting: pooled
+
+operator:
+  signer:
+    backend: file
+    path: "${PAY_SETTLEMENT_KEYPAIR_PATH}"
+  recipient: "${PAY_PAYMENT_RECIPIENT}"
+  currencies:
+    usd: ["USDtest"]
+  network: devnet
+  rpc_url: "${PAY_RPC_URL}"
+  fee_payer: true
+  challenge_binding_secret: "${PAY_SESSION_SECRET}"
+
+session:
+  # 10 requests/s × 1 micro-USD × 20 minutes = 0.012 USD per channel.
+  # Keep headroom above the cumulative watermark; settlement does not reset it.
+  cap_usdc: 0.02
+  min_voucher_delta: 1
+  close_delay_ms: 0
+  settlement_interval_ms: 300000
+
+endpoints:
+  - method: GET
+    path: "api/v1/compute"
+    resource: "compute"
+    description: "Returns 200 after verifying an MPP session voucher."
+    metering:
+      schemes: [mpp-session]
+      dimensions:
+        - direction: usage
+          unit: requests
+          scale: 1
+          tiers:
+            - price_usd: 0.000001

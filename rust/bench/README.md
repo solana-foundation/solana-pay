@@ -152,6 +152,18 @@ cargo run -p pay-bench --release -- run bench/configs/session-devnet.yml \
   --fixture-id devnet-100k-usdtest --yes
 ```
 
+The integrated settlement test uses `configs/devnet-pingora-lifecycle.yml` on
+the gateway and the two `session-devnet-100k-1m-*.yml` generator plans. Both
+plans drive 100,000 channels at 10 requests/s each. The rehearsal runs for six
+minutes and crosses one five-minute watermark boundary; the final plan runs for
+20 minutes and crosses four. They leave channels open so the last boundary can
+be audited before an explicit voucher-preserving recovery.
+
+The channel deposit is 0.02 USDtest, not 0.01: 10 requests/s × 1 micro-USD ×
+1,200 seconds reaches a cumulative 0.012 USDtest watermark, and intermediate
+settlement does not reset that cumulative amount. Each retained fixture wallet
+already holds 10 USDtest.
+
 Provision and settlement progress is checkpointed in batches of 1,024 users.
 The journal uses an in-memory index for constant-time updates, so a 100,000-user
 run does not rewrite the full journal once per user. If a process exits between

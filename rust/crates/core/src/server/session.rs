@@ -275,14 +275,14 @@ impl SessionOperatorRuntime {
     /// the channel. The on-chain watermark is read first, so retries are
     /// idempotent and a successfully landed watermark is not re-broadcast on
     /// every lifecycle tick.
-    async fn operator_push_watermark(&self, channel_id: &str) -> Result<()> {
+    async fn operator_push_watermark(&self, channel_id: &str) -> Result<bool> {
         let Some(signer) = self.payment_channel_signer() else {
             // Verification-only servers have no authority to settle. Idle
             // close retains its existing no-op behavior for these instances.
-            return Ok(());
+            return Ok(false);
         };
         if self.rpc_url.is_none() {
-            return Ok(());
+            return Ok(false);
         }
         let tx_pipeline = self.transaction_pipeline().await?;
         let params = self
@@ -291,18 +291,18 @@ impl SessionOperatorRuntime {
             .await
             .map_err(|e| Error::Mpp(format!("Failed to get watermark params: {e}")))?;
         if params.settled == 0 {
-            return Ok(());
+            return Ok(false);
         }
 
         let channel = self.fetch_payment_channel(channel_id).await?;
         let Some(channel) = channel else {
             // A missing/deallocated channel has nothing left to settle.
-            return Ok(());
+            return Ok(false);
         };
         // Only OPEN channels accept an intermediate settle. CLOSING/SEALED/
         // DISTRIBUTED channels are already advancing through the close path.
         if channel.status != 0 || channel.settlement.settled >= params.settled {
-            return Ok(());
+            return Ok(false);
         }
 
         let authorized_signer = params.authorized_signer.ok_or_else(|| {
@@ -343,13 +343,13 @@ impl SessionOperatorRuntime {
             .settle(params.channel_id.to_string(), instructions)
             .await
             .map_err(|e| Error::Mpp(format!("payment-channel watermark settlement: {e}")))?;
-        tracing::info!(
+        tracing::debug!(
             channel_id,
             cumulative = params.settled,
             %signature,
             "payment-channel watermark broadcast"
         );
-        Ok(())
+        Ok(true)
     }
 
     /// Record a server-initiated close request on the channel state.
@@ -902,9 +902,15 @@ impl SessionLifecycleRunloop {
     }
 
     fn lifecycle_owner_lease_duration(&self) -> Duration {
-        self.close_batch_interval
+        let close_lease = self
+            .close_batch_interval
             .saturating_mul(3)
-            .max(MIN_LIFECYCLE_OWNER_LEASE)
+            .max(MIN_LIFECYCLE_OWNER_LEASE);
+        let settlement_lease = self
+            .settlement_interval
+            .map(|interval| interval.saturating_mul(3))
+            .unwrap_or_default();
+        close_lease.max(settlement_lease)
     }
 
     fn leased_owner(&self, now_ms: u64) -> String {
@@ -941,7 +947,12 @@ impl SessionLifecycleRunloop {
             if state.sealed || state.close_requested_at.is_some() {
                 continue;
             }
-            if state.lifecycle.is_none() {
+            let locally_active_for_settlement = self.settlement_interval.is_some()
+                && self
+                    .runtime
+                    .committed_watermarks
+                    .contains_key(&state.channel_id);
+            if state.lifecycle.is_none() && !locally_active_for_settlement {
                 continue;
             }
             let owner_id = self.owner.clone();
@@ -957,16 +968,22 @@ impl SessionLifecycleRunloop {
                         if current.sealed || current.close_requested_at.is_some() {
                             return Ok(current);
                         }
-                        let Some(lifecycle) = current.lifecycle.as_mut() else {
-                            return Ok(current);
-                        };
-                        let claimable = parse_lifecycle_owner_lease(&lifecycle.owner).is_none_or(
-                            |(current_owner, expires_at_ms)| {
-                                current_owner == owner_id || expires_at_ms <= now_ms
-                            },
-                        );
-                        if claimable {
-                            lifecycle.owner = replacement_owner;
+                        if let Some(lifecycle) = current.lifecycle.as_mut() {
+                            let claimable = parse_lifecycle_owner_lease(&lifecycle.owner)
+                                .is_none_or(|(current_owner, expires_at_ms)| {
+                                    current_owner == owner_id || expires_at_ms <= now_ms
+                                });
+                            if claimable {
+                                lifecycle.owner = replacement_owner;
+                            }
+                        } else if locally_active_for_settlement {
+                            current.lifecycle = Some(ChannelLifecycle {
+                                owner: replacement_owner,
+                                // Automatic close is disabled, so this field
+                                // is ownership metadata only. A later finite
+                                // close touch advances it monotonically.
+                                close_after: now_ms,
+                            });
                         }
                         Ok(current)
                     }),
@@ -1082,6 +1099,11 @@ impl SessionLifecycleRunloop {
             return;
         }
 
+        // Settlement-only configurations deliberately keep request-path
+        // lifecycle touches disabled. Claim channels observed by this process
+        // here, then renew the lease once per settlement interval instead of
+        // once per voucher.
+        self.reconcile_persisted_ownership().await;
         let states = match self.runtime.channel_store.list_channels().await {
             Ok(states) => states,
             Err(error) => {
@@ -1101,6 +1123,8 @@ impl SessionLifecycleRunloop {
             })
             .map(|state| state.channel_id)
             .collect::<Vec<_>>();
+        let candidate_count = channels.len();
+        let cycle_started = Instant::now();
         let mut settlements = Vec::with_capacity(channels.len());
         for channel_id in channels {
             if !self.runtime.reserve_capacity(&channel_id, 0) {
@@ -1112,16 +1136,31 @@ impl SessionLifecycleRunloop {
                 (channel_id, result)
             });
         }
+        let mut broadcast_count = 0usize;
+        let mut failure_count = 0usize;
         for (channel_id, result) in futures_util::future::join_all(settlements).await {
             self.runtime.release_capacity(&channel_id);
-            if let Err(error) = result {
-                tracing::warn!(
-                    channel_id,
-                    error = %error,
-                    "operator watermark push failed; retrying next interval"
-                );
+            match result {
+                Ok(true) => broadcast_count += 1,
+                Ok(false) => {}
+                Err(error) => {
+                    failure_count += 1;
+                    tracing::warn!(
+                        channel_id,
+                        error = %error,
+                        "operator watermark push failed; retrying next interval"
+                    );
+                }
             }
         }
+        tracing::info!(
+            candidates = candidate_count,
+            broadcast = broadcast_count,
+            skipped = candidate_count.saturating_sub(broadcast_count + failure_count),
+            failed = failure_count,
+            elapsed_ms = cycle_started.elapsed().as_millis(),
+            "operator watermark cycle completed"
+        );
 
         self.next_settlement = Some(now + interval);
     }
@@ -2640,6 +2679,52 @@ mod tests {
             next_lifecycle_wakeup(Some(Duration::from_secs(5)), Some(Duration::from_secs(5))),
             Some((Duration::from_secs(5), true))
         );
+    }
+
+    #[tokio::test]
+    async fn settlement_only_claims_active_channels_without_enabling_hot_path_touches() {
+        let session = Arc::new(test_session_mpp());
+        session.start_lifecycle_runloop_with_settlement_and_batching(
+            Duration::ZERO,
+            Duration::from_millis(10),
+            Duration::from_millis(10),
+            SessionLifecycleReconciliation::Embedded,
+        );
+        assert!(!session.lifecycle.touches_enabled.load(Ordering::Acquire));
+
+        let challenge = session.challenge(None).unwrap();
+        let channel = solana_pubkey::Pubkey::new_unique().to_string();
+        seed_channel(
+            &session,
+            &channel,
+            CAP,
+            &solana_pubkey::Pubkey::new_unique().to_string(),
+            "client",
+            &challenge.id,
+            &solana_pubkey::Pubkey::new_unique().to_string(),
+            None,
+        )
+        .await;
+        session.record_committed_watermark(channel.clone(), 75);
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let state = session
+                    .operator_runtime
+                    .channel_store
+                    .get_channel(&channel)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                if state.lifecycle.is_some() {
+                    assert!(state.close_requested_at.is_none());
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("settlement boundary should claim the active channel");
     }
 
     #[tokio::test]
