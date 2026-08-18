@@ -11,7 +11,8 @@ run:
     keypair_env: BENCH_FUNDER_KEYPAIR
   safety:
     max_total_usdc: 2500.0
-    max_total_sol: 900.0
+    # Sponsored opens charge transaction fees and channel rent to the gateway.
+    max_total_sol: 0.0
     require_confirmation: true
 
 load:

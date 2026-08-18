@@ -32,8 +32,17 @@ use crate::config::RunConfig;
 use crate::seeded_session;
 use crate::wallet;
 
-/// SOL funded per user: a payment-channel open needs rent plus a fee margin.
+/// SOL funded per user when the payer funds its own open: payment-channel rent
+/// plus a fee margin. Sponsored challenges move both costs to the operator.
 const PER_USER_SOL_LAMPORTS: u64 = 25_000_000;
+
+fn open_sol_lamports(offline: bool, fee_sponsored: bool) -> u64 {
+    if offline || fee_sponsored {
+        0
+    } else {
+        PER_USER_SOL_LAMPORTS
+    }
+}
 
 pub(crate) fn voucher_base_units(voucher_usdc: f64) -> u64 {
     (voucher_usdc * 1e6).max(1.0) as u64
@@ -167,6 +176,8 @@ impl BenchScheme for MppSession {
             Some(&request.method_details.network),
         )
         .map(str::to_string);
+        let fee_sponsored = request.method_details.fee_payer == Some(true)
+            && request.method_details.fee_payer_key.is_some();
         Ok(ResolvedPrice {
             amount_base: self.voucher_base,
             currency: request.currency,
@@ -174,19 +185,16 @@ impl BenchScheme for MppSession {
             recipient: request.recipient,
             network: request.method_details.network,
             decimals: request.method_details.decimals.unwrap_or(6),
+            fee_sponsored,
         })
     }
 
-    fn funding_plan(&self, _load: &Load, _price: &ResolvedPrice) -> PerUserFunding {
+    fn funding_plan(&self, _load: &Load, price: &ResolvedPrice) -> PerUserFunding {
         // Offline mode touches no chain. A current PayKit session open still
         // requires a valid payment-channel transaction, so offline configs are
         // retained only until the synthetic verifier fixture is ported.
         PerUserFunding {
-            sol_lamports: if self.offline {
-                0
-            } else {
-                PER_USER_SOL_LAMPORTS
-            },
+            sol_lamports: open_sol_lamports(self.offline, price.fee_sponsored),
             token_base: if self.offline { 0 } else { self.deposit_base },
         }
     }
@@ -485,5 +493,33 @@ mod tests {
         assert!(error.to_string().contains("402 Payment Required"));
         assert!(error.to_string().contains("custom program error: 0x35"));
         validate_close_response(StatusCode::OK, b"").unwrap();
+    }
+
+    #[test]
+    fn sponsored_funding_plan_does_not_budget_client_sol() {
+        let config: RunConfig = serde_yml::from_str(include_str!(
+            "../../configs/session-devnet-100k-1m-rehearsal.yml"
+        ))
+        .unwrap();
+        let scheme = MppSession::new(&config);
+        let mut price = ResolvedPrice {
+            amount_base: 1,
+            currency: "USDtest".into(),
+            mint: Some(config.run.mint.clone().unwrap()),
+            recipient: "recipient".into(),
+            network: "devnet".into(),
+            decimals: 6,
+            fee_sponsored: true,
+        };
+
+        let sponsored = scheme.funding_plan(&config.load, &price);
+        assert_eq!(sponsored.sol_lamports, 0);
+        assert_eq!(sponsored.token_base, 20_000);
+
+        price.fee_sponsored = false;
+        assert_eq!(
+            scheme.funding_plan(&config.load, &price).sol_lamports,
+            PER_USER_SOL_LAMPORTS
+        );
     }
 }

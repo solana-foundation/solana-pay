@@ -408,6 +408,7 @@ mod tests {
             assert_eq!(config.load.users, 100_000);
             assert_eq!(config.load.requests_per_sec_per_user, 10.0);
             assert_eq!(config.session.as_ref().unwrap().deposit_usdc, 0.02);
+            assert_eq!(config.run.safety.max_total_sol, 0.0);
 
             let required_per_channel = config.load.requests_per_sec_per_user
                 * config.load.unleash_secs as f64

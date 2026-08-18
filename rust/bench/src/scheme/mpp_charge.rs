@@ -80,6 +80,7 @@ impl BenchScheme for MppCharge {
             recipient: req.recipient.unwrap_or_default(),
             network,
             decimals,
+            fee_sponsored: false,
         })
     }
 

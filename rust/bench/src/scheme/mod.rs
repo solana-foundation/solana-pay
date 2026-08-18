@@ -31,6 +31,9 @@ pub struct ResolvedPrice {
     pub recipient: String,
     pub network: String,
     pub decimals: u8,
+    /// The challenge names a distinct gateway signer that pays transaction
+    /// fees and payment-channel rent for the client.
+    pub fee_sponsored: bool,
 }
 
 /// Funds one user needs for the whole run.

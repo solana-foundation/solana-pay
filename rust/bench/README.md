@@ -35,8 +35,8 @@ Supply `PAY_PAYMENT_RECIPIENT`, `PAY_RPC_URL`,
 through the service environment. The settlement keypair is the configured
 operator signer: the gateway advertises `feePayer: true`, co-signs each
 validated open, pays the transaction fee plus channel-account rent, and later
-settles the channel. A real devnet load run still requires its retained fixture
-wallets to be provisioned with devnet SOL and USDtest before `pay-bench run`.
+settles the channel. A sponsored devnet load still requires retained fixture
+wallets with USDtest, but the load plan budgets no client SOL for the open.
 
 For the Ubuntu benchmark host, install
 `deploy/pay-bench-devnet.service` as `/etc/systemd/system/pay-bench-devnet.service`

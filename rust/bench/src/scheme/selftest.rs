@@ -37,6 +37,7 @@ impl BenchScheme for SelfTest {
             recipient: String::new(),
             network: "localnet".into(),
             decimals: 0,
+            fee_sponsored: false,
         })
     }
 
