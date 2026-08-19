@@ -35,6 +35,18 @@ tokio-util = "0.7"
 reqwest = { workspace = true }
 axum = { workspace = true }
 
+# Churn-free HTTP/2 load transport (StableH2Pool) — a fixed set of persistent
+# h2 connections instead of reqwest's Ver::Auto churning pool. Versions match
+# the reqwest 0.12 stack already resolved in the workspace lock.
+hyper = { version = "1", features = ["client", "http2"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+bytes = "1"
+tokio-rustls = "0.26"
+rustls-pemfile = "2"
+webpki-roots = "1"
+url = "2"
+
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yml = { workspace = true }

@@ -14,6 +14,7 @@ mod driver;
 mod engine;
 mod fixture_rpc;
 mod fixtures;
+mod h2pool;
 mod journal;
 mod observability;
 mod rehearsal;

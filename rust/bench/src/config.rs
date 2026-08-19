@@ -151,6 +151,14 @@ pub struct Load {
     /// Total generator-fleet shards. Each channel is assigned to exactly one.
     #[serde(default = "default_shard_count")]
     pub shard_count: usize,
+    /// Use a fixed pool of this many persistent HTTP/2 connections
+    /// (`StableH2Pool`) instead of reqwest's churning `Ver::Auto` pool. `0`
+    /// (default) keeps the reqwest client. Non-zero opens exactly this many
+    /// connections once and multiplexes all requests over them — mirrors
+    /// `h2load -c`, eliminating the handshake churn that otherwise caps
+    /// throughput far below the gateway's capacity.
+    #[serde(default)]
+    pub stable_connections: usize,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -277,6 +285,31 @@ impl RunConfig {
         let certificate = reqwest::Certificate::from_pem(&pem)
             .with_context(|| format!("parsing benchmark TLS CA certificate {path}"))?;
         Ok(Some(certificate))
+    }
+
+    /// Raw PEM bytes of the optional benchmark CA, for the churn-free
+    /// [`crate::h2pool::StableH2Pool`] (which needs the PEM, not reqwest's
+    /// opaque `Certificate`). Same resolution as [`Self::tls_ca_certificate`].
+    pub fn tls_ca_pem(&self) -> Result<Option<Vec<u8>>> {
+        let path = if let Some(path) = self.run.tls_ca_cert.as_deref() {
+            Some(path.to_string())
+        } else if let Some(var) = self.run.tls_ca_cert_env.as_deref() {
+            Some(
+                std::env::var(var)
+                    .with_context(|| format!("tls_ca_cert_env `{var}` is not set"))?,
+            )
+        } else {
+            None
+        };
+        let Some(path) = path else {
+            return Ok(None);
+        };
+        if path.trim().is_empty() {
+            return Ok(None);
+        }
+        let pem = std::fs::read(&path)
+            .with_context(|| format!("reading benchmark TLS CA certificate {path}"))?;
+        Ok(Some(pem))
     }
 
     pub fn validate(&self) -> Result<()> {

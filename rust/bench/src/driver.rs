@@ -7,13 +7,48 @@
 
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use futures::future::BoxFuture;
 use futures::{FutureExt, StreamExt, stream::FuturesUnordered};
 use hdrhistogram::Histogram;
 
+use crate::h2pool::StableH2Pool;
 use crate::scheme::{RequestSource, build_request};
+
+/// The load-phase HTTP transport. Either reqwest's pooled client (default) or
+/// a fixed pool of persistent h2 connections that never churns.
+#[derive(Clone)]
+enum Transport {
+    Reqwest(reqwest::Client),
+    Stable(Arc<StableH2Pool>),
+}
+
+impl Transport {
+    /// Send one request, returning `Ok(status)` or `Err(error-bucket)` so both
+    /// paths feed the driver's status/error accounting identically.
+    async fn send(
+        &self,
+        method: &str,
+        url: &str,
+        body: &str,
+        headers: &[(String, String)],
+    ) -> Result<u16, String> {
+        match self {
+            Transport::Reqwest(client) => {
+                match build_request(client, method, url, body, None, headers)
+                    .send()
+                    .await
+                {
+                    Ok(resp) => Ok(resp.status().as_u16()),
+                    Err(e) => Err(classify_error(&e)),
+                }
+            }
+            Transport::Stable(pool) => pool.send(method, url, body, headers).await,
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct DriverConfig {
@@ -24,6 +59,14 @@ pub struct DriverConfig {
     pub workers: usize,
     pub http2_prior_knowledge: bool,
     pub tls_ca_certificate: Option<reqwest::Certificate>,
+    /// >0 → use a fixed pool of this many persistent h2 connections
+    /// ([`crate::h2pool::StableH2Pool`]) instead of reqwest. 0 → reqwest.
+    pub stable_connections: usize,
+    /// Target URL for the stable-connection pool (its authority is dialed up
+    /// front). Unused when `stable_connections == 0`.
+    pub target_url: String,
+    /// Raw CA PEM for the stable-connection pool's TLS trust anchor.
+    pub ca_pem: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Clone)]
@@ -84,7 +127,7 @@ type InFlight = BoxFuture<'static, Completion>;
 
 #[derive(Clone)]
 struct WorkerContext {
-    http: reqwest::Client,
+    http: Transport,
     worker_max_in_flight: usize,
     cfg: DriverConfig,
     started: Instant,
@@ -285,19 +328,40 @@ pub async fn run(sources: Vec<Box<dyn RequestSource>>, cfg: DriverConfig) -> Dri
     // pressure.
     let worker_pool_per_host = cfg.pool_per_host.div_ceil(worker_count).max(1);
     let worker_max_in_flight = cfg.max_concurrency.div_ceil(worker_count).max(1);
-    let worker_clients: Vec<_> = (0..worker_count)
-        .map(|_| {
-            build_http(&DriverConfig {
-                pool_per_host: worker_pool_per_host,
-                ..cfg.clone()
+    // Transport per worker. Default: each worker owns a reqwest client (its own
+    // bounded pool). Stable mode: ALL workers share ONE fixed pool of
+    // persistent h2 connections (h2load model) — opened once here, before the
+    // measured window, so there is no handshake churn under load.
+    let worker_clients: Vec<Transport> = if cfg.stable_connections > 0 {
+        let pool = StableH2Pool::connect(
+            &cfg.target_url,
+            cfg.ca_pem.as_deref(),
+            cfg.stable_connections,
+        )
+        .await
+        .expect("open stable h2 connection pool");
+        tracing::info!(
+            connections = cfg.stable_connections,
+            target = %cfg.target_url,
+            "stable h2 pool established (churn-free transport)"
+        );
+        let shared = Transport::Stable(pool);
+        (0..worker_count).map(|_| shared.clone()).collect()
+    } else {
+        (0..worker_count)
+            .map(|_| {
+                Transport::Reqwest(build_http(&DriverConfig {
+                    pool_per_host: worker_pool_per_host,
+                    ..cfg.clone()
+                }))
             })
-        })
-        .collect();
+            .collect()
+    };
     // Client/pool construction is setup, not part of the measured window.
     let started = Instant::now();
     let deadline = started + cfg.deadline;
     let worker_context = WorkerContext {
-        // Replaced by each worker's independently-owned client below.
+        // Replaced by each worker's own transport handle below.
         http: worker_clients[0].clone(),
         worker_max_in_flight,
         cfg: cfg.clone(),
@@ -405,19 +469,17 @@ async fn run_worker(sources: Vec<Box<dyn RequestSource>>, context: WorkerContext
                     match request {
                         Ok(request) => {
                             let dispatched = Instant::now();
-                            let result = build_request(
-                                &client,
-                                &request.method,
-                                &request.url,
-                                &request.body,
-                                None,
-                                &request.headers,
-                            )
-                            .send()
-                            .await;
+                            let result = client
+                                .send(
+                                    &request.method,
+                                    &request.url,
+                                    &request.body,
+                                    &request.headers,
+                                )
+                                .await;
                             let completed_at = Instant::now();
                             match result {
-                                Ok(response) => Completion {
+                                Ok(status) => Completion {
                                     slot,
                                     source: state.source,
                                     scheduled,
@@ -425,7 +487,7 @@ async fn run_worker(sources: Vec<Box<dyn RequestSource>>, context: WorkerContext
                                     dispatched: Some(dispatched),
                                     signing,
                                     logical_payment: request.logical_payment,
-                                    status: Some(response.status().as_u16()),
+                                    status: Some(status),
                                     error: None,
                                     completed_at,
                                 },
@@ -438,7 +500,7 @@ async fn run_worker(sources: Vec<Box<dyn RequestSource>>, context: WorkerContext
                                     signing,
                                     logical_payment: request.logical_payment,
                                     status: None,
-                                    error: Some(classify_error(&error)),
+                                    error: Some(error),
                                     completed_at,
                                 },
                             }
@@ -618,6 +680,9 @@ mod tests {
                 workers: 1,
                 http2_prior_knowledge: false,
                 tls_ca_certificate: None,
+                stable_connections: 0,
+                target_url: String::new(),
+                ca_pem: None,
             },
         )
         .await;
@@ -660,6 +725,9 @@ mod tests {
                 workers: 1,
                 http2_prior_knowledge: false,
                 tls_ca_certificate: None,
+                stable_connections: 0,
+                target_url: String::new(),
+                ca_pem: None,
             },
         )
         .await;
@@ -699,6 +767,9 @@ mod tests {
                 workers: 1,
                 http2_prior_knowledge: false,
                 tls_ca_certificate: None,
+                stable_connections: 0,
+                target_url: String::new(),
+                ca_pem: None,
             },
         )
         .await;
@@ -748,6 +819,9 @@ mod tests {
                     workers: 4,
                     http2_prior_knowledge: false,
                     tls_ca_certificate: None,
+                    stable_connections: 0,
+                    target_url: String::new(),
+                    ca_pem: None,
                 },
             ),
         )
