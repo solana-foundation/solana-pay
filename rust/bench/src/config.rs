@@ -159,6 +159,12 @@ pub struct Load {
     /// throughput far below the gateway's capacity.
     #[serde(default)]
     pub stable_connections: usize,
+    /// Use the closed-loop driver (h2load model) for maximum single-host
+    /// throughput: fixed concurrency lanes that fire-next-on-completion with
+    /// no per-request scheduling/allocation, instead of the rate-paced
+    /// scheduler. Best paired with `stable_connections`. Default `false`.
+    #[serde(default)]
+    pub closed_loop: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -383,9 +389,13 @@ impl RunConfig {
         if let Some(session) = &self.session
             && session.pre_sign_requests_per_user > 0
         {
-            if !session.offline {
-                bail!("session.pre_sign_requests_per_user requires session.offline: true");
-            }
+            // Pre-signing works against a real (online) gateway too: provision
+            // opens the real channel and retains the SessionHandle, and the
+            // pre-sign path calls the SAME `voucher_header_sync` the live path
+            // uses — the vouchers are identical monotonic-cumulative headers,
+            // just generated before the measured window instead of inside it.
+            // This is the lever that takes ed25519 signing out of the hot path
+            // so one generator can drive far more than its live-signing rate.
             let required = (self.load.requests_per_sec_per_user * self.load.unleash_secs as f64)
                 .ceil() as usize;
             if session.pre_sign_requests_per_user < required {

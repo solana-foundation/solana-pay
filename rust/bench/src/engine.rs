@@ -221,6 +221,7 @@ pub async fn run_pipeline(p: PipelineParams<'_>) -> Result<ReportJson> {
         stable_connections: load.stable_connections,
         target_url: endpoint.url.clone(),
         ca_pem: cfg.tls_ca_pem()?,
+        closed_loop: load.closed_loop,
     };
     let report = driver::run(sources, dcfg)
         .instrument(tracing::info_span!("unleash"))

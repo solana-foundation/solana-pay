@@ -67,6 +67,11 @@ pub struct DriverConfig {
     pub target_url: String,
     /// Raw CA PEM for the stable-connection pool's TLS trust anchor.
     pub ca_pem: Option<Vec<u8>>,
+    /// Use the closed-loop driver (h2load model) instead of the rate-paced
+    /// scheduler. Concurrency lanes fire the next request immediately on
+    /// completion, per-user in order, with no per-request scheduling/boxing —
+    /// for maximum single-host throughput. Pairs with `stable_connections`.
+    pub closed_loop: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -227,6 +232,46 @@ impl LocalMetrics {
         record_series(&mut self.rps_series, completion.completed_at, started);
     }
 
+    /// Lightweight record for the closed-loop driver. No `Completion` struct,
+    /// no schedule/dispatch bookkeeping (closed-loop has no scheduling delay —
+    /// a lane fires the next request the instant the prior one completes).
+    #[allow(clippy::too_many_arguments)]
+    fn record_simple(
+        &mut self,
+        service: Duration,
+        signing: Duration,
+        status: Option<u16>,
+        error: Option<&str>,
+        logical_payment: bool,
+        completed_at: Instant,
+        started: Instant,
+    ) {
+        self.signing_us.saturating_record(duration_us(signing));
+        self.service_us.saturating_record(duration_us(service));
+        self.end_to_end_us
+            .saturating_record(duration_us(service + signing));
+        self.dispatched += 1;
+        if let Some(status) = status {
+            *self.status.entry(status).or_insert(0) += 1;
+            if (200..300).contains(&status) {
+                self.ok += 1;
+                if logical_payment {
+                    self.accepted += 1;
+                    record_series(&mut self.accepted_rps_series, completed_at, started);
+                }
+            } else {
+                self.fail += 1;
+            }
+        } else {
+            self.fail += 1;
+        }
+        if let Some(error) = error {
+            *self.errors.entry(error.to_string()).or_insert(0) += 1;
+        }
+        self.completed += 1;
+        record_series(&mut self.rps_series, completed_at, started);
+    }
+
     fn merge(&mut self, other: Self) {
         self.service_us
             .add(&other.service_us)
@@ -301,6 +346,9 @@ fn merge_series(into: &mut Vec<u64>, other: Vec<u64>) {
 /// partitioned by their deterministic shard-local order, keeping every channel
 /// on exactly one worker without aliasing fleet-shard and worker moduli.
 pub async fn run(sources: Vec<Box<dyn RequestSource>>, cfg: DriverConfig) -> DriverReport {
+    if cfg.closed_loop {
+        return run_closed_loop(sources, cfg).await;
+    }
     let source_count = sources.len().max(1);
     let phase_denominator = sources
         .iter()
@@ -384,6 +432,17 @@ pub async fn run(sources: Vec<Box<dyn RequestSource>>, cfg: DriverConfig) -> Dri
         totals.merge(metrics.expect("load worker panicked"));
     }
     let elapsed = started.elapsed();
+    build_report(totals, &cfg, source_count, elapsed)
+}
+
+/// Assemble the final [`DriverReport`] from merged worker/lane metrics. Shared
+/// by the rate-paced scheduler and the closed-loop driver.
+fn build_report(
+    totals: LocalMetrics,
+    cfg: &DriverConfig,
+    source_count: usize,
+    elapsed: Duration,
+) -> DriverReport {
     let wall_secs = cfg.deadline.as_secs_f64().max(f64::MIN_POSITIVE);
     DriverReport {
         target_rps: cfg.rps_per_user * source_count as f64,
@@ -403,14 +462,128 @@ pub async fn run(sources: Vec<Box<dyn RequestSource>>, cfg: DriverConfig) -> Dri
         signing_latency_ms: latency_summary(&totals.signing_us),
         schedule_delay_ms: latency_summary(&totals.schedule_delay_us),
         end_to_end_latency_ms: latency_summary(&totals.end_to_end_us),
-        // Workers have disjoint fixed caps. Summing their observed peaks is a
-        // conservative aggregate peak without a contended global counter in
-        // the measured path.
         max_in_flight: totals.max_in_flight,
         status_counts: totals.status,
         error_counts: totals.errors,
         rps_series: totals.rps_series,
         accepted_rps_series: totals.accepted_rps_series,
+    }
+}
+
+/// Closed-loop driver — h2load's model. `lanes` = concurrent in-flight streams
+/// (= `max_concurrency`, capped at the source count). Sources are partitioned
+/// disjointly across lanes; each lane owns a tight loop that round-robins its
+/// users, and for each fires exactly one request, awaits it, records, and
+/// immediately fires the next — no scheduler, no per-request task spawn, no
+/// boxed future, no `Completion` alloc. Per-user order is preserved because a
+/// lane holds only one of its user's requests in flight at a time. Every lane
+/// shares ONE transport (the fixed `StableH2Pool`, or a single reqwest client),
+/// so connections are opened once and never churned.
+async fn run_closed_loop(sources: Vec<Box<dyn RequestSource>>, cfg: DriverConfig) -> DriverReport {
+    let source_count = sources.len().max(1);
+    let lanes = cfg.max_concurrency.clamp(1, source_count);
+    let mut buckets: Vec<Vec<Box<dyn RequestSource>>> = (0..lanes).map(|_| Vec::new()).collect();
+    for (i, source) in sources.into_iter().enumerate() {
+        buckets[i % lanes].push(source);
+    }
+
+    let transport = build_transport(&cfg).await;
+    // Connection/pool construction is setup, not part of the measured window.
+    let started = Instant::now();
+    let deadline = started + cfg.deadline;
+
+    let mut set = tokio::task::JoinSet::new();
+    for mut bucket in buckets {
+        if bucket.is_empty() {
+            continue;
+        }
+        let transport = transport.clone();
+        set.spawn(async move {
+            let mut m = LocalMetrics::new();
+            m.max_in_flight = 1; // one in-flight per lane; merge() sums → total lanes
+            let mut idx = 0usize;
+            let n = bucket.len();
+            while Instant::now() < deadline {
+                let source = &mut bucket[idx % n];
+                idx += 1;
+                let sign_started = Instant::now();
+                match source.next_request().await {
+                    Ok(request) => {
+                        let signing = sign_started.elapsed();
+                        let dispatched = Instant::now();
+                        let result = transport
+                            .send(
+                                &request.method,
+                                &request.url,
+                                &request.body,
+                                &request.headers,
+                            )
+                            .await;
+                        let completed_at = Instant::now();
+                        let service = completed_at.saturating_duration_since(dispatched);
+                        match result {
+                            Ok(status) => m.record_simple(
+                                service,
+                                signing,
+                                Some(status),
+                                None,
+                                request.logical_payment,
+                                completed_at,
+                                started,
+                            ),
+                            Err(error) => m.record_simple(
+                                service,
+                                signing,
+                                None,
+                                Some(&error),
+                                request.logical_payment,
+                                completed_at,
+                                started,
+                            ),
+                        }
+                    }
+                    Err(_) => m.record_simple(
+                        Duration::ZERO,
+                        sign_started.elapsed(),
+                        None,
+                        Some("signing"),
+                        false,
+                        Instant::now(),
+                        started,
+                    ),
+                }
+            }
+            m
+        });
+    }
+
+    let mut totals = LocalMetrics::new();
+    while let Some(res) = set.join_next().await {
+        totals.merge(res.expect("closed-loop lane panicked"));
+    }
+    let elapsed = started.elapsed();
+    build_report(totals, &cfg, source_count, elapsed)
+}
+
+/// Build the load transport once: the fixed churn-free h2 pool when
+/// `stable_connections > 0`, otherwise a single reqwest client.
+async fn build_transport(cfg: &DriverConfig) -> Transport {
+    if cfg.stable_connections > 0 {
+        let pool = StableH2Pool::connect(
+            &cfg.target_url,
+            cfg.ca_pem.as_deref(),
+            cfg.stable_connections,
+        )
+        .await
+        .expect("open stable h2 connection pool");
+        tracing::info!(
+            connections = cfg.stable_connections,
+            target = %cfg.target_url,
+            "stable h2 pool established (closed-loop, churn-free transport)"
+        );
+        Transport::Stable(pool)
+    } else {
+        Transport::Reqwest(build_http(cfg))
     }
 }
 
@@ -683,6 +856,7 @@ mod tests {
                 stable_connections: 0,
                 target_url: String::new(),
                 ca_pem: None,
+                closed_loop: false,
             },
         )
         .await;
@@ -728,6 +902,7 @@ mod tests {
                 stable_connections: 0,
                 target_url: String::new(),
                 ca_pem: None,
+                closed_loop: false,
             },
         )
         .await;
@@ -770,6 +945,7 @@ mod tests {
                 stable_connections: 0,
                 target_url: String::new(),
                 ca_pem: None,
+                closed_loop: false,
             },
         )
         .await;
@@ -822,6 +998,7 @@ mod tests {
                     stable_connections: 0,
                     target_url: String::new(),
                     ca_pem: None,
+                    closed_loop: false,
                 },
             ),
         )
