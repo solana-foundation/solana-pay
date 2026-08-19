@@ -481,106 +481,156 @@ fn build_report(
 /// so connections are opened once and never churned.
 async fn run_closed_loop(sources: Vec<Box<dyn RequestSource>>, cfg: DriverConfig) -> DriverReport {
     let source_count = sources.len().max(1);
-    let lanes = cfg.max_concurrency.clamp(1, source_count);
-    let mut buckets: Vec<Vec<Box<dyn RequestSource>>> = (0..lanes).map(|_| Vec::new()).collect();
+    // Share-nothing, thread-per-core (h2load's model). Each OS thread runs its
+    // OWN current-thread runtime, opens its OWN connections, and drives its OWN
+    // lanes — so a connection's HTTP/2 stream state (a per-connection mutex in
+    // `h2`) is only ever touched by one thread. That removes the cross-thread
+    // futex/spinlock contention that dominated when thousands of lanes on a
+    // work-stealing runtime shared a few connections (profiled: `h2::proto::
+    // streams::*` under `futex_wait` was the top cost, ~2x vs h2load).
+    let threads = cfg.workers.clamp(1, source_count);
+    let conns_per_thread = if cfg.stable_connections > 0 {
+        cfg.stable_connections.div_ceil(threads).max(1)
+    } else {
+        0
+    };
+    let lanes_per_thread = cfg.max_concurrency.div_ceil(threads).max(1);
+
+    // Partition sources across threads (disjoint).
+    let mut thread_sources: Vec<Vec<Box<dyn RequestSource>>> =
+        (0..threads).map(|_| Vec::new()).collect();
     for (i, source) in sources.into_iter().enumerate() {
-        buckets[i % lanes].push(source);
+        thread_sources[i % threads].push(source);
     }
 
-    let transport = build_transport(&cfg).await;
-    // Connection/pool construction is setup, not part of the measured window.
-    let started = Instant::now();
-    let deadline = started + cfg.deadline;
+    // All threads finish connecting before ANY starts the measured window, so
+    // pool setup is excluded and the windows are aligned.
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(threads));
+    let deadline_dur = cfg.deadline;
 
-    let mut set = tokio::task::JoinSet::new();
-    for mut bucket in buckets {
-        if bucket.is_empty() {
-            continue;
-        }
-        let transport = transport.clone();
-        set.spawn(async move {
-            let mut m = LocalMetrics::new();
-            m.max_in_flight = 1; // one in-flight per lane; merge() sums → total lanes
-            let mut idx = 0usize;
-            let n = bucket.len();
-            while Instant::now() < deadline {
-                let source = &mut bucket[idx % n];
-                idx += 1;
-                let sign_started = Instant::now();
-                match source.next_request().await {
-                    Ok(request) => {
-                        let signing = sign_started.elapsed();
-                        let dispatched = Instant::now();
-                        let result = transport
-                            .send(
-                                &request.method,
-                                &request.url,
-                                &request.body,
-                                &request.headers,
-                            )
-                            .await;
-                        let completed_at = Instant::now();
-                        let service = completed_at.saturating_duration_since(dispatched);
-                        match result {
-                            Ok(status) => m.record_simple(
-                                service,
-                                signing,
-                                Some(status),
-                                None,
-                                request.logical_payment,
-                                completed_at,
-                                started,
-                            ),
-                            Err(error) => m.record_simple(
-                                service,
-                                signing,
-                                None,
-                                Some(&error),
-                                request.logical_payment,
-                                completed_at,
-                                started,
-                            ),
-                        }
+    let mut handles = Vec::with_capacity(threads);
+    for (t, my_sources) in thread_sources.into_iter().enumerate() {
+        let cfg = cfg.clone();
+        let barrier = barrier.clone();
+        let handle = std::thread::Builder::new()
+            .name(format!("bench-cl-{t}"))
+            .spawn(move || {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("current-thread runtime");
+                rt.block_on(async move {
+                    let transport = build_transport_n(&cfg, conns_per_thread).await;
+                    let lanes = lanes_per_thread.min(my_sources.len().max(1));
+                    let mut lane_buckets: Vec<Vec<Box<dyn RequestSource>>> =
+                        (0..lanes).map(|_| Vec::new()).collect();
+                    for (i, source) in my_sources.into_iter().enumerate() {
+                        lane_buckets[i % lanes].push(source);
                     }
-                    Err(_) => m.record_simple(
-                        Duration::ZERO,
-                        sign_started.elapsed(),
+                    // Wait for every thread's pool to be up, then start timing.
+                    barrier.wait();
+                    let started = Instant::now();
+                    let deadline = started + deadline_dur;
+                    let mut set = tokio::task::JoinSet::new();
+                    for bucket in lane_buckets {
+                        if bucket.is_empty() {
+                            continue;
+                        }
+                        let transport = transport.clone();
+                        set.spawn(run_lane(bucket, transport, started, deadline));
+                    }
+                    let mut m = LocalMetrics::new();
+                    while let Some(res) = set.join_next().await {
+                        m.merge(res.expect("closed-loop lane panicked"));
+                    }
+                    m
+                })
+            })
+            .expect("spawn closed-loop thread");
+        handles.push(handle);
+    }
+
+    let mut totals = LocalMetrics::new();
+    for handle in handles {
+        totals.merge(handle.join().expect("closed-loop thread panicked"));
+    }
+    build_report(totals, &cfg, source_count, deadline_dur)
+}
+
+/// One closed-loop lane: round-robin its users, fire ONE request, await it,
+/// record, and immediately fire the next — until the deadline. Holds at most
+/// one of its users' requests in flight, preserving per-user voucher order.
+async fn run_lane(
+    mut bucket: Vec<Box<dyn RequestSource>>,
+    transport: Transport,
+    started: Instant,
+    deadline: Instant,
+) -> LocalMetrics {
+    let mut m = LocalMetrics::new();
+    m.max_in_flight = 1; // one in-flight per lane; merge() sums → total lanes
+    let n = bucket.len();
+    let mut idx = 0usize;
+    while Instant::now() < deadline {
+        let source = &mut bucket[idx % n];
+        idx += 1;
+        let sign_started = Instant::now();
+        match source.next_request().await {
+            Ok(request) => {
+                let signing = sign_started.elapsed();
+                let dispatched = Instant::now();
+                let result = transport
+                    .send(
+                        &request.method,
+                        &request.url,
+                        &request.body,
+                        &request.headers,
+                    )
+                    .await;
+                let completed_at = Instant::now();
+                let service = completed_at.saturating_duration_since(dispatched);
+                match result {
+                    Ok(status) => m.record_simple(
+                        service,
+                        signing,
+                        Some(status),
                         None,
-                        Some("signing"),
-                        false,
-                        Instant::now(),
+                        request.logical_payment,
+                        completed_at,
+                        started,
+                    ),
+                    Err(error) => m.record_simple(
+                        service,
+                        signing,
+                        None,
+                        Some(&error),
+                        request.logical_payment,
+                        completed_at,
                         started,
                     ),
                 }
             }
-            m
-        });
+            Err(_) => m.record_simple(
+                Duration::ZERO,
+                sign_started.elapsed(),
+                None,
+                Some("signing"),
+                false,
+                Instant::now(),
+                started,
+            ),
+        }
     }
-
-    let mut totals = LocalMetrics::new();
-    while let Some(res) = set.join_next().await {
-        totals.merge(res.expect("closed-loop lane panicked"));
-    }
-    let elapsed = started.elapsed();
-    build_report(totals, &cfg, source_count, elapsed)
+    m
 }
 
-/// Build the load transport once: the fixed churn-free h2 pool when
-/// `stable_connections > 0`, otherwise a single reqwest client.
-async fn build_transport(cfg: &DriverConfig) -> Transport {
-    if cfg.stable_connections > 0 {
-        let pool = StableH2Pool::connect(
-            &cfg.target_url,
-            cfg.ca_pem.as_deref(),
-            cfg.stable_connections,
-        )
-        .await
-        .expect("open stable h2 connection pool");
-        tracing::info!(
-            connections = cfg.stable_connections,
-            target = %cfg.target_url,
-            "stable h2 pool established (closed-loop, churn-free transport)"
-        );
+/// Build one thread's transport: a churn-free h2 pool with exactly
+/// `connections` persistent connections (owned by the calling thread), or a
+/// reqwest client when `connections == 0`.
+async fn build_transport_n(cfg: &DriverConfig, connections: usize) -> Transport {
+    if connections > 0 {
+        let pool = StableH2Pool::connect(&cfg.target_url, cfg.ca_pem.as_deref(), connections)
+            .await
+            .expect("open stable h2 connection pool");
         Transport::Stable(pool)
     } else {
         Transport::Reqwest(build_http(cfg))
