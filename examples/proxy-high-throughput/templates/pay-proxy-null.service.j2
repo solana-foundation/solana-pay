@@ -1,0 +1,30 @@
+[Unit]
+Description=High-throughput Pay MPP proxy — unmetered N2 control
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User={{ pay_service_user }}
+Group={{ pay_service_user }}
+WorkingDirectory={{ pay_source_dir }}/rust
+EnvironmentFile={{ pay_config_dir }}/proxy.env
+Environment=RUST_LOG=info,pay_core=warn,hyper=warn,reqwest=warn,tower=warn
+ExecStart={{ pay_install_dir }}/pay server start {{ pay_config_dir }}/paywall-null.yml --bind {{ pay_proxy_null_bind }} --tls-cert {{ pay_tls_cert }} --tls-key {{ pay_tls_key }} --no-register
+Restart=on-failure
+RestartSec=2
+TimeoutStopSec=310
+LimitNOFILE={{ pay_proxy_nofile }}
+TasksMax=infinity
+CPUAccounting=true
+MemoryAccounting=true
+NoNewPrivileges=true
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/{{ pay_service_user }}
+
+[Install]
+WantedBy=multi-user.target

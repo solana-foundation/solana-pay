@@ -7,6 +7,19 @@ all:
           ansible_host: 203.0.113.10
           ansible_user: ubuntu
           pay_proxy_public_ip: 203.0.113.10
+    # Load generators: same kernel/socket tuning as the proxy, plus the
+    # benchmark harness. Optional — omit this group entirely if you're
+    # driving load from an unmanaged host. Add as many as needed; each one
+    # runs the `pay-bench` binary independently (see the Sunburst 1M/s
+    # investigation for why running several *smaller* generator processes
+    # beats one large one, and why every generator needs this same tuning
+    # applied — a freshly added host without it will fail silently under
+    # load with connect errors, not an obvious "not configured" error).
+    pay_generators:
+      hosts:
+        generator-1:
+          ansible_host: 203.0.113.20
+          ansible_user: ubuntu
   vars:
     # This is the native-TLS Pay revision validated for the Sunburst proxy.
     # Change it only to another reviewed, immutable commit SHA.

@@ -30,6 +30,14 @@
     pay_proxy_bind: "0.0.0.0:{{ pay_proxy_port }}"
     pay_proxy_env_file: ""
     pay_proxy_nofile: 524288
+    # Optional unmetered control endpoint ("N2 control" in the Sunburst 1M/s
+    # investigation): same operator/transport/TLS stack, no session/voucher
+    # verification, used to isolate transport cost from paid-path business
+    # logic. Off by default; set -e pay_proxy_null_enabled=true to deploy it
+    # alongside the paid proxy on a second port.
+    pay_proxy_null_enabled: false
+    pay_proxy_null_port: 8443
+    pay_proxy_null_bind: "0.0.0.0:{{ pay_proxy_null_port }}"
 
   environment:
     CARGO_HOME: "{{ pay_cargo_home }}"
@@ -317,6 +325,16 @@
         mode: "0640"
       notify: Restart pay-proxy
 
+    - name: Install the unmetered control paywall
+      ansible.builtin.copy:
+        src: files/paywall-null.yml
+        dest: "{{ pay_config_dir }}/paywall-null.yml"
+        owner: root
+        group: "{{ pay_service_user }}"
+        mode: "0640"
+      when: pay_proxy_null_enabled | bool
+      notify: Restart pay-proxy-null
+
     - name: Install the secret environment file
       ansible.builtin.copy:
         src: "{{ pay_proxy_env_file }}"
@@ -336,6 +354,16 @@
         mode: "0644"
       notify: Restart pay-proxy
 
+    - name: Install the unmetered control systemd service
+      ansible.builtin.template:
+        src: templates/pay-proxy-null.service.j2
+        dest: /etc/systemd/system/pay-proxy-null.service
+        owner: root
+        group: root
+        mode: "0644"
+      when: pay_proxy_null_enabled | bool
+      notify: Restart pay-proxy-null
+
     - name: Flush configuration handlers
       ansible.builtin.meta: flush_handlers
 
@@ -345,6 +373,14 @@
         enabled: true
         state: started
         daemon_reload: true
+
+    - name: Enable and start the unmetered control proxy
+      ansible.builtin.systemd_service:
+        name: pay-proxy-null
+        enabled: true
+        state: started
+        daemon_reload: true
+      when: pay_proxy_null_enabled | bool
 
     - name: Verify the paid endpoint returns a challenge
       ansible.builtin.uri:
@@ -358,6 +394,19 @@
       delay: 1
       until: pay_challenge.status == 402
 
+    - name: Verify the unmetered control endpoint returns 200
+      ansible.builtin.uri:
+        url: "https://{{ pay_proxy_public_ip }}:{{ pay_proxy_null_port }}/api/v1/null"
+        method: GET
+        status_code: 200
+        return_content: false
+        ca_path: "{{ pay_tls_ca_cert }}"
+      register: pay_null_challenge
+      retries: 12
+      delay: 1
+      until: pay_null_challenge.status == 200
+      when: pay_proxy_null_enabled | bool
+
   handlers:
     - name: Apply sysctl tuning
       ansible.builtin.command: sysctl --system
@@ -369,3 +418,184 @@
         state: restarted
         enabled: true
         daemon_reload: true
+
+    - name: Restart pay-proxy-null
+      ansible.builtin.systemd_service:
+        name: pay-proxy-null
+        state: restarted
+        enabled: true
+        daemon_reload: true
+      when: pay_proxy_null_enabled | bool
+
+- name: Provision a load generator for the high-throughput Pay proxy
+  hosts: pay_generators
+  become: true
+  gather_facts: true
+
+  vars:
+    pay_git_repo: "https://github.com/solana-foundation/pay.git"
+    pay_rustflags: "-C target-cpu=native"
+    pay_min_logical_cpus: 8
+    pay_generator_user: "{{ ansible_user }}"
+    pay_generator_dir: "/home/{{ pay_generator_user }}/pay-bench"
+    pay_source_dir: "{{ pay_generator_dir }}/src"
+    pay_target_dir: "{{ pay_generator_dir }}/target"
+    pay_cargo_home: "{{ pay_generator_dir }}/cargo"
+    pay_rustup_home: "{{ pay_generator_dir }}/rustup"
+    pay_rustup_target: "x86_64-unknown-linux-gnu"
+    pay_rustup_init_sha256: "4acc9acc76d5079515b46346a485974457b5a79893cfb01112423c89aeb5aa10"
+    # Generators need the same ephemeral-port headroom and SYN backlog as
+    # the proxy: they are the other end of every connection this benchmark
+    # opens, and a host running several load-generating processes at once
+    # can exhaust the *default* ~28k-port ephemeral range well before the
+    # proxy's own limits matter (see Sunburst 1M/s investigation, 2026-08-19
+    # 10-process test: a freshly-provisioned generator without this tuning
+    # failed catastrophically — >99% connect errors — while an identically
+    # loaded, already-tuned generator on the same run stayed healthy).
+    pay_generator_nofile: 262144
+
+  environment:
+    CARGO_HOME: "{{ pay_cargo_home }}"
+    CARGO_TARGET_DIR: "{{ pay_target_dir }}"
+    RUSTUP_HOME: "{{ pay_rustup_home }}"
+    RUSTFLAGS: "{{ pay_rustflags }}"
+    PATH: "{{ pay_cargo_home }}/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+  pre_tasks:
+    - name: Validate the target
+      ansible.builtin.assert:
+        that:
+          - ansible_distribution == "Ubuntu"
+          - ansible_architecture in ["x86_64", "amd64"]
+          - ansible_processor_vcpus | int >= pay_min_logical_cpus | int
+          - pay_git_ref | length == 40
+        fail_msg: >-
+          This playbook requires x86_64 Ubuntu with at least
+          {{ pay_min_logical_cpus }} logical CPUs and an immutable
+          40-character pay_git_ref.
+
+  tasks:
+    - name: Install build dependencies
+      ansible.builtin.apt:
+        name:
+          - binutils
+          - build-essential
+          - ca-certificates
+          - clang
+          - cmake
+          - curl
+          - git
+          - libssl-dev
+          - openssl
+          - pkg-config
+        state: present
+        update_cache: true
+        cache_valid_time: 3600
+
+    - name: Create generator directories
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        owner: "{{ pay_generator_user }}"
+        group: "{{ pay_generator_user }}"
+        mode: "0755"
+      loop:
+        - "{{ pay_generator_dir }}"
+        - "{{ pay_source_dir }}"
+        - "{{ pay_target_dir }}"
+        - "{{ pay_cargo_home }}"
+        - "{{ pay_rustup_home }}"
+        - "{{ pay_generator_dir }}/reports"
+
+    - name: Install kernel and socket tuning (same profile as the proxy)
+      ansible.builtin.template:
+        src: templates/99-pay-proxy.conf.j2
+        dest: /etc/sysctl.d/99-pay-proxy.conf
+        owner: root
+        group: root
+        mode: "0644"
+      notify: Apply sysctl tuning
+
+    # LimitNOFILE in a systemd unit only bounds a *service*; ad-hoc
+    # `bench run` invocations over SSH inherit PAM's session limits
+    # instead. Without this, every run script needs its own `ulimit -n`
+    # line and it's easy to forget on a freshly provisioned host.
+    - name: Raise the default open-file limit for interactive sessions
+      ansible.builtin.copy:
+        dest: /etc/security/limits.d/99-pay-bench.conf
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          # Managed by Ansible: proxy-high-throughput example (generator role).
+          {{ pay_generator_user }} soft nofile {{ pay_generator_nofile }}
+          {{ pay_generator_user }} hard nofile 524288
+
+    - name: Install rustup
+      ansible.builtin.get_url:
+        url: >-
+          https://static.rust-lang.org/rustup/dist/{{ pay_rustup_target }}/rustup-init
+        checksum: "sha256:{{ pay_rustup_init_sha256 }}"
+        dest: /usr/local/src/rustup-init
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Initialize rustup for the generator user
+      become: true
+      become_user: "{{ pay_generator_user }}"
+      ansible.builtin.command:
+        cmd: /usr/local/src/rustup-init -y --no-modify-path --profile minimal
+      args:
+        creates: "{{ pay_cargo_home }}/bin/rustup"
+
+    - name: Install the pinned Rust toolchain
+      become: true
+      become_user: "{{ pay_generator_user }}"
+      ansible.builtin.command:
+        cmd: >-
+          {{ pay_cargo_home }}/bin/rustup toolchain install
+          {{ pay_rust_toolchain }} --profile minimal
+      register: pay_rustup_install
+      changed_when: >-
+        'unchanged' not in (pay_rustup_install.stdout + pay_rustup_install.stderr)
+
+    - name: Check out the immutable Pay revision
+      become: true
+      become_user: "{{ pay_generator_user }}"
+      ansible.builtin.git:
+        repo: "{{ pay_git_repo }}"
+        dest: "{{ pay_source_dir }}"
+        version: "{{ pay_git_ref }}"
+        update: true
+        force: false
+
+    - name: Build the benchmark harness
+      become: true
+      become_user: "{{ pay_generator_user }}"
+      environment:
+        PAY_PDB_ALLOW_PLACEHOLDER: "1"
+      ansible.builtin.command:
+        cmd: >-
+          {{ pay_cargo_home }}/bin/cargo +{{ pay_rust_toolchain }}
+          build --release --locked -p pay-bench
+        chdir: "{{ pay_source_dir }}/rust"
+      register: pay_bench_build
+      changed_when: "'Finished' in pay_bench_build.stderr and '0.00s' not in pay_bench_build.stderr"
+
+    # The proxy play (earlier in this same file) fetches its CA certificate
+    # to the controller as artifacts/<proxy-inventory-name>-ca.crt. Run both
+    # plays in one `ansible-playbook` invocation (the default — plays run in
+    # file order) so that file exists by the time this task runs.
+    - name: Install the benchmark CA certificate fetched from the proxy
+      ansible.builtin.copy:
+        src: "{{ playbook_dir }}/artifacts/{{ groups['pay_proxies'][0] }}-ca.crt"
+        dest: "{{ pay_generator_dir }}/ca.crt"
+        owner: "{{ pay_generator_user }}"
+        group: "{{ pay_generator_user }}"
+        mode: "0644"
+
+  handlers:
+    - name: Apply sysctl tuning
+      ansible.builtin.command: sysctl --system
+      changed_when: true
