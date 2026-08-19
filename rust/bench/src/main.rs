@@ -49,6 +49,12 @@ struct Cli {
         default_missing_value = "http://localhost:4040"
     )]
     pyroscope: Option<String>,
+    /// Allow payment credentials over plaintext HTTP to non-loopback hosts.
+    /// Benchmarking escape hatch ONLY — never point this at a gateway holding
+    /// real funds. Also requires `PAY_BENCH_ALLOW_INSECURE_HTTP=1` in the
+    /// environment so it can't be muscle-memory'd into a real run.
+    #[arg(long, global = true)]
+    allow_insecure_http: bool,
 }
 
 #[derive(Subcommand)]
@@ -150,6 +156,21 @@ fn identity(cmd: &Cmd) -> &'static str {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    if cli.allow_insecure_http {
+        if std::env::var("PAY_BENCH_ALLOW_INSECURE_HTTP").as_deref() != Ok("1") {
+            bail!(
+                "--allow-insecure-http also requires PAY_BENCH_ALLOW_INSECURE_HTTP=1 in the \
+                 environment — belt-and-suspenders so this can't be muscle-memory'd into a \
+                 real run against real funds"
+            );
+        }
+        eprintln!(
+            "\u{26a0}\u{fe0f}  --allow-insecure-http: payment credentials will be sent over \
+             PLAINTEXT HTTP to non-loopback hosts. Benchmarking only — never point this at a \
+             gateway handling real funds."
+        );
+        scheme::ALLOW_INSECURE_HTTP.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
     let otlp = cli
         .otlp
         .clone()

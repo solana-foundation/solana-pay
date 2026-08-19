@@ -163,9 +163,16 @@ pub fn build_request(
     rb
 }
 
+/// Set only via the `--allow-insecure-http` CLI flag (which itself requires
+/// `PAY_BENCH_ALLOW_INSECURE_HTTP=1`). Benchmarking escape hatch to isolate
+/// TLS/transport from a run's numbers — never set this against real funds.
+pub static ALLOW_INSECURE_HTTP: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// Payment credentials are bearer-like until their cumulative watermark is
 /// consumed. Never send them over public cleartext transport; local loopback
-/// HTTP remains available for deterministic rehearsal and profiling.
+/// HTTP remains available for deterministic rehearsal and profiling, and
+/// `--allow-insecure-http` opts a whole run out for controlled benchmarking.
 pub fn validate_payment_transport(url: &str) -> Result<()> {
     let parsed = reqwest::Url::parse(url).with_context(|| format!("invalid endpoint URL {url}"))?;
     if parsed.scheme() == "https" {
@@ -178,11 +185,13 @@ pub fn validate_payment_transport(url: &str) -> Result<()> {
                 .parse::<std::net::IpAddr>()
                 .is_ok_and(|ip| ip.is_loopback())
     });
-    if parsed.scheme() == "http" && loopback {
+    if parsed.scheme() == "http"
+        && (loopback || ALLOW_INSECURE_HTTP.load(std::sync::atomic::Ordering::Relaxed))
+    {
         return Ok(());
     }
     bail!(
-        "refusing to send payment credentials to cleartext endpoint {url}; use HTTPS (HTTP is allowed only on loopback)"
+        "refusing to send payment credentials to cleartext endpoint {url}; use HTTPS (HTTP is allowed only on loopback, or pass --allow-insecure-http for a controlled benchmark run)"
     )
 }
 
@@ -209,5 +218,11 @@ mod tests {
 
         let error = validate_payment_transport("http://213.239.141.29:1402/v1").unwrap_err();
         assert!(error.to_string().contains("use HTTPS"));
+
+        // Shares process-wide state with other tests in this binary, so flip
+        // it and reset within this single test rather than a separate one.
+        ALLOW_INSECURE_HTTP.store(true, std::sync::atomic::Ordering::Relaxed);
+        assert!(validate_payment_transport("http://213.239.141.29:1402/v1").is_ok());
+        ALLOW_INSECURE_HTTP.store(false, std::sync::atomic::Ordering::Relaxed);
     }
 }
