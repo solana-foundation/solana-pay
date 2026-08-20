@@ -88,6 +88,48 @@ pub trait RequestSource: Send {
     async fn next_request(&mut self) -> Result<PreparedRequest>;
 }
 
+/// RAII handle for a scheme's background hot-path pipeline (e.g. the session
+/// signer pool). Started after prepare, stopped when this drops (after the
+/// measured window). Dropping signals the workers and joins them.
+pub struct HotPathGuard {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    joins: Vec<std::thread::JoinHandle<()>>,
+    /// Reported once on drop: (vouchers produced, times a lane found its queue
+    /// empty and had to wait for a signer).
+    stats: std::sync::Arc<HotPathStats>,
+}
+
+#[derive(Default)]
+pub struct HotPathStats {
+    pub produced: std::sync::atomic::AtomicU64,
+    pub stalls: std::sync::atomic::AtomicU64,
+}
+
+impl HotPathGuard {
+    pub fn new(
+        stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        joins: Vec<std::thread::JoinHandle<()>>,
+        stats: std::sync::Arc<HotPathStats>,
+    ) -> Self {
+        Self { stop, joins, stats }
+    }
+}
+
+impl Drop for HotPathGuard {
+    fn drop(&mut self) {
+        use std::sync::atomic::Ordering;
+        self.stop.store(true, Ordering::Relaxed);
+        for j in self.joins.drain(..) {
+            let _ = j.join();
+        }
+        tracing::info!(
+            produced = self.stats.produced.load(Ordering::Relaxed),
+            lane_stalls = self.stats.stalls.load(Ordering::Relaxed),
+            "signer pool stopped"
+        );
+    }
+}
+
 /// Result of firing one prepared request. (The driver records into its own
 /// metrics sink today; this type is for schemes that need richer per-fire data.)
 #[derive(Clone, Debug)]
@@ -129,6 +171,15 @@ pub trait BenchScheme: Send + Sync {
 
     /// Settle + close for one user. Charge: no-op (engine sweeps funds).
     async fn settle_and_close(&self, ctx: &UserCtx, setup: &UserSetup) -> Result<()>;
+
+    /// Optionally start a background pipeline that feeds the hot path, after
+    /// prepare and before the measured window. Returns a guard whose drop stops
+    /// it (after unleash). Default: none. The session scheme uses this to run a
+    /// dedicated signer pool so ed25519 stays off the request lanes for the
+    /// whole run, not just a fixed pre-signed window.
+    fn spawn_hot_path(&self) -> Option<HotPathGuard> {
+        None
+    }
 }
 
 /// Construct the scheme impl named by config.

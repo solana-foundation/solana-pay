@@ -94,8 +94,14 @@ pub async fn run_pipeline(p: PipelineParams<'_>) -> Result<ReportJson> {
     };
 
     // ── 3. Build per-user contexts (deterministic wallets) ──────────────────
+    // Provisioning opens a real payment channel per user, which broadcasts an
+    // on-chain transaction and waits for the gateway to confirm it. Under a
+    // large open burst devnet/RPC latency makes individual opens occasionally
+    // stall for tens of seconds; a tight timeout aborts the whole run on the
+    // first such stall (no per-open retry). Give opens generous headroom so
+    // provisioning tens of thousands of channels rides through those spikes.
     let mut prep_builder = reqwest::Client::builder()
-        .timeout(Duration::from_secs(30))
+        .timeout(Duration::from_secs(120))
         .pool_max_idle_per_host(64);
     if let Some(certificate) = tls_ca_certificate.clone() {
         prep_builder = prep_builder.add_root_certificate(certificate);
@@ -134,6 +140,12 @@ pub async fn run_pipeline(p: PipelineParams<'_>) -> Result<ReportJson> {
         })
         .buffer_unordered(load.provision_concurrency);
     let ctx_by_index: HashMap<u32, &UserCtx> = ctxs.iter().map(|ctx| (ctx.index, ctx)).collect();
+    // Best-effort provisioning: with `provision_min_success_fraction < 1.0` a
+    // few transient open failures (devnet RPC drops when opening tens of
+    // thousands of channels) are skipped rather than aborting the whole run.
+    let tolerate_failures = load.provision_min_success_fraction < 1.0;
+    let mut provision_failures = 0usize;
+    let mut failure_sample: Option<String> = None;
     let mut provisioned: Vec<(u32, UserSetup)> = Vec::with_capacity(ctxs.len());
     let mut provision_checkpoint = Vec::with_capacity(JOURNAL_CHECKPOINT_USERS);
     while let Some((idx, res)) = provisioning.next().await {
@@ -161,6 +173,15 @@ pub async fn run_pipeline(p: PipelineParams<'_>) -> Result<ReportJson> {
                 if !provision_checkpoint.is_empty() {
                     p.journal.upsert_users(provision_checkpoint.drain(..))?;
                 }
+                if tolerate_failures {
+                    // Skip this channel and keep going; the measured run uses
+                    // whatever came up. Sample the first error for the summary.
+                    provision_failures += 1;
+                    if failure_sample.is_none() {
+                        failure_sample = Some(format!("{e:#}"));
+                    }
+                    continue;
+                }
                 // Keep the journal outstanding: the open request may have
                 // reached chain even when its HTTP response failed, and prior
                 // users are definitely funded. Recovery must reconcile it.
@@ -172,10 +193,31 @@ pub async fn run_pipeline(p: PipelineParams<'_>) -> Result<ReportJson> {
         p.journal.upsert_users(provision_checkpoint.drain(..))?;
     }
     provisioned.sort_by_key(|(idx, _)| *idx);
-    let setups: Vec<UserSetup> = provisioned.into_iter().map(|(_, setup)| setup).collect();
+    let succeeded = provisioned.len();
+    if tolerate_failures {
+        let attempted = ctxs.len();
+        let fraction = succeeded as f64 / attempted.max(1) as f64;
+        if fraction < load.provision_min_success_fraction {
+            bail!(
+                "provisioning succeeded for only {succeeded}/{attempted} channels \
+                 ({fraction:.3} < required {:.3}); first failure: {}",
+                load.provision_min_success_fraction,
+                failure_sample.as_deref().unwrap_or("<none>")
+            );
+        }
+        if provision_failures > 0 {
+            tracing::warn!(
+                succeeded,
+                attempted,
+                skipped = provision_failures,
+                first_failure = failure_sample.as_deref().unwrap_or(""),
+                "phase: provisioned best-effort (skipped transient open failures)"
+            );
+        }
+    }
     p.journal.set_status(Status::Provisioned)?;
     tracing::info!(
-        users = ctxs.len(),
+        users = succeeded,
         elapsed_ms = t_provision.elapsed().as_millis() as u64,
         "phase: provisioned"
     );
@@ -185,11 +227,12 @@ pub async fn run_pipeline(p: PipelineParams<'_>) -> Result<ReportJson> {
     // explicit offline capacity-isolation config may instead pre-sign a fixed,
     // validated window so client signing does not compete with the proxy.
     let t_prepare = Instant::now();
-    let prepared = stream::iter(ctxs.iter().zip(setups.iter()))
-        .map(|(ctx, setup)| {
+    let prepared = stream::iter(provisioned.iter())
+        .map(|(idx, setup)| {
+            let ctx = ctx_by_index[idx];
             scheme
                 .request_source(ctx, setup)
-                .instrument(tracing::info_span!("request_source", index = ctx.index))
+                .instrument(tracing::info_span!("request_source", index = *idx))
         })
         .buffer_unordered(PREPARE_CONCURRENCY)
         .collect::<Vec<_>>()
@@ -206,6 +249,10 @@ pub async fn run_pipeline(p: PipelineParams<'_>) -> Result<ReportJson> {
     );
 
     // ── 6. Unleash (measured) ───────────────────────────────────────────────
+    // Optionally start the scheme's background hot-path pipeline (session signer
+    // pool) now that channels + queues exist. The guard stops + joins the signer
+    // threads when dropped, immediately after the measured window.
+    let hot_path = scheme.spawn_hot_path();
     p.journal.set_status(Status::Unleashing)?;
     let dcfg = DriverConfig {
         rps_per_user: load.requests_per_sec_per_user,
@@ -226,6 +273,8 @@ pub async fn run_pipeline(p: PipelineParams<'_>) -> Result<ReportJson> {
     let report = driver::run(sources, dcfg)
         .instrument(tracing::info_span!("unleash"))
         .await;
+    // Stop the signer pool now the measured window is over (logs produced/stalls).
+    drop(hot_path);
     tracing::info!(
         completed = report.completed,
         ok = report.ok,
@@ -240,8 +289,10 @@ pub async fn run_pipeline(p: PipelineParams<'_>) -> Result<ReportJson> {
     p.journal.set_status(Status::Settling)?;
     let t_settle = Instant::now();
     if !no_chain {
-        let mut settlement = stream::iter(ctxs.iter().zip(setups.iter()))
-            .map(|(ctx, setup)| async move {
+        let mut settlement = stream::iter(provisioned.iter())
+            .map(|(idx, setup)| {
+                let ctx = ctx_by_index[idx];
+                async move {
                 let result: Result<()> = async {
                     scheme
                         .settle_and_close(ctx, setup)
@@ -255,6 +306,7 @@ pub async fn run_pipeline(p: PipelineParams<'_>) -> Result<ReportJson> {
                 }
                 .await;
                 (ctx.index, result)
+                }
             })
             .buffer_unordered(load.settlement_concurrency);
         let mut swept_checkpoint = Vec::with_capacity(JOURNAL_CHECKPOINT_USERS);
@@ -298,7 +350,7 @@ pub async fn run_pipeline(p: PipelineParams<'_>) -> Result<ReportJson> {
         &run_id,
         scheme.name(),
         cfg,
-        ctxs.len(),
+        succeeded,
         &report,
     ))
 }

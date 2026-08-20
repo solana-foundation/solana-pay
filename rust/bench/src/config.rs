@@ -165,6 +165,13 @@ pub struct Load {
     /// scheduler. Best paired with `stable_connections`. Default `false`.
     #[serde(default)]
     pub closed_loop: bool,
+    /// Fraction of the shard's channels that must provision successfully for the
+    /// run to proceed. `1.0` (default) aborts on the first failed open. Lower it
+    /// for large fixtures where a few transient devnet RPC drops are expected
+    /// when opening tens of thousands of channels — failed users are skipped and
+    /// the measured run uses whatever channels came up. Must be in (0, 1].
+    #[serde(default = "default_provision_min_success_fraction")]
+    pub provision_min_success_fraction: f64,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -213,12 +220,28 @@ pub struct SessionCfg {
     /// Offline capacity-isolation runs use this to keep client signing from
     /// consuming the same host CPU as the proxy under test. Zero keeps the
     /// production-shaped on-demand signing path.
+    ///
+    /// When `background_signers > 0` this is reinterpreted as the per-channel
+    /// voucher-queue depth (head-start capacity), NOT a fixed window — the
+    /// signer pool keeps refilling it, so it need not cover the whole run.
     #[serde(default)]
     pub pre_sign_requests_per_user: usize,
+    /// Number of dedicated OS threads that continuously sign vouchers into
+    /// per-channel queues while the load lanes only pop-and-send. Zero keeps
+    /// the in-lane signing path. When set, signing runs off the hot path
+    /// *for the whole run* (unlike `pre_sign_requests_per_user` alone, which is
+    /// a fixed pre-signed window), so one host can sustain its gateway-bound
+    /// paid ceiling indefinitely with bounded memory. Users are partitioned
+    /// across these threads (one producer per channel → monotonic vouchers).
+    #[serde(default)]
+    pub background_signers: usize,
 }
 
 fn default_true() -> bool {
     true
+}
+fn default_provision_min_success_fraction() -> f64 {
+    1.0
 }
 fn default_prepare_secs() -> u64 {
     30
@@ -388,6 +411,10 @@ impl RunConfig {
         }
         if let Some(session) = &self.session
             && session.pre_sign_requests_per_user > 0
+            // In background-signer mode `pre_sign_requests_per_user` is only the
+            // queue depth (a head start); the pool refills it for the whole run,
+            // so it need not cover the full request window.
+            && session.background_signers == 0
         {
             // Pre-signing works against a real (online) gateway too: provision
             // opens the real channel and retains the SessionHandle, and the

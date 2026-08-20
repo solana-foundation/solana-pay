@@ -11,10 +11,12 @@
 //!   - **settle_and_close**: send the `close` Authorization → server batch-settles.
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
+use crossbeam_queue::ArrayQueue;
 use pay_core::client::session::{SessionHandle, voucher_header_sync};
 use pay_kit::mpp::client::{
     PaymentChannelOpenOptions, PaymentChannelSessionOpenOptions,
@@ -25,8 +27,9 @@ use pay_kit::mpp::{PaymentCredential, format_authorization};
 use reqwest::StatusCode;
 
 use super::{
-    BenchScheme, Endpoint, Load, PerUserFunding, PreparedRequest, RequestSource, ResolvedPrice,
-    UserCtx, UserSetup, build_request, validate_payment_transport, www_authenticate,
+    BenchScheme, Endpoint, HotPathGuard, HotPathStats, Load, PerUserFunding, PreparedRequest,
+    RequestSource, ResolvedPrice, UserCtx, UserSetup, build_request, validate_payment_transport,
+    www_authenticate,
 };
 use crate::config::RunConfig;
 use crate::seeded_session;
@@ -48,17 +51,33 @@ pub(crate) fn voucher_base_units(voucher_usdc: f64) -> u64 {
     (voucher_usdc * 1e6).max(1.0) as u64
 }
 
+/// One channel's slot in the background signer pipeline: its handle (single
+/// producer, so vouchers stay monotonic) and the bounded queue lanes drain.
+struct SignerTask {
+    handle: SessionHandle,
+    queue: Arc<ArrayQueue<String>>,
+    base: u64,
+}
+
 pub struct MppSession {
     deposit_base: u64,
     voucher_base: u64,
     offline: bool,
     offline_namespace: String,
     pre_sign_requests_per_user: usize,
+    /// >0 → dedicated signer threads fill per-channel queues off the hot path
+    /// for the whole run (see [`SessionCfg::background_signers`]).
+    background_signers: usize,
     close_after_run: bool,
     /// Live channel handles, keyed by user index. `SessionHandle` is `Clone`
     /// (Arc inside), so we clone one out under the lock and `.await` on it —
     /// never holding the std mutex across an await.
     handles: Mutex<HashMap<u32, SessionHandle>>,
+    /// Per-channel signer slots, registered as request sources are built and
+    /// consumed by [`MppSession::spawn_hot_path`]. Empty unless background mode.
+    signer_registry: Mutex<Vec<SignerTask>>,
+    /// Shared with the sources (stall counter) and the pool (produced counter).
+    hot_stats: Arc<HotPathStats>,
 }
 
 impl MppSession {
@@ -74,6 +93,11 @@ impl MppSession {
             .as_ref()
             .map(|session| session.pre_sign_requests_per_user)
             .unwrap_or(0);
+        let background_signers = cfg
+            .session
+            .as_ref()
+            .map(|session| session.background_signers)
+            .unwrap_or(0);
         let close_after_run = cfg
             .session
             .as_ref()
@@ -86,8 +110,21 @@ impl MppSession {
             offline,
             offline_namespace: cfg.offline_namespace().to_string(),
             pre_sign_requests_per_user,
+            background_signers,
             close_after_run,
             handles: Mutex::new(HashMap::new()),
+            signer_registry: Mutex::new(Vec::new()),
+            hot_stats: Arc::new(HotPathStats::default()),
+        }
+    }
+
+    /// Per-channel queue depth for background mode. Falls back to a sane default
+    /// when `pre_sign_requests_per_user` is left at 0.
+    fn queue_depth(&self) -> usize {
+        if self.pre_sign_requests_per_user > 0 {
+            self.pre_sign_requests_per_user
+        } else {
+            1024
         }
     }
 
@@ -324,6 +361,31 @@ impl BenchScheme for MppSession {
         let handle = self
             .handle(ctx.index)
             .with_context(|| format!("no session handle for user {}", ctx.index))?;
+
+        // Background-signer mode: a shared bounded queue is filled by the signer
+        // pool (started in `spawn_hot_path`) and drained by this source's lane.
+        // The source never signs — ed25519 is off the hot path for the whole run.
+        if self.background_signers > 0 {
+            let queue = Arc::new(ArrayQueue::new(self.queue_depth()));
+            self.signer_registry.lock().unwrap().push(SignerTask {
+                handle: handle.clone(),
+                queue: queue.clone(),
+                base: self.voucher_base,
+            });
+            return Ok(Box::new(SessionSource {
+                index: ctx.index,
+                handle,
+                voucher_base: self.voucher_base,
+                method: ctx.endpoint.method.clone(),
+                url: ctx.endpoint.url.clone(),
+                host_override: ctx.host_override.clone(),
+                body: ctx.endpoint.body.clone(),
+                presigned: None,
+                queue: Some(queue),
+                stats: self.hot_stats.clone(),
+            }));
+        }
+
         let presigned = if self.pre_sign_requests_per_user > 0 {
             let count = self.pre_sign_requests_per_user;
             let voucher_base = self.voucher_base;
@@ -352,6 +414,8 @@ impl BenchScheme for MppSession {
             host_override: ctx.host_override.clone(),
             body: ctx.endpoint.body.clone(),
             presigned: (self.pre_sign_requests_per_user > 0).then_some(presigned),
+            queue: None,
+            stats: self.hot_stats.clone(),
         }))
     }
 
@@ -385,6 +449,102 @@ impl BenchScheme for MppSession {
         let body = resp.bytes().await.context("reading close response")?;
         validate_close_response(status, &body)
     }
+
+    fn spawn_hot_path(&self) -> Option<HotPathGuard> {
+        if self.background_signers == 0 {
+            return None;
+        }
+        let tasks: Vec<SignerTask> = std::mem::take(&mut *self.signer_registry.lock().unwrap());
+        if tasks.is_empty() {
+            return None;
+        }
+        let threads = self.background_signers.min(tasks.len());
+        let stop = Arc::new(AtomicBool::new(false));
+        let stats = self.hot_stats.clone();
+
+        // Partition channels across signer threads round-robin: each channel is
+        // owned by exactly one thread, so its `voucher_header` calls are
+        // serialized and the cumulative watermark stays strictly monotonic
+        // without any cross-thread coordination.
+        let mut buckets: Vec<Vec<SignerTask>> = (0..threads).map(|_| Vec::new()).collect();
+        for (i, task) in tasks.into_iter().enumerate() {
+            buckets[i % threads].push(task);
+        }
+
+        let mut joins = Vec::with_capacity(threads);
+        for (tid, bucket) in buckets.into_iter().enumerate() {
+            let stop = stop.clone();
+            let stats = stats.clone();
+            let join = std::thread::Builder::new()
+                .name(format!("signer-{tid}"))
+                .spawn(move || signer_thread(bucket, stop, stats))
+                .expect("spawn signer thread");
+            joins.push(join);
+        }
+        tracing::info!(
+            signer_threads = threads,
+            "signer pool started (ed25519 off the hot path for the whole run)"
+        );
+        Some(HotPathGuard::new(stop, joins, stats))
+    }
+}
+
+/// One signer thread: owns a disjoint set of channels and keeps their queues
+/// topped up. Builds a single current-thread runtime and reuses it for every
+/// voucher — `voucher_header_sync` builds a fresh runtime per call, which would
+/// dominate cost at these rates. Uncontended per-channel async mutex, so
+/// `block_on` here is just driving the ed25519 sign + header serialization.
+fn signer_thread(bucket: Vec<SignerTask>, stop: Arc<AtomicBool>, stats: Arc<HotPathStats>) {
+    let rt = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => {
+            tracing::error!("signer thread runtime: {e}");
+            return;
+        }
+    };
+    rt.block_on(async move {
+        let mut produced_local: u64 = 0;
+        while !stop.load(Ordering::Relaxed) {
+            let mut progressed = false;
+            for task in &bucket {
+                // Top this channel back up to capacity, then move on so every
+                // channel gets refilled each pass (fair across the bucket).
+                while task.queue.len() < task.queue.capacity() {
+                    match task.handle.voucher_header(task.base).await {
+                        Ok(header) => {
+                            if task.queue.push(header).is_err() {
+                                break; // drained concurrently filled it; race, fine
+                            }
+                            produced_local += 1;
+                            progressed = true;
+                            if produced_local % 8192 == 0 {
+                                stats.produced.fetch_add(8192, Ordering::Relaxed);
+                            }
+                        }
+                        Err(e) => {
+                            tracing::error!("signer: voucher_header failed: {e}");
+                            break;
+                        }
+                    }
+                }
+                if stop.load(Ordering::Relaxed) {
+                    break;
+                }
+            }
+            // All queues full: nothing to do until lanes drain. Park briefly
+            // (dedicated thread) instead of spinning hot, so we don't steal a
+            // core from the lane threads while waiting.
+            if !progressed {
+                std::thread::sleep(std::time::Duration::from_micros(100));
+            }
+        }
+        stats
+            .produced
+            .fetch_add(produced_local % 8192, Ordering::Relaxed);
+    });
 }
 
 struct SessionSource {
@@ -396,6 +556,10 @@ struct SessionSource {
     host_override: Option<String>,
     body: String,
     presigned: Option<VecDeque<String>>,
+    /// Background-signer mode: pop pre-signed vouchers the pool fills. When set,
+    /// this source never signs (single producer per channel is the signer pool).
+    queue: Option<Arc<ArrayQueue<String>>>,
+    stats: Arc<HotPathStats>,
 }
 
 #[async_trait]
@@ -405,15 +569,29 @@ impl RequestSource for SessionSource {
     }
 
     async fn next_request(&mut self) -> Result<PreparedRequest> {
-        let auth = match &mut self.presigned {
-            Some(presigned) => presigned
-                .pop_front()
-                .context("pre-signed voucher window exhausted")?,
-            None => self
-                .handle
-                .voucher_header(self.voucher_base)
-                .await
-                .map_err(|e| anyhow::anyhow!("voucher_header: {e}"))?,
+        let auth = if let Some(queue) = &self.queue {
+            // Vouchers are FIFO within a channel, so popping in order preserves
+            // the monotonic watermark. If the queue is momentarily empty the
+            // signer pool fell behind — wait for it rather than signing here
+            // (which would race the pool's watermark and break ordering).
+            loop {
+                if let Some(header) = queue.pop() {
+                    break header;
+                }
+                self.stats.stalls.fetch_add(1, Ordering::Relaxed);
+                tokio::task::yield_now().await;
+            }
+        } else {
+            match &mut self.presigned {
+                Some(presigned) => presigned
+                    .pop_front()
+                    .context("pre-signed voucher window exhausted")?,
+                None => self
+                    .handle
+                    .voucher_header(self.voucher_base)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("voucher_header: {e}"))?,
+            }
         };
         let mut headers = vec![("authorization".to_string(), auth)];
         if let Some(host) = &self.host_override {
