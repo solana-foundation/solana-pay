@@ -999,6 +999,43 @@ fn token_program(asset: &FixtureAsset) -> Result<Pubkey> {
         .with_context(|| format!("invalid {} token program in fixture journal", asset.label))
 }
 
+/// Mint `amount` (human decimal) of the setup config's first asset to the
+/// funder's own ATA. The funder must be the asset's mint authority (devnet
+/// USDtest). Used to top up the distributor before `setup` when extending a
+/// fixture beyond the currently-funded supply.
+pub async fn mint_supply(config_path: &str, amount: &str, yes: bool) -> Result<()> {
+    let config = SetupConfig::from_yaml_path(config_path)?;
+    require_confirmation(yes, "mint")?;
+    let rpc_url = config.resolve_rpc_url()?;
+    let rpc = FixtureRpc::new(rpc_url, config.execution.clone());
+    let funder = load_funder(&config.setup.funder, config.setup.network)?;
+    let assets = config.journal_assets()?;
+    let asset = assets.first().context("setup config declares no assets")?;
+    let amount_base = decimal_to_base(amount, asset.decimals)?;
+    let mint_pk = mint(asset)?;
+    let token_prog = token_program(asset)?;
+    let funder_ata = associated_token_address(&funder.pubkey, asset)?;
+    let ix = token_instruction::mint_to(
+        &token_prog,
+        &mint_pk,
+        &funder_ata,
+        &funder.pubkey,
+        &[],
+        amount_base,
+    )
+    .map_err(|e| anyhow::anyhow!("building mint_to instruction: {e}"))?;
+    let (blockhash, _) = rpc.latest_blockhash().await.context("fetching blockhash")?;
+    let message = Message::new_with_blockhash(&[ix], Some(&funder.pubkey), &blockhash);
+    let mut transaction = Transaction::new_unsigned(message);
+    sign_transaction(&mut transaction, &funder).await?;
+    let sig = rpc
+        .submit_and_confirm(&transaction)
+        .await
+        .context("submitting mint_to")?;
+    println!("minted {amount} {} to funder ATA {funder_ata}: {sig}", asset.label);
+    Ok(())
+}
+
 async fn rpc_minimum_ata_rent(rpc: &FixtureRpc) -> Result<u64> {
     rpc.minimum_balance_for_rent(TokenAccount::LEN)
         .await

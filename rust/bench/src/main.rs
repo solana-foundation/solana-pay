@@ -82,6 +82,17 @@ enum Cmd {
         #[arg(long)]
         yes: bool,
     },
+    /// Mint the setup config's first asset to the funder ATA (funder must be the
+    /// mint authority). Tops up the distributor before `setup` when extending a
+    /// fixture beyond the currently-funded supply. Devnet only.
+    Mint {
+        config: String,
+        /// Human decimal amount to mint, e.g. "700000".
+        #[arg(long)]
+        amount: String,
+        #[arg(long)]
+        yes: bool,
+    },
     /// Export deterministic fixture recipients as a `pay fanout` CSV without
     /// exposing any derived private keys.
     ExportFanout {
@@ -221,6 +232,11 @@ async fn run(cmd: Cmd) -> Result<()> {
             yes,
         } => run_real(&config, fixture_id.as_deref(), yes).await,
         Cmd::Setup { config, id, yes } => fixtures::setup(&config, id.as_deref(), yes).await,
+        Cmd::Mint {
+            config,
+            amount,
+            yes,
+        } => fixtures::mint_supply(&config, &amount, yes).await,
         Cmd::ExportFanout {
             config,
             id,

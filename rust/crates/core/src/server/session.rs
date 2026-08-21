@@ -1138,7 +1138,18 @@ impl SessionLifecycleRunloop {
         }
         let mut broadcast_count = 0usize;
         let mut failure_count = 0usize;
-        for (channel_id, result) in futures_util::future::join_all(settlements).await {
+        // Each settlement does an on-chain getAccountInfo read. Draining the
+        // whole set with an unbounded join_all bursts the RPC with tens of
+        // thousands of concurrent reads (429s/timeouts) and backpressures the
+        // request path. Bound in-flight reads so the burst is smoothed while the
+        // cycle still completes well within the settlement interval.
+        const SETTLEMENT_READ_CONCURRENCY: usize = 256;
+        use futures_util::stream::StreamExt as _;
+        let results: Vec<_> = futures_util::stream::iter(settlements)
+            .buffer_unordered(SETTLEMENT_READ_CONCURRENCY)
+            .collect()
+            .await;
+        for (channel_id, result) in results {
             self.runtime.release_capacity(&channel_id);
             match result {
                 Ok(true) => broadcast_count += 1,
