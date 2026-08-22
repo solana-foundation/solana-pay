@@ -141,6 +141,20 @@ enum Cmd {
         #[arg(long)]
         assume_no_vouchers: bool,
     },
+    /// Top up existing fixture channels' deposits to a target so a long reuse
+    /// run does not hit the per-channel cap mid-run. Each top-up is signed and
+    /// funded by the channel's own deterministic payer wallet. Devnet only.
+    TopUp {
+        config: String,
+        /// Reusable fixture whose deterministic wallets own the channels.
+        #[arg(long)]
+        fixture_id: String,
+        /// Target per-channel deposit in USDC; channels below it are topped up.
+        #[arg(long)]
+        target_usdc: f64,
+        #[arg(long)]
+        yes: bool,
+    },
     /// Validate a config and print the parsed settings.
     Estimate { config: String },
     /// Spin only the proxy (+ fork) and block, so it can be profiled in
@@ -256,6 +270,12 @@ async fn run(cmd: Cmd) -> Result<()> {
             yes,
             assume_no_vouchers,
         } => session_recovery::recover(&config, &fixture_id, yes, assume_no_vouchers).await,
+        Cmd::TopUp {
+            config,
+            fixture_id,
+            target_usdc,
+            yes,
+        } => session_recovery::top_up(&config, &fixture_id, target_usdc, yes).await,
         Cmd::Serve { config } => {
             let cfg = RunConfig::from_yaml_path(&config)?;
             rehearsal::serve_proxy(cfg).await

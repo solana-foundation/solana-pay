@@ -13,10 +13,10 @@ use pay_kit::core::payment_channels::{default_program_id, find_event_authority_p
 use pay_kit::generated::payment_channels::generated::accounts::Channel;
 use pay_kit::generated::payment_channels::generated::instructions::{
     DistributeBuilder, OPEN_DISCRIMINATOR, ReclaimBuilder, RequestCloseBuilder, SealBuilder,
-    SettleAndSealBuilder, WithdrawPayerBuilder,
+    SettleAndSealBuilder, TopUpBuilder, WithdrawPayerBuilder,
 };
 use pay_kit::generated::payment_channels::generated::types::{
-    DistributeArgs, DistributionEntry, SettleAndSealArgs,
+    DistributeArgs, DistributionEntry, SettleAndSealArgs, TopUpArgs,
 };
 use sha2::{Digest, Sha256};
 use solana_instruction::Instruction;
@@ -378,6 +378,28 @@ pub fn build_withdraw_payer_ix(
         .payer_token_account(to_address(&payer_ata))
         .mint(to_address(mint))
         .token_program(to_address(token_program))
+        .instruction()
+}
+
+/// `top_up` — add `amount` (base units) to an open channel's deposit vault.
+/// Signer = `payer` (the channel's payer), whose ATA funds the transfer.
+pub fn build_top_up_ix(
+    channel: &Pubkey,
+    payer: &Pubkey,
+    mint: &Pubkey,
+    token_program: &Pubkey,
+    amount: u64,
+) -> Instruction {
+    let channel_ata = associated_token_address(channel, mint, token_program);
+    let payer_ata = associated_token_address(payer, mint, token_program);
+    TopUpBuilder::new()
+        .payer(to_address(payer))
+        .channel(to_address(channel))
+        .channel_token_account(to_address(&channel_ata))
+        .payer_token_account(to_address(&payer_ata))
+        .mint(to_address(mint))
+        .token_program(to_address(token_program))
+        .top_up_args(TopUpArgs { amount })
         .instruction()
 }
 

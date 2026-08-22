@@ -568,6 +568,140 @@ async fn close_channel(
     crate::scheme::mpp_session::validate_close_response(status, &body)
 }
 
+/// Top up existing fixture channels' deposit vaults to `target_usdc` so a long
+/// reuse run does not exhaust a channel's cap mid-run. Each `top_up` is signed
+/// by its channel's payer (the deterministic fixture wallet), which also pays
+/// the fee and funds the transfer from its own token account. Best-effort:
+/// channels already at/above the target are skipped and per-channel failures
+/// (e.g. a payer short on tokens) are reported without aborting the sweep.
+pub async fn top_up(
+    config_path: &str,
+    fixture_id: &str,
+    target_usdc: f64,
+    yes: bool,
+) -> Result<()> {
+    ensure!(
+        yes,
+        "top-up submits on-chain deposit transactions; re-run with --yes"
+    );
+    let config = RunConfig::from_yaml_path(config_path)?;
+    ensure!(
+        config.run.scheme == Scheme::MppSession,
+        "top-up requires run.scheme: mpp_session"
+    );
+    let rpc_url = config
+        .resolve_rpc_url()?
+        .context("top-up requires an RPC URL")?;
+    let funder = wallet::load_funder(&config.run.funder, config.run.network)?;
+    let wallet_set_id = crate::fixtures::validate_ready_fixture(fixture_id, &config, &funder)?;
+
+    // USDC-like 6-decimal base units, matching the mpp_session deposit math.
+    let target_base = (target_usdc * 1e6) as u64;
+    ensure!(target_base > 0, "--target-usdc must be positive");
+
+    let expected: HashMap<Pubkey, (u32, Wallet, Pubkey)> = (0..config.load.users as u32)
+        .map(|index| {
+            let wallet = wallet::derive_user(&funder.seed(), &wallet_set_id, index);
+            let session = wallet::subkey(&wallet.seed(), "session");
+            (wallet.pubkey, (index, wallet, session.pubkey))
+        })
+        .collect();
+
+    let discovery = pay_api_core::RpcClient::new(Duration::from_secs(30))?;
+    let channels =
+        discover_fixture_channels(&discovery, &rpc_url, CHANNEL_STATUS_OPEN, &expected).await?;
+    println!(
+        "discovered {} open channels for fixture `{fixture_id}`",
+        channels.len()
+    );
+    if channels.is_empty() {
+        return Ok(());
+    }
+
+    let mint = from_address(&channels[0].channel.mint);
+    ensure!(
+        channels
+            .iter()
+            .all(|channel| from_address(&channel.channel.mint) == mint),
+        "refusing top-up: fixture channels use multiple settlement mints"
+    );
+    let token_program =
+        pay_worker::channel::resolve_token_program(&discovery, &rpc_url, &mint).await?;
+
+    let pending: Vec<(&RecoverableChannel, u64)> = channels
+        .iter()
+        .filter_map(|channel| {
+            let delta = target_base.saturating_sub(channel.channel.deposit);
+            (delta > 0).then_some((channel, delta))
+        })
+        .collect();
+    println!(
+        "{} channels below target {target_usdc} USDC ({} already funded); topping up",
+        pending.len(),
+        channels.len() - pending.len()
+    );
+    if pending.is_empty() {
+        return Ok(());
+    }
+
+    let concurrency = config.load.provision_concurrency.clamp(1, 256);
+    let execution = ExecutionConfig {
+        window_users: concurrency,
+        reconcile_concurrency: concurrency,
+        submit_concurrency: concurrency,
+        rpc_requests_per_second: 1_000,
+        rpc_burst: concurrency.saturating_mul(2),
+        request_timeout_seconds: 30,
+        confirmation_timeout_seconds: 90,
+        ..ExecutionConfig::default()
+    };
+    let rpc = FixtureRpc::new(rpc_url.clone(), execution);
+
+    let mut topped = 0usize;
+    let mut failures = Vec::new();
+    // Sign only one concurrency window per blockhash — a full-scale top-up
+    // outlives Solana's blockhash validity window.
+    for batch in pending.chunks(concurrency) {
+        let (blockhash, _) = rpc.latest_blockhash().await?;
+        let mut transactions = Vec::with_capacity(batch.len());
+        for &(channel, delta) in batch {
+            let instruction = pay_worker::channel::build_top_up_ix(
+                &channel.address,
+                &channel.wallet.pubkey,
+                &mint,
+                &token_program,
+                delta,
+            );
+            let transaction =
+                signed_transaction(&channel.wallet, vec![instruction], blockhash).await?;
+            transactions.push((channel.index, channel.address, transaction));
+        }
+        let rpc_ref = &rpc;
+        let mut submitting = stream::iter(transactions.into_iter().map(
+            move |(index, channel, tx)| async move {
+                (index, channel, rpc_ref.submit_and_confirm(&tx).await)
+            },
+        ))
+        .buffer_unordered(concurrency);
+        while let Some((index, channel, result)) = submitting.next().await {
+            match result {
+                Ok(_) => topped += 1,
+                Err(error) => failures.push(format!("user {index} channel {channel}: {error:#}")),
+            }
+        }
+        println!("top-up progress: {topped} confirmed, {} failed", failures.len());
+    }
+    println!(
+        "top-up complete: {topped} channels funded toward {target_usdc} USDC; {} failed",
+        failures.len()
+    );
+    if !failures.is_empty() {
+        let shown = failures.iter().take(20).cloned().collect::<Vec<_>>();
+        eprintln!("first {} top-up failures:\n{}", shown.len(), shown.join("\n"));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
