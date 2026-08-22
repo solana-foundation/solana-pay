@@ -755,6 +755,9 @@ struct SessionLifecycleRunloop {
     next_settlement: Option<Instant>,
     reconciliation: SessionLifecycleReconciliation,
     rx: mpsc::UnboundedReceiver<SessionLifecycleCommand>,
+    /// Rotating offset into the active-channel set for the per-cycle settlement
+    /// cap, so successive cycles cover different channels (bounded settle age).
+    settlement_cursor: usize,
 }
 
 impl SessionLifecycleRunloop {
@@ -771,6 +774,7 @@ impl SessionLifecycleRunloop {
             next_settlement: None,
             reconciliation: SessionLifecycleReconciliation::Embedded,
             rx,
+            settlement_cursor: 0,
         }
     }
 
@@ -1099,30 +1103,37 @@ impl SessionLifecycleRunloop {
             return;
         }
 
-        // Settlement-only configurations deliberately keep request-path
-        // lifecycle touches disabled. Claim channels observed by this process
-        // here, then renew the lease once per settlement interval instead of
-        // once per voucher.
-        self.reconcile_persisted_ownership().await;
-        let states = match self.runtime.channel_store.list_channels().await {
-            Ok(states) => states,
-            Err(error) => {
-                tracing::warn!(%error, "failed to enumerate active payment channels");
-                self.next_settlement = Some(now + interval);
-                return;
+        // Candidates are the channels this process has accepted vouchers for,
+        // read directly from `committed_watermarks` (a DashMap updated on the
+        // voucher hot path). Deriving candidacy here — rather than from the
+        // lifecycle-ownership reconcile — decouples settlement from the
+        // request-path lifecycle touch, which starves under high request load
+        // and left busy channels unsettled until they went idle.
+        // `operator_push_watermark` still reads each channel's stored voucher to
+        // build the settle and skips any sealed/closing or already-settled.
+        let mut all: Vec<String> = self
+            .runtime
+            .committed_watermarks
+            .iter()
+            .map(|entry| entry.key().clone())
+            .collect();
+        let active_count = all.len();
+        // Optional per-cycle cap (PAY_SETTLEMENT_MAX_PER_CYCLE): settle at most
+        // this many channels per cycle, rotating a cursor through the fleet so
+        // every active channel settles within ceil(active / cap) cycles. Bounds
+        // both the on-chain settle rate and the worst-case settle age. Unset =
+        // settle every active channel every cycle (prior behavior).
+        let channels = match settlement_max_per_cycle() {
+            Some(cap) if all.len() > cap => {
+                all.sort_unstable();
+                let start = self.settlement_cursor % all.len();
+                let slice: Vec<String> =
+                    all.iter().cycle().skip(start).take(cap).cloned().collect();
+                self.settlement_cursor = (start + cap) % all.len();
+                slice
             }
+            _ => all,
         };
-        let channels = states
-            .into_iter()
-            .filter(|state| !state.sealed && state.close_requested_at.is_none())
-            .filter(|state| {
-                state
-                    .lifecycle
-                    .as_ref()
-                    .is_some_and(|lifecycle| self.owns_lifecycle(lifecycle))
-            })
-            .map(|state| state.channel_id)
-            .collect::<Vec<_>>();
         let candidate_count = channels.len();
         let cycle_started = Instant::now();
         let mut settlements = Vec::with_capacity(channels.len());
@@ -1165,6 +1176,7 @@ impl SessionLifecycleRunloop {
             }
         }
         tracing::info!(
+            active = active_count,
             candidates = candidate_count,
             broadcast = broadcast_count,
             skipped = candidate_count.saturating_sub(broadcast_count + failure_count),
@@ -1179,6 +1191,21 @@ impl SessionLifecycleRunloop {
 
 fn duration_millis(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+/// Per-cycle cap on how many active channels the settlement runloop pushes
+/// on-chain, from `PAY_SETTLEMENT_MAX_PER_CYCLE`. `None`/unset/0 = no cap
+/// (settle every active channel each cycle). Cached on first read. A cap bounds
+/// the on-chain settle rate (RPC load) while the runloop rotates through the
+/// fleet, so every active channel settles within ceil(active / cap) cycles.
+fn settlement_max_per_cycle() -> Option<usize> {
+    static CAP: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    *CAP.get_or_init(|| {
+        std::env::var("PAY_SETTLEMENT_MAX_PER_CYCLE")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&n| n > 0)
+    })
 }
 
 fn unix_millis() -> u64 {
