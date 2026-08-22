@@ -46,6 +46,7 @@ pub async fn recover(
     fixture_id: &str,
     yes: bool,
     assume_no_vouchers: bool,
+    allow_settled: bool,
 ) -> Result<()> {
     ensure!(
         yes,
@@ -77,9 +78,20 @@ pub async fn recover(
         .collect();
 
     if assume_no_vouchers {
-        return recover_without_gateway_state(&config, &rpc_url, fixture_id, &funder, &expected)
-            .await;
+        return recover_without_gateway_state(
+            &config,
+            &rpc_url,
+            fixture_id,
+            &funder,
+            &expected,
+            allow_settled,
+        )
+        .await;
     }
+    ensure!(
+        !allow_settled,
+        "--allow-settled only applies to --assume-no-vouchers direct recovery"
+    );
 
     let rpc = pay_api_core::RpcClient::new(Duration::from_secs(30))?;
     let channels =
@@ -195,6 +207,7 @@ async fn recover_without_gateway_state(
     fixture_id: &str,
     funder: &Wallet,
     expected: &HashMap<Pubkey, (u32, Wallet, Pubkey)>,
+    allow_settled: bool,
 ) -> Result<()> {
     let discovery = pay_api_core::RpcClient::new(Duration::from_secs(30))?;
     let open =
@@ -206,7 +219,7 @@ async fn recover_without_gateway_state(
         open.len(),
         already_sealed.len()
     );
-    validate_zero_voucher_channels(open.iter().chain(already_sealed.iter()), funder)?;
+    validate_zero_voucher_channels(open.iter().chain(already_sealed.iter()), funder, allow_settled)?;
 
     let concurrency = config.load.provision_concurrency.clamp(1, 256);
     let execution = ExecutionConfig {
@@ -253,7 +266,7 @@ async fn recover_without_gateway_state(
 
     let sealed =
         discover_fixture_channels(&discovery, rpc_url, CHANNEL_STATUS_SEALED, expected).await?;
-    validate_zero_voucher_channels(sealed.iter(), funder)?;
+    validate_zero_voucher_channels(sealed.iter(), funder, allow_settled)?;
     if !sealed.is_empty() {
         let mint = from_address(&sealed[0].channel.mint);
         ensure!(
@@ -391,6 +404,7 @@ fn recovery_treasury_owner(network: Network) -> Result<Pubkey> {
 fn validate_zero_voucher_channels<'a>(
     channels: impl Iterator<Item = &'a RecoverableChannel>,
     funder: &Wallet,
+    allow_settled: bool,
 ) -> Result<()> {
     let empty_hash = Sha256::digest(0u32.to_le_bytes());
     for channel in channels {
@@ -401,10 +415,17 @@ fn validate_zero_voucher_channels<'a>(
             channel.payee,
             funder.pubkey
         );
+        // Sealing with `has_voucher = 0` finalizes the channel at whatever
+        // amount is already settled on-chain, and `distribute` then pays that
+        // to the payee (== funder) and refunds the remainder to the payer. This
+        // is safe for channels that carried real vouchers, so `--allow-settled`
+        // opts out of the stricter never-metered guard when cleaning up stale
+        // channels whose gateway voucher state is gone.
         ensure!(
-            channel.channel.settlement.settled == 0
-                && channel.channel.settlement.payout_watermark == 0,
-            "refusing zero-voucher recovery: channel {} has non-zero settlement watermarks",
+            allow_settled
+                || (channel.channel.settlement.settled == 0
+                    && channel.channel.settlement.payout_watermark == 0),
+            "refusing zero-voucher recovery: channel {} has non-zero settlement watermarks (pass --allow-settled to seal at the on-chain amount)",
             channel.address
         );
         ensure!(

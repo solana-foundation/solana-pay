@@ -140,6 +140,12 @@ enum Cmd {
         /// Safe only when the measured load phase never started.
         #[arg(long)]
         assume_no_vouchers: bool,
+        /// With --assume-no-vouchers, also close channels that already carry a
+        /// non-zero settled amount: seal at the on-chain amount, pay the payee
+        /// (== funder), refund the payer, and reclaim rent. Used to sweep stale
+        /// channels from prior runs whose gateway voucher state is gone.
+        #[arg(long)]
+        allow_settled: bool,
     },
     /// Top up existing fixture channels' deposits to a target so a long reuse
     /// run does not hit the per-channel cap mid-run. Each top-up is signed and
@@ -269,7 +275,11 @@ async fn run(cmd: Cmd) -> Result<()> {
             fixture_id,
             yes,
             assume_no_vouchers,
-        } => session_recovery::recover(&config, &fixture_id, yes, assume_no_vouchers).await,
+            allow_settled,
+        } => {
+            session_recovery::recover(&config, &fixture_id, yes, assume_no_vouchers, allow_settled)
+                .await
+        }
         Cmd::TopUp {
             config,
             fixture_id,
