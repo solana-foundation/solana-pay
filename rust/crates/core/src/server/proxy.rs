@@ -100,6 +100,9 @@ pub fn routing_signs_request_body(api: &ApiSpec, path: &str) -> bool {
 /// - Returns the upstream response (status, headers, body)
 ///
 /// For `Respond` routing, returns 200 with `{"status":"ok"}`.
+// A direct `Response` error preserves the proxy's intentionally constructed
+// HTTP response for the axum caller.
+#[allow(clippy::result_large_err)]
 pub async fn forward_request(
     api: &ApiSpec,
     method: Method,
@@ -118,6 +121,9 @@ pub async fn forward_request(
     skip(api, headers, body, session_context),
     fields(subdomain = %api.subdomain, method = %method, path = %uri.path())
 )]
+// A direct `Response` error preserves the proxy's intentionally constructed
+// HTTP response for the axum caller.
+#[allow(clippy::result_large_err)]
 pub async fn forward_request_with_session_metering(
     api: &ApiSpec,
     method: Method,
@@ -219,6 +225,9 @@ pub enum UpstreamPlan {
 /// headers, and inject auth — everything up to (but not including) sending the
 /// request. Framework-neutral: the result is consumed by axum's reqwest send and
 /// by the pingora gate's native proxying alike.
+// A direct `Response` error preserves status, headers, and body for both
+// framework adapters without a lossy intermediate error type.
+#[allow(clippy::result_large_err)]
 pub async fn prepare_upstream(
     api: &ApiSpec,
     method: &Method,

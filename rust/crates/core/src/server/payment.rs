@@ -236,6 +236,9 @@ async fn gate_adapter<S: PaymentState>(state: S, req: Request<Body>, next: Next)
 /// Read the model selected by OpenAI/Anthropic-compatible JSON requests and
 /// restore the body for the upstream handler. Native model routes already
 /// carry their variant in the path and never enter this path.
+// A direct `Response` error lets the middleware short-circuit without losing
+// status, headers, or body content produced while reading the request body.
+#[allow(clippy::result_large_err)]
 async fn prepare_delegated_request_body(
     request: Request<Body>,
     force_stream_usage: bool,
