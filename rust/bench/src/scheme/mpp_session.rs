@@ -11,13 +11,15 @@
 //!   - **settle_and_close**: send the `close` Authorization → server batch-settles.
 
 use std::collections::{HashMap, VecDeque};
+use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use crossbeam_queue::ArrayQueue;
-use pay_core::client::session::{SessionHandle, voucher_header_sync};
+use pay_core::client::session::{RawSession, SessionHandle, voucher_header_sync};
+use solana_pubkey::Pubkey;
 use pay_kit::mpp::client::{
     PaymentChannelOpenOptions, PaymentChannelSessionOpenOptions,
     create_payment_channel_session_opener,
@@ -73,6 +75,10 @@ pub struct MppSession {
     /// (Arc inside), so we clone one out under the lock and `.await` on it —
     /// never holding the std mutex across an await.
     handles: Mutex<HashMap<u32, SessionHandle>>,
+    /// Reuse mode: user index → (existing channel address, on-chain settled).
+    /// Populated once before provisioning; `provision_user` drives these instead
+    /// of opening new channels. Empty unless `session.reuse` is set.
+    reuse_channels: Mutex<HashMap<u32, (String, u64)>>,
     /// Per-channel signer slots, registered as request sources are built and
     /// consumed by [`MppSession::spawn_hot_path`]. Empty unless background mode.
     signer_registry: Mutex<Vec<SignerTask>>,
@@ -113,6 +119,7 @@ impl MppSession {
             background_signers,
             close_after_run,
             handles: Mutex::new(HashMap::new()),
+            reuse_channels: Mutex::new(HashMap::new()),
             signer_registry: Mutex::new(Vec::new()),
             hot_stats: Arc::new(HotPathStats::default()),
         }
@@ -130,6 +137,10 @@ impl MppSession {
 
     fn handle(&self, index: u32) -> Option<SessionHandle> {
         self.handles.lock().unwrap().get(&index).cloned()
+    }
+
+    fn reuse_lookup(&self, index: u32) -> Option<(String, u64)> {
+        self.reuse_channels.lock().unwrap().get(&index).cloned()
     }
 }
 
@@ -236,6 +247,10 @@ impl BenchScheme for MppSession {
         }
     }
 
+    fn set_reuse_channels(&self, channels: HashMap<u32, (String, u64)>) {
+        *self.reuse_channels.lock().unwrap() = channels;
+    }
+
     async fn provision_user(&self, ctx: &UserCtx) -> Result<UserSetup> {
         validate_payment_transport(&ctx.endpoint.url)?;
         if self.offline {
@@ -290,6 +305,33 @@ impl BenchScheme for MppSession {
         let www = www_authenticate(&resp).context("provision: no www-authenticate")?;
         let (challenge, request) =
             SessionHandle::parse_challenge(&www).context("provision: not a session challenge")?;
+
+        // Reuse: this wallet already owns an open channel on-chain. Drive it by
+        // address, resuming from its settled watermark, instead of opening (and
+        // paying rent for) a new one. The gateway loads it from chain on the
+        // first voucher (see `session.load_from_chain`).
+        if let Some((channel_id, settled)) = self.reuse_lookup(ctx.index) {
+            let channel = Pubkey::from_str(&channel_id)
+                .map_err(|e| anyhow::anyhow!("reuse: bad channel id {channel_id}: {e}"))?;
+            let session_kp = wallet::subkey(&ctx.wallet.seed(), "session");
+            let signer = Box::new(
+                MemorySigner::from_bytes(&session_kp.keypair)
+                    .map_err(|e| anyhow::anyhow!("reuse session signer: {e}"))?,
+            );
+            let mut raw = RawSession::new(channel, signer);
+            // Continue the monotonic voucher watermark above what is already
+            // settled on-chain, so the first reuse voucher is accepted and
+            // settlement advances rather than rejecting a stale amount.
+            raw.cumulative = settled;
+            let voucher_key = ed25519_dalek::SigningKey::from_bytes(&session_kp.seed());
+            let handle = SessionHandle::from_active(raw, challenge).with_voucher_key(voucher_key);
+            self.handles.lock().unwrap().insert(ctx.index, handle);
+            return Ok(UserSetup {
+                channel_id: Some(channel_id),
+                open_sig: None,
+                ata: None,
+            });
+        }
 
         // 2. Build a genuine payment-channel open transaction against the
         // challenged blockhash and slot. The proxy verifies and broadcasts the

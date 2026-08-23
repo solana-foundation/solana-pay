@@ -875,6 +875,13 @@ pub struct SessionSpec {
     /// converted to basis points for the payment channel distribution.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub splits: Vec<SplitRule>,
+    /// Reuse channels opened by a prior run. When true, a client voucher for a
+    /// channel not in this process's in-memory store is honored by loading the
+    /// channel from chain (resuming from its on-chain settled watermark) instead
+    /// of rejecting it as unknown. Lets a restarted gateway drive channels a
+    /// previous run opened, avoiding re-opening (and re-paying rent for) them.
+    #[serde(default)]
+    pub reuse_from_chain: bool,
 }
 
 /// Idle grace period restarted by each channel touch. The resulting deadline

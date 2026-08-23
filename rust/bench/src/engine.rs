@@ -120,6 +120,30 @@ pub async fn run_pipeline(p: PipelineParams<'_>) -> Result<ReportJson> {
         })
         .collect();
 
+    // ── 3b. Reuse: discover each wallet's existing open channel so provisioning
+    //        drives it by address instead of opening a new one (no new rent). ──
+    if cfg.session.as_ref().is_some_and(|s| s.reuse) && !no_chain {
+        let expected: HashMap<Pubkey, (u32, wallet::Wallet, Pubkey)> = ctxs
+            .iter()
+            .map(|ctx| {
+                let session = wallet::subkey(&ctx.wallet.seed(), "session");
+                (
+                    ctx.wallet.pubkey,
+                    (ctx.index, ctx.wallet.clone(), session.pubkey),
+                )
+            })
+            .collect();
+        let map = crate::session_recovery::discover_reuse_map(&p.rpc_url, &expected)
+            .await
+            .context("discovering reusable channels")?;
+        tracing::info!(
+            reusable = map.len(),
+            users = ctxs.len(),
+            "reuse: discovered existing channels (wallets without one will open)"
+        );
+        scheme.set_reuse_channels(map);
+    }
+
     // ── 4. Provision: fund each wallet, then scheme-specific on-chain setup ──
     p.journal.set_status(Status::Provisioning)?;
     let t_provision = Instant::now();

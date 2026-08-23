@@ -1104,7 +1104,8 @@ impl StartCommand {
                         Arc::clone(&session_channel_store),
                     )
                         .with_realm(api.title.clone())
-                        .with_blockhash_cache(blockhash_cache.clone());
+                        .with_blockhash_cache(blockhash_cache.clone())
+                        .with_reuse_from_chain(sess.reuse_from_chain);
                     if let Some(operator_signer) = fee_payer_signer.clone() {
                         smpp = smpp.with_payment_channel_signer(operator_signer);
                     }

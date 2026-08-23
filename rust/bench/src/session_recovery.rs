@@ -151,6 +151,30 @@ pub async fn recover(
     Ok(())
 }
 
+/// Discover one reusable open channel per fixture wallet, returning
+/// `user index → (channel address, on-chain settled watermark)`. When a wallet
+/// owns several open channels the most-settled one is chosen so a reuse run
+/// resumes from the furthest-progressed watermark. Used by `session.reuse`.
+pub(crate) async fn discover_reuse_map(
+    rpc_url: &str,
+    expected: &HashMap<Pubkey, (u32, Wallet, Pubkey)>,
+) -> Result<HashMap<u32, (String, u64)>> {
+    let rpc = pay_api_core::RpcClient::new(Duration::from_secs(30))?;
+    let channels =
+        discover_fixture_channels(&rpc, rpc_url, CHANNEL_STATUS_OPEN, expected).await?;
+    let mut map: HashMap<u32, (String, u64)> = HashMap::new();
+    for channel in channels {
+        let settled = channel.channel.settlement.settled;
+        let entry = map
+            .entry(channel.index)
+            .or_insert_with(|| (channel.address.to_string(), settled));
+        if settled > entry.1 {
+            *entry = (channel.address.to_string(), settled);
+        }
+    }
+    Ok(map)
+}
+
 async fn discover_fixture_channels(
     rpc: &pay_api_core::RpcClient,
     rpc_url: &str,

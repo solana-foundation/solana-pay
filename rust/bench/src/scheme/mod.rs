@@ -10,6 +10,7 @@ pub mod mpp_session;
 pub mod selftest;
 pub mod x402;
 
+use std::collections::HashMap;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -155,6 +156,12 @@ pub trait BenchScheme: Send + Sync {
 
     /// How much to fund each user, given the load and resolved price.
     fn funding_plan(&self, load: &Load, price: &ResolvedPrice) -> PerUserFunding;
+
+    /// Supply pre-discovered reusable channels (user index → (channel address,
+    /// on-chain settled watermark)) so `provision_user` can drive an existing
+    /// channel instead of opening a new one. Called once before provisioning
+    /// when `session.reuse` is set. Default: ignored.
+    fn set_reuse_channels(&self, _channels: HashMap<u32, (String, u64)>) {}
 
     /// On-chain (or registration) setup for one user. Charge: no-op.
     async fn provision_user(&self, ctx: &UserCtx) -> Result<UserSetup>;

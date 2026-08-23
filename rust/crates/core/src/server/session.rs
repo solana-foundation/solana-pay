@@ -1270,6 +1270,11 @@ pub struct SessionMpp {
     committed_watermarks: Arc<dashmap::DashMap<String, u64>>,
     lifecycle: SessionLifecycleHandle,
     operator_runtime: SessionOperatorRuntime,
+    /// When true, a client voucher for a channel this process never opened
+    /// lazily loads the channel from chain (resuming from its on-chain settled
+    /// watermark) instead of rejecting it. Enables reusing channels opened by a
+    /// prior run across a gateway restart (`session.reuse_from_chain` in yml).
+    reuse_from_chain: bool,
 }
 
 impl SessionMpp {
@@ -1368,11 +1373,19 @@ impl SessionMpp {
                 touches_enabled: Arc::new(AtomicBool::new(false)),
             },
             operator_runtime,
+            reuse_from_chain: false,
         }
     }
 
     pub fn with_realm(mut self, realm: impl Into<String>) -> Self {
         self.realm = realm.into();
+        self
+    }
+
+    /// Enable lazy loading of prior-run channels from chain on an unknown-channel
+    /// client voucher (see [`SessionMpp::reuse_from_chain`]).
+    pub fn with_reuse_from_chain(mut self, enabled: bool) -> Self {
+        self.reuse_from_chain = enabled;
         self
     }
 
@@ -1856,6 +1869,10 @@ impl SessionMpp {
             }
 
             SessionAction::Voucher(p) => {
+                // Reuse: adopt a prior-run channel from chain before verifying,
+                // so a voucher for a channel this process never opened is honored
+                // instead of rejected as unknown.
+                self.ensure_channel_loaded(&p.voucher.data.channel_id).await?;
                 let cumulative = self
                     .server
                     .verify_voucher(p)
@@ -1997,6 +2014,87 @@ impl SessionMpp {
     /// Authenticates the request only — metering happens response-side via
     /// [`Self::authorize_delegated_usage`], which prices the delivered
     /// service and persists the operator-signed cumulative voucher.
+    /// Lazily load a channel opened by a prior run into the in-memory store so a
+    /// client voucher for it verifies instead of being rejected as unknown.
+    /// No-op unless `reuse_from_chain` is set, the channel is absent from the
+    /// store, and it exists on-chain in the open state. The resumed watermark is
+    /// the on-chain settled amount, so the first reuse voucher must exceed it.
+    async fn ensure_channel_loaded(&self, channel_id: &str) -> Result<()> {
+        if !self.reuse_from_chain {
+            return Ok(());
+        }
+        if self
+            .operator_runtime
+            .channel_store
+            .get_channel(channel_id)
+            .await
+            .map_err(|e| Error::Mpp(format!("read session channel {channel_id}: {e}")))?
+            .is_some()
+        {
+            return Ok(());
+        }
+        // Absent on-chain → leave it for verify_voucher to reject as unknown.
+        let Some(chan) = self.operator_runtime.fetch_payment_channel(channel_id).await? else {
+            return Ok(());
+        };
+        // Only adopt channels still open (status 0); sealed/closing ones cannot
+        // accept new vouchers.
+        if chan.status != 0 {
+            return Ok(());
+        }
+        let settled = chan.settlement.settled;
+        let voucher_signer = if self.voucher_signer() == SessionVoucherSigner::Operator {
+            "operator"
+        } else {
+            "client"
+        };
+        let state = ChannelState {
+            channel_id: channel_id.to_string(),
+            authorized_signer: chan.authorized_signer.to_string(),
+            deposit: chan.deposit,
+            cumulative: settled,
+            sealed: false,
+            highest_voucher_signature: None,
+            highest_voucher_expires_at: None,
+            close_requested_at: None,
+            open_slot: Some(chan.open_slot),
+            payer: chan.payer.to_string(),
+            rent_payer: chan.rent_payer.to_string(),
+            // The proof-binding fields live off-chain (open credential) and are
+            // absent here — fine for the client-voucher path, which verifies the
+            // ed25519 signature against `authorized_signer` rather than a proof.
+            opening_challenge_id: String::new(),
+            authentication: None,
+            voucher_signer: voucher_signer.to_string(),
+            idle_timeout_seconds: Some(300),
+            last_activity_at: unix_millis(),
+            spent_amount: 0,
+            settled_on_chain: settled,
+            processed_uses: vec![],
+            processed_topup_signatures: vec![],
+            next_delivery_sequence: 0,
+            pending_deliveries: vec![],
+            committed_deliveries: vec![],
+            lifecycle: None,
+            schema_version: pay_kit::mpp::CHANNEL_STATE_SCHEMA_VERSION,
+            extra: Default::default(),
+        };
+        // Insert only if still absent — a concurrent voucher for the same
+        // channel may have loaded it first.
+        self.operator_runtime
+            .channel_store
+            .update_channel(
+                channel_id,
+                Box::new(move |existing| Ok(existing.unwrap_or(state))),
+            )
+            .await
+            .map_err(|e| Error::Mpp(format!("load channel {channel_id} from chain: {e}")))?;
+        // Adopt it into the settlement candidate set at its on-chain watermark.
+        self.record_committed_watermark(channel_id.to_string(), settled);
+        tracing::debug!(channel = channel_id, settled, "reuse: loaded channel from chain");
+        Ok(())
+    }
+
     async fn verify_use_authentication(&self, payload: &UsePayload) -> Result<ChannelState> {
         if self.voucher_signer() != SessionVoucherSigner::Operator {
             return Err(Error::Mpp(terminal_errors::OPERATOR_ONLY.to_string()));

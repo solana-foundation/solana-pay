@@ -202,6 +202,14 @@ pub struct SessionCfg {
     /// this when validating the server's periodic settlement lifecycle.
     #[serde(default = "default_true")]
     pub close_after_run: bool,
+    /// Reuse existing on-chain channels instead of opening new ones. Before
+    /// provisioning, the engine discovers each fixture wallet's open channel and
+    /// the scheme drives it by address (resuming from its on-chain settled
+    /// watermark), skipping the open. Wallets with no existing channel fall back
+    /// to opening one (bootstrap). Avoids re-paying channel rent every run.
+    /// Requires the gateway to run with `session.load_from_chain: true`.
+    #[serde(default)]
+    pub reuse: bool,
     /// Pure off-chain benchmark mode (no surfpool/fork): deterministic,
     /// confirmed channel state is seeded in the `pay-bench` process and normal
     /// client vouchers are verified through the regular gateway path.
