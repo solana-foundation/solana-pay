@@ -3797,6 +3797,7 @@ value_from_env: PAY_SIGNER_KEYPAIR
             close_batch_interval_ms: 60_000,
             settlement_interval_ms: 5_000,
             splits: vec![],
+            reuse_from_chain: false,
         });
 
         let errs = validate_api_spec(&spec);
@@ -3962,6 +3963,7 @@ value_from_env: PAY_SIGNER_KEYPAIR
             close_batch_interval_ms: 60_000,
             settlement_interval_ms: 5_000,
             splits,
+            reuse_from_chain: false,
         });
         spec
     }

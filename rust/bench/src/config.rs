@@ -365,6 +365,12 @@ impl RunConfig {
         if self.load.settlement_concurrency == 0 {
             bail!("load.settlement_concurrency must be > 0");
         }
+        if !(self.load.provision_min_success_fraction.is_finite()
+            && self.load.provision_min_success_fraction > 0.0
+            && self.load.provision_min_success_fraction <= 1.0)
+        {
+            bail!("load.provision_min_success_fraction must be finite and in (0, 1]");
+        }
         if self.load.proxy_workers == Some(0) {
             bail!("load.proxy_workers must be > 0 when set");
         }
@@ -538,5 +544,18 @@ mod tests {
         cfg.load.settlement_concurrency = 0;
         let error = cfg.validate().unwrap_err();
         assert!(error.to_string().contains("settlement_concurrency"));
+    }
+
+    #[test]
+    fn invalid_provision_success_fraction_is_rejected() {
+        for fraction in [f64::NEG_INFINITY, -0.1, 0.0, 1.1, f64::INFINITY, f64::NAN] {
+            let mut cfg = selftest_config();
+            cfg.load.provision_min_success_fraction = fraction;
+            let error = cfg.validate().unwrap_err();
+            assert!(
+                error.to_string().contains("provision_min_success_fraction"),
+                "fraction={fraction} must be rejected"
+            );
+        }
     }
 }

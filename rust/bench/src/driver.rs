@@ -59,8 +59,8 @@ pub struct DriverConfig {
     pub workers: usize,
     pub http2_prior_knowledge: bool,
     pub tls_ca_certificate: Option<reqwest::Certificate>,
-    /// >0 → use a fixed pool of this many persistent h2 connections
-    /// ([`crate::h2pool::StableH2Pool`]) instead of reqwest. 0 → reqwest.
+    /// A positive value uses a fixed pool of persistent h2 connections via
+    /// [`crate::h2pool::StableH2Pool`] instead of reqwest; zero uses reqwest.
     pub stable_connections: usize,
     /// Target URL for the stable-connection pool (its authority is dialed up
     /// front). Unused when `stable_connections == 0`.

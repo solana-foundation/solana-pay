@@ -67,8 +67,8 @@ pub struct MppSession {
     offline: bool,
     offline_namespace: String,
     pre_sign_requests_per_user: usize,
-    /// >0 → dedicated signer threads fill per-channel queues off the hot path
-    /// for the whole run (see [`SessionCfg::background_signers`]).
+    /// A positive value uses dedicated signer threads to fill per-channel
+    /// queues off the hot path for the whole run (see [`SessionCfg::background_signers`]).
     background_signers: usize,
     close_after_run: bool,
     /// Live channel handles, keyed by user index. `SessionHandle` is `Clone`
@@ -562,7 +562,7 @@ fn signer_thread(bucket: Vec<SignerTask>, stop: Arc<AtomicBool>, stats: Arc<HotP
                             }
                             produced_local += 1;
                             progressed = true;
-                            if produced_local % 8192 == 0 {
+                            if produced_local.is_multiple_of(8192) {
                                 stats.produced.fetch_add(8192, Ordering::Relaxed);
                             }
                         }

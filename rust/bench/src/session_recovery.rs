@@ -11,6 +11,7 @@ use pay_kit::generated::payment_channels::generated::accounts::Channel;
 use pay_kit::mpp::program::payment_channels::{default_program_id, from_address};
 use pay_kit::mpp::solana_keychain::SolanaSigner;
 use pay_kit::mpp::solana_keychain::memory::MemorySigner;
+use pay_worker::channel::STATUS_DISTRIBUTED;
 use sha2::{Digest, Sha256};
 use solana_hash::Hash;
 use solana_instruction::Instruction;
@@ -28,7 +29,6 @@ const CHANNEL_ACCOUNT_SIZE: usize = 256;
 const CHANNEL_STATUS_OFFSET: usize = 3;
 const CHANNEL_STATUS_OPEN: u8 = 0;
 const CHANNEL_STATUS_SEALED: u8 = 1;
-const CHANNEL_STATUS_DISTRIBUTED: u8 = 2;
 
 struct RecoverableChannel {
     address: Pubkey,
@@ -346,8 +346,7 @@ async fn recover_without_gateway_state(
     }
 
     let distributed =
-        discover_fixture_channels(&discovery, rpc_url, CHANNEL_STATUS_DISTRIBUTED, expected)
-            .await?;
+        discover_fixture_channels(&discovery, rpc_url, STATUS_DISTRIBUTED, expected).await?;
     for channel in &distributed {
         validate_rent_reclaim_destination(
             channel.address,
@@ -397,8 +396,7 @@ async fn recover_without_gateway_state(
     let remaining_sealed =
         discover_fixture_channels(&discovery, rpc_url, CHANNEL_STATUS_SEALED, expected).await?;
     let remaining_distributed =
-        discover_fixture_channels(&discovery, rpc_url, CHANNEL_STATUS_DISTRIBUTED, expected)
-            .await?;
+        discover_fixture_channels(&discovery, rpc_url, STATUS_DISTRIBUTED, expected).await?;
     ensure!(
         remaining_open.is_empty()
             && remaining_sealed.is_empty()
@@ -771,5 +769,10 @@ mod tests {
         let error =
             validate_rent_reclaim_destination(Pubkey::new_unique(), Pubkey::default()).unwrap_err();
         assert!(error.to_string().contains("zero rent payer"));
+    }
+
+    #[test]
+    fn distributed_status_uses_the_shared_channel_contract() {
+        assert_eq!(STATUS_DISTRIBUTED, 3);
     }
 }
