@@ -79,6 +79,10 @@ pub struct MppSession {
     /// Populated once before provisioning; `provision_user` drives these instead
     /// of opening new channels. Empty unless `session.reuse` is set.
     reuse_channels: Mutex<HashMap<u32, (String, u64)>>,
+    /// Opens for which the authorization was constructed and is about to be
+    /// sent. If the request/response fails ambiguously, retain the deterministic
+    /// channel address so the engine can journal and close it before sweeping.
+    ambiguous_opens: Mutex<HashMap<u32, UserSetup>>,
     /// Per-channel signer slots, registered as request sources are built and
     /// consumed by [`MppSession::spawn_hot_path`]. Empty unless background mode.
     signer_registry: Mutex<Vec<SignerTask>>,
@@ -120,6 +124,7 @@ impl MppSession {
             close_after_run,
             handles: Mutex::new(HashMap::new()),
             reuse_channels: Mutex::new(HashMap::new()),
+            ambiguous_opens: Mutex::new(HashMap::new()),
             signer_registry: Mutex::new(Vec::new()),
             hot_stats: Arc::new(HotPathStats::default()),
         }
@@ -365,6 +370,18 @@ impl BenchScheme for MppSession {
         let handle =
             SessionHandle::from_active(opened.session, challenge).with_voucher_key(voucher_key);
         let channel_id = opened.open.channel_id.to_string();
+        let setup = UserSetup {
+            channel_id: Some(channel_id.clone()),
+            open_sig: None,
+            ata: None,
+        };
+        // The gateway may broadcast this authorization and then lose its HTTP
+        // response. Save its deterministic channel ID before sending so that
+        // an error cannot turn an on-chain deposit into an untracked wallet.
+        self.ambiguous_opens
+            .lock()
+            .unwrap()
+            .insert(ctx.index, setup.clone());
 
         // 3. Submit the open authorization. A successful open returns a 402
         // requesting the first voucher, not a free 200 response.
@@ -387,11 +404,8 @@ impl BenchScheme for MppSession {
         validate_open_response(status, &body, &channel_id)?;
 
         self.handles.lock().unwrap().insert(ctx.index, handle);
-        Ok(UserSetup {
-            channel_id: Some(channel_id),
-            open_sig: None,
-            ata: None,
-        })
+        self.ambiguous_opens.lock().unwrap().remove(&ctx.index);
+        Ok(setup)
     }
 
     async fn request_source(
@@ -461,7 +475,11 @@ impl BenchScheme for MppSession {
         }))
     }
 
-    async fn settle_and_close(&self, ctx: &UserCtx, _setup: &UserSetup) -> Result<()> {
+    fn take_ambiguous_setup(&self, ctx: &UserCtx) -> Option<UserSetup> {
+        self.ambiguous_opens.lock().unwrap().remove(&ctx.index)
+    }
+
+    async fn settle_and_close(&self, ctx: &UserCtx, setup: &UserSetup) -> Result<()> {
         // Seeded offline fixtures do not own real channels or a settlement
         // signer.  Closing them after the measured window adds an unbounded
         // serial HTTP tail (and can outlive the synthetic challenge) without
@@ -469,8 +487,47 @@ impl BenchScheme for MppSession {
         if self.offline || !self.close_after_run {
             return Ok(());
         }
-        let Some(handle) = self.handle(ctx.index) else {
-            return Ok(());
+        let handle = if let Some(handle) = self.handle(ctx.index) {
+            handle
+        } else {
+            // An open request can reach the gateway while the client observes
+            // a transport/response error. Rebuild a close-only session from
+            // the durable deterministic channel ID; if this close fails the
+            // engine leaves the journal unswept instead of reclaiming only the
+            // wallet balance and stranding the channel deposit/rent.
+            let channel_id = setup
+                .channel_id
+                .as_deref()
+                .context("ambiguous session open has no channel id")?
+                .parse()
+                .context("ambiguous session open has an invalid channel id")?;
+            let challenge_response = build_request(
+                &ctx.http,
+                &ctx.endpoint.method,
+                &ctx.endpoint.url,
+                &ctx.endpoint.body,
+                ctx.host_override.as_deref(),
+                &[],
+            )
+            .send()
+            .await
+            .context("requesting recovery challenge for ambiguous open")?;
+            anyhow::ensure!(
+                challenge_response.status() == StatusCode::PAYMENT_REQUIRED,
+                "expected 402 recovery challenge, got {}",
+                challenge_response.status()
+            );
+            let www = www_authenticate(&challenge_response)
+                .context("ambiguous-open recovery challenge missing")?;
+            let (challenge, _) = SessionHandle::parse_challenge(&www)
+                .context("invalid ambiguous-open recovery challenge")?;
+            let session_key = wallet::subkey(&ctx.wallet.seed(), "session");
+            let signer = Box::new(
+                MemorySigner::from_bytes(&session_key.keypair)
+                    .map_err(|error| anyhow::anyhow!("session signer: {error}"))?,
+            );
+            let voucher_key = ed25519_dalek::SigningKey::from_bytes(&session_key.seed());
+            SessionHandle::new(channel_id, signer, challenge).with_voucher_key(voucher_key)
         };
         let auth = handle
             .close_header(None)
@@ -741,5 +798,41 @@ mod tests {
             scheme.funding_plan(&config.load, &price).sol_lamports,
             PER_USER_SOL_LAMPORTS
         );
+    }
+
+    #[test]
+    fn ambiguous_open_setup_is_retained_for_engine_cleanup() {
+        let config: RunConfig = serde_yml::from_str(include_str!(
+            "../../configs/session-devnet-100k-1m-rehearsal.yml"
+        ))
+        .unwrap();
+        let scheme = MppSession::new(&config);
+        let setup = UserSetup {
+            channel_id: Some("channel-after-response-loss".to_string()),
+            open_sig: None,
+            ata: None,
+        };
+        scheme
+            .ambiguous_opens
+            .lock()
+            .unwrap()
+            .insert(7, setup.clone());
+        let ctx = UserCtx {
+            index: 7,
+            wallet: wallet::derive_user(&[9; 32], "ambiguous-open-test", 7),
+            rpc_url: "http://127.0.0.1:8899".to_string(),
+            endpoint: config.endpoints[0].clone(),
+            http: reqwest::Client::new(),
+            host_override: None,
+            mint: None,
+        };
+
+        assert_eq!(
+            scheme
+                .take_ambiguous_setup(&ctx)
+                .and_then(|value| value.channel_id),
+            setup.channel_id
+        );
+        assert!(scheme.take_ambiguous_setup(&ctx).is_none());
     }
 }

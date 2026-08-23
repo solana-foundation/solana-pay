@@ -166,6 +166,14 @@ pub trait BenchScheme: Send + Sync {
     /// On-chain (or registration) setup for one user. Charge: no-op.
     async fn provision_user(&self, ctx: &UserCtx) -> Result<UserSetup>;
 
+    /// Takes setup state for an open that may have reached chain even though
+    /// [`Self::provision_user`] returned an error. The engine persists and
+    /// closes this state before allowing a wallet to be swept. Most schemes
+    /// have no ambiguous on-chain operation, so the default is empty.
+    fn take_ambiguous_setup(&self, _ctx: &UserCtx) -> Option<UserSetup> {
+        None
+    }
+
     /// Create the bounded request producer for one user. The production-shaped
     /// path signs only when the driver asks for an eligible request. Explicit
     /// offline capacity-isolation configs may pre-sign a fixed, validated

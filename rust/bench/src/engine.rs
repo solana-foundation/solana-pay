@@ -218,11 +218,19 @@ pub async fn run_pipeline(p: PipelineParams<'_>) -> Result<ReportJson> {
                 if !provision_checkpoint.is_empty() {
                     p.journal.upsert_users(provision_checkpoint.drain(..))?;
                 }
+                let setup = scheme.take_ambiguous_setup(ctx_by_index[&idx]);
                 if !no_chain {
-                    p.journal
-                        .upsert_users([user_record(ctx_by_index[&idx], None, per, true)])?;
+                    p.journal.upsert_users([user_record(
+                        ctx_by_index[&idx],
+                        setup.as_ref(),
+                        per,
+                        true,
+                    )])?;
                 }
-                cleanup.push((idx, None));
+                // An MPP open can have been broadcast before its response
+                // failed. Keep its deterministic channel ID and require a
+                // successful close before the wallet is swept/marked clean.
+                cleanup.push((idx, setup));
                 if tolerate_failures {
                     // Skip this channel and keep going; the measured run uses
                     // whatever came up. Sample the first error for the summary.
