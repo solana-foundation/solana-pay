@@ -544,6 +544,9 @@ mod tests {
                 proxy_workers: None,
                 shard_index: 0,
                 shard_count: 1,
+                stable_connections: 0,
+                closed_loop: false,
+                provision_min_success_fraction: 1.0,
             },
             endpoints: vec![],
             session: Some(SessionCfg {
@@ -555,6 +558,8 @@ mod tests {
                 offline_namespace: None,
                 offline_seeded_channels: 1,
                 pre_sign_requests_per_user: 0,
+                background_signers: 0,
+                reuse: false,
             }),
         }
     }

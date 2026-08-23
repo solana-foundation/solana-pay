@@ -160,8 +160,7 @@ pub(crate) async fn discover_reuse_map(
     expected: &HashMap<Pubkey, (u32, Wallet, Pubkey)>,
 ) -> Result<HashMap<u32, (String, u64)>> {
     let rpc = pay_api_core::RpcClient::new(Duration::from_secs(30))?;
-    let channels =
-        discover_fixture_channels(&rpc, rpc_url, CHANNEL_STATUS_OPEN, expected).await?;
+    let channels = discover_fixture_channels(&rpc, rpc_url, CHANNEL_STATUS_OPEN, expected).await?;
     let mut map: HashMap<u32, (String, u64)> = HashMap::new();
     for channel in channels {
         let settled = channel.channel.settlement.settled;
@@ -243,7 +242,11 @@ async fn recover_without_gateway_state(
         open.len(),
         already_sealed.len()
     );
-    validate_zero_voucher_channels(open.iter().chain(already_sealed.iter()), funder, allow_settled)?;
+    validate_zero_voucher_channels(
+        open.iter().chain(already_sealed.iter()),
+        funder,
+        allow_settled,
+    )?;
 
     let concurrency = config.load.provision_concurrency.clamp(1, 256);
     let execution = ExecutionConfig {
@@ -734,7 +737,10 @@ pub async fn top_up(
                 Err(error) => failures.push(format!("user {index} channel {channel}: {error:#}")),
             }
         }
-        println!("top-up progress: {topped} confirmed, {} failed", failures.len());
+        println!(
+            "top-up progress: {topped} confirmed, {} failed",
+            failures.len()
+        );
     }
     println!(
         "top-up complete: {topped} channels funded toward {target_usdc} USDC; {} failed",
@@ -742,7 +748,11 @@ pub async fn top_up(
     );
     if !failures.is_empty() {
         let shown = failures.iter().take(20).cloned().collect::<Vec<_>>();
-        eprintln!("first {} top-up failures:\n{}", shown.len(), shown.join("\n"));
+        eprintln!(
+            "first {} top-up failures:\n{}",
+            shown.len(),
+            shown.join("\n")
+        );
     }
     Ok(())
 }

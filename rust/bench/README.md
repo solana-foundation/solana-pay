@@ -117,13 +117,15 @@ The USDtest session load runs against the retained `devnet-100k-usdg` cohort:
   cohort for USDC benchmarks, not the base for the USDtest session below.
 
 `configs/session-devnet.yml` and `configs/session-devnet-smoke-10.yml` connect
-to the gate over plaintext loopback (`http://127.0.0.1:1402`), so run the bench
-on the gateway host or through an SSH tunnel. TLS is optional — see the note in
-those configs to point them at a remote `https://<host>:1402` gate instead.
+to the TLS-only devnet gateway at `https://213.239.141.29:1402`. Before running
+either plan, set `BENCH_TLS_CA_CERT` to the PEM for the CA that issued the
+gateway certificate. For a self-signed deployment, use the public server
+certificate as the trust anchor; do not use the private key as a CA file.
 
 ```sh
 export BENCH_DEVNET_RPC_URL='https://…'
 export BENCH_FUNDER_KEYPAIR='[solana keypair bytes]'
+export BENCH_TLS_CA_CERT='/path/to/pay-bench-devnet-ca.pem'
 
 # Review the caps in the YAML, then fund SOL + USDG on the retained cohort.
 cargo run -p pay-bench --release -- setup \

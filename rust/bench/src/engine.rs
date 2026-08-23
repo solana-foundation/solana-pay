@@ -317,19 +317,19 @@ pub async fn run_pipeline(p: PipelineParams<'_>) -> Result<ReportJson> {
             .map(|(idx, setup)| {
                 let ctx = ctx_by_index[idx];
                 async move {
-                let result: Result<()> = async {
-                    scheme
-                        .settle_and_close(ctx, setup)
-                        .await
-                        .with_context(|| format!("settling user {}", ctx.index))?;
-                    funder
-                        .sweep(&ctx.wallet, mint_pk.as_ref())
-                        .await
-                        .with_context(|| format!("sweeping user {}", ctx.index))?;
-                    Ok(())
-                }
-                .await;
-                (ctx.index, result)
+                    let result: Result<()> = async {
+                        scheme
+                            .settle_and_close(ctx, setup)
+                            .await
+                            .with_context(|| format!("settling user {}", ctx.index))?;
+                        funder
+                            .sweep(&ctx.wallet, mint_pk.as_ref())
+                            .await
+                            .with_context(|| format!("sweeping user {}", ctx.index))?;
+                        Ok(())
+                    }
+                    .await;
+                    (ctx.index, result)
                 }
             })
             .buffer_unordered(load.settlement_concurrency);

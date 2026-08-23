@@ -39,12 +39,14 @@ operator:
   challenge_binding_secret: "${PAY_SESSION_SECRET}"
 
 session:
-  cap_usdc: 0.01
+  # Keep enough headroom for sustained reuse runs without reopening channels.
+  cap_usdc: 5.0
   min_voucher_delta: 1
-  # The benchmark closes explicitly after each run; background lifecycle and
-  # watermark writes stay disabled so they do not distort the measured window.
+  # Advance the on-chain watermark periodically during long reuse runs.
   close_delay_ms: 0
-  settlement_interval_ms: 0
+  settlement_interval_ms: 120000
+  # Allow a restarted gateway to resume channels opened by a prior run.
+  reuse_from_chain: true
 
 endpoints:
   - method: GET

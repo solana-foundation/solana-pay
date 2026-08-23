@@ -1032,7 +1032,10 @@ pub async fn mint_supply(config_path: &str, amount: &str, yes: bool) -> Result<(
         .submit_and_confirm(&transaction)
         .await
         .context("submitting mint_to")?;
-    println!("minted {amount} {} to funder ATA {funder_ata}: {sig}", asset.label);
+    println!(
+        "minted {amount} {} to funder ATA {funder_ata}: {sig}",
+        asset.label
+    );
     Ok(())
 }
 

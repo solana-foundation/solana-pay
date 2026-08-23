@@ -19,7 +19,6 @@ use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use crossbeam_queue::ArrayQueue;
 use pay_core::client::session::{RawSession, SessionHandle, voucher_header_sync};
-use solana_pubkey::Pubkey;
 use pay_kit::mpp::client::{
     PaymentChannelOpenOptions, PaymentChannelSessionOpenOptions,
     create_payment_channel_session_opener,
@@ -27,6 +26,7 @@ use pay_kit::mpp::client::{
 use pay_kit::mpp::solana_keychain::memory::MemorySigner;
 use pay_kit::mpp::{PaymentCredential, format_authorization};
 use reqwest::StatusCode;
+use solana_pubkey::Pubkey;
 
 use super::{
     BenchScheme, Endpoint, HotPathGuard, HotPathStats, Load, PerUserFunding, PreparedRequest,

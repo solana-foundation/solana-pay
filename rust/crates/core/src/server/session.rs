@@ -1872,7 +1872,8 @@ impl SessionMpp {
                 // Reuse: adopt a prior-run channel from chain before verifying,
                 // so a voucher for a channel this process never opened is honored
                 // instead of rejected as unknown.
-                self.ensure_channel_loaded(&p.voucher.data.channel_id).await?;
+                self.ensure_channel_loaded(&p.voucher.data.channel_id)
+                    .await?;
                 let cumulative = self
                     .server
                     .verify_voucher(p)
@@ -2034,7 +2035,11 @@ impl SessionMpp {
             return Ok(());
         }
         // Absent on-chain → leave it for verify_voucher to reject as unknown.
-        let Some(chan) = self.operator_runtime.fetch_payment_channel(channel_id).await? else {
+        let Some(chan) = self
+            .operator_runtime
+            .fetch_payment_channel(channel_id)
+            .await?
+        else {
             return Ok(());
         };
         // Only adopt channels still open (status 0); sealed/closing ones cannot
@@ -2091,7 +2096,11 @@ impl SessionMpp {
             .map_err(|e| Error::Mpp(format!("load channel {channel_id} from chain: {e}")))?;
         // Adopt it into the settlement candidate set at its on-chain watermark.
         self.record_committed_watermark(channel_id.to_string(), settled);
-        tracing::debug!(channel = channel_id, settled, "reuse: loaded channel from chain");
+        tracing::debug!(
+            channel = channel_id,
+            settled,
+            "reuse: loaded channel from chain"
+        );
         Ok(())
     }
 
