@@ -373,7 +373,11 @@ fn list_runs() -> Result<()> {
         "RUN ID", "SCHEME", "NETWORK", "USERS", "UNSWPT"
     );
     for r in runs {
-        let unswept = r.users.iter().filter(|u| u.funded && !u.swept).count();
+        let unswept = r
+            .users
+            .iter()
+            .filter(|u| (u.funded || u.funding_started) && !u.swept)
+            .count();
         println!(
             "{:<34} {:<13} {:<9} {:>6} {:>6}  {:?}",
             r.run_id,
@@ -402,7 +406,11 @@ async fn recover(run_id: Option<String>, all: bool) -> Result<()> {
         return Ok(());
     }
     for state in targets {
-        let unswept = state.users.iter().filter(|u| u.funded && !u.swept).count();
+        let unswept = state
+            .users
+            .iter()
+            .filter(|u| (u.funded || u.funding_started) && !u.swept)
+            .count();
         println!(
             "recover {} ({:?}, {:?}): {} unswept of {} users",
             state.run_id,

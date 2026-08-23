@@ -194,6 +194,10 @@ pub struct UserRecord {
     pub token_base: u64,
     #[serde(default)]
     pub sol_lamports: u64,
+    /// Set before a funding RPC is issued. Recovery treats this as potentially
+    /// funded: a transport error can occur after the transfer reached chain.
+    #[serde(default)]
+    pub funding_started: bool,
     #[serde(default)]
     pub funded: bool,
     #[serde(default)]

@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use futures::stream::{self, StreamExt};
+use serde_json::{Value, json};
 use solana_pubkey::Pubkey;
 use tracing::Instrument;
 
@@ -74,10 +75,25 @@ pub async fn run_pipeline(p: PipelineParams<'_>) -> Result<ReportJson> {
     );
 
     // ── 2. Funding plan + hard spend caps ───────────────────────────────────
+    let mint_pk: Option<Pubkey> = match &price.mint {
+        Some(m) => Some(m.parse().context("price.mint is not a valid pubkey")?),
+        None => None,
+    };
     let per = scheme.funding_plan(load, &price);
+    // The 402 challenge is untrusted input. For SPL funding, use the mint's
+    // on-chain decimals for cap arithmetic and reject a conflicting challenge
+    // before any wallet receives funds.
+    let token_decimals = if per.token_base == 0 || no_chain {
+        price.decimals
+    } else {
+        let mint = mint_pk
+            .as_ref()
+            .context("SPL funding plan requires a mint in the payment challenge")?;
+        verified_mint_decimals(&p.rpc_url, mint, price.decimals).await?
+    };
     let users = load.users as u128;
     let total_sol = (per.sol_lamports as u128 * users) as f64 / 1e9;
-    let total_token = (per.token_base as u128 * users) as f64 / 10f64.powi(price.decimals as i32);
+    let total_token = (per.token_base as u128 * users) as f64 / 10f64.powi(token_decimals as i32);
     enforce_caps(cfg, total_sol, total_token)?;
     tracing::info!(
         per_user_sol = per.sol_lamports,
@@ -87,11 +103,6 @@ pub async fn run_pipeline(p: PipelineParams<'_>) -> Result<ReportJson> {
         funder = funder.kind(),
         "funding plan within caps"
     );
-
-    let mint_pk: Option<Pubkey> = match &price.mint {
-        Some(m) => Some(m.parse().context("price.mint is not a valid pubkey")?),
-        None => None,
-    };
 
     // ── 3. Build per-user contexts (deterministic wallets) ──────────────────
     // Provisioning opens a real payment channel per user, which broadcasts an
@@ -146,19 +157,29 @@ pub async fn run_pipeline(p: PipelineParams<'_>) -> Result<ReportJson> {
 
     // ── 4. Provision: fund each wallet, then scheme-specific on-chain setup ──
     p.journal.set_status(Status::Provisioning)?;
+    // Persist every wallet before the first funding RPC. A timeout can be
+    // returned after a transfer lands, so even a failed funding result must be
+    // recoverable and swept rather than silently disappearing from the run.
+    if !no_chain {
+        p.journal
+            .upsert_users(ctxs.iter().map(|ctx| user_record(ctx, None, per, false)))?;
+    }
     let t_provision = Instant::now();
     let mut provisioning = stream::iter(ctxs.iter())
         .map(|ctx| {
             async move {
                 let token = mint_pk.as_ref().map(|m| (m, per.token_base));
-                let res = match funder
+                let outcome = match funder
                     .fund(&ctx.wallet.pubkey, per.sol_lamports, token)
                     .await
                 {
-                    Ok(()) => scheme.provision_user(ctx).await,
-                    Err(e) => Err(e),
+                    Ok(()) => match scheme.provision_user(ctx).await {
+                        Ok(setup) => ProvisionOutcome::Provisioned(setup),
+                        Err(error) => ProvisionOutcome::ProvisionFailed(error),
+                    },
+                    Err(error) => ProvisionOutcome::FundingFailed(error),
                 };
-                (ctx.index, res)
+                (ctx.index, outcome)
             }
             .instrument(tracing::info_span!("provision", index = ctx.index))
         })
@@ -171,45 +192,66 @@ pub async fn run_pipeline(p: PipelineParams<'_>) -> Result<ReportJson> {
     let mut provision_failures = 0usize;
     let mut failure_sample: Option<String> = None;
     let mut provisioned: Vec<(u32, UserSetup)> = Vec::with_capacity(ctxs.len());
+    // All funding attempts, including provision failures, must get a sweep.
+    // A `None` setup means no protocol close can safely be attempted, but the
+    // wallet itself still needs its residual SOL/SPL balance reclaimed.
+    let mut cleanup: Vec<(u32, Option<UserSetup>)> = Vec::with_capacity(ctxs.len());
     let mut provision_checkpoint = Vec::with_capacity(JOURNAL_CHECKPOINT_USERS);
-    while let Some((idx, res)) = provisioning.next().await {
-        match res {
-            Ok(setup) => {
+    while let Some((idx, outcome)) = provisioning.next().await {
+        match outcome {
+            ProvisionOutcome::Provisioned(setup) => {
                 if !no_chain {
-                    provision_checkpoint.push(UserRecord {
-                        index: idx,
-                        pubkey: ctx_by_index[&idx].wallet.pubkey.to_string(),
-                        ata: setup.ata.clone(),
-                        channel_id: setup.channel_id.clone(),
-                        open_sig: setup.open_sig.clone(),
-                        token_base: per.token_base,
-                        sol_lamports: per.sol_lamports,
-                        funded: true,
-                        swept: false,
-                    });
+                    provision_checkpoint.push(user_record(
+                        ctx_by_index[&idx],
+                        Some(&setup),
+                        per,
+                        true,
+                    ));
                     if provision_checkpoint.len() == JOURNAL_CHECKPOINT_USERS {
                         p.journal.upsert_users(provision_checkpoint.drain(..))?;
                     }
                 }
+                cleanup.push((idx, Some(setup.clone())));
                 provisioned.push((idx, setup));
             }
-            Err(e) => {
+            ProvisionOutcome::ProvisionFailed(error) => {
                 if !provision_checkpoint.is_empty() {
                     p.journal.upsert_users(provision_checkpoint.drain(..))?;
                 }
+                if !no_chain {
+                    p.journal
+                        .upsert_users([user_record(ctx_by_index[&idx], None, per, true)])?;
+                }
+                cleanup.push((idx, None));
                 if tolerate_failures {
                     // Skip this channel and keep going; the measured run uses
                     // whatever came up. Sample the first error for the summary.
                     provision_failures += 1;
                     if failure_sample.is_none() {
-                        failure_sample = Some(format!("{e:#}"));
+                        failure_sample = Some(format!("{error:#}"));
                     }
                     continue;
                 }
                 // Keep the journal outstanding: the open request may have
                 // reached chain even when its HTTP response failed, and prior
                 // users are definitely funded. Recovery must reconcile it.
-                return Err(e).with_context(|| format!("provisioning user {idx} failed"));
+                return Err(error).with_context(|| format!("provisioning user {idx} failed"));
+            }
+            ProvisionOutcome::FundingFailed(error) => {
+                if !provision_checkpoint.is_empty() {
+                    p.journal.upsert_users(provision_checkpoint.drain(..))?;
+                }
+                // The intent record is already durable; include it in cleanup
+                // because the transfer may have landed despite the RPC error.
+                cleanup.push((idx, None));
+                if tolerate_failures {
+                    provision_failures += 1;
+                    if failure_sample.is_none() {
+                        failure_sample = Some(format!("{error:#}"));
+                    }
+                    continue;
+                }
+                return Err(error).with_context(|| format!("funding user {idx} failed"));
             }
         }
     }
@@ -313,15 +355,17 @@ pub async fn run_pipeline(p: PipelineParams<'_>) -> Result<ReportJson> {
     p.journal.set_status(Status::Settling)?;
     let t_settle = Instant::now();
     if !no_chain {
-        let mut settlement = stream::iter(provisioned.iter())
+        let mut settlement = stream::iter(cleanup.iter())
             .map(|(idx, setup)| {
                 let ctx = ctx_by_index[idx];
                 async move {
                     let result: Result<()> = async {
-                        scheme
-                            .settle_and_close(ctx, setup)
-                            .await
-                            .with_context(|| format!("settling user {}", ctx.index))?;
+                        if let Some(setup) = setup {
+                            scheme
+                                .settle_and_close(ctx, setup)
+                                .await
+                                .with_context(|| format!("settling user {}", ctx.index))?;
+                        }
                         funder
                             .sweep(&ctx.wallet, mint_pk.as_ref())
                             .await
@@ -411,6 +455,95 @@ fn enforce_caps(cfg: &RunConfig, total_sol: f64, total_token: f64) -> Result<()>
     Ok(())
 }
 
+enum ProvisionOutcome {
+    Provisioned(UserSetup),
+    ProvisionFailed(anyhow::Error),
+    FundingFailed(anyhow::Error),
+}
+
+fn user_record(
+    ctx: &UserCtx,
+    setup: Option<&UserSetup>,
+    per: crate::scheme::PerUserFunding,
+    funded: bool,
+) -> UserRecord {
+    UserRecord {
+        index: ctx.index,
+        pubkey: ctx.wallet.pubkey.to_string(),
+        ata: setup.and_then(|value| value.ata.clone()),
+        channel_id: setup.and_then(|value| value.channel_id.clone()),
+        open_sig: setup.and_then(|value| value.open_sig.clone()),
+        token_base: per.token_base,
+        sol_lamports: per.sol_lamports,
+        funding_started: true,
+        funded,
+        swept: false,
+    }
+}
+
+async fn verified_mint_decimals(
+    rpc_url: &str,
+    mint: &Pubkey,
+    challenge_decimals: u8,
+) -> Result<u8> {
+    let response: Value = reqwest::Client::new()
+        .post(rpc_url)
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getAccountInfo",
+            "params": [mint.to_string(), {"encoding": "jsonParsed", "commitment": "confirmed"}],
+        }))
+        .send()
+        .await
+        .context("fetching SPL mint decimals")?
+        .error_for_status()
+        .context("SPL mint decimals RPC returned an error status")?
+        .json()
+        .await
+        .context("decoding SPL mint decimals RPC response")?;
+    validate_challenge_decimals(mint, challenge_decimals, mint_decimals_from_rpc(&response)?)
+}
+
+fn mint_decimals_from_rpc(response: &Value) -> Result<u8> {
+    if let Some(error) = response.get("error") {
+        bail!("SPL mint decimals RPC error: {error}");
+    }
+    let account = response
+        .pointer("/result/value")
+        .filter(|value| !value.is_null())
+        .context("SPL mint account does not exist")?;
+    let owner = account
+        .get("owner")
+        .and_then(Value::as_str)
+        .context("SPL mint account owner is missing")?;
+    anyhow::ensure!(
+        matches!(
+            owner,
+            "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+                | "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
+        ),
+        "mint account is not owned by a recognized SPL token program"
+    );
+    account
+        .pointer("/data/parsed/info/decimals")
+        .and_then(Value::as_u64)
+        .and_then(|value| u8::try_from(value).ok())
+        .context("SPL mint decimals are missing or invalid")
+}
+
+fn validate_challenge_decimals(
+    mint: &Pubkey,
+    challenge_decimals: u8,
+    mint_decimals: u8,
+) -> Result<u8> {
+    anyhow::ensure!(
+        mint_decimals == challenge_decimals,
+        "payment challenge decimals ({challenge_decimals}) do not match mint {mint} decimals ({mint_decimals})"
+    );
+    Ok(mint_decimals)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -444,5 +577,31 @@ mod tests {
         assert!(enforce_caps(&config_with_caps(1.0, f64::NAN), 0.5, 1.0).is_err());
         // A NaN estimate is likewise rejected rather than compared away.
         assert!(enforce_caps(&config_with_caps(1.0, 1.0), f64::NAN, 0.5).is_err());
+    }
+
+    #[test]
+    fn challenge_decimals_must_match_the_mint() {
+        let mint = Pubkey::new_from_array([7; 32]);
+        assert_eq!(validate_challenge_decimals(&mint, 6, 6).unwrap(), 6);
+        assert!(validate_challenge_decimals(&mint, 6, 9).is_err());
+    }
+
+    #[test]
+    fn mint_decimals_requires_a_token_program_owned_mint() {
+        let response = json!({
+            "result": {"value": {
+                "owner": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+                "data": {"parsed": {"info": {"decimals": 6}}}
+            }}
+        });
+        assert_eq!(mint_decimals_from_rpc(&response).unwrap(), 6);
+
+        let not_a_mint = json!({
+            "result": {"value": {
+                "owner": "11111111111111111111111111111111",
+                "data": {"parsed": {"info": {"decimals": 6}}}
+            }}
+        });
+        assert!(mint_decimals_from_rpc(&not_a_mint).is_err());
     }
 }
