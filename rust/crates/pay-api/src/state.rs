@@ -11,6 +11,7 @@ use crate::config::{
     Config, FeePayerConfig, MoonpayConfig, NetworkConfig, SendConfig, SubscriptionsConfig,
 };
 use crate::endpoints::redeem::RedemptionState;
+use crate::endpoints::transfer_batches::PushState;
 
 /// Application state — read-only after construction, so a plain `Arc<AppState>`
 /// is enough; no `RwLock` is needed.
@@ -37,6 +38,11 @@ pub struct AppState {
     /// can't be configured (send disabled, no fee-payer signer, no network, or
     /// no Token-2022 coin).
     pub confidential: HashMap<Network, ConfidentialHandle>,
+    /// Resolved `POST /api/v1/transfer-batches` state. `None` when
+    /// `push.enabled` is false. The endpoint is deliberately not routed until
+    /// caller authentication and fee reimbursement collection are available.
+    #[allow(dead_code)]
+    pub push: Option<PushState>,
 }
 
 impl AppState {
@@ -61,6 +67,12 @@ impl AppState {
 
         let confidential = build_confidential_workers(config, &stablecoins).await;
 
+        let push = if config.push.enabled {
+            Some(PushState::from_config(&config.push).await?)
+        } else {
+            None
+        };
+
         Ok(Self {
             rpc: RpcClient::new(Duration::from_millis(config.rpc_timeout_ms))?,
             networks: config.networks.clone(),
@@ -72,6 +84,7 @@ impl AppState {
             subscriptions_fee_payer,
             redemption,
             confidential,
+            push,
         })
     }
 

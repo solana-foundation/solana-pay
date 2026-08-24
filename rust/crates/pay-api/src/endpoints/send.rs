@@ -266,15 +266,9 @@ async fn verify_paid_send(
             }
         }
     };
-    // Wrap the charge receipt in ReceiptKind::Charge for the new
-    // intent-tagged Payment-Receipt header shape introduced by pay-kit.
-    let kind = pay_kit::mpp::ReceiptKind::Charge(receipt);
-    let receipt_header =
-        pay_kit::mpp::format_receipt(&kind).map_err(|_| ApiError(Error::PaymentChallenge))?;
-    let receipt = match kind {
-        pay_kit::mpp::ReceiptKind::Charge(r) => r,
-        pay_kit::mpp::ReceiptKind::Subscription { base, .. } => base,
-    };
+    let receipt_header = receipt
+        .to_header()
+        .map_err(|_| ApiError(Error::PaymentChallenge))?;
 
     let mut response = (StatusCode::OK, Json(SendReceiptResponse { receipt })).into_response();
     response.headers_mut().insert(

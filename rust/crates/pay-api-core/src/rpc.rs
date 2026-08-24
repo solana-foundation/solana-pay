@@ -423,6 +423,39 @@ impl RpcClient {
             .ok_or(Error::RpcMalformed)
     }
 
+    /// `getLatestBlockhash`, returning both the blockhash and the block
+    /// height after which it stops being valid.
+    ///
+    /// Used by `/api/v1/transfer-batches`' quote step: the caller needs
+    /// `lastValidBlockHeight` (not just the blockhash) so it knows exactly
+    /// when its signed chunk expires and a fresh quote is required. Kept
+    /// separate from [`Self::get_latest_blockhash`] rather than changing
+    /// that method's return type, since `/v1/send` and `/v1/redeem` already
+    /// depend on its `String`-only shape.
+    pub async fn get_latest_blockhash_with_last_valid_height(
+        &self,
+        rpc_url: &str,
+    ) -> Result<(String, u64)> {
+        let body = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getLatestBlockhash",
+            "params": [{ "commitment": "confirmed" }],
+        });
+        let result = self.post_rpc_value(rpc_url, body).await?;
+        let value = result.get("value").ok_or(Error::RpcMalformed)?;
+        let blockhash = value
+            .get("blockhash")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .ok_or(Error::RpcMalformed)?;
+        let last_valid_block_height = value
+            .get("lastValidBlockHeight")
+            .and_then(Value::as_u64)
+            .ok_or(Error::RpcMalformed)?;
+        Ok((blockhash, last_valid_block_height))
+    }
+
     /// `sendTransaction` — submit a fully-signed, base64-encoded transaction.
     /// Returns the transaction signature on success.
     ///

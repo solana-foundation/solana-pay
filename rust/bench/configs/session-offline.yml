@@ -1,0 +1,32 @@
+# Historical recovered baseline — intentionally rejected by current `pay-bench`.
+# Current PayKit requires a verifiable payment-channel transaction for every
+# session open, so this former synthetic Axum verifier must not be used as a
+# proxy or MPP-session result. Use `session-fork.yml` with BENCH_FORK_RPC_URL.
+run:
+  name: session-offline
+  scheme: mpp_session
+  network: fork
+  safety:
+    max_total_usdc: 1.0
+    max_total_sol: 1.0
+    require_confirmation: false
+
+load:
+  # 2000 × 15 = 30k aggregate RPS (the target) for 10s = 300k pre-signed
+  # vouchers — tractable prepare. On fast loopback, in-flight concurrency is
+  # RPS×latency, so high RPS (not user count) is what stresses the proxy.
+  users: 2000
+  requests_per_sec_per_user: 15
+  prepare_secs: 10
+  unleash_secs: 10
+  max_concurrency: 4096
+
+endpoints:
+  - url: "http://placeholder.local/v1/charge"  # overridden at runtime
+    method: POST
+    body: "{}"
+
+session:
+  deposit_usdc: 1.0
+  voucher_usdc: 0.001
+  offline: true

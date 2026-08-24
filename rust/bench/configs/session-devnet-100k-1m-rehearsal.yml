@@ -1,0 +1,37 @@
+# One-boundary rehearsal: 100k live channels at 1M target payments/s.
+run:
+  name: session-devnet-100k-1m-rehearsal
+  scheme: mpp_session
+  network: devnet
+  rpc_url_env: BENCH_DEVNET_RPC_URL
+  tls_ca_cert_env: BENCH_TLS_CA_CERT
+  mint: 6MJyWHwFpPsaTEuYarEz49ngtsSKPYn6yHqtJUW2a9St
+  funder:
+    keypair_env: BENCH_FUNDER_KEYPAIR
+  safety:
+    max_total_usdc: 2500.0
+    # Sponsored opens charge transaction fees and channel rent to the gateway.
+    max_total_sol: 0.0
+    require_confirmation: true
+
+load:
+  users: 100000
+  requests_per_sec_per_user: 10
+  prepare_secs: 30
+  unleash_secs: 360
+  max_concurrency: 131072
+  provision_concurrency: 1000
+  settlement_concurrency: 64
+  workers: 128
+
+endpoints:
+  - url: https://213.239.141.29:1402/api/v1/compute
+    method: GET
+    body: ""
+
+session:
+  deposit_usdc: 0.02
+  voucher_usdc: 0.000001
+  settle_onchain: false
+  # Keep channels open until the boundary audit completes; recover explicitly.
+  close_after_run: false

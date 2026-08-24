@@ -1,0 +1,21 @@
+# Short free-path control with the same offered load as session-offline-10k.
+run:
+  name: selftest-10k-50k
+  scheme: self_test
+  network: fork
+  safety:
+    max_total_usdc: 0.0
+    max_total_sol: 0.0
+    require_confirmation: false
+
+load:
+  users: 10000
+  requests_per_sec_per_user: 5
+  unleash_secs: 15
+  max_concurrency: 4096
+  workers: 32
+
+endpoints:
+  - url: http://127.0.0.1:1/v1/free
+    method: GET
+    body: ""

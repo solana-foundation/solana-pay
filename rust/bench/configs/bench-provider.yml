@@ -1,0 +1,32 @@
+# Provider spec for the local rehearsal proxy. One flat-priced metered endpoint.
+# The middleware routes by subdomain, so rehearsal requests carry
+# `Host: bench.localhost`.
+name: bench
+subdomain: bench
+title: "Bench Rehearsal API"
+description: "Minimal metered endpoint for fork rehearsal."
+category: ai_ml
+version: v1
+
+routing:
+  type: proxy
+  url: https://api.test.invalid/
+
+accounting: pooled
+
+endpoints:
+  - method: POST
+    path: "v1/charge"
+    resource: "charge"
+    description: "Flat rate per request."
+    metering:
+      # The recovered harness supplies only a session backend. Current Pay
+      # defaults an unspecified endpoint to mpp-charge, which correctly fails
+      # closed with 500 because no charge backend is configured here.
+      schemes: [mpp-session]
+      dimensions:
+        - direction: usage
+          unit: requests
+          scale: 1
+          tiers:
+            - price_usd: 0.001

@@ -8,13 +8,21 @@ license.workspace = true
 pay-api-types = { path = "../pay-api-types" }
 
 base64 = "0.22"
+bincode = { workspace = true }
+blake3 = { workspace = true }
 borsh = { version = "1", features = ["derive"] }
 bs58 = "0.5"
+chrono = { workspace = true }
 reqwest = { workspace = true, features = ["json"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 pay-kit = { workspace = true }
+solana-hash = { workspace = true }
+solana-instruction = { workspace = true }
+solana-message = { workspace = true }
 solana-pubkey = { workspace = true }
+solana-signature = { workspace = true }
+solana-transaction = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["time"] }
 tracing = { workspace = true }
@@ -23,3 +31,5 @@ tracing = { workspace = true }
 borsh = { version = "1", features = ["derive"] }
 serde_json = { workspace = true }
 solana-address = { version = "2", features = ["borsh", "curve25519"] }
+solana-keypair = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt"] }

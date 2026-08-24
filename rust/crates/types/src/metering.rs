@@ -690,6 +690,13 @@ pub struct OperatorConfig {
     /// When present, charge endpoints advertise one challenge per listed currency.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub currencies: std::collections::BTreeMap<String, Vec<String>>,
+    /// Explicit non-production mints permitted for MPP session benchmarks.
+    ///
+    /// These mints are never treated as canonical stablecoins. The gateway
+    /// additionally requires `PAY_ALLOW_BENCHMARK_TEST_MINTS=1` before it
+    /// will advertise one as a USD-priced session currency.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub session_benchmark_test_mints: Vec<SessionBenchmarkTestMint>,
     /// Solana RPC URL. Overrides --rpc-url CLI flag.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rpc_url: Option<String>,
@@ -718,6 +725,23 @@ pub struct OperatorConfig {
     pub realm: Option<String>,
 }
 
+/// A locally administered mint allowed only for an explicitly opted-in MPP
+/// session benchmark. The mint owner is checked on-chain at gateway startup.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SessionBenchmarkTestMint {
+    /// Token mint address (base58).
+    pub mint: String,
+    /// Token decimal count. Session USD pricing currently supports six-decimal
+    /// test mints, matching the stablecoin path.
+    #[serde(default = "default_session_benchmark_test_mint_decimals")]
+    pub decimals: u8,
+}
+
+fn default_session_benchmark_test_mint_decimals() -> u8 {
+    6
+}
+
 impl OperatorConfig {
     /// Resolve `${VAR}` placeholders in operator fields.
     pub fn resolve_env_templates(&mut self, context: &str) -> Result<(), String> {
@@ -742,6 +766,12 @@ impl OperatorConfig {
         }
         if let Some(realm) = self.realm.as_mut() {
             *realm = resolve_env_templates_in_string(realm, &format!("{context}.realm"))?;
+        }
+        for (index, mint) in self.session_benchmark_test_mints.iter_mut().enumerate() {
+            mint.mint = resolve_env_templates_in_string(
+                &mint.mint,
+                &format!("{context}.session_benchmark_test_mints[{index}].mint"),
+            )?;
         }
         Ok(())
     }
@@ -875,6 +905,13 @@ pub struct SessionSpec {
     /// converted to basis points for the payment channel distribution.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub splits: Vec<SplitRule>,
+    /// Reuse channels opened by a prior run. When true, a client voucher for a
+    /// channel not in this process's in-memory store is honored by loading the
+    /// channel from chain (resuming from its on-chain settled watermark) instead
+    /// of rejecting it as unknown. Lets a restarted gateway drive channels a
+    /// previous run opened, avoiding re-opening (and re-paying rent for) them.
+    #[serde(default)]
+    pub reuse_from_chain: bool,
 }
 
 /// Idle grace period restarted by each channel touch. The resulting deadline
@@ -3790,6 +3827,7 @@ value_from_env: PAY_SIGNER_KEYPAIR
             close_batch_interval_ms: 60_000,
             settlement_interval_ms: 5_000,
             splits: vec![],
+            reuse_from_chain: false,
         });
 
         let errs = validate_api_spec(&spec);
@@ -3955,6 +3993,7 @@ value_from_env: PAY_SIGNER_KEYPAIR
             close_batch_interval_ms: 60_000,
             settlement_interval_ms: 5_000,
             splits,
+            reuse_from_chain: false,
         });
         spec
     }

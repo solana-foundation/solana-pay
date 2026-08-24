@@ -23,6 +23,15 @@ pub enum AuthIntent {
     OpenSession(String),
     UseGatewayFeePayer(String),
     UseAccount(String),
+    /// One-approval authorization for a `pay push` CSV batch. Shown once
+    /// after read-only preflight, naming the exact recipient count, token
+    /// total, and worst-case ceiling (including gasless reimbursement) the
+    /// resulting signing permit may sign — never a generic "N payments"
+    /// allowance. See `pay_core::client::push::permit`.
+    AuthorizeBatch {
+        message: String,
+        limit: Option<PaymentLimit>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -221,6 +230,39 @@ impl AuthIntent {
         Self::UseGatewayFeePayer("use your pay account as the gateway fee payer".to_string())
     }
 
+    /// Build the one-approval `pay push` batch authorization prompt.
+    ///
+    /// `recipient_total_display` and `max_total_display` are pre-formatted
+    /// decimal amounts (e.g. `"1234.56 USDG"`); `max_total_usd` is the same
+    /// maximum expressed as a `"$..."` string used only to pick the Linux
+    /// Polkit action bucket (stablecoins are USD-pegged 1:1, so the raw
+    /// batch ceiling doubles as its own USD estimate).
+    #[allow(clippy::too_many_arguments)]
+    pub fn authorize_batch(
+        account: &str,
+        recipient_count: usize,
+        recipient_total_display: &str,
+        max_total_display: &str,
+        max_total_usd: &str,
+        currency: &str,
+        network: &str,
+        manifest_hash_prefix: &str,
+    ) -> Self {
+        let message = batch_authorization_message(
+            account,
+            recipient_count,
+            recipient_total_display,
+            max_total_display,
+            currency,
+            network,
+            manifest_hash_prefix,
+        );
+        Self::AuthorizeBatch {
+            message,
+            limit: PaymentLimit::from_amount(max_total_usd),
+        }
+    }
+
     pub fn use_account(message: impl Into<String>) -> Self {
         Self::UseAccount(message.into())
     }
@@ -255,6 +297,7 @@ impl AuthIntent {
     pub fn message(&self) -> &str {
         match self {
             Self::AuthorizePayment { message, .. }
+            | Self::AuthorizeBatch { message, .. }
             | Self::CreateAccount(message)
             | Self::ImportAccount(message)
             | Self::ExportAccount(message)
@@ -267,7 +310,7 @@ impl AuthIntent {
 
     pub fn payment_limit(&self) -> Option<PaymentLimit> {
         match self {
-            Self::AuthorizePayment { limit, .. } => *limit,
+            Self::AuthorizePayment { limit, .. } | Self::AuthorizeBatch { limit, .. } => *limit,
             _ => None,
         }
     }
@@ -359,6 +402,33 @@ fn payment_authorization_message(
     }
 
     message
+}
+
+#[allow(clippy::too_many_arguments)]
+fn batch_authorization_message(
+    account: &str,
+    recipient_count: usize,
+    recipient_total_display: &str,
+    max_total_display: &str,
+    currency: &str,
+    network: &str,
+    manifest_hash_prefix: &str,
+) -> String {
+    let account = truncate_detail(&prompt_detail(account), 64);
+    let currency = truncate_detail(&prompt_detail(currency), 24);
+    let network = truncate_detail(&prompt_detail(network), 24);
+    let manifest_hash_prefix = truncate_detail(&prompt_detail(manifest_hash_prefix), 24);
+
+    format!(
+        "authorize a batch payout from {account}.\n\n\
+         recipients: {recipient_count}\n\n\
+         recipient total: {recipient_total} {currency}\n\n\
+         maximum total: {max_total} {currency}\n\n\
+         network: {network}\n\n\
+         manifest: {manifest_hash_prefix}",
+        recipient_total = truncate_detail(&prompt_detail(recipient_total_display), 32),
+        max_total = truncate_detail(&prompt_detail(max_total_display), 32),
+    )
 }
 
 fn payment_message_with_account(message: &str, account: &str) -> String {
@@ -578,6 +648,21 @@ mod tests {
                 .count(),
             64
         );
+    }
+
+    #[test]
+    fn authorize_batch_names_every_required_field() {
+        let intent = AuthIntent::authorize_batch(
+            "default", 1_000, "1234.56", "1250.00", "$1250.00", "USDG", "mainnet", "a42f82c1",
+        );
+        let message = intent.prompt_message();
+        assert!(message.starts_with("authorize a batch payout from default."));
+        assert!(message.contains("recipients: 1000"));
+        assert!(message.contains("recipient total: 1234.56 USDG"));
+        assert!(message.contains("maximum total: 1250.00 USDG"));
+        assert!(message.contains("network: mainnet"));
+        assert!(message.contains("manifest: a42f82c1"));
+        assert_eq!(intent.payment_limit(), Some(PaymentLimit::AboveUsd50));
     }
 
     #[test]

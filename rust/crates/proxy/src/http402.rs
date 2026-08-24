@@ -96,6 +96,9 @@ pub struct Ctx {
     /// downstream response. Pingora's recorded response can omit headers added
     /// by filters, so keep these explicitly for PDB logging.
     logged_payment_headers: Vec<(HeaderName, HeaderValue)>,
+    /// Normalized request path retained for paid-request and upstream-error
+    /// metrics even when debugger exchange logging is disabled.
+    request_path: String,
 }
 
 struct PendingUpto {
@@ -597,6 +600,7 @@ impl<S: PaymentState> ProxyHttp for Http402Gate<S> {
             observer: None,
             buffered_usage: None,
             logged_payment_headers: Vec::new(),
+            request_path: String::new(),
         }
     }
 
@@ -607,6 +611,7 @@ impl<S: PaymentState> ProxyHttp for Http402Gate<S> {
         let headers = rh.headers.clone();
 
         let path = uri.path().trim_start_matches('/').to_string();
+        ctx.request_path = format!("/{path}");
         let str_h = |n: &str| headers.get(n).and_then(|v| v.to_str().ok());
         let host = str_h("host").map(str::to_string);
 
@@ -615,7 +620,7 @@ impl<S: PaymentState> ProxyHttp for Http402Gate<S> {
         // `/.well-known/*`, `/`) so the debugger only shows real traffic —
         // e.g. the ephemeral `/.well-known/pay-skills.json` that the MCP
         // catalog tools poll must not show up as a failed OLLAMA request.
-        if !is_control_plane(&path) {
+        if !is_control_plane(&path) && self.state.records_http_exchanges() {
             let client_ip = str_h("x-forwarded-for")
                 .and_then(|v| v.split(',').next())
                 .map(|s| s.trim().to_string())
@@ -814,10 +819,9 @@ impl<S: PaymentState> ProxyHttp for Http402Gate<S> {
                 ..
             }) = &ctx.target
         {
-            let path = ctx.log.as_ref().map_or("", |log| log.path.as_str());
             telemetry::record_upstream_error(
                 subdomain,
-                path,
+                &ctx.request_path,
                 upstream,
                 &format!("upstream returned {}", upstream_response.status),
             );
@@ -933,11 +937,10 @@ impl<S: PaymentState> ProxyHttp for Http402Gate<S> {
                         StatusCode::INTERNAL_SERVER_ERROR
                     }
                 });
-            let path = ctx.log.as_ref().map_or("", |log| log.path.as_str());
             telemetry::record_paid_request_completed(
                 paid_request.protocol,
                 &paid_request.subdomain,
-                path,
+                &ctx.request_path,
                 status,
                 paid_request.payment.as_ref(),
             );
@@ -1403,6 +1406,7 @@ mod tests {
             1,
             1,
             100_000,
+            300,
         )
         .unwrap();
         let headers = annotation
@@ -1421,6 +1425,7 @@ mod tests {
         assert_eq!(decoded.decoded["amount"], "1");
         assert_eq!(decoded.decoded["acceptedCumulative"], "1");
         assert_eq!(decoded.decoded["spent"], "1");
+        assert_eq!(decoded.decoded["idleTimeoutSeconds"], 300);
         assert_eq!(decoded.decoded["remaining"], "99999");
         assert!(headers.iter().any(|(name, value)| {
             name == "payment-receipt-url"
