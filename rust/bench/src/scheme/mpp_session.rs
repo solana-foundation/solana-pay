@@ -147,6 +147,15 @@ impl MppSession {
     fn reuse_lookup(&self, index: u32) -> Option<(String, u64)> {
         self.reuse_channels.lock().unwrap().get(&index).cloned()
     }
+
+    fn require_live_channel_close(&self) -> Result<()> {
+        if !self.offline && !self.close_after_run {
+            bail!(
+                "session.close_after_run=false leaves live payment channels open; refusing to sweep wallets or mark the run complete without real-network recovery"
+            );
+        }
+        Ok(())
+    }
 }
 
 fn validate_open_response(status: StatusCode, body: &[u8], expected_channel: &str) -> Result<()> {
@@ -484,9 +493,14 @@ impl BenchScheme for MppSession {
         // signer.  Closing them after the measured window adds an unbounded
         // serial HTTP tail (and can outlive the synthetic challenge) without
         // exercising a production path.
-        if self.offline || !self.close_after_run {
+        if self.offline {
             return Ok(());
         }
+        // A successful return lets the engine sweep the wallet and mark the
+        // durable user record clean. Deferred real channels cannot be recovered
+        // on devnet/mainnet yet, so fail before that point and leave the journal
+        // outstanding with its channel ID instead of stranding the deposit.
+        self.require_live_channel_close()?;
         let handle = if let Some(handle) = self.handle(ctx.index) {
             handle
         } else {
@@ -834,5 +848,33 @@ mod tests {
             setup.channel_id
         );
         assert!(scheme.take_ambiguous_setup(&ctx).is_none());
+    }
+
+    #[test]
+    fn live_deferred_channels_are_not_reported_as_cleaned_up() {
+        let mut config: RunConfig = serde_yml::from_str(include_str!(
+            "../../configs/session-devnet-100k-1m-rehearsal.yml"
+        ))
+        .unwrap();
+        config.session.as_mut().unwrap().close_after_run = false;
+        let scheme = MppSession::new(&config);
+
+        let error = scheme.require_live_channel_close().unwrap_err();
+        assert!(error.to_string().contains("refusing to sweep wallets"));
+    }
+
+    #[test]
+    fn offline_deferred_channels_do_not_require_a_close() {
+        let mut config: RunConfig = serde_yml::from_str(include_str!(
+            "../../configs/session-devnet-100k-1m-rehearsal.yml"
+        ))
+        .unwrap();
+        let session = config.session.as_mut().unwrap();
+        session.offline = true;
+        session.close_after_run = false;
+
+        MppSession::new(&config)
+            .require_live_channel_close()
+            .unwrap();
     }
 }

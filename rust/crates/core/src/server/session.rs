@@ -2047,7 +2047,7 @@ impl SessionMpp {
         // unrelated channel could make this server account for/settle it.
         if chan.status != 0
             || chan.payee.to_string() != self.session_config.recipient
-            || chan.mint.to_string() != self.session_config.currency
+            || !self.accepts_currency(&chan.mint.to_string())
         {
             return Ok(());
         }
