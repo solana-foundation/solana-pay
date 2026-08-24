@@ -14,7 +14,9 @@ use pay_core::server::telemetry::FeePayerWallet;
 use pay_kit::mpp::server::Mpp;
 use pay_kit::mpp::solana_keychain::SolanaSigner;
 use pay_types::Stablecoin;
-use pay_types::metering::{ApiSpec, OperatorConfig, RoutingConfig, SignerConfig};
+use pay_types::metering::{
+    ApiSpec, OperatorConfig, RoutingConfig, SessionBenchmarkTestMint, SignerConfig,
+};
 use tokio::time::{Duration, Instant};
 
 use super::payments::{
@@ -284,22 +286,98 @@ fn x402_currency_configs(
 /// non-pegged session currency (e.g. `SOL`) would advertise and settle a
 /// `$0.01` price as `0.01 SOL`, so refuse to boot instead of mispricing
 /// every voucher.
+fn benchmark_test_mints_enabled() -> bool {
+    matches!(
+        std::env::var("PAY_ALLOW_BENCHMARK_TEST_MINTS").as_deref(),
+        Ok("1") | Ok("true") | Ok("TRUE")
+    )
+}
+
+fn session_benchmark_test_mint<'a>(
+    mint: &str,
+    test_mints: &'a [SessionBenchmarkTestMint],
+) -> Option<&'a SessionBenchmarkTestMint> {
+    test_mints.iter().find(|candidate| candidate.mint == mint)
+}
+
 fn ensure_session_currencies_usd_pegged(
     currency_configs: &[(String, String, u8)],
+    test_mints: &[SessionBenchmarkTestMint],
 ) -> pay_core::Result<()> {
     for (symbol, mint, _decimals) in currency_configs {
+        let is_benchmark_test_mint = session_benchmark_test_mint(mint, test_mints).is_some();
+        if is_benchmark_test_mint && !benchmark_test_mints_enabled() {
+            return Err(pay_core::Error::Config(format!(
+                "session benchmark mint `{mint}` requires PAY_ALLOW_BENCHMARK_TEST_MINTS=1"
+            )));
+        }
         if Stablecoin::parse_symbol(symbol).is_none()
             && !pay_kit::mpp::protocol::solana::is_known_stablecoin_mint(mint)
+            && !is_benchmark_test_mint
         {
             return Err(pay_core::Error::Config(format!(
                 "session currency `{symbol}` is not a recognized USD-pegged stablecoin: \
                  session prices are USD amounts settled 1:1 in token base units, so a \
-                 non-pegged asset would be mispriced; use {}, or USDtest on devnet",
+                 non-pegged asset would be mispriced; use {} or explicitly configure a \
+                 benchmark test mint",
                 Stablecoin::SYMBOL_LIST
             )));
         }
     }
     Ok(())
+}
+
+/// Resolve the program for each advertised session currency. Canonical assets
+/// use PayKit's static table; an explicitly configured benchmark mint is read
+/// from RPC so Token-2022 cannot silently be mistaken for legacy SPL Token.
+fn resolve_session_currency_token_programs(
+    currency_configs: &[(String, String, u8)],
+    test_mints: &[SessionBenchmarkTestMint],
+    rpc_url: &str,
+) -> pay_core::Result<Vec<solana_pubkey::Pubkey>> {
+    use pay_kit::mpp::protocol::solana::programs;
+    use pay_kit::mpp::solana_rpc_client::rpc_client::RpcClient;
+
+    let rpc = RpcClient::new(rpc_url.to_string());
+    currency_configs
+        .iter()
+        .map(|(symbol, mint, decimals)| {
+            if Stablecoin::parse_symbol(symbol).is_some() || Stablecoin::from_mint(mint).is_some() {
+                return solana_pubkey::Pubkey::from_str(
+                    pay_kit::mpp::protocol::solana::default_token_program_for_currency(
+                        mint,
+                        None,
+                    ),
+                )
+                .map_err(|error| pay_core::Error::Config(format!("invalid canonical token program: {error}")));
+            }
+
+            let configured = session_benchmark_test_mint(mint, test_mints).ok_or_else(|| {
+                pay_core::Error::Config(format!("session benchmark mint `{mint}` is not configured"))
+            })?;
+            if configured.decimals != *decimals {
+                return Err(pay_core::Error::Config(format!(
+                    "session benchmark mint `{mint}` declares {} decimals, but session currency `{symbol}` resolves to {decimals}",
+                    configured.decimals
+                )));
+            }
+            let mint_pubkey = solana_pubkey::Pubkey::from_str(mint).map_err(|error| {
+                pay_core::Error::Config(format!("session benchmark mint `{mint}` is invalid: {error}"))
+            })?;
+            let account = rpc.get_account(&mint_pubkey).map_err(|error| {
+                pay_core::Error::Config(format!("failed to fetch session benchmark mint `{mint}`: {error}"))
+            })?;
+            let owner = account.owner.to_string();
+            if owner != programs::TOKEN_2022_PROGRAM {
+                return Err(pay_core::Error::Config(format!(
+                    "session benchmark mint `{mint}` must be owned by Token-2022, found {owner}"
+                )));
+            }
+            solana_pubkey::Pubkey::from_str(programs::TOKEN_2022_PROGRAM).map_err(|error| {
+                pay_core::Error::Config(format!("invalid Token-2022 program id: {error}"))
+            })
+        })
+        .collect()
 }
 
 fn resolve_session_splits(
@@ -948,6 +1026,9 @@ impl StartCommand {
                     Ok((currency.clone(), mpp_currency, decimals))
                 })
                 .collect::<pay_core::Result<_>>()?;
+            let session_benchmark_test_mints = op
+                .map(|operator| operator.session_benchmark_test_mints.clone())
+                .unwrap_or_default();
             let operator_pubkey = fee_payer_signer
                 .as_ref()
                 .map(|signer| signer.pubkey().to_string());
@@ -1020,7 +1101,15 @@ impl StartCommand {
                 use pay_types::metering::SessionVoucherSigner as ConfigVoucherSigner;
                 use std::str::FromStr;
 
-                ensure_session_currencies_usd_pegged(&currency_configs)?;
+                ensure_session_currencies_usd_pegged(
+                    &currency_configs,
+                    &session_benchmark_test_mints,
+                )?;
+                let session_token_programs = resolve_session_currency_token_programs(
+                    &currency_configs,
+                    &session_benchmark_test_mints,
+                    &rpc_url,
+                )?;
 
                 let session_secret = std::env::var("PAY_SESSION_SECRET")
                     .unwrap_or_else(|_| challenge_binding_secret.clone());
@@ -1082,7 +1171,9 @@ impl StartCommand {
                 let (session_channel_store, durable_session_store) =
                     session_channel_store().await?;
                 let mut session_mpps = Vec::with_capacity(currency_configs.len());
-                for (_currency, session_mpp_currency, session_decimals) in &currency_configs {
+                for ((_, session_mpp_currency, session_decimals), token_program) in
+                    currency_configs.iter().zip(session_token_programs)
+                {
                     let cap_base =
                         (sess.cap_usdc * 10f64.powi(i32::from(*session_decimals))).round() as u64;
                     let config = SessionConfig {
@@ -1111,7 +1202,7 @@ impl StartCommand {
                             pay_kit::mpp::program::payment_channels::DEFAULT_GRACE_PERIOD_SECONDS,
                         rpc_url: Some(rpc_url.clone()),
                         channel_program: Some(channel_program_id),
-                        token_program: None,
+                        token_program: Some(token_program),
                     };
 
                     let mut smpp = SessionMpp::new_with_channel_store(
@@ -3602,12 +3693,12 @@ endpoints:
                 6,
             ),
         ];
-        assert!(ensure_session_currencies_usd_pegged(&pegged).is_ok());
+        assert!(ensure_session_currencies_usd_pegged(&pegged, &[]).is_ok());
 
         // SOL resolves (9 decimals) for other schemes but must not open
         // sessions: $0.01 would be advertised and settled as 0.01 SOL.
         let sol = vec![resolve_currency_config("SOL", "mainnet")];
-        let err = ensure_session_currencies_usd_pegged(&sol).unwrap_err();
+        let err = ensure_session_currencies_usd_pegged(&sol, &[]).unwrap_err();
         assert!(err.to_string().contains("not a recognized USD-pegged"));
         assert!(err.to_string().contains("SOL"));
 
@@ -3617,7 +3708,7 @@ endpoints:
             "BonkMintAddress111111111111111111111111111".to_string(),
             6,
         )];
-        assert!(ensure_session_currencies_usd_pegged(&unknown).is_err());
+        assert!(ensure_session_currencies_usd_pegged(&unknown, &[]).is_err());
     }
 
     fn resolve_currency_config(symbol: &str, network: &str) -> (String, String, u8) {
