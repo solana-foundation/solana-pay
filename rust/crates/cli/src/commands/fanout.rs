@@ -66,9 +66,15 @@ pub struct FanoutCommand {
 }
 
 impl FanoutCommand {
-    pub fn run(self, account_override: Option<&str>, verbose: bool) -> Result<()> {
-        validate_network(&self.network)?;
-        if self.network == "mainnet" && self.keypair.is_some() {
+    pub fn run(
+        self,
+        network_override: Option<&str>,
+        account_override: Option<&str>,
+        verbose: bool,
+    ) -> Result<()> {
+        let network = effective_network(&self.network, network_override).to_string();
+        validate_network(&network)?;
+        if network == "mainnet" && self.keypair.is_some() {
             return Err(Error::Config(
                 "--keypair is disabled for mainnet fanout; use a configured pay account so its authentication policy is enforced"
                     .to_string(),
@@ -84,10 +90,10 @@ impl FanoutCommand {
             .rpc_url
             .clone()
             .or_else(|| std::env::var("PAY_RPC_URL").ok())
-            .unwrap_or_else(|| default_rpc_url(&self.network).to_string());
-        let (currency, mint) = resolve_currency(&self.currency, &self.network)?;
+            .unwrap_or_else(|| default_rpc_url(&network).to_string());
+        let (currency, mint) = resolve_currency(&self.currency, &network)?;
         let (store, account_name, sender) =
-            resolve_signing_account(&self.network, account_override, self.keypair.as_deref())?;
+            resolve_signing_account(&network, account_override, self.keypair.as_deref())?;
         let csv = std::fs::read(&self.csv).map_err(|error| {
             Error::Config(format!("failed to read {}: {error}", self.csv.display()))
         })?;
@@ -154,7 +160,7 @@ impl FanoutCommand {
         let mut journal = Journal::create_new(journal_path.clone())?;
         journal.append_run_created(
             manifest_hash,
-            self.network.clone(),
+            network.clone(),
             currency.clone(),
             mint.to_string(),
             mint_info.token_program.to_string(),
@@ -186,12 +192,12 @@ impl FanoutCommand {
             account: &account_name,
             currency: &currency,
             currency_decimals: mint_info.decimals,
-            network: &self.network,
+            network: &network,
             recipient_total_raw: manifest.total_amount_raw,
             max_total_raw: manifest.total_amount_raw,
         };
         let mut permit = BatchSigningPermit::authorize(
-            &self.network,
+            &network,
             store.as_ref(),
             Some(&account_name),
             genesis_hash,
@@ -484,6 +490,10 @@ fn validate_network(network: &str) -> Result<()> {
     }
 }
 
+fn effective_network<'a>(configured: &'a str, override_network: Option<&'a str>) -> &'a str {
+    override_network.unwrap_or(configured)
+}
+
 fn resolve_signing_account(
     network: &str,
     account_override: Option<&str>,
@@ -602,5 +612,11 @@ mod tests {
         assert_eq!(DEFAULT_MAX_IN_FLIGHT, 128);
         assert!(validate_network("devnet").is_ok());
         assert!(validate_network("bogus").is_err());
+    }
+
+    #[test]
+    fn global_network_override_wins_over_fanout_default() {
+        assert_eq!(effective_network("mainnet", Some("devnet")), "devnet");
+        assert_eq!(effective_network("devnet", None), "devnet");
     }
 }

@@ -14,7 +14,7 @@
 //!   unit-testable without a network.
 
 use std::fs::{File, OpenOptions};
-use std::io::{BufRead, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
@@ -420,17 +420,17 @@ pub fn load_events(path: &Path) -> Result<Vec<JournalEvent>> {
     if !path.exists() {
         return Ok(Vec::new());
     }
-    let file = File::open(path)
-        .map_err(|e| Error::Config(format!("failed to open journal {}: {e}", path.display())))?;
-    let lines: Vec<String> = std::io::BufReader::new(file)
-        .lines()
-        .collect::<std::io::Result<_>>()
+    let raw = std::fs::read_to_string(path)
         .map_err(|e| Error::Config(format!("failed to read journal {}: {e}", path.display())))?;
+    let lines: Vec<&str> = raw.split_inclusive('\n').collect();
 
     let mut events = Vec::with_capacity(lines.len());
     let last_index = lines.len().saturating_sub(1);
-    for (index, line) in lines.iter().enumerate() {
+    let mut offset = 0usize;
+    for (index, raw_line) in lines.iter().enumerate() {
+        let line = raw_line.trim_end_matches(['\r', '\n']);
         if line.trim().is_empty() {
+            offset += raw_line.len();
             continue;
         }
         match serde_json::from_str::<JournalEvent>(line) {
@@ -439,6 +439,18 @@ pub fn load_events(path: &Path) -> Result<Vec<JournalEvent>> {
                 if index == last_index {
                     // Tolerate a crash mid-write: the last line may be a
                     // partial JSON record that never finished fsync'ing.
+                    // Remove it before the append-mode writer reopens the
+                    // file so its next event cannot merge into invalid JSON.
+                    OpenOptions::new()
+                        .write(true)
+                        .open(path)
+                        .and_then(|file| file.set_len(offset as u64))
+                        .map_err(|error| {
+                            Error::Config(format!(
+                                "failed to truncate partial journal line in {}: {error}",
+                                path.display()
+                            ))
+                        })?;
                     break;
                 }
                 return Err(Error::Config(format!(
@@ -448,6 +460,7 @@ pub fn load_events(path: &Path) -> Result<Vec<JournalEvent>> {
                 )));
             }
         }
+        offset += raw_line.len();
     }
 
     for pair in events.windows(2) {
@@ -670,6 +683,15 @@ mod tests {
 
         let events = load_events(&path).unwrap();
         assert_eq!(events.len(), 2);
+        let contents = std::fs::read_to_string(&path).unwrap();
+        assert!(contents.ends_with('\n'));
+        assert_eq!(contents.lines().count(), 2);
+
+        let (mut reopened, _) = Journal::open_existing(path.clone()).unwrap();
+        reopened
+            .append_chunk_prepared(2, vec![4], "memo".into())
+            .unwrap();
+        assert_eq!(load_events(&path).unwrap().len(), 3);
     }
 
     #[test]

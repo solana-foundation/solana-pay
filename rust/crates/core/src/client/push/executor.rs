@@ -53,7 +53,9 @@
 //! final) both directly throttle the loop's throughput — no separate rate
 //! limiter is needed for either.
 
+use std::collections::HashMap;
 use std::str::FromStr;
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use solana_hash::Hash;
@@ -635,15 +637,6 @@ impl ChunkBroadcaster for DirectSolanaBroadcaster {
 /// module docs in `pay-api-core::transfer_batch`) instead of a direct RPC
 /// call.
 ///
-/// **Known gap, flagged rather than silently worked around:** this hand-builds
-/// the request/response JSON to the documented wire shape instead of
-/// depending on the shared `pay-api-types` crate, so `core` and
-/// `pay-api-types` can drift without a compiler error catching it. The
-/// correct fix is adding `pay-api-types` as a dependency of `core` (it's
-/// deliberately dependency-light for exactly this kind of cross-consumption)
-/// and importing `TransferBatchRequest`/`TransferBatchChallengeBody`/
-/// `TransferBatchResponse` directly; left as-is here to keep this pass's
-/// blast radius on `core`'s dependency graph to zero.
 pub struct GaslessApiBroadcaster {
     http: reqwest::Client,
     /// e.g. `https://pay.example.com/api/v1/transfer-batches`.
@@ -652,6 +645,8 @@ pub struct GaslessApiBroadcaster {
     sender: Pubkey,
     currency: String,
     network: &'static str,
+    decimals: u8,
+    prepared_requests: Mutex<HashMap<u32, serde_json::Value>>,
 }
 
 impl GaslessApiBroadcaster {
@@ -661,6 +656,7 @@ impl GaslessApiBroadcaster {
         sender: Pubkey,
         currency: String,
         network: &'static str,
+        decimals: u8,
     ) -> Self {
         Self {
             http: reqwest::Client::new(),
@@ -669,6 +665,8 @@ impl GaslessApiBroadcaster {
             sender,
             currency,
             network,
+            decimals,
+            prepared_requests: Mutex::new(HashMap::new()),
         }
     }
 
@@ -684,7 +682,7 @@ impl GaslessApiBroadcaster {
             "transfers": chunk.entries.iter().map(|entry| serde_json::json!({
                 "rowId": entry.row_number,
                 "recipient": entry.recipient.to_string(),
-                "amount": format_token_amount(entry.amount_raw, /* decimals resolved server-side */ 6),
+                "amount": format_token_amount(entry.amount_raw, self.decimals),
             })).collect::<Vec<_>>(),
         })
     }
@@ -692,10 +690,11 @@ impl GaslessApiBroadcaster {
 
 impl ChunkBroadcaster for GaslessApiBroadcaster {
     async fn prepare(&self, chunk: &PlannedChunk) -> Result<PreparedChunkContext> {
+        let request = self.request_body(chunk);
         let response = self
             .http
             .post(&self.endpoint)
-            .json(&self.request_body(chunk))
+            .json(&request)
             .send()
             .await
             .map_err(|e| Error::Config(format!("pay-api transport error: {e}")))?;
@@ -723,6 +722,10 @@ impl ChunkBroadcaster for GaslessApiBroadcaster {
                 Error::Config("pay-api quote is missing challengeLastValidBlockHeight".to_string())
             })?;
 
+        self.prepared_requests
+            .lock()
+            .map_err(|_| Error::Config("gasless request cache lock poisoned".to_string()))?
+            .insert(chunk.chunk_index, request);
         Ok(PreparedChunkContext {
             fee_payer: Pubkey::from_str(fee_payer_str).map_err(|_| {
                 Error::Config("pay-api quote returned a malformed feePayer".to_string())
@@ -735,14 +738,18 @@ impl ChunkBroadcaster for GaslessApiBroadcaster {
     }
 
     async fn broadcast(&self, signed: &SignedChunk) -> Result<BroadcastOutcome> {
-        // Rebuilding the exact submitted body isn't possible from
-        // `SignedChunk` alone (it doesn't carry `chunk_index`'s original
-        // `PlannedChunk`); a real integration keeps the last `prepare`d
-        // chunk around. Recomputing via `row_numbers` here would drop the
-        // recipient/amount fields pay-api's re-validation needs, so this is
-        // deliberately left to construct the body from the caller's
-        // retained chunk — see the doc comment above about the
-        // `pay-api-types` dependency this should really use.
+        let request = self
+            .prepared_requests
+            .lock()
+            .map_err(|_| Error::Config("gasless request cache lock poisoned".to_string()))?
+            .get(&signed.chunk_index)
+            .cloned()
+            .ok_or_else(|| {
+                Error::Config(format!(
+                    "missing prepared gasless request for chunk {}",
+                    signed.chunk_index
+                ))
+            })?;
         let response = self
             .http
             .post(&self.endpoint)
@@ -750,16 +757,7 @@ impl ChunkBroadcaster for GaslessApiBroadcaster {
                 "Authorization",
                 format!("Bearer {}", signed.signed_transaction_base64),
             )
-            .json(&serde_json::json!({
-                "batchId": self.batch_id,
-                "chunkIndex": signed.chunk_index,
-                "sender": self.sender.to_string(),
-                "currency": self.currency,
-                "network": self.network,
-                "transfers": signed.row_numbers.iter().map(|row_id| serde_json::json!({
-                    "rowId": row_id,
-                })).collect::<Vec<_>>(),
-            }))
+            .json(&request)
             .send()
             .await
             .map_err(|e| Error::Config(format!("pay-api transport error: {e}")))?;
@@ -781,6 +779,10 @@ impl ChunkBroadcaster for GaslessApiBroadcaster {
         let signature = Signature::from_str(signature_str).map_err(|_| {
             Error::Config("pay-api submit returned a malformed signature".to_string())
         })?;
+        self.prepared_requests
+            .lock()
+            .map_err(|_| Error::Config("gasless request cache lock poisoned".to_string()))?
+            .remove(&signed.chunk_index);
         Ok(BroadcastOutcome::Settled(signature))
     }
 
@@ -801,7 +803,7 @@ mod tests {
     use crate::accounts::{Account, AccountsFile, Keystore, MemoryAccountsStore};
     use crate::client::push::manifest::{ManifestContext, parse_manifest_csv};
     use crate::client::push::planner::{
-        AtaSnapshot, DestinationAtaStatus, FeePayerMode, pack_chunks,
+        AtaSnapshot, DestinationAtaStatus, FeePayerMode, PlannedTransferEntry, pack_chunks,
     };
     use std::collections::HashMap;
     use std::sync::Mutex;
@@ -831,6 +833,38 @@ mod tests {
         let store = MemoryAccountsStore::with_file(file);
         let pubkey = Pubkey::new_from_array(verifying_key.to_bytes());
         (store, pubkey)
+    }
+
+    #[test]
+    fn gasless_request_keeps_transfer_data_and_uses_mint_decimals() {
+        let sender = Pubkey::new_from_array([1; 32]);
+        let recipient = Pubkey::new_from_array([2; 32]);
+        let broadcaster = GaslessApiBroadcaster::new(
+            "https://pay.example/api/v1/transfer-batches".to_string(),
+            "batch-1".to_string(),
+            sender,
+            "USDG".to_string(),
+            "devnet",
+            2,
+        );
+        let chunk = PlannedChunk {
+            chunk_index: 7,
+            entries: vec![PlannedTransferEntry {
+                row_number: 42,
+                recipient,
+                amount_raw: 123,
+                ata_creation_required: false,
+            }],
+            compute_unit_price_micro_lamports: 0,
+            compute_unit_limit: 0,
+            memo: "test".to_string(),
+            serialized_len: 0,
+        };
+
+        let body = broadcaster.request_body(&chunk);
+        assert_eq!(body["transfers"][0]["rowId"], 42);
+        assert_eq!(body["transfers"][0]["recipient"], recipient.to_string());
+        assert_eq!(body["transfers"][0]["amount"], "1.23");
     }
 
     /// Builds a fresh keystore-backed account, plans `rows` gasless

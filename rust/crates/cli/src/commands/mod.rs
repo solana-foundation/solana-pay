@@ -263,7 +263,7 @@ impl Command {
             Command::Send(cmd) => {
                 return cmd.run(network_override, account_override, verbose);
             }
-            Command::Fanout(cmd) => return cmd.run(account_override, verbose),
+            Command::Fanout(cmd) => return cmd.run(network_override, account_override, verbose),
             Command::Setup(cmd) => return cmd.run(),
             Command::Topup(cmd) => return cmd.run(),
             Command::Server { command } => {

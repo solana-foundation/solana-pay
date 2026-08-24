@@ -2042,9 +2042,13 @@ impl SessionMpp {
         else {
             return Ok(());
         };
-        // Only adopt channels still open (status 0); sealed/closing ones cannot
-        // accept new vouchers.
-        if chan.status != 0 {
+        // Only adopt channels still open (status 0), for this gateway's
+        // configured recipient and mint. Otherwise a valid voucher for an
+        // unrelated channel could make this server account for/settle it.
+        if chan.status != 0
+            || chan.payee.to_string() != self.session_config.recipient
+            || chan.mint.to_string() != self.session_config.currency
+        {
             return Ok(());
         }
         let settled = chan.settlement.settled;

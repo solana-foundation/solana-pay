@@ -819,7 +819,7 @@ impl StartCommand {
                 Some(signer)
             } else if let Some(ref cfg) = signer_cfg {
                 Some(resolve_signer(cfg).await?)
-            } else if (fee_payer || !has_explicit_recipient)
+            } else if (fee_payer || !has_explicit_recipient || api.session.is_some())
                 && let Some(signer) = super::load_account_or_legacy_signer(
                     network.slug(),
                     account_override.as_deref(),
@@ -882,6 +882,13 @@ impl StartCommand {
                      `backend: account`, `backend: file`, or a gcp-kms signer in a \
                      gcp_kms build) or set `operator.fee_payer: false` \
                      so clients pay their own fees."
+                        .to_string(),
+                ));
+            }
+
+            if api.session.is_some() && fee_payer_signer.is_none() {
+                return Err(pay_core::Error::Config(
+                    "live MPP sessions require an operator signer so the gateway can settle and close channels; configure operator.signer or a pay account"
                         .to_string(),
                 ));
             }
@@ -1062,6 +1069,15 @@ impl StartCommand {
                     } else {
                         (recipient.clone(), session_splits)
                     };
+                let settlement_signer = fee_payer_signer
+                    .as_ref()
+                    .expect("live MPP session signer validated above");
+                if settlement_signer.pubkey().to_string() != session_recipient {
+                    return Err(pay_core::Error::Config(
+                        "session settlement signer must match the configured payment recipient"
+                            .to_string(),
+                    ));
+                }
 
                 let (session_channel_store, durable_session_store) =
                     session_channel_store().await?;
@@ -1106,9 +1122,9 @@ impl StartCommand {
                         .with_realm(api.title.clone())
                         .with_blockhash_cache(blockhash_cache.clone())
                         .with_reuse_from_chain(sess.reuse_from_chain);
-                    if let Some(operator_signer) = fee_payer_signer.clone() {
-                        smpp = smpp.with_payment_channel_signer(operator_signer);
-                    }
+                    smpp = smpp.with_payment_channel_signer(fee_payer_signer
+                        .clone()
+                        .expect("live MPP session signer validated above"));
 
                     let smpp = Arc::new(smpp);
                     smpp.start_lifecycle_runloop_with_settlement_and_batching(

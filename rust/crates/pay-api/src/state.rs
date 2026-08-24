@@ -39,7 +39,9 @@ pub struct AppState {
     /// no Token-2022 coin).
     pub confidential: HashMap<Network, ConfidentialHandle>,
     /// Resolved `POST /api/v1/transfer-batches` state. `None` when
-    /// `push.enabled` is false; the handler returns 503 in that case.
+    /// `push.enabled` is false. The endpoint is deliberately not routed until
+    /// caller authentication and fee reimbursement collection are available.
+    #[allow(dead_code)]
     pub push: Option<PushState>,
 }
 
