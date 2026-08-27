@@ -11,7 +11,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature, VerifyingKey};
 use pay_keystore::{AuthGate, AuthIntent, Error as KeystoreError, SubscriptionAuthorization};
 use reqwest::Url;
 use reqwest::blocking::{Client, Response};
@@ -518,8 +518,11 @@ fn verify_attestation_jwt(
         let Ok(verifying_key) = VerifyingKey::from_bytes(&bytes) else {
             return false;
         };
+        // `verify_strict` rejects small-order and non-canonical keys and
+        // signatures. Nothing here is attacker-supplied today, but this is the
+        // single check that gates the whole flow — take the strict variant.
         verifying_key
-            .verify(signing_input.as_bytes(), &signature)
+            .verify_strict(signing_input.as_bytes(), &signature)
             .is_ok()
     });
     if eligible_keys == 0 {

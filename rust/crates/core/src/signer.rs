@@ -337,6 +337,23 @@ pub fn load_keypair_bytes_from_account_with_intent_and_override(
             });
     }
 
+    // An explicitly supplied gate authorizes the ACTION; whether the account's
+    // platform gate is armed is a separate question. The arms below only
+    // consult the override when `auth_required_for_network` is true, and that
+    // defaults to false off mainnet (and can be turned off on mainnet), so
+    // without this a remote backend such as `PAY_AUTH_BACKEND=very` would be
+    // silently dropped — the gate would fail open. Run it here instead, then
+    // hand `None` down so the platform gate is not prompted for twice.
+    let auth_override = if account.auth_required_for_network(network) {
+        auth_override
+    } else {
+        if let Some(gate) = auth_override.as_ref() {
+            gate.authenticate(&account_intent)
+                .map_err(map_file_auth_error)?;
+        }
+        None
+    };
+
     let source = account
         .signer_source(name)
         .expect("non-ephemeral accounts must provide a signer source");
@@ -1018,7 +1035,7 @@ mod tests {
     }
 
     #[test]
-    fn file_account_skips_auth_gate_when_disabled() {
+    fn file_account_skips_platform_auth_gate_when_disabled() {
         let (_temp_dir, account, expected) = fresh_file_account(Some(false));
 
         let bytes = load_keypair_bytes_from_account_with_intent_and_override(
@@ -1026,11 +1043,58 @@ mod tests {
             "default",
             MAINNET_NETWORK,
             &AuthIntent::default_payment(),
-            Some(Box::new(DenyAuth)),
+            None,
         )
         .unwrap();
 
         assert_eq!(&*bytes, &expected);
+    }
+
+    /// `auth_required: false` disarms the *platform* gate. It must not also
+    /// disarm a gate the caller passed in explicitly — that override is how
+    /// `PAY_AUTH_BACKEND=very` reaches the subscription flow, and silently
+    /// dropping it would let the activation sign with no human approval.
+    #[test]
+    fn explicit_auth_override_still_runs_when_platform_gate_is_disabled() {
+        for keystore in [Keystore::File, Keystore::OnePassword] {
+            let (_temp_dir, mut account, _) = fresh_file_account(Some(false));
+            account.keystore = keystore.clone();
+            if keystore == Keystore::OnePassword {
+                account.path = None;
+            }
+
+            let err = load_keypair_bytes_from_account_with_intent_and_override(
+                &account,
+                "default",
+                MAINNET_NETWORK,
+                &AuthIntent::default_payment(),
+                Some(Box::new(DenyAuth)),
+            )
+            .unwrap_err();
+
+            assert!(
+                matches!(err, Error::PaymentRejected(_)),
+                "{keystore:?}: {err}"
+            );
+        }
+    }
+
+    /// Off mainnet `auth_required` defaults to false, so this is the shape the
+    /// sandbox/devnet demo actually hits.
+    #[test]
+    fn explicit_auth_override_runs_on_networks_that_default_to_no_auth() {
+        let (_temp_dir, account, _) = fresh_file_account(None);
+
+        let err = load_keypair_bytes_from_account_with_intent_and_override(
+            &account,
+            "default",
+            "devnet",
+            &AuthIntent::default_payment(),
+            Some(Box::new(DenyAuth)),
+        )
+        .unwrap_err();
+
+        assert!(matches!(err, Error::PaymentRejected(_)));
     }
 
     fn fresh_ephemeral_account() -> Account {

@@ -59,6 +59,11 @@ jobs:
           workspaces: rust
       - run: cargo fmt --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
+      # The optional Very auth backend is off by default, so the two
+      # `#[cfg(feature = "very")]` blocks in pay-cli and pay-mcp are invisible
+      # to the sweep above. Lint them explicitly or they rot.
+      # (`pay`'s `very` feature turns on `pay-mcp/very` too.)
+      - run: cargo clippy -p pay --features very --all-targets -- -D warnings
 
   # ── Windows Rust check ──
   rust-windows-check:

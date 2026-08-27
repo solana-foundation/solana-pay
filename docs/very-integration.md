@@ -13,7 +13,9 @@ action-bound human authorization attestation.
 
 Before opening Very, Pay validates that the subscription request and the
 transaction builder agree on the currency, amount, recipient, cadence, Plan,
-and on-chain Plan terms. It then hashes a canonical, one-time authorization
+and on-chain Plan terms, and that the advertised `decimals` matches the mint's
+real precision for mints Pay knows (so a server cannot make a large recurring
+pull render as a small one). It then hashes a canonical, one-time authorization
 envelope containing:
 
 - the server challenge identity and expiry;
@@ -71,10 +73,13 @@ the service migrates its hostname and issued claims.
 
 If the binary was built without `--features very`, selecting the backend returns
 a configuration error. Leaving `PAY_AUTH_BACKEND` unset preserves the platform
-default. The override applies to sandbox ephemeral wallets and to auth-enabled
-Apple Keychain, GNOME Keyring, Windows Hello, file, and 1Password accounts.
-For 1Password, Very authorizes the subscription action first and the existing
-`op` CLI flow then unlocks the stored key, so expect both approvals.
+default. When selected, the backend applies to every account the subscription
+flow can sign with — sandbox ephemeral wallets and Apple Keychain, GNOME
+Keyring, Windows Hello, file, and 1Password accounts alike — including accounts
+whose own `auth_required` gate is off, which is the default off mainnet. Very
+authorizes the subscription *action*; the account's platform gate, where it is
+armed, still guards the key, so on mainnet expect both a Palm approval and the
+usual Touch ID / polkit / `op` prompt.
 
 ## No-mainnet demo
 

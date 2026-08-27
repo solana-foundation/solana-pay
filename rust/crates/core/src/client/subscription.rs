@@ -206,6 +206,19 @@ fn validate_authorized_terms(
         }
     }
 
+    // `decimals` never reaches the chain — it only scales the amount rendered
+    // in the Touch ID / polkit prompt, in the payment-limit tier, and in the
+    // remote gate's approval description. A server that overstates it makes a
+    // 10 USDC/period pull read as "$0.01", so pin it to the mint whenever the
+    // mint is one we know the true precision for.
+    if let Some(expected) = pay_types::Stablecoin::decimals_for_mint(&details.mint)
+        && details.decimals.unwrap_or(expected) != expected
+    {
+        return Err(Error::Mpp(
+            "Subscription methodDetails.decimals does not match the mint's precision".into(),
+        ));
+    }
+
     let transaction_recipient = details.recipient.as_deref().unwrap_or(&details.puller);
     if request.recipient != transaction_recipient {
         return Err(Error::Mpp(
@@ -1013,6 +1026,26 @@ mod tests {
         request["methodDetails"]["recipient"] = serde_json::json!(PULLER);
         let err = decode(&challenge_from_request(request)).unwrap_err();
         assert!(err.to_string().contains("recipient does not match"));
+    }
+
+    #[test]
+    fn decode_rejects_decimals_that_disagree_with_the_mint() {
+        let mut request = subscription_request("mainnet");
+        // 10 USDC/period rendered as "$0.01" if the client trusts `decimals`.
+        request["methodDetails"]["decimals"] = serde_json::json!(9);
+        let err = decode(&challenge_from_request(request)).unwrap_err();
+        assert!(err.to_string().contains("decimals does not match"));
+    }
+
+    #[test]
+    fn decode_accepts_a_challenge_that_omits_decimals_for_a_known_mint() {
+        let mut request = subscription_request("mainnet");
+        request["methodDetails"]
+            .as_object_mut()
+            .unwrap()
+            .remove("decimals");
+        let decoded = decode(&challenge_from_request(request)).expect("decode");
+        assert_eq!(decoded.decimals, 6);
     }
 
     #[test]
