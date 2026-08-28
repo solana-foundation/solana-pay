@@ -324,7 +324,8 @@ pub fn load_keypair_bytes_from_account_with_intent_and_override(
     intent: &AuthIntent,
     auth_override: AuthOverride,
 ) -> Result<crate::keystore::Zeroizing<Vec<u8>>> {
-    let account_intent = intent.with_account_context_and_pubkey(name, account.pubkey.as_deref());
+    let account_intent = intent
+        .with_account_context_and_pubkey(name, approval_pubkey(intent, account, name).as_deref());
     if account.keystore == Keystore::Ephemeral {
         let _ = auth_override;
         return account
@@ -551,6 +552,38 @@ fn ensure_signer_matches_account_pubkey(
     Ok(())
 }
 
+/// Wallet pubkey to bind into an approval envelope, resolved *before* the gate
+/// runs so a remote backend can show the human which wallet it is authorizing.
+///
+/// The `accounts.yml` cache is the only pre-auth source for OS-keystore and
+/// 1Password accounts: reading their key material is precisely what the gate
+/// exists to authorize, so we must not touch it first. File and ephemeral
+/// accounts are different — their bytes are already readable without a prompt,
+/// so when the cache is absent (hand-written or legacy entries, which every
+/// `pay account` creation path does populate) derive the key instead of handing
+/// the gate an empty subscriber and failing an otherwise valid activation.
+/// [`ensure_signer_matches_account_pubkey`] still cross-checks the cache
+/// afterwards whenever it is present.
+fn approval_pubkey(intent: &AuthIntent, account: &Account, name: &str) -> Option<String> {
+    use pay_kit::mpp::solana_keychain::SolanaSigner;
+
+    if let Some(cached) = account.pubkey.as_deref() {
+        return Some(cached.to_string());
+    }
+    // Only subscription intents carry a subscriber, so ordinary payment
+    // prompts should not pay for a keypair read.
+    intent.subscription_authorization()?;
+
+    let bytes = match account.keystore {
+        Keystore::Ephemeral => crate::keystore::Zeroizing::new(account.ephemeral_keypair_bytes()?),
+        Keystore::File => load_from_file(&account.signer_source(name)?).ok()?,
+        _ => return None,
+    };
+    MemorySigner::from_bytes(&bytes)
+        .ok()
+        .map(|signer| signer.pubkey().to_string())
+}
+
 fn signer_from_ephemeral_with_override(
     account: &Account,
     name: &str,
@@ -558,8 +591,10 @@ fn signer_from_ephemeral_with_override(
     auth_override: AuthOverride,
 ) -> Result<MemorySigner> {
     if let Some(gate) = auth_override {
-        let account_intent =
-            intent.with_account_context_and_pubkey(name, account.pubkey.as_deref());
+        let account_intent = intent.with_account_context_and_pubkey(
+            name,
+            approval_pubkey(intent, account, name).as_deref(),
+        );
         gate.authenticate(&account_intent)
             .map_err(map_file_auth_error)?;
     }
@@ -899,6 +934,73 @@ mod tests {
         }
     }
 
+    /// Records the intent the gate was handed, then denies, so tests can assert
+    /// on what a remote backend would actually have been asked to authorize.
+    #[derive(Clone, Default)]
+    struct CapturingAuth(std::sync::Arc<std::sync::Mutex<Option<AuthIntent>>>);
+
+    impl CapturingAuth {
+        fn subscriber(&self) -> Option<String> {
+            self.0
+                .lock()
+                .unwrap()
+                .as_ref()
+                .and_then(|intent| intent.subscription_authorization())
+                .and_then(|authorization| authorization.subscriber.clone())
+        }
+    }
+
+    impl AuthGate for CapturingAuth {
+        fn authenticate(
+            &self,
+            intent: &AuthIntent,
+        ) -> std::result::Result<(), crate::keystore::Error> {
+            *self.0.lock().unwrap() = Some(intent.clone());
+            Err(crate::keystore::Error::AuthDenied("captured".to_string()))
+        }
+
+        fn is_available(&self) -> bool {
+            true
+        }
+    }
+
+    fn subscription_intent() -> AuthIntent {
+        AuthIntent::authorize_subscription(
+            "$1.00",
+            "Recurring subscription",
+            "merchant.example",
+            crate::keystore::SubscriptionAuthorization {
+                version: 1,
+                challenge_id: "challenge-1".to_string(),
+                challenge_realm: "merchant.example".to_string(),
+                challenge_expires: None,
+                challenge_digest: None,
+                network: MAINNET_NETWORK.to_string(),
+                plan_id: "plan".to_string(),
+                plan_id_numeric: Some(42),
+                plan_bump: Some(254),
+                plan_created_at: Some(1_770_000_000),
+                recipient: "recipient".to_string(),
+                puller: "puller".to_string(),
+                merchant: None,
+                mint: "mint".to_string(),
+                token_program: "token-program".to_string(),
+                program_id: None,
+                amount_base_units: "1000000".to_string(),
+                decimals: 6,
+                period_unit: "day".to_string(),
+                period_count: 30,
+                expected_period_hours: Some(720),
+                subscription_expires: None,
+                external_id: None,
+                fee_payer: false,
+                fee_payer_key: None,
+                account: None,
+                subscriber: None,
+            },
+        )
+    }
+
     fn fresh_file_account(auth_required: Option<bool>) -> (tempfile::TempDir, Account, Vec<u8>) {
         let signing_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
         let verifying_key = signing_key.verifying_key();
@@ -1095,6 +1197,69 @@ mod tests {
         .unwrap_err();
 
         assert!(matches!(err, Error::PaymentRejected(_)));
+    }
+
+    /// A legacy `keystore: file` entry can omit the optional `pubkey` cache.
+    /// The subscriber bound into the approval must then come from the keypair
+    /// itself — otherwise the gate is asked to approve an empty wallet and
+    /// rejects an activation that is perfectly valid.
+    #[test]
+    fn file_account_without_cached_pubkey_still_binds_the_subscriber() {
+        let (_temp_dir, mut account, keypair_bytes) = fresh_file_account(Some(true));
+        let expected = account.pubkey.take().expect("fixture caches a pubkey");
+
+        let gate = CapturingAuth::default();
+        let err = load_keypair_bytes_from_account_with_intent_and_override(
+            &account,
+            "default",
+            MAINNET_NETWORK,
+            &subscription_intent(),
+            Some(Box::new(gate.clone())),
+        )
+        .unwrap_err();
+
+        assert!(matches!(err, Error::PaymentRejected(_)));
+        assert_eq!(gate.subscriber().as_deref(), Some(expected.as_str()));
+        // And the derived key really is the one that would have signed.
+        let signer = MemorySigner::from_bytes(&keypair_bytes).unwrap();
+        use pay_kit::mpp::solana_keychain::SolanaSigner;
+        assert_eq!(signer.pubkey().to_string(), expected);
+    }
+
+    /// The cache stays authoritative when present — deriving must not quietly
+    /// paper over an accounts.yml whose pubkey disagrees with the key on disk.
+    #[test]
+    fn cached_pubkey_is_still_what_gets_bound_and_cross_checked() {
+        let (_temp_dir, mut account, _) = fresh_file_account(Some(true));
+        account.pubkey = Some("11111111111111111111111111111111".to_string());
+
+        let gate = CapturingAuth::default();
+        let _ = load_keypair_bytes_from_account_with_intent_and_override(
+            &account,
+            "default",
+            MAINNET_NETWORK,
+            &subscription_intent(),
+            Some(Box::new(gate.clone())),
+        );
+
+        assert_eq!(
+            gate.subscriber().as_deref(),
+            Some("11111111111111111111111111111111")
+        );
+    }
+
+    /// Ordinary payment prompts have no subscriber field, so the derivation
+    /// must not read key material for them.
+    #[test]
+    fn non_subscription_intents_do_not_derive_a_pubkey() {
+        let (_temp_dir, mut account, _) = fresh_file_account(Some(true));
+        account.pubkey = None;
+
+        assert_eq!(
+            approval_pubkey(&AuthIntent::default_payment(), &account, "default"),
+            None
+        );
+        assert!(approval_pubkey(&subscription_intent(), &account, "default").is_some());
     }
 
     fn fresh_ephemeral_account() -> Account {
