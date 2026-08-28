@@ -25,8 +25,8 @@ import {
     setTransactionMessageFeePayer,
     setTransactionMessageLifetimeUsingBlockhash,
 } from '@solana/kit';
-import { SYSTEM_PROGRAM_ADDRESS } from '@solana-program/system';
-import { TOKEN_PROGRAM_ADDRESS } from '@solana-program/token';
+import { identifySystemInstruction, SYSTEM_PROGRAM_ADDRESS, SystemInstruction } from '@solana-program/system';
+import { identifyTokenInstruction, TOKEN_PROGRAM_ADDRESS, TokenInstruction } from '@solana-program/token';
 
 import { MEMO_PROGRAM_ADDRESS, TOKEN_2022_PROGRAM_ADDRESS } from './constants.js';
 
@@ -52,13 +52,35 @@ const DEFAULT_COMPUTE_UNITS_PER_INSTRUCTION = 200_000;
 
 const MICRO_LAMPORTS_PER_LAMPORT = 1_000_000n;
 
-/** Programs on which `account` is expected to sign in a Solana Pay transaction. */
-const EXPECTED_SIGNER_PROGRAMS: readonly Address[] = [
-    SYSTEM_PROGRAM_ADDRESS,
-    TOKEN_PROGRAM_ADDRESS,
-    TOKEN_2022_PROGRAM_ADDRESS,
-    MEMO_PROGRAM_ADDRESS,
-];
+/**
+ * Whether an instruction referencing the signing account is one it is expected to sign in a
+ * Solana Pay transaction: a SOL or token transfer, or a memo. Everything else — including other
+ * opcodes of the System and Token programs, such as `Assign` or `SetAuthority` — is rejected,
+ * since those can change ownership or authority of the account.
+ */
+function isExpectedAccountInstruction(instruction: Instruction): boolean {
+    if (instruction.programAddress === MEMO_PROGRAM_ADDRESS) return true;
+    if (!instruction.data) return false;
+    const parseable = instruction as Instruction & { data: ReadonlyUint8Array };
+    try {
+        switch (instruction.programAddress) {
+            case SYSTEM_PROGRAM_ADDRESS:
+                return identifySystemInstruction(parseable) === SystemInstruction.TransferSol;
+            case TOKEN_PROGRAM_ADDRESS:
+            case TOKEN_2022_PROGRAM_ADDRESS: {
+                const tokenInstruction = identifyTokenInstruction(parseable);
+                return (
+                    tokenInstruction === TokenInstruction.Transfer ||
+                    tokenInstruction === TokenInstruction.TransferChecked
+                );
+            }
+            default:
+                return false;
+        }
+    } catch {
+        return false;
+    }
+}
 
 /** What a merchant-supplied transaction asks of the account, decoded before it is signed. */
 export interface TransactionInspection {
@@ -130,10 +152,11 @@ function inspectTransactionMessage(message: TransactionMessage): TransactionInsp
 function assertNoUnexpectedAccountUse(instructions: readonly Instruction[], account: Address): void {
     // Signer privileges are transaction-global on Solana: once the account signs the transaction,
     // every instruction referencing the account can act with its signature, regardless of the
-    // role the merchant declared for it. So any reference from an unexpected program is rejected.
+    // role the merchant declared for it. So any reference from an unexpected instruction is
+    // rejected.
     for (const instruction of instructions) {
         const referencesAccount = instruction.accounts?.some(meta => meta.address === account);
-        if (referencesAccount && !EXPECTED_SIGNER_PROGRAMS.includes(instruction.programAddress)) {
+        if (referencesAccount && !isExpectedAccountInstruction(instruction)) {
             throw new FetchTransactionError(
                 `account is a signer on an unexpected instruction for program ${instruction.programAddress}`,
             );

@@ -15,7 +15,8 @@ import {
     setTransactionMessageFeePayerSigner,
     setTransactionMessageLifetimeUsingBlockhash,
 } from '@solana/kit';
-import { getTransferSolInstruction } from '@solana-program/system';
+import { getAssignInstruction, getTransferSolInstruction } from '@solana-program/system';
+import { AuthorityType, getSetAuthorityInstruction, getTransferCheckedInstruction } from '@solana-program/token';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { fetchTransaction, FetchTransactionError } from '../src/index.js';
@@ -178,6 +179,46 @@ describe('fetchTransaction inspection', () => {
             await expect(fetchTransaction(createMockRpc(), SENDER, LINK)).rejects.toThrow(
                 /account is a signer on an unexpected instruction/,
             );
+        });
+
+        it('should reject a System Assign instruction that changes the account owner', async () => {
+            const assignInstruction = getAssignInstruction({
+                account: createNoopSigner(SENDER),
+                programAddress: address('82ZJ7nbGpixjeDCmEhUcmwXYfvurzAgGdtSMuHnUgyny'),
+            });
+            mockMerchantResponse(buildTx({ instructions: [transferInstruction(), assignInstruction] }));
+
+            await expect(fetchTransaction(createMockRpc(), SENDER, LINK)).rejects.toThrow(
+                /account is a signer on an unexpected instruction/,
+            );
+        });
+
+        it('should reject a token SetAuthority instruction referencing the account', async () => {
+            const setAuthorityInstruction = getSetAuthorityInstruction({
+                owned: RECIPIENT,
+                owner: createNoopSigner(SENDER),
+                authorityType: AuthorityType.AccountOwner,
+                newAuthority: address('82ZJ7nbGpixjeDCmEhUcmwXYfvurzAgGdtSMuHnUgyny'),
+            });
+            mockMerchantResponse(buildTx({ instructions: [setAuthorityInstruction] }));
+
+            await expect(fetchTransaction(createMockRpc(), SENDER, LINK)).rejects.toThrow(
+                /account is a signer on an unexpected instruction/,
+            );
+        });
+
+        it('should accept a token TransferChecked instruction with the account as authority', async () => {
+            const transferChecked = getTransferCheckedInstruction({
+                source: address('7dHbWXmci3dT1h5tC8S1ZLw6KcDk4chx6Y6bx4dM3f1h'),
+                mint: address('So11111111111111111111111111111111111111112'),
+                destination: address('GfC73miMwXBoRYDn7gvEZVbhM7n6SUHxJb4LdBz2Mfp6'),
+                authority: createNoopSigner(SENDER),
+                amount: 1_000_000n,
+                decimals: 6,
+            });
+            mockMerchantResponse(buildTx({ instructions: [transferChecked] }));
+
+            await expect(fetchTransaction(createMockRpc(), SENDER, LINK)).resolves.toBeDefined();
         });
 
         it('should accept instructions of unexpected programs that do not reference the account', async () => {
