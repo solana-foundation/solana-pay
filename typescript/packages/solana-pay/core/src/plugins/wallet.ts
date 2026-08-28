@@ -1,6 +1,5 @@
 import type {
     Address,
-    Commitment,
     GetAccountInfoApi,
     GetLatestBlockhashApi,
     GetMultipleAccountsApi,
@@ -10,7 +9,7 @@ import type {
 import type { ClientWithPayer, ClientWithRpc } from '@solana/plugin-interfaces';
 
 import { createTransfer } from '../createTransfer.js';
-import type { FetchedTransaction } from '../fetchTransaction.js';
+import type { FetchedTransaction, FetchTransactionOptions } from '../fetchTransaction.js';
 import { fetchTransaction } from '../fetchTransaction.js';
 import type { TransactionRequestURL, TransferRequestURL } from '../parseURL.js';
 import { parseURL } from '../parseURL.js';
@@ -28,7 +27,7 @@ export interface SolanaPayWalletMethods {
         fetchTransaction(
             account: Address,
             link: URL | string,
-            options?: { commitment?: Commitment },
+            options?: FetchTransactionOptions,
         ): Promise<FetchedTransaction>;
     };
 }
@@ -60,7 +59,7 @@ export function solanaPayWallet() {
             async fetchTransaction(
                 account: Address,
                 link: URL | string,
-                options?: { commitment?: Commitment },
+                options?: FetchTransactionOptions,
             ): Promise<FetchedTransaction> {
                 return await fetchTransaction(client.rpc, account, link, options);
             },
