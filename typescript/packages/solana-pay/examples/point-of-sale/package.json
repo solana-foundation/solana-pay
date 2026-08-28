@@ -19,10 +19,10 @@
         "proxy": "local-ssl-proxy --source 3001 --target 3000"
     },
     "dependencies": {
-        "@solana-program/system": "^0.12.0",
-        "@solana-program/token": "^0.12.0",
+        "@solana-program/system": "^0.14.0",
+        "@solana-program/token": "^0.16.0",
         "@solana/connector": "^0.2.4",
-        "@solana/kit": "^6.9.0",
+        "@solana/kit": "^8.1.0",
         "@solana/pay": "file:../../core",
         "@solana/qr-code-styling": "^1.6.0",
         "@walletconnect/universal-provider": "^2.23.6",
