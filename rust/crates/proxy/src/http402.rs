@@ -876,15 +876,15 @@ impl<S: PaymentState> ProxyHttp for Http402Gate<S> {
         body: &mut Option<bytes::Bytes>,
         end_of_stream: bool,
         ctx: &mut Ctx,
-    ) -> pingora::Result<()> {
+    ) -> pingora::Result<Option<std::time::Duration>> {
         let Some(observer) = ctx.observer.as_mut() else {
-            return Ok(());
+            return Ok(None);
         };
         let Some(log) = ctx.log.as_ref() else {
-            return Ok(());
+            return Ok(None);
         };
         let Some(log_id) = log.log_id else {
-            return Ok(());
+            return Ok(None);
         };
 
         if let Some(chunk) = body.as_ref()
@@ -898,7 +898,7 @@ impl<S: PaymentState> ProxyHttp for Http402Gate<S> {
         } else if observer.should_emit() {
             self.state.record_exchange_update(log_id, &observer.usage);
         }
-        Ok(())
+        Ok(None)
     }
 
     /// Emit the completed exchange to the Payment Debugger. Pingora is the data

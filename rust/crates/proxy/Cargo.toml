@@ -17,7 +17,7 @@ path = "src/lib.rs"
 # coexists with the OpenSSL that solana-rpc-client pulls via native-tls. Pingora's
 # boringssl backend can NOT coexist with that OpenSSL (duplicate symbols → linker
 # error), so rustls is the sole backend.
-pingora = { version = "0.5", default-features = false, features = ["proxy", "rustls"] }
+pingora = { version = "0.8", default-features = false, features = ["proxy", "rustls"] }
 # rustls 0.23 needs a process-default CryptoProvider installed at startup. The
 # dep tree pulls BOTH ring (via pingora) and aws-lc-rs (via reqwest), so rustls
 # can't auto-pick — we install ring explicitly in `run()`. `ring` matches what
