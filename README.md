@@ -40,7 +40,7 @@ pay curl https://debugger.pay.sh/mpp/quote/AAPL
 Wrap your CLI (`curl`, `claude`, `codex`, etc.) -- when an API returns 402, `pay` detects the payment protocol, prepares the stablecoin transaction, asks the local wallet to authorize and sign it, then retries with the payment proof.
 
 Supports both live payment standards on Solana:
-- **[MPP](https://paymentauth.org/draft-solana-charge-00.html/)** — Machine Payments Protocol
+- **[MPP](https://mpp.dev/)** — Machine Payments Protocol
 - **[x402](https://x402.org/)** — x402 Payment Protocol
 
 Stablecoins deployed to Solana are supported out of the box.
