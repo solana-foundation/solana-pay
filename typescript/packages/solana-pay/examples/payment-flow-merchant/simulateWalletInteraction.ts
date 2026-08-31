@@ -1,19 +1,23 @@
 import { lamports } from '@solana/kit';
 import type { TransferRequestURL } from '@solana/pay';
 import { createWalletClient } from '@solana/pay';
-import { airdrop } from '@solana/kit-plugin-airdrop';
+import { rpcAirdrop } from '@solana/kit-plugin-rpc';
+import { airdropPayer } from '@solana/kit-plugin-signer';
 import { CUSTOMER_WALLET } from './constants.js';
 
 export async function simulateWalletInteraction(url: URL) {
     /**
      * Create a wallet client with the customer's signer.
      * Includes transaction planner/executor so we can just call sendTransaction().
+     * Airdrops some SOL to the customer wallet for a successful transaction.
      */
-    const wallet = createWalletClient({
+    const wallet = await createWalletClient({
         rpcUrl: 'http://127.0.0.1:8899',
         rpcSubscriptionsConfig: { url: 'ws://127.0.0.1:8900' },
         payer: CUSTOMER_WALLET,
-    }).use(airdrop());
+    })
+        .use(rpcAirdrop())
+        .use(airdropPayer(lamports(2_000_000_000n)));
 
     /**
      * The URL that triggers the wallet interaction; follows the Solana Pay URL scheme.
@@ -22,12 +26,6 @@ export async function simulateWalletInteraction(url: URL) {
     const { recipient, amount, reference, label, message, memo } = wallet.pay.parseURL(url) as TransferRequestURL;
     console.log('label: ', label);
     console.log('message: ', message);
-
-    /**
-     * Airdrop some SOL to the customer wallet for a successful transaction
-     */
-    await wallet.airdrop(CUSTOMER_WALLET.address, lamports(2_000_000_000n));
-    await new Promise((resolve) => setTimeout(resolve, 5000));
 
     /**
      * Create the transfer instructions from the parsed URL parameters

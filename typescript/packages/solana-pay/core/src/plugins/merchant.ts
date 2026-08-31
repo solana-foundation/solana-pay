@@ -1,10 +1,19 @@
-import type { Address, GetSignaturesForAddressApi, GetTransactionApi, Instruction, Signature } from '@solana/kit';
+import type {
+    Address,
+    GetSignaturesForAddressApi,
+    GetTransactionApi,
+    Instruction,
+    Signature,
+    TransactionVersion,
+    V1TransactionConfig,
+} from '@solana/kit';
 import {
     appendTransactionMessageInstructions,
     compileTransaction,
     createTransactionMessage,
     getBase64EncodedWireTransaction,
     pipe,
+    setTransactionMessageConfig,
     setTransactionMessageFeePayer,
 } from '@solana/kit';
 import type { ClientWithRpc, ClientWithRpcSubscriptions } from '@solana/plugin-interfaces';
@@ -26,6 +35,19 @@ type MerchantRpcSubscriptionsApi = LogsNotificationsApi;
 
 type MerchantCompatibleClient = ClientWithRpc<MerchantRpcApi> & ClientWithRpcSubscriptions<MerchantRpcSubscriptionsApi>;
 
+/** Options for {@link SolanaPayMerchantMethods.pay.buildTransaction}. */
+export interface BuildTransactionOptions {
+    /**
+     * Transaction version to build. Defaults to 0.
+     *
+     * Version 1 transactions budget zero compute units unless `config.computeUnitLimit` is set,
+     * so always provide a config when building version 1.
+     */
+    version?: TransactionVersion;
+    /** Message-level resource limits and priority fee. Only valid for version 1. */
+    config?: V1TransactionConfig;
+}
+
 /** Methods added to a client by the merchant plugin. */
 export interface SolanaPayMerchantMethods {
     readonly pay: {
@@ -44,7 +66,7 @@ export interface SolanaPayMerchantMethods {
             fields: TransferFields,
             options?: { commitment?: Finality },
         ): Promise<Awaited<ReturnType<typeof validateTransfer>>>;
-        buildTransaction(feePayer: Address, instructions: Instruction[]): string;
+        buildTransaction(feePayer: Address, instructions: Instruction[], options?: BuildTransactionOptions): string;
     };
 }
 
@@ -80,9 +102,26 @@ export function solanaPayMerchant() {
             async validateTransfer(signature: Signature, fields: TransferFields, options?: { commitment?: Finality }) {
                 return await validateTransfer(client.rpc, signature, fields, options);
             },
-            buildTransaction(feePayer: Address, instructions: Instruction[]): string {
+            buildTransaction(
+                feePayer: Address,
+                instructions: Instruction[],
+                options?: BuildTransactionOptions,
+            ): string {
+                const { version = 0, config } = options ?? {};
+                if (config && version !== 1) {
+                    throw new Error('buildTransaction config is only valid for version 1 transactions');
+                }
+                if (version === 1) {
+                    const tx = pipe(
+                        createTransactionMessage({ version: 1 }),
+                        m => setTransactionMessageFeePayer(feePayer, m),
+                        m => appendTransactionMessageInstructions(instructions, m),
+                        m => (config ? setTransactionMessageConfig(config, m) : m),
+                    );
+                    return getBase64EncodedWireTransaction(compileTransaction(tx));
+                }
                 const tx = pipe(
-                    createTransactionMessage({ version: 0 }),
+                    createTransactionMessage({ version }),
                     m => setTransactionMessageFeePayer(feePayer, m),
                     m => appendTransactionMessageInstructions(instructions, m),
                 );
