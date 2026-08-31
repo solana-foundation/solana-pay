@@ -48,19 +48,19 @@ impl Default for InMemoryStore {
 
 impl AccountingStore for InMemoryStore {
     fn get_usage(&self, key: &AccountingKey) -> u64 {
-        let counters = self.counters.lock().unwrap();
+        let counters = self.counters.lock().unwrap_or_else(|e| e.into_inner());
         counters.get(key).copied().unwrap_or(0)
     }
 
     fn increment(&self, key: &AccountingKey, amount: u64) -> u64 {
-        let mut counters = self.counters.lock().unwrap();
+        let mut counters = self.counters.lock().unwrap_or_else(|e| e.into_inner());
         let entry = counters.entry(key.clone()).or_insert(0);
         *entry += amount;
         *entry
     }
 
     fn reset_period(&self, period: &str) {
-        let mut counters = self.counters.lock().unwrap();
+        let mut counters = self.counters.lock().unwrap_or_else(|e| e.into_inner());
         counters.retain(|k, _| k.period != period);
     }
 }
