@@ -14,28 +14,28 @@
     "test:proxy": "tsx proxy/e2e.ts"
   },
   "dependencies": {
-    "@solana/kit": "^6.5.0",
-    "@solana/mpp": "^0.5.1",
-    "cors": "^2.8.5",
-    "express": "^4.21.0",
-    "mppx": "^0.5.8",
-    "react": "^19.1.0",
-    "react-dom": "^19.1.0",
-    "x402": "^1.1.0",
-    "x402-express": "^1.1.0"
+    "@solana/kit": "^6.10.0",
+    "@solana/mpp": "^0.5.2",
+    "cors": "^2.8.6",
+    "express": "^4.22.2",
+    "mppx": "^0.5.17",
+    "react": "^19.2.8",
+    "react-dom": "^19.2.8",
+    "x402": "^1.2.0",
+    "x402-express": "^1.2.0"
   },
   "devDependencies": {
-    "@types/cors": "^2.8.0",
-    "@types/express": "^5.0.0",
-    "@types/node": "^22.0.0",
-    "@types/react": "^19.1.0",
-    "@types/react-dom": "^19.1.0",
-    "@vitejs/plugin-react": "^4.4.0",
-    "concurrently": "^9.1.0",
-    "tsx": "^4.0.0",
-    "typescript": "^5.8.0",
-    "vite": "^6.3.0",
-    "vitest": "^3.1.0"
+    "@types/cors": "^2.8.19",
+    "@types/express": "^5.0.6",
+    "@types/node": "^22.20.1",
+    "@types/react": "^19.2.18",
+    "@types/react-dom": "^19.2.5",
+    "@vitejs/plugin-react": "^4.7.0",
+    "concurrently": "^9.2.4",
+    "tsx": "^4.23.13",
+    "typescript": "^5.9.3",
+    "vite": "^6.4.3",
+    "vitest": "^3.2.7"
   },
   "packageManager": "pnpm@9.15.0"
 }

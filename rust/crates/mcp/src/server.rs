@@ -180,12 +180,10 @@ For detailed authoring guidance, use the Pay skill reference
 #[tool_handler]
 impl ServerHandler for PayMcp {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo {
-            protocol_version: ProtocolVersion::V_2025_06_18,
-            capabilities: ServerCapabilities::builder().enable_tools().build(),
-            server_info: rmcp::model::Implementation::from_build_env(),
-            instructions: Some(pay_core::instructions::INSTRUCTIONS.to_string()),
-        }
+        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+            .with_protocol_version(ProtocolVersion::V_2025_06_18)
+            .with_server_info(rmcp::model::Implementation::from_build_env())
+            .with_instructions(pay_core::instructions::INSTRUCTIONS)
     }
 }
 

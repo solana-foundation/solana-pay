@@ -1,4 +1,4 @@
-import type { Address, GetSignaturesForAddressApi, Rpc } from '@solana/kit';
+import type { GetSignaturesForAddressApi, Rpc } from '@solana/kit';
 import type { Commitment, Signature } from '@solana/kit';
 
 import type { Reference } from './types.js';
@@ -47,7 +47,7 @@ export async function findReference(
     { commitment, ...options }: FindReferenceOptions = {},
 ): Promise<ConfirmedSignatureInfo> {
     const signatures = await rpc
-        .getSignaturesForAddress(reference as Address, { ...options, ...(commitment ? { commitment } : {}) })
+        .getSignaturesForAddress(reference, { ...options, ...(commitment ? { commitment } : {}) })
         .send();
 
     const length = signatures.length;

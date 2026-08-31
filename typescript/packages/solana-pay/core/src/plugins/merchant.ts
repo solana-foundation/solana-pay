@@ -90,6 +90,6 @@ export function solanaPayMerchant() {
             },
         };
 
-        return Object.freeze({ ...client, pay }) as SolanaPayMerchantMethods & TClient;
+        return Object.freeze({ ...client, pay });
     };
 }

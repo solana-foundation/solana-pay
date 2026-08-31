@@ -2,7 +2,6 @@ import type {
     CornerDotType,
     CornerSquareType,
     DotType,
-    DrawType,
     ErrorCorrectionLevel,
     Mode,
     Options,
@@ -38,7 +37,7 @@ export function createQR(
 /** @ignore */
 export function createQROptions(url: URL | string, size = 512, background = 'white', color = 'black'): Options {
     return {
-        type: 'svg' as DrawType,
+        type: 'svg',
         width: size,
         height: size,
         data: String(url),

@@ -217,6 +217,10 @@ async fn approved_body_file(
     method: &str,
     url: &str,
 ) -> Result<ApprovedBodyFile, String> {
+    // Filesystem roots remain necessary for body-file authorization on clients
+    // that implement the current roots capability; rmcp marks the helper
+    // deprecated while the protocol transition is underway.
+    #[allow(deprecated)]
     let roots = peer
         .list_roots()
         .await
@@ -1303,12 +1307,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("photo.png");
         std::fs::write(&path, b"image bytes").unwrap();
-        let root = Root {
-            uri: reqwest::Url::from_directory_path(dir.path())
+        let root = Root::new(
+            reqwest::Url::from_directory_path(dir.path())
                 .unwrap()
                 .to_string(),
-            name: Some("workspace".to_string()),
-        };
+        )
+        .with_name("workspace");
 
         let file = resolve_body_file_path("photo.png", &[root]).unwrap();
         assert_eq!(file.path, std::fs::canonicalize(path).unwrap());
@@ -1320,12 +1324,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("payload.json");
         std::fs::write(&path, br#"{"approved":true}"#).unwrap();
-        let root = Root {
-            uri: reqwest::Url::from_directory_path(dir.path())
+        let root = Root::new(
+            reqwest::Url::from_directory_path(dir.path())
                 .unwrap()
                 .to_string(),
-            name: Some("workspace".to_string()),
-        };
+        )
+        .with_name("workspace");
 
         let file = resolve_body_file_path("payload.json", &[root]).unwrap();
         std::fs::write(&path, b"changed").unwrap();
@@ -1346,12 +1350,12 @@ mod tests {
         std::fs::create_dir(&outside).unwrap();
         std::fs::write(root_path.join("payload"), b"approved").unwrap();
         std::fs::write(outside.join("payload"), b"outside!").unwrap();
-        let root = Root {
-            uri: reqwest::Url::from_directory_path(&root_path)
+        let root = Root::new(
+            reqwest::Url::from_directory_path(&root_path)
                 .unwrap()
                 .to_string(),
-            name: Some("workspace".to_string()),
-        };
+        )
+        .with_name("workspace");
 
         let file = resolve_body_file_path("payload", &[root]).unwrap();
         std::fs::rename(&root_path, &moved_root).unwrap();
@@ -1364,12 +1368,11 @@ mod tests {
     fn rejects_file_outside_declared_roots() {
         let allowed = tempfile::tempdir().unwrap();
         let outside = tempfile::NamedTempFile::new().unwrap();
-        let root = Root {
-            uri: reqwest::Url::from_directory_path(allowed.path())
+        let root = Root::new(
+            reqwest::Url::from_directory_path(allowed.path())
                 .unwrap()
                 .to_string(),
-            name: None,
-        };
+        );
 
         let error = resolve_body_file_path(outside.path().to_str().unwrap(), &[root]).unwrap_err();
         assert!(error.contains("outside the MCP client's declared filesystem roots"));
@@ -1380,18 +1383,16 @@ mod tests {
         let first = tempfile::tempdir().unwrap();
         let second = tempfile::tempdir().unwrap();
         let roots = [
-            Root {
-                uri: reqwest::Url::from_directory_path(first.path())
+            Root::new(
+                reqwest::Url::from_directory_path(first.path())
                     .unwrap()
                     .to_string(),
-                name: None,
-            },
-            Root {
-                uri: reqwest::Url::from_directory_path(second.path())
+            ),
+            Root::new(
+                reqwest::Url::from_directory_path(second.path())
                     .unwrap()
                     .to_string(),
-                name: None,
-            },
+            ),
         ];
 
         let error = resolve_body_file_path("photo.png", &roots).unwrap_err();
