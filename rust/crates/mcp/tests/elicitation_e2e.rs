@@ -33,7 +33,7 @@ impl ServerHandler for BareServer {}
 #[derive(Clone)]
 struct ConfigurableClient {
     action: ElicitationAction,
-    last_request: Arc<Mutex<Option<CreateElicitationRequestParam>>>,
+    last_request: Arc<Mutex<Option<CreateElicitationRequestParams>>>,
 }
 
 impl ConfigurableClient {
@@ -48,7 +48,7 @@ impl ConfigurableClient {
 impl ClientHandler for ConfigurableClient {
     async fn create_elicitation(
         &self,
-        request: CreateElicitationRequestParam,
+        request: CreateElicitationRequestParams,
         _context: RequestContext<RoleClient>,
     ) -> Result<CreateElicitationResult, McpError> {
         *self.last_request.lock().await = Some(request);
@@ -60,6 +60,7 @@ impl ClientHandler for ConfigurableClient {
         Ok(CreateElicitationResult {
             action: self.action.clone(),
             content,
+            meta: None,
         })
     }
 }
@@ -68,7 +69,7 @@ async fn run_with_action(
     action: ElicitationAction,
 ) -> (
     Result<(), pay_keystore::Error>,
-    Option<CreateElicitationRequestParam>,
+    Option<CreateElicitationRequestParams>,
 ) {
     let (server_transport, client_transport) = tokio::io::duplex(8192);
 
@@ -134,16 +135,17 @@ async fn auth_succeeds_when_client_accepts() {
     );
 
     let req = received.expect("client should have received an elicitation");
+    let CreateElicitationRequestParams::FormElicitationParams { message, .. } = req else {
+        panic!("client should have received a form elicitation request");
+    };
     // The message should carry the amount and operator from the intent.
     assert!(
-        req.message.contains("$0.50"),
-        "message should mention amount: {:?}",
-        req.message
+        message.contains("$0.50"),
+        "message should mention amount: {message:?}"
     );
     assert!(
-        req.message.contains("test API call"),
-        "message should mention reason: {:?}",
-        req.message
+        message.contains("test API call"),
+        "message should mention reason: {message:?}"
     );
 }
 

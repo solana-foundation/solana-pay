@@ -66,6 +66,6 @@ export function solanaPayWallet() {
             },
         };
 
-        return Object.freeze({ ...client, pay }) as SolanaPayWalletMethods & TClient;
+        return Object.freeze({ ...client, pay });
     };
 }
