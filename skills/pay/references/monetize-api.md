@@ -281,8 +281,8 @@ After the runtime YAML works, add a provider markdown file in the
 `https://github.com/solana-foundation/pay-skills` repository:
 
 ```text
-providers/<operator>/<name>.md
-providers/<operator>/<origin>/<name>.md
+providers/<operator>/<name>/PAY.md
+providers/<operator>/<origin>/<name>/PAY.md
 ```
 
 Use the two-level path when you operate the API directly. Use the three-level
@@ -325,12 +325,13 @@ Use `v1/search` for direct lookup. Include filters in the first request and keep
 - Ask before broad crawls, bulk enrichment, dynamic pricing, or purchases.
 ```
 
-### `openapi:` form (recommended when you serve `/openapi.json`)
+### `openapi:` form (recommended when an OpenAPI document exists)
 
-If your gateway serves `/openapi.json` (see "Serving `/openapi.json`"
-above), drop the inline `endpoints[]` from the registry markdown and point
-`openapi:` at the doc instead. `pay skills build` resolves it at build
-time, walks `paths × methods`, probes each endpoint, and reconstructs
+Fetch and review the OpenAPI document once, trim it to the operations exposed
+through the gateway, and commit it next to `PAY.md`. Drop the inline
+`endpoints[]` from the registry markdown and point `openapi:` at the committed
+sidecar. `pay catalog check` resolves it relative to `PAY.md`, walks
+`paths × methods`, probes each endpoint, and reconstructs
 pricing/protocol/`supported_usd` from the live 402 challenge:
 
 ```markdown
@@ -342,27 +343,24 @@ use_case: "..."
 category: data
 service_url: https://my-api.example.com
 openapi:
-  url: openapi.json
+  path: openapi.json
 ---
 
 ## Usage Notes
 ...
 ```
 
-`openapi:` accepts two forms in the registry:
+`openapi:` accepts two forms in the public registry:
 
-- `openapi: { url: https://my-api.example.com/openapi.json }` —
-  fully-qualified `https://` URL, fetched as-is at build time. This is
-  the recommended form when your gateway exposes `/openapi.json` itself.
+- `openapi: { path: openapi.json }` — a relative path resolved from the
+  directory containing `PAY.md`. Commit the sidecar in that directory. Paths
+  must not be absolute or escape the provider directory.
 - `openapi: { content: | ... }` — inline JSON body via a YAML literal
   block. Useful for small specs that change rarely.
 
-The registry validator requires the `url:` value to be a fully-qualified
-`https://` URL — relative URLs are not accepted because the registry is
-consumed remotely and resolving against `service_url` would be ambiguous.
-`openapi: { path: ... }` is **not** valid in the registry either —
-`path:` is filesystem-only and reserved for `pay gate api --openapi
-<file>`, where the doc is co-located with the YAML on disk.
+`openapi.url` is rejected in the public registry. A remote document can change
+without review and would make builds depend on mutable external state. Fetch it
+for authoring, then commit a reviewed `openapi.json` sidecar instead.
 
 Specs must declare exactly one of `endpoints:` or `openapi:`. Inline
 `endpoints:` is fine for tiny APIs and when you don't have an OpenAPI
@@ -372,15 +370,15 @@ metadata each time the upstream API changes.
 
 ## Frontmatter Best Practices
 
-- `name` must match the filename without `.md`.
+- `name` must match the directory containing `PAY.md`.
 - `title` is the human-readable provider name.
 - `description` is required, 64-255 characters. It should say what the service
   is and what it returns. Do not start it with `Use for`.
 - `use_case` is required, 32-255 characters. Start with `Use for` or `Use when`
   and include task phrases agents will see from users.
 - `category` must be one of the registry categories:
-  `ai_ml analytics cloud compute data devtools finance identity iot maps media
-  messaging other productivity search security storage translation`.
+  `ai_ml cloud compute data devtools finance identity maps media messaging
+  other productivity search security shopping storage translation`.
 - `service_url` must be production HTTPS with a domain name, not localhost or an
   IP address.
 - Add `sandbox_service_url` when available; configure sandbox services to use
@@ -415,49 +413,33 @@ optimize execution and reduce wasted paid calls:
 From a local checkout of `https://github.com/solana-foundation/pay-skills`:
 
 ```sh
-# Static + structural validation; --no-probe skips the network round-trip.
-pay skills build . --output /tmp/pay-skills-dist --no-probe
+# Fast static and structural validation of one provider.
+pay catalog check providers/<operator>/<name>/PAY.md --no-probe
 
-# Probe-driven validation: hit each endpoint, classify, surface the result.
-pay skills probe . \
-  --files providers/<operator>/<name>.md \
+# Probe the provider and calculate the Solana compatibility verdict.
+pay catalog check providers/<operator>/<name>/PAY.md \
   --currencies USDC,USDT \
-  --timeout 15 \
-  --concurrency 5
+  --probe-timeout 15 \
+  --probe-concurrency 5
 
-# Solana-compat gate: warns per non-Solana endpoint, errors when zero
-# classifiable endpoints accept Solana stables.
-pay skills validate . \
-  --files providers/<operator>/<name>.md \
-  --currencies USDC,USDT
+# Run the same changed-provider selection used for local PR preparation.
+pay catalog check . --changed-from origin/main --format github
 ```
 
-`pay skills validate` is the CI gate. Pass `--changed-from origin/main` to
-auto-detect changed providers via git diff, and `--format github` to emit
-`::warning::` / `::error::` workflow-command annotations that surface
-inline on the PR. `--strict` upgrades non-Solana warnings to blocking
-errors when you want zero tolerance.
+`pay catalog check` is the read-only validation command. It parses frontmatter,
+resolves a committed OpenAPI sidecar when present, probes endpoints unless
+`--no-probe` is set, and calculates the Solana compatibility verdict. Use
+`--strict` when every non-Solana endpoint should block. `--format github`
+emits workflow annotations for CI.
 
-If you already have runtime YAML, generate provider markdown from it:
-
-```sh
-pay skills provider sync path/to/*.yml \
-  --operator <operator> \
-  --origin <origin> \
-  --service-url 'https://production-{name}.example.com' \
-  --sandbox-service-url 'https://sandbox-{name}.example.com' \
-  --out providers
-```
-
-The sync command creates a starting point from runtime YAML. Before running
-`pay skills build`, inspect the generated markdown and add registry-only fields
-such as `use_case` plus spend-aware usage notes when they were not present in
-the YAML.
+If you already have runtime YAML, use it as evidence for routes and prices, but
+write the public `PAY.md` in the contributor layout above and validate it with
+`pay catalog check`. Do not publish secrets or unresolved environment values.
 
 ### Partial rebuild on merge
 
-Full rebuilds re-probe every provider and take 5-15 minutes for a registry
-of 30 providers. `pay skills build` accepts `--only` and `--previous-dist`
+Full rebuilds re-probe every provider and take longer as the registry grows.
+`pay catalog build` accepts `--only` and `--previous-dist`
 so a merge-time CI job only re-probes what actually changed:
 
 ```sh
@@ -465,7 +447,7 @@ so a merge-time CI job only re-probes what actually changed:
 gcloud storage rsync gs://pay-skills/v1/ ./prev-dist --recursive
 
 # Rebuild just the providers that changed in this merge; copy the rest verbatim
-pay skills build . \
+pay catalog build . \
   --only operator/foo,operator/bar \
   --previous-dist ./prev-dist \
   --output ./dist
@@ -480,8 +462,8 @@ exists (first run, manual dispatch).
 
 Before opening a PR:
 
-- `pay skills build --no-probe` succeeds.
-- `pay skills validate --files <changed>` either passes or emits warnings
+- `pay catalog check <changed PAY.md> --no-probe` succeeds.
+- `pay catalog check . --changed-from origin/main` either passes or emits warnings
   you've reviewed; nothing should be marked `block`.
 - Paid endpoints return HTTP 402 before payment.
 - Challenges are MPP, MPP session, or x402.
@@ -491,8 +473,8 @@ Before opening a PR:
 - Provider descriptions and endpoint descriptions meet length limits.
 
 Open the PR against `https://github.com/solana-foundation/pay-skills`. CI runs
-static validation and probes changed providers via `pay skills validate`,
+static validation and probes changed providers via `pay catalog check`,
 posting per-endpoint warnings inline. After merge, the partial-rebuild
 workflow re-probes only the providers in the diff, merges them into the
 prior `dist/`, and republishes. Agents discover the updated provider
-through `pay skills search` and Pay MCP `search_catalog`.
+through the Pay catalog and Pay MCP `search_catalog`.

@@ -6,15 +6,15 @@ use std::path::{Component, Path};
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct Params {
-    /// The full `.md` file content (YAML frontmatter + markdown body).
+    /// The full `PAY.md` file content (YAML frontmatter + markdown body).
     #[schemars(
-        description = "Full .md file content with YAML frontmatter between --- delimiters, followed by markdown body"
+        description = "Full PAY.md file content with YAML frontmatter between --- delimiters, followed by markdown body"
     )]
     pub content: String,
 
     /// Optional path to write the validated file to disk.
     #[schemars(
-        description = "Optional: pay-skills provider path to write after validation. Use providers/<operator>/<name>.md for native APIs or providers/<operator>/<origin>/<name>.md for proxied APIs; filename must match the frontmatter name."
+        description = "Optional: pay-skills provider path to write after validation. Use providers/<operator>/<name>/PAY.md for native APIs or providers/<operator>/<origin>/<name>/PAY.md for proxied APIs; the parent directory must match the frontmatter name."
     )]
     pub output_path: Option<String>,
 }
@@ -74,8 +74,8 @@ pub async fn run(params: Params) -> Result<CallToolResult, rmcp::ErrorData> {
                             response.push_str(&format!(
                             "\n## Validate before PR\n\n\
                              ```bash\n\
-                             pay skills build . --output /tmp/pay-skills-dist\n\
-                             pay skills probe . --files {path} --currencies USDC,USDT --timeout 15 --concurrency 5\n\
+                             pay catalog check {path} --no-probe\n\
+                             pay catalog check {path} --currencies USDC,USDT --probe-timeout 15 --probe-concurrency 5\n\
                              ```\n"
                         ));
                         }
@@ -93,11 +93,12 @@ pub async fn run(params: Params) -> Result<CallToolResult, rmcp::ErrorData> {
                      ```text\n{}\n```\n\n\
                      3. Run:\n\n\
                      ```bash\n\
-                     pay skills build . --output /tmp/pay-skills-dist\n\
-                     pay skills probe . --files providers/<operator>/{}.md --currencies USDC,USDT --timeout 15 --concurrency 5\n\
+                     pay catalog check providers/<operator>/{}/PAY.md --no-probe\n\
+                     pay catalog check providers/<operator>/{}/PAY.md --currencies USDC,USDT --probe-timeout 15 --probe-concurrency 5\n\
                      ```\n\n\
                      4. Open a PR. CI will validate the YAML and probe changed paid endpoints.\n",
                     recommended_paths(&validated.spec.name),
+                    validated.spec.name,
                     validated.spec.name
                 ));
             }
@@ -199,32 +200,36 @@ fn endpoint_counts(spec: &pay_types::registry::ProviderFrontmatter) -> (usize, u
 }
 
 fn recommended_paths(name: &str) -> String {
-    format!("providers/<operator>/{name}.md\nproviders/<operator>/<origin>/{name}.md")
+    format!("providers/<operator>/{name}/PAY.md\nproviders/<operator>/<origin>/{name}/PAY.md")
 }
 
 fn validate_output_path(path: &str, name: &str) -> Vec<String> {
     let mut errors = Vec::new();
     let path_ref = Path::new(path);
 
-    if path_ref.extension().and_then(|e| e.to_str()) != Some("md") {
-        errors.push("output_path must end in `.md`".to_string());
+    if path_ref.file_name().and_then(|e| e.to_str()) != Some("PAY.md") {
+        errors.push("output_path must end in `PAY.md`".to_string());
     }
 
-    match path_ref.file_stem().and_then(|s| s.to_str()) {
-        Some(stem) if stem == name => {}
-        Some(stem) => errors.push(format!(
-            "filename `{stem}.md` must match frontmatter name `{name}`"
+    match path_ref
+        .parent()
+        .and_then(Path::file_name)
+        .and_then(|s| s.to_str())
+    {
+        Some(directory) if directory == name => {}
+        Some(directory) => errors.push(format!(
+            "parent directory `{directory}` must match frontmatter name `{name}`"
         )),
-        None => errors.push("output_path must include a filename".to_string()),
+        None => errors.push("output_path must include a provider directory".to_string()),
     }
 
     let components = normal_components(path_ref);
     match components.iter().position(|c| c == "providers") {
         Some(idx) => {
             let tail_len = components.len().saturating_sub(idx + 1);
-            if tail_len < 2 {
+            if !matches!(tail_len, 3 | 4) {
                 errors.push(
-                    "output_path must be providers/<operator>/<name>.md or providers/<operator>/<origin>/<name>.md"
+                    "output_path must be providers/<operator>/<name>/PAY.md or providers/<operator>/<origin>/<name>/PAY.md"
                         .to_string(),
                 );
             }
@@ -386,21 +391,32 @@ mod tests {
 
     #[test]
     fn output_path_accepts_native_and_proxied_provider_paths() {
-        assert!(validate_output_path("providers/acme/search.md", "search").is_empty());
-        assert!(validate_output_path("providers/acme/google/search.md", "search").is_empty());
+        assert!(validate_output_path("providers/acme/search/PAY.md", "search").is_empty());
+        assert!(validate_output_path("providers/acme/google/search/PAY.md", "search").is_empty());
     }
 
     #[test]
     fn output_path_reports_contributor_path_issues() {
         let errs = validate_output_path("tmp/search.yml", "search");
-        assert!(errs.iter().any(|e| e.contains("`.md`")));
+        assert!(errs.iter().any(|e| e.contains("`PAY.md`")));
         assert!(errs.iter().any(|e| e.contains("providers/")));
 
-        let errs = validate_output_path("providers/acme/wrong.md", "search");
-        assert!(errs.iter().any(|e| e.contains("must match")));
+        let errs = validate_output_path("providers/acme/wrong/PAY.md", "search");
+        assert!(errs.iter().any(|e| e.contains("directory `wrong`")));
 
-        let errs = validate_output_path("providers/search.md", "search");
+        let errs = validate_output_path("providers/search/PAY.md", "search");
         assert!(errs.iter().any(|e| e.contains("providers/<operator>")));
+
+        let errs = validate_output_path("providers/acme/search.md", "search");
+        assert!(errs.iter().any(|e| e.contains("`PAY.md`")));
+    }
+
+    #[test]
+    fn recommended_paths_use_pay_md_layout() {
+        assert_eq!(
+            recommended_paths("search"),
+            "providers/<operator>/search/PAY.md\nproviders/<operator>/<origin>/search/PAY.md"
+        );
     }
 
     #[test]
