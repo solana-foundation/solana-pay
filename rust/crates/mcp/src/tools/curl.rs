@@ -1184,6 +1184,10 @@ fn do_paid_fetch(
             // `authenticate` challenge in the 402, we sign it with the
             // same unlocked signer and cache the resulting token so
             // subsequent requests in the period skip the prompt.
+            let auth_override = match subscription_auth_override()? {
+                Some(gate) => Some(gate),
+                None => make_auth_override(),
+            };
             let built =
                 pay_core::client::subscription::build_credential_with_authenticate_and_override(
                     &challenge,
@@ -1192,7 +1196,7 @@ fn do_paid_fetch(
                     network_override.as_deref(),
                     account_override.as_deref(),
                     Some(url),
-                    make_auth_override(),
+                    auth_override,
                 )?;
             let mut headers = extra_headers.to_vec();
             headers.push(("Authorization".to_string(), built.authorization.clone()));
@@ -1218,6 +1222,29 @@ fn do_paid_fetch(
         RunOutcome::Completed {
             body, content_type, ..
         } => Ok((body.unwrap_or_default(), content_type)),
+    }
+}
+
+fn subscription_auth_override() -> Result<pay_core::signer::AuthOverride, pay_core::Error> {
+    #[cfg(feature = "very")]
+    {
+        pay_auth_very::configured_gate_from_env()
+            .map_err(|e| pay_core::Error::Config(e.to_string()))
+    }
+
+    #[cfg(not(feature = "very"))]
+    {
+        let backend = std::env::var("PAY_AUTH_BACKEND").unwrap_or_default();
+        match backend.trim().to_ascii_lowercase().as_str() {
+            "" | "platform" | "local" => Ok(None),
+            "very" => Err(pay_core::Error::Config(
+                "PAY_AUTH_BACKEND=very requires a Pay binary built with `--features very`"
+                    .to_string(),
+            )),
+            other => Err(pay_core::Error::Config(format!(
+                "Unsupported PAY_AUTH_BACKEND `{other}`; expected `platform` or `very`"
+            ))),
+        }
     }
 }
 

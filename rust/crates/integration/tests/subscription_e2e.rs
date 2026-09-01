@@ -1,7 +1,6 @@
 //! End-to-end-shaped tests for the subscription intent.
 //!
-//! v0 covers the pieces pay owns end-to-end without an on-chain settlement
-//! step:
+//! Covers the deterministic, credential-free pieces of the subscription flow:
 //!
 //! - Server builds a 402 challenge from a `SubscriptionEndpoint` config.
 //! - Client classifies the challenge as `SubscriptionChallenge`.
@@ -10,9 +9,8 @@
 //!   `Payment-Receipt` header.
 //! - `AccountsFile::upsert_subscription` round-trips the persisted entry.
 //!
-//! The on-chain activation broadcast + server-side verify path are not yet
-//! implemented — when they land, this file is the natural home for a true
-//! Surfpool-backed flow.
+//! The live on-chain activation broadcast and Palm interaction require
+//! external Surfpool and Very identities, so they remain a separate demo step.
 
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -37,9 +35,9 @@ fn spec() -> SubscriptionEndpoint {
         currency: "USDC".into(),
         expires_at: None,
         plan_id: Some(PLAN.into()),
-        plan_id_numeric: None,
-        plan_bump: None,
-        plan_created_at: None,
+        plan_id_numeric: Some(42),
+        plan_bump: Some(254),
+        plan_created_at: Some(1_770_000_000),
         puller: None,
         recipient: None,
         free_trial_days: None,
@@ -57,6 +55,26 @@ fn defaults<'a>() -> sub_server::OperatorDefaults<'a> {
         fee_payer: false,
         fee_payer_signer: None,
     }
+}
+
+#[test]
+fn very_integration_demo_spec_is_valid_and_sandbox_only() {
+    let spec: pay_types::metering::ApiSpec =
+        serde_yml::from_str(include_str!("../../../very-integration-demo.yaml"))
+            .expect("demo spec should parse");
+    assert!(pay_types::metering::validate_api_spec(&spec).is_empty());
+    assert_eq!(
+        spec.operator
+            .as_ref()
+            .and_then(|operator| operator.network.as_deref()),
+        Some("localnet")
+    );
+    let subscription = spec.endpoints[0]
+        .subscription
+        .as_ref()
+        .expect("subscription endpoint");
+    assert_eq!(subscription.period, "1d");
+    assert_eq!(subscription.price_usd, Some(0.10));
 }
 
 #[test]

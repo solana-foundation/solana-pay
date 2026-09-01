@@ -1385,13 +1385,14 @@ fn pay_subscription_and_retry(
     }
 
     let store = pay_core::accounts::FileAccountsStore::default_path();
-    let built = sub_client::build_credential_with_authenticate(
+    let built = sub_client::build_credential_with_authenticate_and_override(
         challenge,
         authenticate_challenge,
         &store,
         ctx.network_override,
         ctx.account_override,
         Some(resource_url),
+        subscription_auth_override()?,
     )?;
 
     if let Some(resolved) = built.ephemeral_notice.clone() {
@@ -1443,6 +1444,29 @@ fn pay_subscription_and_retry(
         receipt_network.as_deref(),
         ReceiptProvenance::PaidRetry(None),
     )
+}
+
+fn subscription_auth_override() -> pay_core::Result<pay_core::signer::AuthOverride> {
+    #[cfg(feature = "very")]
+    {
+        pay_auth_very::configured_gate_from_env()
+            .map_err(|e| pay_core::Error::Config(e.to_string()))
+    }
+
+    #[cfg(not(feature = "very"))]
+    {
+        let backend = std::env::var("PAY_AUTH_BACKEND").unwrap_or_default();
+        match backend.trim().to_ascii_lowercase().as_str() {
+            "" | "platform" | "local" => Ok(None),
+            "very" => Err(pay_core::Error::Config(
+                "PAY_AUTH_BACKEND=very requires a Pay binary built with `--features very`"
+                    .to_string(),
+            )),
+            other => Err(pay_core::Error::Config(format!(
+                "Unsupported PAY_AUTH_BACKEND `{other}`; expected `platform` or `very`"
+            ))),
+        }
+    }
 }
 
 // `persist_local_subscription_after_activation` lives in

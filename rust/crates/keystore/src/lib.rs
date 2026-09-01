@@ -17,7 +17,7 @@ pub mod macos;
 #[cfg(target_os = "windows")]
 pub mod windows;
 
-pub use auth::{AuthGate, AuthIntent, PaymentLimit};
+pub use auth::{AuthGate, AuthIntent, PaymentLimit, SubscriptionAuthorization};
 pub use error::{Error, Result};
 pub use store::SecretStore;
 pub use zeroize::Zeroizing;

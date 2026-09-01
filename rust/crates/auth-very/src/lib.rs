@@ -1,0 +1,1207 @@
+//! Device-independent Very Palm authorization for Pay subscription activation.
+//!
+//! This crate is intentionally optional. Pay's core emits a typed
+//! [`SubscriptionAuthorization`]; this backend binds those durable terms to a
+//! fresh Very approval, verifies the returned Ed25519 JWT locally, and only then
+//! lets the keystore unlock the subscriber key.
+
+use std::io::Read;
+use std::thread;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use ed25519_dalek::{Signature, VerifyingKey};
+use pay_keystore::{AuthGate, AuthIntent, Error as KeystoreError, SubscriptionAuthorization};
+use reqwest::Url;
+use reqwest::blocking::{Client, Response};
+use reqwest::redirect::Policy;
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use serde_json::Value;
+use sha2::{Digest, Sha256};
+use thiserror::Error;
+use uuid::Uuid;
+
+// Very's attestation service still uses this legacy wire hostname and issuer.
+// Keep both exact until the service migrates its endpoints and issued claims.
+const DEFAULT_API_BASE_URL: &str = "https://api.ag9.ai";
+const DEFAULT_ISSUER: &str = "api.ag9.ai";
+const DEFAULT_AUDIENCE: &str = "pay.sh";
+const HUMAN_SUBJECT: &str = "human_authorization_attestation";
+const PALM_METHOD: &str = "veryai_oauth_palm";
+const DEFAULT_TIMEOUT: Duration = Duration::from_secs(240);
+const DEFAULT_POLL_INTERVAL: Duration = Duration::from_millis(2_500);
+const DEFAULT_MAX_AGE: Duration = Duration::from_secs(300);
+const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
+const CLOCK_SKEW_SECONDS: i64 = 60;
+const MAX_RESPONSE_BYTES: u64 = 1_048_576;
+
+/// Runtime settings for a registered Very device identity.
+#[derive(Debug, Clone)]
+pub struct VeryConfig {
+    pub api_base_url: String,
+    pub jwks_url: String,
+    pub issuer: String,
+    pub audience: String,
+    pub device_id: String,
+    pub public_key: String,
+    pub timeout: Duration,
+    pub poll_interval: Duration,
+    pub max_attestation_age: Duration,
+    pub request_timeout: Duration,
+}
+
+impl VeryConfig {
+    /// Load the Very backend from environment variables.
+    ///
+    /// Required: `VERY_DEVICE_ID` and `VERY_PUBLIC_KEY`.
+    pub fn from_env() -> Result<Self, VeryError> {
+        let api_base_url = first_env(&["PAY_VERY_API_BASE_URL", "VERY_API_BASE_URL"])
+            .unwrap_or_else(|| DEFAULT_API_BASE_URL.to_string())
+            .trim_end_matches('/')
+            .to_string();
+        let jwks_url = first_env(&["PAY_VERY_JWKS_URL", "VERY_JWKS_URL"])
+            .unwrap_or_else(|| format!("{api_base_url}/.well-known/jwks.json"));
+        let issuer = first_env(&["PAY_VERY_ISSUER", "VERY_ISSUER"])
+            .unwrap_or_else(|| DEFAULT_ISSUER.to_string());
+        let audience = first_env(&["PAY_VERY_AUDIENCE", "VERY_AUDIENCE"])
+            .unwrap_or_else(|| DEFAULT_AUDIENCE.to_string());
+        let device_id = required_env("VERY_DEVICE_ID")?;
+        let public_key = required_env("VERY_PUBLIC_KEY")?;
+
+        Ok(Self {
+            api_base_url,
+            jwks_url,
+            issuer,
+            audience,
+            device_id,
+            public_key,
+            timeout: duration_env("PAY_VERY_TIMEOUT_SECONDS", DEFAULT_TIMEOUT)?,
+            poll_interval: duration_env_millis("PAY_VERY_POLL_INTERVAL_MS", DEFAULT_POLL_INTERVAL)?,
+            max_attestation_age: duration_env("PAY_VERY_MAX_AGE_SECONDS", DEFAULT_MAX_AGE)?,
+            request_timeout: duration_env(
+                "PAY_VERY_REQUEST_TIMEOUT_SECONDS",
+                DEFAULT_REQUEST_TIMEOUT,
+            )?,
+        })
+    }
+}
+
+/// Build an auth gate only when `PAY_AUTH_BACKEND=very` is explicitly set.
+/// `platform`, `local`, and an unset value retain Pay's existing behavior.
+pub fn configured_gate_from_env() -> Result<Option<Box<dyn AuthGate>>, VeryError> {
+    let Some(backend) = std::env::var("PAY_AUTH_BACKEND").ok() else {
+        return Ok(None);
+    };
+    match backend.trim().to_ascii_lowercase().as_str() {
+        "" | "platform" | "local" => Ok(None),
+        "very" => Ok(Some(Box::new(VeryAuthGate::try_new(
+            VeryConfig::from_env()?,
+        )?))),
+        other => Err(VeryError::Configuration(format!(
+            "unsupported PAY_AUTH_BACKEND `{other}`; expected `platform` or `very`"
+        ))),
+    }
+}
+
+/// Very-backed implementation of Pay's synchronous auth gate.
+pub struct VeryAuthGate {
+    config: VeryConfig,
+    client: Client,
+}
+
+impl VeryAuthGate {
+    pub fn try_new(config: VeryConfig) -> Result<Self, VeryError> {
+        let client = Client::builder()
+            .timeout(config.request_timeout)
+            // These endpoints establish the authorization result and its
+            // signing keys. Never let an HTTP redirect silently change the
+            // trust origin.
+            .redirect(Policy::none())
+            .build()
+            .map_err(|e| VeryError::Configuration(format!("could not build HTTP client: {e}")))?;
+        Ok(Self { config, client })
+    }
+
+    fn authorize(&self, intent: &AuthIntent) -> Result<(), VeryError> {
+        let now = now_unix()?;
+        let prepared = prepare_action(intent, &self.config, now, Uuid::new_v4().to_string())?;
+        let init: InitResponse = read_json(
+            self.client
+                .post(format!(
+                    "{}/v1/human/attestation/init",
+                    self.config.api_base_url
+                ))
+                .json(&InitRequest {
+                    device_id: &self.config.device_id,
+                    public_key: &self.config.public_key,
+                    audience: &self.config.audience,
+                    action_hash: &prepared.action_hash,
+                    action_description: &prepared.description,
+                })
+                .send()
+                .map_err(|e| VeryError::Http(format!("could not start approval: {e}")))?,
+            "start Very approval",
+        )?;
+
+        if init.session_id.trim().is_empty() || init.verification_url.trim().is_empty() {
+            return Err(VeryError::Protocol(
+                "Very approval response omitted session_id or verification_url".into(),
+            ));
+        }
+        let verification_url =
+            validate_verification_url(&self.config.api_base_url, &init.verification_url)?;
+
+        eprintln!(
+            "\nVery Palm approval required for this subscription:\n{}\n",
+            verification_url
+        );
+
+        let jwt = self.wait_for_attestation(&init.session_id)?;
+        let verification_time = now_unix()?;
+        if verification_time >= prepared.authorization_expires_at {
+            return Err(VeryError::Verification(
+                "authorization action expired while waiting for approval".into(),
+            ));
+        }
+        let jwks: Jwks = read_json(
+            self.client
+                .get(&self.config.jwks_url)
+                .send()
+                .map_err(|e| VeryError::Http(format!("could not fetch Very JWKS: {e}")))?,
+            "fetch Very JWKS",
+        )?;
+        verify_attestation_jwt(
+            &jwt,
+            &jwks,
+            &self.config,
+            &prepared.action_hash,
+            verification_time,
+        )
+    }
+
+    fn wait_for_attestation(&self, session_id: &str) -> Result<String, VeryError> {
+        let deadline = std::time::Instant::now() + self.config.timeout;
+        loop {
+            if std::time::Instant::now() >= deadline {
+                return Err(VeryError::Timeout);
+            }
+            let status: StatusResponse = read_json(
+                self.client
+                    .get(status_url(&self.config.api_base_url, session_id)?)
+                    .send()
+                    .map_err(|e| VeryError::Http(format!("could not poll approval: {e}")))?,
+                "poll Very approval",
+            )?;
+
+            match status.status.as_str() {
+                "completed" => {
+                    return status.attestation_jwt.ok_or_else(|| {
+                        VeryError::Protocol(
+                            "completed Very approval omitted attestation_jwt".into(),
+                        )
+                    });
+                }
+                "rejected" | "cancelled" => {
+                    return Err(VeryError::Denied(status.status));
+                }
+                "expired" => return Err(VeryError::Timeout),
+                "failed" => {
+                    return Err(VeryError::Protocol(
+                        "Very approval failed before an attestation was issued".into(),
+                    ));
+                }
+                "pending" | "created" | "waiting" | "scanning" => {
+                    thread::sleep(self.config.poll_interval);
+                }
+                other => {
+                    return Err(VeryError::Protocol(format!(
+                        "Very returned unknown approval status `{other}`"
+                    )));
+                }
+            }
+        }
+    }
+}
+
+impl AuthGate for VeryAuthGate {
+    fn authenticate(&self, intent: &AuthIntent) -> Result<(), KeystoreError> {
+        self.authorize(intent).map_err(map_auth_error)
+    }
+
+    fn is_available(&self) -> bool {
+        true
+    }
+}
+
+fn map_auth_error(error: VeryError) -> KeystoreError {
+    match error {
+        VeryError::Denied(status) => KeystoreError::AuthDenied(format!("Very approval {status}")),
+        other => KeystoreError::Backend(format!("Very authorization failed: {other}")),
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum VeryError {
+    #[error("configuration error: {0}")]
+    Configuration(String),
+    #[error("HTTP error: {0}")]
+    Http(String),
+    #[error("protocol error: {0}")]
+    Protocol(String),
+    #[error("verification error: {0}")]
+    Verification(String),
+    #[error("approval {0}")]
+    Denied(String),
+    #[error("timed out waiting for approval")]
+    Timeout,
+}
+
+#[derive(Serialize)]
+struct InitRequest<'a> {
+    device_id: &'a str,
+    public_key: &'a str,
+    audience: &'a str,
+    action_hash: &'a str,
+    action_description: &'a str,
+}
+
+#[derive(Deserialize)]
+struct InitResponse {
+    session_id: String,
+    verification_url: String,
+}
+
+#[derive(Deserialize)]
+struct StatusResponse {
+    status: String,
+    attestation_jwt: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct ActionEnvelope<'a> {
+    namespace: &'static str,
+    version: u8,
+    audience: &'a str,
+    agent_device_id: &'a str,
+    authorization_nonce: String,
+    authorization_expires_at: i64,
+    request_context: &'a str,
+    subscription: &'a SubscriptionAuthorization,
+}
+
+#[derive(Debug)]
+struct PreparedAction {
+    action_hash: String,
+    description: String,
+    authorization_expires_at: i64,
+}
+
+fn prepare_action(
+    intent: &AuthIntent,
+    config: &VeryConfig,
+    now: i64,
+    nonce: String,
+) -> Result<PreparedAction, VeryError> {
+    let subscription = intent.subscription_authorization().ok_or_else(|| {
+        VeryError::Verification(
+            "Very is restricted to typed MPP subscription activation intents".into(),
+        )
+    })?;
+    if subscription.subscriber.as_deref().is_none_or(str::is_empty) {
+        return Err(VeryError::Verification(
+            "subscription authorization is missing the subscriber wallet".into(),
+        ));
+    }
+
+    let max_age = i64::try_from(config.max_attestation_age.as_secs())
+        .map_err(|_| VeryError::Configuration("PAY_VERY_MAX_AGE_SECONDS is too large".into()))?;
+    let authorization_expires_at = now
+        .checked_add(max_age)
+        .ok_or_else(|| VeryError::Protocol("authorization expiry overflowed".into()))?;
+    let request_context = intent.message();
+    let action = ActionEnvelope {
+        namespace: "pay.mpp.subscription_activation",
+        version: 1,
+        audience: &config.audience,
+        agent_device_id: &config.device_id,
+        authorization_nonce: nonce,
+        authorization_expires_at,
+        request_context,
+        subscription,
+    };
+    let value = serde_json::to_value(&action)
+        .map_err(|e| VeryError::Protocol(format!("could not encode action: {e}")))?;
+    let canonical = canonical_json(&value)?;
+    let action_hash = URL_SAFE_NO_PAD.encode(Sha256::digest(canonical.as_bytes()));
+    let expiry_description = subscription
+        .subscription_expires
+        .as_deref()
+        .filter(|expires| !expires.trim().is_empty())
+        .map_or_else(
+            || "subscription continues until cancelled".to_string(),
+            |expires| format!("subscription expires at {expires}"),
+        );
+    let fee_payer_description = match (
+        subscription.fee_payer,
+        subscription
+            .fee_payer_key
+            .as_deref()
+            .filter(|key| !key.trim().is_empty()),
+    ) {
+        (true, Some(key)) => format!("activation transaction fee payer {key}"),
+        (true, None) => {
+            "activation transaction uses a sponsor, but its fee-payer key is missing".to_string()
+        }
+        (false, _) => "subscriber is the activation transaction fee payer".to_string(),
+    };
+    let external_reference = subscription
+        .external_id
+        .as_deref()
+        .filter(|external_id| !external_id.trim().is_empty())
+        .map_or_else(String::new, |external_id| {
+            format!("; external reference {external_id}")
+        });
+    let subscription_program = subscription
+        .program_id
+        .as_deref()
+        .filter(|program_id| !program_id.trim().is_empty())
+        .unwrap_or("canonical default");
+    let merchant = subscription
+        .merchant
+        .as_deref()
+        .filter(|merchant| !merchant.trim().is_empty())
+        .unwrap_or("derived from plan");
+    let description = format!(
+        "Approve Pay MPP subscription for challenge realm {}. Request context: {}. Terms: {} base units ({} decimals) of mint {} every {} {}(s), recipient {}, puller {}, merchant {}, plan {}, subscription program {}, token program {}, network {}, subscriber {}; {}; {}{}.",
+        subscription.challenge_realm,
+        request_context,
+        subscription.amount_base_units,
+        subscription.decimals,
+        subscription.mint,
+        subscription.period_count,
+        subscription.period_unit,
+        subscription.recipient,
+        subscription.puller,
+        merchant,
+        subscription.plan_id,
+        subscription_program,
+        subscription.token_program,
+        subscription.network,
+        subscription.subscriber.as_deref().unwrap_or("unknown"),
+        expiry_description,
+        fee_payer_description,
+        external_reference,
+    );
+    Ok(PreparedAction {
+        action_hash,
+        description,
+        authorization_expires_at,
+    })
+}
+
+fn canonical_json(value: &Value) -> Result<String, VeryError> {
+    match value {
+        Value::Null => Ok("null".to_string()),
+        Value::Bool(value) => Ok(value.to_string()),
+        Value::Number(value) => Ok(value.to_string()),
+        Value::String(value) => serde_json::to_string(value)
+            .map_err(|e| VeryError::Protocol(format!("could not encode string: {e}"))),
+        Value::Array(values) => {
+            let values = values
+                .iter()
+                .map(canonical_json)
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(format!("[{}]", values.join(",")))
+        }
+        Value::Object(values) => {
+            let mut keys = values.keys().collect::<Vec<_>>();
+            keys.sort_unstable();
+            let fields = keys
+                .into_iter()
+                .map(|key| {
+                    let encoded_key = serde_json::to_string(key).map_err(|e| {
+                        VeryError::Protocol(format!("could not encode object key: {e}"))
+                    })?;
+                    let value = canonical_json(&values[key])?;
+                    Ok(format!("{encoded_key}:{value}"))
+                })
+                .collect::<Result<Vec<_>, VeryError>>()?;
+            Ok(format!("{{{}}}", fields.join(",")))
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct JwtHeader {
+    alg: String,
+    kid: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct HumanClaims {
+    iss: String,
+    sub: String,
+    aud: Value,
+    human_id: String,
+    device_id: String,
+    action_hash: String,
+    verification_method: String,
+    iat: i64,
+    exp: i64,
+}
+
+#[derive(Deserialize)]
+struct Jwks {
+    keys: Vec<Jwk>,
+}
+
+#[derive(Deserialize)]
+struct Jwk {
+    kty: String,
+    crv: String,
+    x: String,
+    kid: Option<String>,
+    #[serde(rename = "use")]
+    key_use: Option<String>,
+    alg: Option<String>,
+}
+
+fn verify_attestation_jwt(
+    jwt: &str,
+    jwks: &Jwks,
+    config: &VeryConfig,
+    expected_action_hash: &str,
+    now: i64,
+) -> Result<(), VeryError> {
+    let parts = jwt.split('.').collect::<Vec<_>>();
+    if parts.len() != 3 {
+        return Err(VeryError::Verification("invalid JWT format".into()));
+    }
+    let header: JwtHeader = decode_json_segment(parts[0], "JWT header")?;
+    if header.alg != "EdDSA" {
+        return Err(VeryError::Verification(format!(
+            "unexpected JWT alg `{}`",
+            header.alg
+        )));
+    }
+    let claims: HumanClaims = decode_json_segment(parts[1], "JWT claims")?;
+    let signature_bytes = URL_SAFE_NO_PAD
+        .decode(parts[2])
+        .map_err(|e| VeryError::Verification(format!("invalid JWT signature encoding: {e}")))?;
+    let signature_bytes: [u8; 64] = signature_bytes
+        .try_into()
+        .map_err(|_| VeryError::Verification("JWT signature must be 64 bytes".into()))?;
+    let signature = Signature::from_bytes(&signature_bytes);
+    let signing_input = format!("{}.{}", parts[0], parts[1]);
+
+    let mut eligible_keys = 0usize;
+    let signature_valid = jwks.keys.iter().any(|key| {
+        if key.kty != "OKP"
+            || key.crv != "Ed25519"
+            || key.key_use.as_deref().is_some_and(|usage| usage != "sig")
+            || key.alg.as_deref().is_some_and(|alg| alg != "EdDSA")
+            || header
+                .kid
+                .as_ref()
+                .is_some_and(|kid| key.kid.as_deref() != Some(kid))
+        {
+            return false;
+        }
+        eligible_keys += 1;
+        let Ok(bytes) = URL_SAFE_NO_PAD.decode(&key.x) else {
+            return false;
+        };
+        let Ok(bytes) = <Vec<u8> as TryInto<[u8; 32]>>::try_into(bytes) else {
+            return false;
+        };
+        let Ok(verifying_key) = VerifyingKey::from_bytes(&bytes) else {
+            return false;
+        };
+        // `verify_strict` rejects small-order and non-canonical keys and
+        // signatures. Nothing here is attacker-supplied today, but this is the
+        // single check that gates the whole flow — take the strict variant.
+        verifying_key
+            .verify_strict(signing_input.as_bytes(), &signature)
+            .is_ok()
+    });
+    if eligible_keys == 0 {
+        return Err(VeryError::Verification(
+            "Very JWKS contained no eligible Ed25519 key".into(),
+        ));
+    }
+    if !signature_valid {
+        return Err(VeryError::Verification(
+            "Very JWT signature verification failed".into(),
+        ));
+    }
+
+    if claims.iss != config.issuer {
+        return Err(VeryError::Verification("issuer mismatch".into()));
+    }
+    if claims.sub != HUMAN_SUBJECT {
+        return Err(VeryError::Verification("subject mismatch".into()));
+    }
+    if !audience_matches(&claims.aud, &config.audience) {
+        return Err(VeryError::Verification("audience mismatch".into()));
+    }
+    if claims.human_id.trim().is_empty() {
+        return Err(VeryError::Verification("human_id is missing".into()));
+    }
+    if claims.device_id != config.device_id {
+        return Err(VeryError::Verification("device_id mismatch".into()));
+    }
+    if claims.action_hash != expected_action_hash {
+        return Err(VeryError::Verification("action_hash mismatch".into()));
+    }
+    if claims.verification_method != PALM_METHOD {
+        return Err(VeryError::Verification(
+            "verification_method is not Palm".into(),
+        ));
+    }
+    if claims.exp <= now {
+        return Err(VeryError::Verification("attestation is expired".into()));
+    }
+    if claims.iat > now + CLOCK_SKEW_SECONDS {
+        return Err(VeryError::Verification(
+            "attestation iat is in the future".into(),
+        ));
+    }
+    let max_age = i64::try_from(config.max_attestation_age.as_secs())
+        .map_err(|_| VeryError::Configuration("PAY_VERY_MAX_AGE_SECONDS is too large".into()))?;
+    if now.saturating_sub(claims.iat) > max_age {
+        return Err(VeryError::Verification("attestation is too old".into()));
+    }
+    Ok(())
+}
+
+fn audience_matches(claim: &Value, expected: &str) -> bool {
+    match claim {
+        Value::String(value) => value == expected,
+        Value::Array(values) => values.iter().any(|value| value.as_str() == Some(expected)),
+        _ => false,
+    }
+}
+
+fn decode_json_segment<T: DeserializeOwned>(segment: &str, label: &str) -> Result<T, VeryError> {
+    let bytes = URL_SAFE_NO_PAD
+        .decode(segment)
+        .map_err(|e| VeryError::Verification(format!("invalid {label} encoding: {e}")))?;
+    serde_json::from_slice(&bytes)
+        .map_err(|e| VeryError::Verification(format!("invalid {label}: {e}")))
+}
+
+fn read_json<T: DeserializeOwned>(response: Response, operation: &str) -> Result<T, VeryError> {
+    let status = response.status();
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_RESPONSE_BYTES)
+    {
+        return Err(VeryError::Protocol(format!(
+            "{operation} response exceeded {MAX_RESPONSE_BYTES} bytes"
+        )));
+    }
+    let mut body = Vec::new();
+    response
+        .take(MAX_RESPONSE_BYTES + 1)
+        .read_to_end(&mut body)
+        .map_err(|e| VeryError::Http(format!("{operation} response could not be read: {e}")))?;
+    if body.len() as u64 > MAX_RESPONSE_BYTES {
+        return Err(VeryError::Protocol(format!(
+            "{operation} response exceeded {MAX_RESPONSE_BYTES} bytes"
+        )));
+    }
+    if !status.is_success() {
+        let preview = String::from_utf8_lossy(&body)
+            .chars()
+            .filter(|character| !character.is_control())
+            .take(300)
+            .collect::<String>();
+        return Err(VeryError::Http(format!(
+            "{operation} returned HTTP {status}: {preview}"
+        )));
+    }
+    serde_json::from_slice(&body)
+        .map_err(|e| VeryError::Protocol(format!("{operation} returned invalid JSON: {e}")))
+}
+
+fn validate_verification_url(api_base_url: &str, raw: &str) -> Result<Url, VeryError> {
+    let base = Url::parse(api_base_url)
+        .map_err(|e| VeryError::Configuration(format!("invalid Very API base URL: {e}")))?;
+    let verification = Url::parse(raw)
+        .map_err(|e| VeryError::Protocol(format!("invalid Very verification URL: {e}")))?;
+    if !matches!(verification.scheme(), "https" | "http") {
+        return Err(VeryError::Protocol(
+            "Very verification URL must use HTTP or HTTPS".into(),
+        ));
+    }
+    if verification.origin() != base.origin() {
+        return Err(VeryError::Protocol(
+            "Very verification URL changed the configured API origin".into(),
+        ));
+    }
+    Ok(verification)
+}
+
+fn status_url(api_base_url: &str, session_id: &str) -> Result<Url, VeryError> {
+    let mut url = Url::parse(&format!(
+        "{}/v1/human/attestation",
+        api_base_url.trim_end_matches('/')
+    ))
+    .map_err(|e| VeryError::Configuration(format!("invalid Very API base URL: {e}")))?;
+    url.path_segments_mut()
+        .map_err(|_| VeryError::Configuration("Very API base URL cannot be a base".into()))?
+        .push(session_id)
+        .push("status");
+    Ok(url)
+}
+
+fn first_env(names: &[&str]) -> Option<String> {
+    names.iter().find_map(|name| {
+        std::env::var(name)
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+    })
+}
+
+fn required_env(name: &str) -> Result<String, VeryError> {
+    std::env::var(name)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| VeryError::Configuration(format!("{name} is required")))
+}
+
+fn duration_env(name: &str, default: Duration) -> Result<Duration, VeryError> {
+    let Some(raw) = std::env::var(name).ok() else {
+        return Ok(default);
+    };
+    let seconds = raw.parse::<u64>().map_err(|_| {
+        VeryError::Configuration(format!(
+            "{name} must be a positive integer number of seconds"
+        ))
+    })?;
+    if seconds == 0 {
+        return Err(VeryError::Configuration(format!(
+            "{name} must be greater than zero"
+        )));
+    }
+    Ok(Duration::from_secs(seconds))
+}
+
+fn duration_env_millis(name: &str, default: Duration) -> Result<Duration, VeryError> {
+    let Some(raw) = std::env::var(name).ok() else {
+        return Ok(default);
+    };
+    let millis = raw.parse::<u64>().map_err(|_| {
+        VeryError::Configuration(format!(
+            "{name} must be a positive integer number of milliseconds"
+        ))
+    })?;
+    if millis == 0 {
+        return Err(VeryError::Configuration(format!(
+            "{name} must be greater than zero"
+        )));
+    }
+    Ok(Duration::from_millis(millis))
+}
+
+fn now_unix() -> Result<i64, VeryError> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .map_err(|e| VeryError::Protocol(format!("system clock is before Unix epoch: {e}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ed25519_dalek::{Signer, SigningKey};
+    use rand::rngs::OsRng;
+    use std::net::{TcpListener, TcpStream};
+
+    fn config() -> VeryConfig {
+        VeryConfig {
+            api_base_url: "https://api.ag9.ai".to_string(),
+            jwks_url: "https://api.ag9.ai/.well-known/jwks.json".to_string(),
+            issuer: DEFAULT_ISSUER.to_string(),
+            audience: DEFAULT_AUDIENCE.to_string(),
+            device_id: "device-1".to_string(),
+            public_key: "public-key".to_string(),
+            timeout: DEFAULT_TIMEOUT,
+            poll_interval: DEFAULT_POLL_INTERVAL,
+            max_attestation_age: DEFAULT_MAX_AGE,
+            request_timeout: DEFAULT_REQUEST_TIMEOUT,
+        }
+    }
+
+    fn authorization() -> SubscriptionAuthorization {
+        SubscriptionAuthorization {
+            version: 1,
+            challenge_id: "challenge-1".to_string(),
+            challenge_realm: "merchant.example".to_string(),
+            challenge_expires: Some("2026-07-28T12:05:00Z".to_string()),
+            challenge_digest: None,
+            network: "mainnet".to_string(),
+            plan_id: "plan".to_string(),
+            plan_id_numeric: Some(42),
+            plan_bump: Some(254),
+            plan_created_at: Some(1_770_000_000),
+            recipient: "recipient".to_string(),
+            puller: "puller".to_string(),
+            merchant: Some("merchant".to_string()),
+            mint: "mint".to_string(),
+            token_program: "token-program".to_string(),
+            program_id: Some("subscription-program".to_string()),
+            amount_base_units: "1000000".to_string(),
+            decimals: 6,
+            period_unit: "day".to_string(),
+            period_count: 30,
+            expected_period_hours: Some(720),
+            subscription_expires: None,
+            external_id: Some("customer-plan".to_string()),
+            fee_payer: false,
+            fee_payer_key: None,
+            account: None,
+            subscriber: None,
+        }
+    }
+
+    fn intent(authorization: SubscriptionAuthorization) -> AuthIntent {
+        intent_with_reason(authorization, "Recurring subscription")
+    }
+
+    fn intent_with_reason(authorization: SubscriptionAuthorization, reason: &str) -> AuthIntent {
+        AuthIntent::authorize_subscription("$1.00", reason, "merchant.example", authorization)
+            .with_account_context_and_pubkey("primary", Some("subscriber"))
+    }
+
+    fn jwks(signing_key: &SigningKey) -> Jwks {
+        Jwks {
+            keys: vec![Jwk {
+                kty: "OKP".to_string(),
+                crv: "Ed25519".to_string(),
+                x: URL_SAFE_NO_PAD.encode(signing_key.verifying_key().to_bytes()),
+                kid: None,
+                key_use: Some("sig".to_string()),
+                alg: Some("EdDSA".to_string()),
+            }],
+        }
+    }
+
+    fn sign_jwt(signing_key: &SigningKey, claims: Value) -> String {
+        let header = URL_SAFE_NO_PAD.encode(br#"{"alg":"EdDSA","typ":"JWT"}"#);
+        let claims = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).unwrap());
+        let input = format!("{header}.{claims}");
+        let signature = signing_key.sign(input.as_bytes());
+        format!("{input}.{}", URL_SAFE_NO_PAD.encode(signature.to_bytes()))
+    }
+
+    fn claims(now: i64, action_hash: &str) -> Value {
+        serde_json::json!({
+            "iss": DEFAULT_ISSUER,
+            "sub": HUMAN_SUBJECT,
+            "aud": DEFAULT_AUDIENCE,
+            "human_id": "human-1",
+            "device_id": "device-1",
+            "action_hash": action_hash,
+            "verification_method": PALM_METHOD,
+            "iat": now,
+            "exp": now + 300,
+        })
+    }
+
+    fn read_http_request(stream: &mut TcpStream) -> (String, Vec<u8>) {
+        let mut request = Vec::new();
+        let header_end = loop {
+            let mut buffer = [0; 1024];
+            let count = std::io::Read::read(stream, &mut buffer).unwrap();
+            assert_ne!(count, 0, "connection closed before HTTP headers");
+            request.extend_from_slice(&buffer[..count]);
+            if let Some(end) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+                break end + 4;
+            }
+        };
+        let headers = std::str::from_utf8(&request[..header_end]).unwrap();
+        let request_line = headers.lines().next().unwrap().to_string();
+        let content_length = headers
+            .lines()
+            .find_map(|line| {
+                line.split_once(':').and_then(|(name, value)| {
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().unwrap())
+                })
+            })
+            .unwrap_or(0);
+        while request.len() < header_end + content_length {
+            let mut buffer = [0; 1024];
+            let count = std::io::Read::read(stream, &mut buffer).unwrap();
+            assert_ne!(count, 0, "connection closed before HTTP body");
+            request.extend_from_slice(&buffer[..count]);
+        }
+        (
+            request_line,
+            request[header_end..header_end + content_length].to_vec(),
+        )
+    }
+
+    fn write_json_response(stream: &mut TcpStream, status: &str, body: &Value) {
+        let body = serde_json::to_vec(body).unwrap();
+        let response = format!(
+            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        std::io::Write::write_all(stream, response.as_bytes()).unwrap();
+        std::io::Write::write_all(stream, &body).unwrap();
+    }
+
+    #[test]
+    fn action_hash_is_deterministic_and_sensitive_to_terms() {
+        let config = config();
+        let first = prepare_action(&intent(authorization()), &config, 100, "nonce".into()).unwrap();
+        let second =
+            prepare_action(&intent(authorization()), &config, 100, "nonce".into()).unwrap();
+        assert_eq!(first.action_hash, second.action_hash);
+        assert_eq!(first.authorization_expires_at, 400);
+
+        let mut changed = authorization();
+        changed.amount_base_units = "2000000".to_string();
+        let changed = prepare_action(&intent(changed), &config, 100, "nonce".into()).unwrap();
+        assert_ne!(first.action_hash, changed.action_hash);
+    }
+
+    #[test]
+    fn action_hash_changes_for_each_authorization_nonce() {
+        let config = config();
+        let first =
+            prepare_action(&intent(authorization()), &config, 100, "nonce-1".into()).unwrap();
+        let second =
+            prepare_action(&intent(authorization()), &config, 100, "nonce-2".into()).unwrap();
+        assert_ne!(first.action_hash, second.action_hash);
+    }
+
+    #[test]
+    fn action_hash_is_sensitive_to_account_bound_request_context() {
+        let config = config();
+        let first_intent = intent_with_reason(authorization(), "Recurring subscription");
+        let changed_intent = intent_with_reason(
+            authorization(),
+            "Recurring subscription requested by a delegated agent",
+        );
+        assert_eq!(
+            first_intent.subscription_authorization(),
+            changed_intent.subscription_authorization()
+        );
+        assert_ne!(first_intent.message(), changed_intent.message());
+
+        let first = prepare_action(&first_intent, &config, 100, "nonce".into()).unwrap();
+        let changed = prepare_action(&changed_intent, &config, 100, "nonce".into()).unwrap();
+
+        assert_ne!(first.action_hash, changed.action_hash);
+    }
+
+    #[test]
+    fn approval_description_surfaces_duration_and_fee_payer_terms() {
+        let config = config();
+        let mut expiring = authorization();
+        expiring.subscription_expires = Some("2027-07-28T12:00:00Z".to_string());
+        expiring.fee_payer = true;
+        expiring.fee_payer_key = Some("fee-payer".to_string());
+        let expiring = prepare_action(&intent(expiring), &config, 100, "nonce".into()).unwrap();
+
+        assert!(
+            expiring
+                .description
+                .contains("challenge realm merchant.example")
+        );
+        assert!(
+            expiring
+                .description
+                .contains("Request context: authorize a payment from primary.")
+        );
+        assert!(
+            expiring
+                .description
+                .contains("reason: Recurring subscription")
+        );
+        assert!(expiring.description.contains("amount: $1.00"));
+        assert!(expiring.description.contains("operator: merchant.example"));
+        assert!(expiring.description.contains("merchant merchant"));
+        assert!(
+            expiring
+                .description
+                .contains("subscription program subscription-program")
+        );
+        assert!(expiring.description.contains("token program token-program"));
+        assert!(
+            expiring
+                .description
+                .contains("subscription expires at 2027-07-28T12:00:00Z")
+        );
+        assert!(
+            expiring
+                .description
+                .contains("activation transaction fee payer fee-payer")
+        );
+        assert!(
+            expiring
+                .description
+                .contains("external reference customer-plan")
+        );
+
+        let mut ongoing = authorization();
+        ongoing.external_id = None;
+        let ongoing = prepare_action(&intent(ongoing), &config, 100, "nonce".into()).unwrap();
+
+        assert!(
+            ongoing
+                .description
+                .contains("subscription continues until cancelled")
+        );
+        assert!(
+            ongoing
+                .description
+                .contains("subscriber is the activation transaction fee payer")
+        );
+        assert!(!ongoing.description.contains("external reference"));
+    }
+
+    #[test]
+    fn authenticates_through_init_status_and_jwks_http_flow() {
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let base_url = format!("http://{address}");
+        let server_base_url = base_url.clone();
+        let server = std::thread::spawn(move || {
+            let (mut init_stream, _) = listener.accept().unwrap();
+            let (request_line, body) = read_http_request(&mut init_stream);
+            assert_eq!(request_line, "POST /v1/human/attestation/init HTTP/1.1");
+            let init: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(init.as_object().unwrap().len(), 5);
+            assert_eq!(init["device_id"], "device-1");
+            assert_eq!(init["public_key"], "public-key");
+            assert_eq!(init["audience"], DEFAULT_AUDIENCE);
+            let action_hash = init["action_hash"].as_str().unwrap().to_string();
+            let description = init["action_description"].as_str().unwrap();
+            assert!(description.contains("challenge realm merchant.example"));
+            assert!(description.contains("authorize a payment from primary"));
+            assert!(description.contains("amount: $1.00"));
+            assert!(description.contains("subscription continues until cancelled"));
+            write_json_response(
+                &mut init_stream,
+                "201 Created",
+                &serde_json::json!({
+                    "session_id": "session-1",
+                    "verification_url": format!("{server_base_url}/verify/session-1"),
+                }),
+            );
+
+            let (mut status_stream, _) = listener.accept().unwrap();
+            let (request_line, _) = read_http_request(&mut status_stream);
+            assert_eq!(
+                request_line,
+                "GET /v1/human/attestation/session-1/status HTTP/1.1"
+            );
+            let jwt = sign_jwt(&signing_key, claims(now_unix().unwrap(), &action_hash));
+            write_json_response(
+                &mut status_stream,
+                "200 OK",
+                &serde_json::json!({
+                    "status": "completed",
+                    "attestation_jwt": jwt,
+                }),
+            );
+
+            let (mut jwks_stream, _) = listener.accept().unwrap();
+            let (request_line, _) = read_http_request(&mut jwks_stream);
+            assert_eq!(request_line, "GET /.well-known/jwks.json HTTP/1.1");
+            write_json_response(
+                &mut jwks_stream,
+                "200 OK",
+                &serde_json::json!({
+                    "keys": [{
+                        "kty": "OKP",
+                        "crv": "Ed25519",
+                        "x": URL_SAFE_NO_PAD.encode(signing_key.verifying_key().to_bytes()),
+                        "use": "sig",
+                        "alg": "EdDSA",
+                    }],
+                }),
+            );
+        });
+
+        let mut test_config = config();
+        test_config.api_base_url = base_url.clone();
+        test_config.jwks_url = format!("{base_url}/.well-known/jwks.json");
+        test_config.timeout = Duration::from_secs(5);
+        test_config.poll_interval = Duration::from_millis(1);
+        test_config.request_timeout = Duration::from_secs(5);
+        let gate = VeryAuthGate::try_new(test_config).unwrap();
+
+        gate.authenticate(&intent(authorization())).unwrap();
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn distinguishes_human_denial_from_backend_failure() {
+        assert!(matches!(
+            map_auth_error(VeryError::Denied("rejected".to_string())),
+            KeystoreError::AuthDenied(_)
+        ));
+        assert!(matches!(
+            map_auth_error(VeryError::Timeout),
+            KeystoreError::Backend(_)
+        ));
+        assert!(matches!(
+            map_auth_error(VeryError::Verification("wrong action".to_string())),
+            KeystoreError::Backend(_)
+        ));
+    }
+
+    #[test]
+    fn non_subscription_intent_fails_closed() {
+        let err = prepare_action(
+            &AuthIntent::default_payment(),
+            &config(),
+            100,
+            "nonce".into(),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("restricted"));
+    }
+
+    #[test]
+    fn verification_url_must_stay_on_the_configured_origin() {
+        let accepted = validate_verification_url(
+            "https://api.ag9.ai",
+            "https://api.ag9.ai/v1/human/attestation/session/verify",
+        )
+        .unwrap();
+        assert_eq!(accepted.host_str(), Some("api.ag9.ai"));
+
+        let err = validate_verification_url(
+            "https://api.ag9.ai",
+            "https://example.com/pretend-palm-check",
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("changed the configured API origin")
+        );
+    }
+
+    #[test]
+    fn status_url_encodes_the_session_as_one_path_segment() {
+        let url = status_url("https://api.ag9.ai", "session/with?delimiters").unwrap();
+        assert_eq!(
+            url.as_str(),
+            "https://api.ag9.ai/v1/human/attestation/session%2Fwith%3Fdelimiters/status"
+        );
+    }
+
+    #[test]
+    fn verifies_matching_fresh_palm_attestation() {
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let now = 1_800_000_000;
+        let hash = "action-hash";
+        let jwt = sign_jwt(&signing_key, claims(now, hash));
+        verify_attestation_jwt(&jwt, &jwks(&signing_key), &config(), hash, now).unwrap();
+    }
+
+    #[test]
+    fn rejects_attestation_for_different_action() {
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let now = 1_800_000_000;
+        let jwt = sign_jwt(&signing_key, claims(now, "other-action"));
+        let err =
+            verify_attestation_jwt(&jwt, &jwks(&signing_key), &config(), "expected-action", now)
+                .unwrap_err();
+        assert!(err.to_string().contains("action_hash mismatch"));
+    }
+
+    #[test]
+    fn rejects_expired_or_wrong_device_attestation() {
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let now = 1_800_000_000;
+        let mut expired = claims(now - 400, "hash");
+        expired["exp"] = serde_json::json!(now - 1);
+        let jwt = sign_jwt(&signing_key, expired);
+        assert!(
+            verify_attestation_jwt(&jwt, &jwks(&signing_key), &config(), "hash", now)
+                .unwrap_err()
+                .to_string()
+                .contains("expired")
+        );
+
+        let mut wrong_device = claims(now, "hash");
+        wrong_device["device_id"] = serde_json::json!("other-device");
+        let jwt = sign_jwt(&signing_key, wrong_device);
+        assert!(
+            verify_attestation_jwt(&jwt, &jwks(&signing_key), &config(), "hash", now)
+                .unwrap_err()
+                .to_string()
+                .contains("device_id mismatch")
+        );
+    }
+
+    #[test]
+    fn rejects_wrong_audience_or_verification_method() {
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let now = 1_800_000_000;
+
+        let mut wrong_audience = claims(now, "hash");
+        wrong_audience["aud"] = serde_json::json!("other-service");
+        let jwt = sign_jwt(&signing_key, wrong_audience);
+        assert!(
+            verify_attestation_jwt(&jwt, &jwks(&signing_key), &config(), "hash", now)
+                .unwrap_err()
+                .to_string()
+                .contains("audience mismatch")
+        );
+
+        let mut wrong_method = claims(now, "hash");
+        wrong_method["verification_method"] = serde_json::json!("password");
+        let jwt = sign_jwt(&signing_key, wrong_method);
+        assert!(
+            verify_attestation_jwt(&jwt, &jwks(&signing_key), &config(), "hash", now)
+                .unwrap_err()
+                .to_string()
+                .contains("not Palm")
+        );
+    }
+
+    #[test]
+    fn rejects_stale_or_future_attestation() {
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let now = 1_800_000_000;
+
+        let mut stale_claims = claims(now - 301, "hash");
+        stale_claims["exp"] = serde_json::json!(now + 300);
+        let stale = sign_jwt(&signing_key, stale_claims);
+        assert!(
+            verify_attestation_jwt(&stale, &jwks(&signing_key), &config(), "hash", now)
+                .unwrap_err()
+                .to_string()
+                .contains("too old")
+        );
+
+        let future = sign_jwt(&signing_key, claims(now + CLOCK_SKEW_SECONDS + 1, "hash"));
+        assert!(
+            verify_attestation_jwt(&future, &jwks(&signing_key), &config(), "hash", now)
+                .unwrap_err()
+                .to_string()
+                .contains("in the future")
+        );
+    }
+
+    #[test]
+    fn rejects_forged_signature() {
+        let signer = SigningKey::generate(&mut OsRng);
+        let trusted = SigningKey::generate(&mut OsRng);
+        let now = 1_800_000_000;
+        let jwt = sign_jwt(&signer, claims(now, "hash"));
+        let err =
+            verify_attestation_jwt(&jwt, &jwks(&trusted), &config(), "hash", now).unwrap_err();
+        assert!(err.to_string().contains("signature verification failed"));
+    }
+}

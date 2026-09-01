@@ -971,6 +971,57 @@ impl StartCommand {
                 ));
             }
 
+            let currency_configs: Vec<_> = currencies
+                .iter()
+                .map(|currency| {
+                    let (mpp_currency, decimals) =
+                        resolve_currency_checked(currency, network.slug())?;
+                    Ok((currency.clone(), mpp_currency, decimals))
+                })
+                .collect::<pay_core::Result<_>>()?;
+            let session_benchmark_test_mints = op
+                .map(|operator| operator.session_benchmark_test_mints.clone())
+                .unwrap_or_default();
+            let operator_pubkey = fee_payer_signer
+                .as_ref()
+                .map(|signer| signer.pubkey().to_string());
+            let operator_balance_address = operator_pubkey.as_deref().unwrap_or(&recipient);
+            let x402_upto_beneficiary =
+                x402_upto_beneficiary_pubkey(&api, &recipient, operator_pubkey.as_deref())?;
+            let payout_recipient_targets =
+                payout_recipient_targets(&api, x402_upto_beneficiary)?;
+            let payout_recipients = payout_recipient_pubkeys(&payout_recipient_targets);
+            let stable_requirements =
+                stable_token_account_requirements(&currency_configs, network.slug())?;
+
+            // ── Auto-fund local Surfpool wallets ──
+            //
+            // This must happen before publishing a missing subscription Plan:
+            // a freshly generated sandbox gateway has no SOL to pay the
+            // create_plan transaction fee until Surfpool funding completes.
+            // See `payments::prepare_funding_targets` for why it's idempotent.
+            let surfpool_targets =
+                surfpool_funding_targets(&recipient, operator_pubkey.as_deref());
+            let (should_fund, funding_balances) = payments::prepare_funding_targets(
+                sandbox,
+                &network,
+                &rpc_url,
+                &surfpool_targets,
+                &payout_recipient_targets,
+                &stable_requirements,
+            )
+            .await?;
+            let operator_sol = funding_balances
+                .iter()
+                .find(|balance| balance.address == operator_balance_address)
+                .map(|balance| lamports_to_sol(balance.lamports))
+                .ok_or_else(|| {
+                    pay_core::Error::Config(
+                        "internal error: operator signer was not validated".to_string(),
+                    )
+                })?;
+
+
             // ── Ensure each subscription endpoint has its on-chain Plan ─
             //
             // A subscription endpoint can't emit a usable 402 challenge
@@ -1017,54 +1068,6 @@ impl StartCommand {
                     )))
                 }
             };
-
-            let currency_configs: Vec<_> = currencies
-                .iter()
-                .map(|currency| {
-                    let (mpp_currency, decimals) =
-                        resolve_currency_checked(currency, network.slug())?;
-                    Ok((currency.clone(), mpp_currency, decimals))
-                })
-                .collect::<pay_core::Result<_>>()?;
-            let session_benchmark_test_mints = op
-                .map(|operator| operator.session_benchmark_test_mints.clone())
-                .unwrap_or_default();
-            let operator_pubkey = fee_payer_signer
-                .as_ref()
-                .map(|signer| signer.pubkey().to_string());
-            let operator_balance_address = operator_pubkey.as_deref().unwrap_or(&recipient);
-            let x402_upto_beneficiary =
-                x402_upto_beneficiary_pubkey(&api, &recipient, operator_pubkey.as_deref())?;
-            let payout_recipient_targets =
-                payout_recipient_targets(&api, x402_upto_beneficiary)?;
-            let payout_recipients = payout_recipient_pubkeys(&payout_recipient_targets);
-            let stable_requirements =
-                stable_token_account_requirements(&currency_configs, network.slug())?;
-
-            // ── Auto-fund local Surfpool wallets ──
-            //
-            // See `payments::prepare_funding_targets` for when funding
-            // triggers and why it's idempotent.
-            let surfpool_targets =
-                surfpool_funding_targets(&recipient, operator_pubkey.as_deref());
-            let (should_fund, funding_balances) = payments::prepare_funding_targets(
-                sandbox,
-                &network,
-                &rpc_url,
-                &surfpool_targets,
-                &payout_recipient_targets,
-                &stable_requirements,
-            )
-            .await?;
-            let operator_sol = funding_balances
-                .iter()
-                .find(|balance| balance.address == operator_balance_address)
-                .map(|balance| lamports_to_sol(balance.lamports))
-                .ok_or_else(|| {
-                    pay_core::Error::Config(
-                        "internal error: operator signer was not validated".to_string(),
-                    )
-                })?;
 
             // ── Create MPP servers ──
             // (Also mirrors the charge HMAC secret into
@@ -2168,7 +2171,8 @@ async fn ensure_subscription_plans(
     use dialoguer::Confirm;
     use dialoguer::theme::ColorfulTheme;
     use pay_core::server::subscription::{
-        PlanStatus, check_plan_exists, compute_plan_id_numeric, publish_plan,
+        MAX_SAFE_JSON_PLAN_ID, PlanStatus, PublishedPlan, check_plan_exists,
+        compute_plan_id_numeric, fetch_plan_created_at, publish_plan,
     };
     use pay_kit::mpp::program::subscriptions::{default_program_id, find_plan_pda, plan_id_seed};
     use solana_pubkey::Pubkey;
@@ -2235,6 +2239,12 @@ async fn ensure_subscription_plans(
         let plan_id_numeric = sub_spec
             .plan_id_numeric
             .unwrap_or_else(|| compute_plan_id_numeric(operator_pubkey_str, &endpoint.path));
+        if plan_id_numeric > MAX_SAFE_JSON_PLAN_ID {
+            return Err(pay_core::Error::Config(format!(
+                "endpoint `{}` has plan_id_numeric={plan_id_numeric}, which cannot round-trip through canonical JSON. Clear plan_id, plan_id_numeric, plan_bump, and plan_created_at so Pay can derive a safe replacement Plan ID.",
+                endpoint.path
+            )));
+        }
         let seed = plan_id_seed(plan_id_numeric);
         let (plan_pda, plan_bump) = find_plan_pda(&operator, &seed, &program_id);
 
@@ -2260,12 +2270,29 @@ async fn ensure_subscription_plans(
                     plan = %plan_pda,
                     "subscription Plan already on-chain — reusing",
                 );
-                sub_spec.plan_id = Some(plan_pda.to_string());
+                let plan_pda_string = plan_pda.to_string();
+                let needs_writeback = sub_spec.plan_id.as_deref() != Some(plan_pda_string.as_str())
+                    || sub_spec.plan_id_numeric != Some(plan_id_numeric)
+                    || sub_spec.plan_bump != Some(plan_bump)
+                    || sub_spec.plan_created_at.is_none();
+                let plan_created_at = match sub_spec.plan_created_at {
+                    Some(created_at) => created_at,
+                    None => fetch_plan_created_at(rpc_url, &plan_pda).await?,
+                };
+                sub_spec.plan_id = Some(plan_pda_string.clone());
                 sub_spec.plan_id_numeric = Some(plan_id_numeric);
                 sub_spec.plan_bump = Some(plan_bump);
-                // created_at we cannot determine without an extra RPC fetch;
-                // leave any existing YAML value untouched. The client falls
-                // back to fetching the Plan when this is None.
+                sub_spec.plan_created_at = Some(plan_created_at);
+                if needs_writeback {
+                    publications.push(PublishedPlan {
+                        endpoint_path: endpoint.path.clone(),
+                        plan_id_numeric,
+                        plan_pda: plan_pda_string,
+                        plan_bump,
+                        plan_created_at,
+                        broadcast_signature: None,
+                    });
+                }
             }
             PlanStatus::WrongOwner { actual_owner } => {
                 return Err(pay_core::Error::Config(format!(
@@ -2355,8 +2382,8 @@ async fn ensure_subscription_plans(
         }
     }
 
-    // Persist any new plan IDs back to disk so subsequent restarts skip
-    // the publish prompt and the subscriber client picks up the same PDA.
+    // Persist published or recovered Plan metadata so subsequent restarts
+    // skip both the publish prompt and the on-chain metadata backfill.
     if !publications.is_empty() {
         let expanded = shellexpand::tilde(spec_path);
         let raw = std::fs::read_to_string(expanded.as_ref()).map_err(|e| {
@@ -2375,7 +2402,7 @@ async fn ensure_subscription_plans(
 }
 
 /// In-place YAML rewrite of `plan_id` / `plan_id_numeric` / `plan_bump`
-/// / `plan_created_at` under each freshly-published subscription block.
+/// / `plan_created_at` under each resolved subscription block.
 /// Preserves comments and key ordering — line-based rewrite rather than
 /// a full serde round-trip.
 fn write_back_published_plans(
@@ -3150,8 +3177,8 @@ mod tests {
         build_pdb_config, default_bind, delegated_session_channel_payout,
         ensure_session_currencies_usd_pegged, payout_recipient_pubkeys, payout_recipient_targets,
         resolve_operator_currencies, session_lifecycle_reconciliation,
-        validate_browser_rpc_request, x402_currency_configs, x402_upto_beneficiary_pubkey,
-        x402_upto_payout_for_recipient,
+        validate_browser_rpc_request, write_back_published_plans, x402_currency_configs,
+        x402_upto_beneficiary_pubkey, x402_upto_payout_for_recipient,
     };
     use crate::network::SolanaNetwork;
     use serial_test::serial;
@@ -3168,6 +3195,32 @@ mod tests {
             session_lifecycle_reconciliation(true),
             super::SessionLifecycleReconciliation::Embedded
         );
+    }
+
+    #[test]
+    fn existing_plan_metadata_is_persisted_for_a_pristine_subscription_spec() {
+        let yaml = r#"endpoints:
+  - method: GET
+    path: "api/v1/very-feed"
+    subscription:
+      period: "1d"
+      price_usd: 0.10
+      currency: "USDC"
+"#;
+        let publication = pay_core::server::subscription::PublishedPlan {
+            endpoint_path: "api/v1/very-feed".to_string(),
+            plan_id_numeric: 42,
+            plan_pda: "8tWbqLkUJoYy7zXc5h2EvCRoaQEv2xnQjUuYhc3rzCgT".to_string(),
+            plan_bump: 254,
+            plan_created_at: 1_770_000_123,
+            broadcast_signature: None,
+        };
+
+        let updated = write_back_published_plans(yaml, &[publication]);
+
+        assert!(updated.contains("plan_id_numeric: 42"));
+        assert!(updated.contains("plan_bump: 254"));
+        assert!(updated.contains("plan_created_at: 1770000123"));
     }
 
     #[test]

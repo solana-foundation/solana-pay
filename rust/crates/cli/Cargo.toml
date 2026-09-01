@@ -13,6 +13,7 @@ default = []
 gcp_kms = ["pay-kit/gcp_kms"]
 vendored-openssl = ["pay-core/vendored-openssl"]
 redis-session-store = ["pay-core/redis-session-store", "pay-kit/redis-store"]
+very = ["dep:pay-auth-very", "pay-mcp/very"]
 
 [dependencies]
 async-trait = "0.1"
@@ -37,6 +38,7 @@ opentelemetry-otlp = { workspace = true }
 opentelemetry-semantic-conventions = { workspace = true }
 opentelemetry_sdk = { workspace = true }
 pay-mcp = { workspace = true }
+pay-auth-very = { workspace = true, optional = true }
 reqwest = { workspace = true }
 pay-kit = { workspace = true }
 solana-pubkey = { workspace = true }

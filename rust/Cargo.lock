@@ -6630,6 +6630,7 @@ dependencies = [
  "opentelemetry_sdk 0.31.0",
  "owo-colors",
  "pay-acp",
+ "pay-auth-very",
  "pay-core",
  "pay-keystore",
  "pay-mcp",
@@ -6752,6 +6753,22 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.20",
+]
+
+[[package]]
+name = "pay-auth-very"
+version = "0.28.0"
+dependencies = [
+ "base64 0.22.1",
+ "ed25519-dalek 2.2.0",
+ "pay-keystore",
+ "rand 0.8.6",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror 2.0.18",
+ "uuid",
 ]
 
 [[package]]
@@ -6886,6 +6903,7 @@ dependencies = [
  "pay-core",
  "pay-types",
  "serde_json",
+ "serde_yml",
  "solana-pay-kit",
 ]
 
@@ -6914,6 +6932,7 @@ dependencies = [
  "crc32fast",
  "flate2",
  "mime_guess",
+ "pay-auth-very",
  "pay-core",
  "pay-keystore",
  "pay-types",

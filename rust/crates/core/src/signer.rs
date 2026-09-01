@@ -111,21 +111,52 @@ pub fn load_signer_for_network_with_intent_and_override(
     intent: &AuthIntent,
     auth_override: AuthOverride,
 ) -> Result<(MemorySigner, Option<ResolvedEphemeral>)> {
+    load_signer_for_network_with_intent_and_override_policy(
+        network,
+        store,
+        account_override,
+        intent,
+        auth_override,
+        false,
+    )
+}
+
+fn load_signer_for_network_with_intent_and_override_policy(
+    network: &str,
+    store: &dyn AccountsStore,
+    account_override: Option<&str>,
+    intent: &AuthIntent,
+    auth_override: AuthOverride,
+    authorize_ephemeral: bool,
+) -> Result<(MemorySigner, Option<ResolvedEphemeral>)> {
     let file = store.load()?;
     if let Some(name) = account_override {
         if let Some(account) = file.named_account_for_network(network, name).cloned() {
-            let signer = load_signer_from_account_with_intent_and_override(
-                &account,
-                name,
-                network,
-                intent,
-                auth_override,
-            )?;
+            let signer = if authorize_ephemeral && account.keystore == Keystore::Ephemeral {
+                signer_from_ephemeral_with_override(&account, name, intent, auth_override)?
+            } else {
+                load_signer_from_account_with_intent_and_override(
+                    &account,
+                    name,
+                    network,
+                    intent,
+                    auth_override,
+                )?
+            };
             return Ok((signer, None));
         }
         if is_lazy_ephemeral_network(network) {
             let resolved = load_or_create_ephemeral_for_network_as(network, name, store)?;
-            let signer = signer_from_ephemeral(&resolved.account)?;
+            let signer = if authorize_ephemeral {
+                signer_from_ephemeral_with_override(
+                    &resolved.account,
+                    &resolved.account_name,
+                    intent,
+                    auth_override,
+                )?
+            } else {
+                signer_from_ephemeral(&resolved.account)?
+            };
             return Ok((signer, Some(resolved)));
         }
         return Err(Error::Config(format!(
@@ -134,19 +165,32 @@ pub fn load_signer_for_network_with_intent_and_override(
     }
     match resolve_account_for_network(network, &file) {
         AccountChoice::Resolved { name, account } => {
-            let signer = load_signer_from_account_with_intent_and_override(
-                &account,
-                &name,
-                network,
-                intent,
-                auth_override,
-            )?;
+            let signer = if authorize_ephemeral && account.keystore == Keystore::Ephemeral {
+                signer_from_ephemeral_with_override(&account, &name, intent, auth_override)?
+            } else {
+                load_signer_from_account_with_intent_and_override(
+                    &account,
+                    &name,
+                    network,
+                    intent,
+                    auth_override,
+                )?
+            };
             Ok((signer, None))
         }
         AccountChoice::Missing => {
             if is_lazy_ephemeral_network(network) {
                 let resolved = load_or_create_ephemeral_for_network(network, store)?;
-                let signer = signer_from_ephemeral(&resolved.account)?;
+                let signer = if authorize_ephemeral {
+                    signer_from_ephemeral_with_override(
+                        &resolved.account,
+                        &resolved.account_name,
+                        intent,
+                        auth_override,
+                    )?
+                } else {
+                    signer_from_ephemeral(&resolved.account)?
+                };
                 Ok((signer, Some(resolved)))
             } else {
                 Err(Error::Config(format!(
@@ -213,6 +257,34 @@ pub fn load_signer_for_network_payment_with_intent_and_override(
     })
 }
 
+/// Subscription activations grant standing payment authority. When a remote
+/// gate is explicitly supplied, apply it even to sandbox/devnet ephemeral
+/// accounts so the full approval flow can be exercised without mainnet funds.
+/// Ordinary one-off payments retain the existing ephemeral behavior.
+pub fn load_signer_for_network_subscription_with_intent_and_override(
+    network: &str,
+    store: &dyn AccountsStore,
+    account_override: Option<&str>,
+    amount: &str,
+    intent: &AuthIntent,
+    auth_override: AuthOverride,
+) -> Result<(MemorySigner, Option<ResolvedEphemeral>)> {
+    load_signer_for_network_with_intent_and_override_policy(
+        network,
+        store,
+        account_override,
+        intent,
+        auth_override,
+        true,
+    )
+    .map_err(|e| match e {
+        Error::PaymentRejected(where_) => {
+            Error::PaymentRejected(format!("{amount} subscription authorization was {where_}"))
+        }
+        other => other,
+    })
+}
+
 /// Networks where missing-entry → auto-generate-an-ephemeral is a safe
 /// default. Real money networks are NOT in this list — we refuse to
 /// silently create a mainnet wallet.
@@ -252,7 +324,8 @@ pub fn load_keypair_bytes_from_account_with_intent_and_override(
     intent: &AuthIntent,
     auth_override: AuthOverride,
 ) -> Result<crate::keystore::Zeroizing<Vec<u8>>> {
-    let account_intent = intent.with_account_context(name);
+    let account_intent = intent
+        .with_account_context_and_pubkey(name, approval_pubkey(intent, account, name).as_deref());
     if account.keystore == Keystore::Ephemeral {
         let _ = auth_override;
         return account
@@ -264,6 +337,23 @@ pub fn load_keypair_bytes_from_account_with_intent_and_override(
                 )
             });
     }
+
+    // An explicitly supplied gate authorizes the ACTION; whether the account's
+    // platform gate is armed is a separate question. The arms below only
+    // consult the override when `auth_required_for_network` is true, and that
+    // defaults to false off mainnet (and can be turned off on mainnet), so
+    // without this a remote backend such as `PAY_AUTH_BACKEND=very` would be
+    // silently dropped — the gate would fail open. Run it here instead, then
+    // hand `None` down so the platform gate is not prompted for twice.
+    let auth_override = if account.auth_required_for_network(network) {
+        auth_override
+    } else {
+        if let Some(gate) = auth_override.as_ref() {
+            gate.authenticate(&account_intent)
+                .map_err(map_file_auth_error)?;
+        }
+        None
+    };
 
     let source = account
         .signer_source(name)
@@ -363,9 +453,14 @@ pub fn load_keypair_bytes_from_account_with_intent_and_override(
             }
         }
         Keystore::OnePassword => {
-            // 1Password manages its own auth via the `op` CLI; the
-            // MCP-elicitation override does not apply.
-            let _ = auth_override;
+            // An explicit override authorizes the action; 1Password's own
+            // `op` flow still protects access to the stored secret. Compose
+            // both gates so selecting a remote backend can never silently
+            // fall back to 1Password-only authorization.
+            if let Some(gate) = auth_override {
+                gate.authenticate(&account_intent)
+                    .map_err(map_file_auth_error)?;
+            }
             let op_account = account.account.clone();
             let ks = if let Some(vault) = &account.vault {
                 crate::keystore::Keystore::onepassword_with_vault(vault.clone(), op_account)
@@ -389,18 +484,7 @@ pub fn load_signer_from_account_with_reason(
     network: &str,
     reason: &str,
 ) -> Result<MemorySigner> {
-    let bytes = load_keypair_bytes_from_account_with_intent(
-        account,
-        name,
-        network,
-        &AuthIntent::from_reason(reason),
-    )?;
-    MemorySigner::from_bytes(&bytes).map_err(|e| {
-        Error::Config(format!(
-            "Storage corrupted: keypair for account `{name}` on `{network}` failed to decode ({e}). \
-             Re-import the account: `pay account destroy --name {name}` then `pay account new --name {name}`."
-        ))
-    })
+    load_signer_from_account_with_intent(account, name, network, &AuthIntent::from_reason(reason))
 }
 
 pub fn load_signer_from_account_with_intent(
@@ -428,20 +512,93 @@ pub fn load_signer_from_account_with_intent_and_override(
         intent,
         auth_override,
     )?;
-    MemorySigner::from_bytes(&bytes).map_err(|e| {
+    let signer = MemorySigner::from_bytes(&bytes).map_err(|e| {
         Error::Config(format!(
             "Storage corrupted: keypair for account `{name}` on `{network}` failed to decode ({e}). \
              Re-import the account: `pay account destroy --name {name}` then `pay account new --name {name}`."
         ))
-    })
+    })?;
+    ensure_signer_matches_account_pubkey(account, &signer, name)?;
+    Ok(signer)
 }
 
 fn signer_from_ephemeral(account: &Account) -> Result<MemorySigner> {
     let bytes = account.ephemeral_keypair_bytes().ok_or_else(|| {
         Error::Config("Ephemeral account is missing its inline `secret_key_b58` field".to_string())
     })?;
+    let signer = MemorySigner::from_bytes(&bytes)
+        .map_err(|e| Error::Config(format!("Invalid ephemeral keypair bytes: {e}")))?;
+    ensure_signer_matches_account_pubkey(account, &signer, "ephemeral")?;
+    Ok(signer)
+}
+
+fn ensure_signer_matches_account_pubkey(
+    account: &Account,
+    signer: &MemorySigner,
+    name: &str,
+) -> Result<()> {
+    use pay_kit::mpp::solana_keychain::SolanaSigner;
+
+    let Some(expected) = account.pubkey.as_deref() else {
+        return Ok(());
+    };
+    let actual = signer.pubkey().to_string();
+    if actual != expected {
+        return Err(Error::Config(format!(
+            "Account `{name}` metadata pubkey `{expected}` does not match the loaded signer `{actual}`. \
+             Re-import or repair the account before signing."
+        )));
+    }
+    Ok(())
+}
+
+/// Wallet pubkey to bind into an approval envelope, resolved *before* the gate
+/// runs so a remote backend can show the human which wallet it is authorizing.
+///
+/// The `accounts.yml` cache is the only pre-auth source for OS-keystore and
+/// 1Password accounts: reading their key material is precisely what the gate
+/// exists to authorize, so we must not touch it first. File and ephemeral
+/// accounts are different — their bytes are already readable without a prompt,
+/// so when the cache is absent (hand-written or legacy entries, which every
+/// `pay account` creation path does populate) derive the key instead of handing
+/// the gate an empty subscriber and failing an otherwise valid activation.
+/// [`ensure_signer_matches_account_pubkey`] still cross-checks the cache
+/// afterwards whenever it is present.
+fn approval_pubkey(intent: &AuthIntent, account: &Account, name: &str) -> Option<String> {
+    use pay_kit::mpp::solana_keychain::SolanaSigner;
+
+    if let Some(cached) = account.pubkey.as_deref() {
+        return Some(cached.to_string());
+    }
+    // Only subscription intents carry a subscriber, so ordinary payment
+    // prompts should not pay for a keypair read.
+    intent.subscription_authorization()?;
+
+    let bytes = match account.keystore {
+        Keystore::Ephemeral => crate::keystore::Zeroizing::new(account.ephemeral_keypair_bytes()?),
+        Keystore::File => load_from_file(&account.signer_source(name)?).ok()?,
+        _ => return None,
+    };
     MemorySigner::from_bytes(&bytes)
-        .map_err(|e| Error::Config(format!("Invalid ephemeral keypair bytes: {e}")))
+        .ok()
+        .map(|signer| signer.pubkey().to_string())
+}
+
+fn signer_from_ephemeral_with_override(
+    account: &Account,
+    name: &str,
+    intent: &AuthIntent,
+    auth_override: AuthOverride,
+) -> Result<MemorySigner> {
+    if let Some(gate) = auth_override {
+        let account_intent = intent.with_account_context_and_pubkey(
+            name,
+            approval_pubkey(intent, account, name).as_deref(),
+        );
+        gate.authenticate(&account_intent)
+            .map_err(map_file_auth_error)?;
+    }
+    signer_from_ephemeral(account)
 }
 
 /// Apply a file-backed account's auth policy before reading its keypair.
@@ -777,6 +934,73 @@ mod tests {
         }
     }
 
+    /// Records the intent the gate was handed, then denies, so tests can assert
+    /// on what a remote backend would actually have been asked to authorize.
+    #[derive(Clone, Default)]
+    struct CapturingAuth(std::sync::Arc<std::sync::Mutex<Option<AuthIntent>>>);
+
+    impl CapturingAuth {
+        fn subscriber(&self) -> Option<String> {
+            self.0
+                .lock()
+                .unwrap()
+                .as_ref()
+                .and_then(|intent| intent.subscription_authorization())
+                .and_then(|authorization| authorization.subscriber.clone())
+        }
+    }
+
+    impl AuthGate for CapturingAuth {
+        fn authenticate(
+            &self,
+            intent: &AuthIntent,
+        ) -> std::result::Result<(), crate::keystore::Error> {
+            *self.0.lock().unwrap() = Some(intent.clone());
+            Err(crate::keystore::Error::AuthDenied("captured".to_string()))
+        }
+
+        fn is_available(&self) -> bool {
+            true
+        }
+    }
+
+    fn subscription_intent() -> AuthIntent {
+        AuthIntent::authorize_subscription(
+            "$1.00",
+            "Recurring subscription",
+            "merchant.example",
+            crate::keystore::SubscriptionAuthorization {
+                version: 1,
+                challenge_id: "challenge-1".to_string(),
+                challenge_realm: "merchant.example".to_string(),
+                challenge_expires: None,
+                challenge_digest: None,
+                network: MAINNET_NETWORK.to_string(),
+                plan_id: "plan".to_string(),
+                plan_id_numeric: Some(42),
+                plan_bump: Some(254),
+                plan_created_at: Some(1_770_000_000),
+                recipient: "recipient".to_string(),
+                puller: "puller".to_string(),
+                merchant: None,
+                mint: "mint".to_string(),
+                token_program: "token-program".to_string(),
+                program_id: None,
+                amount_base_units: "1000000".to_string(),
+                decimals: 6,
+                period_unit: "day".to_string(),
+                period_count: 30,
+                expected_period_hours: Some(720),
+                subscription_expires: None,
+                external_id: None,
+                fee_payer: false,
+                fee_payer_key: None,
+                account: None,
+                subscriber: None,
+            },
+        )
+    }
+
     fn fresh_file_account(auth_required: Option<bool>) -> (tempfile::TempDir, Account, Vec<u8>) {
         let signing_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
         let verifying_key = signing_key.verifying_key();
@@ -860,7 +1084,60 @@ mod tests {
     }
 
     #[test]
-    fn file_account_skips_auth_gate_when_disabled() {
+    fn file_account_rejects_loaded_signer_that_differs_from_approved_pubkey() {
+        let (_temp_dir, mut account, _) = fresh_file_account(Some(true));
+        account.pubkey = Some("11111111111111111111111111111111".to_string());
+
+        let err = load_signer_from_account_with_intent_and_override(
+            &account,
+            "default",
+            MAINNET_NETWORK,
+            &AuthIntent::default_payment(),
+            Some(Box::new(crate::keystore::auth::NoAuth)),
+        )
+        .unwrap_err();
+
+        assert!(matches!(err, Error::Config(_)));
+        assert!(err.to_string().contains("does not match the loaded signer"));
+    }
+
+    #[test]
+    fn file_account_reason_loader_enforces_pubkey_match() {
+        let (_temp_dir, mut account, _) = fresh_file_account(Some(false));
+        account.pubkey = Some("11111111111111111111111111111111".to_string());
+
+        let err = load_signer_from_account_with_reason(
+            &account,
+            "default",
+            MAINNET_NETWORK,
+            "authorize payment",
+        )
+        .unwrap_err();
+
+        assert!(matches!(err, Error::Config(_)));
+        assert!(err.to_string().contains("does not match the loaded signer"));
+    }
+
+    #[test]
+    fn onepassword_composes_explicit_auth_override_before_store_access() {
+        let (_temp_dir, mut account, _) = fresh_file_account(Some(true));
+        account.keystore = Keystore::OnePassword;
+        account.path = None;
+
+        let err = load_keypair_bytes_from_account_with_intent_and_override(
+            &account,
+            "default",
+            MAINNET_NETWORK,
+            &AuthIntent::default_payment(),
+            Some(Box::new(DenyAuth)),
+        )
+        .unwrap_err();
+
+        assert!(matches!(err, Error::PaymentRejected(_)));
+    }
+
+    #[test]
+    fn file_account_skips_platform_auth_gate_when_disabled() {
         let (_temp_dir, account, expected) = fresh_file_account(Some(false));
 
         let bytes = load_keypair_bytes_from_account_with_intent_and_override(
@@ -868,11 +1145,121 @@ mod tests {
             "default",
             MAINNET_NETWORK,
             &AuthIntent::default_payment(),
-            Some(Box::new(DenyAuth)),
+            None,
         )
         .unwrap();
 
         assert_eq!(&*bytes, &expected);
+    }
+
+    /// `auth_required: false` disarms the *platform* gate. It must not also
+    /// disarm a gate the caller passed in explicitly — that override is how
+    /// `PAY_AUTH_BACKEND=very` reaches the subscription flow, and silently
+    /// dropping it would let the activation sign with no human approval.
+    #[test]
+    fn explicit_auth_override_still_runs_when_platform_gate_is_disabled() {
+        for keystore in [Keystore::File, Keystore::OnePassword] {
+            let (_temp_dir, mut account, _) = fresh_file_account(Some(false));
+            account.keystore = keystore.clone();
+            if keystore == Keystore::OnePassword {
+                account.path = None;
+            }
+
+            let err = load_keypair_bytes_from_account_with_intent_and_override(
+                &account,
+                "default",
+                MAINNET_NETWORK,
+                &AuthIntent::default_payment(),
+                Some(Box::new(DenyAuth)),
+            )
+            .unwrap_err();
+
+            assert!(
+                matches!(err, Error::PaymentRejected(_)),
+                "{keystore:?}: {err}"
+            );
+        }
+    }
+
+    /// Off mainnet `auth_required` defaults to false, so this is the shape the
+    /// sandbox/devnet demo actually hits.
+    #[test]
+    fn explicit_auth_override_runs_on_networks_that_default_to_no_auth() {
+        let (_temp_dir, account, _) = fresh_file_account(None);
+
+        let err = load_keypair_bytes_from_account_with_intent_and_override(
+            &account,
+            "default",
+            "devnet",
+            &AuthIntent::default_payment(),
+            Some(Box::new(DenyAuth)),
+        )
+        .unwrap_err();
+
+        assert!(matches!(err, Error::PaymentRejected(_)));
+    }
+
+    /// A legacy `keystore: file` entry can omit the optional `pubkey` cache.
+    /// The subscriber bound into the approval must then come from the keypair
+    /// itself — otherwise the gate is asked to approve an empty wallet and
+    /// rejects an activation that is perfectly valid.
+    #[test]
+    fn file_account_without_cached_pubkey_still_binds_the_subscriber() {
+        let (_temp_dir, mut account, keypair_bytes) = fresh_file_account(Some(true));
+        let expected = account.pubkey.take().expect("fixture caches a pubkey");
+
+        let gate = CapturingAuth::default();
+        let err = load_keypair_bytes_from_account_with_intent_and_override(
+            &account,
+            "default",
+            MAINNET_NETWORK,
+            &subscription_intent(),
+            Some(Box::new(gate.clone())),
+        )
+        .unwrap_err();
+
+        assert!(matches!(err, Error::PaymentRejected(_)));
+        assert_eq!(gate.subscriber().as_deref(), Some(expected.as_str()));
+        // And the derived key really is the one that would have signed.
+        let signer = MemorySigner::from_bytes(&keypair_bytes).unwrap();
+        use pay_kit::mpp::solana_keychain::SolanaSigner;
+        assert_eq!(signer.pubkey().to_string(), expected);
+    }
+
+    /// The cache stays authoritative when present — deriving must not quietly
+    /// paper over an accounts.yml whose pubkey disagrees with the key on disk.
+    #[test]
+    fn cached_pubkey_is_still_what_gets_bound_and_cross_checked() {
+        let (_temp_dir, mut account, _) = fresh_file_account(Some(true));
+        account.pubkey = Some("11111111111111111111111111111111".to_string());
+
+        let gate = CapturingAuth::default();
+        let _ = load_keypair_bytes_from_account_with_intent_and_override(
+            &account,
+            "default",
+            MAINNET_NETWORK,
+            &subscription_intent(),
+            Some(Box::new(gate.clone())),
+        );
+
+        assert_eq!(
+            gate.subscriber().as_deref(),
+            Some("11111111111111111111111111111111")
+        );
+    }
+
+    /// Ordinary payment prompts have no subscriber field, so the derivation
+    /// must not read key material for them.
+    #[test]
+    fn non_subscription_intents_do_not_derive_a_pubkey() {
+        let (_temp_dir, mut account, _) = fresh_file_account(Some(true));
+        account.pubkey = None;
+
+        assert_eq!(
+            approval_pubkey(&AuthIntent::default_payment(), &account, "default"),
+            None
+        );
+        assert!(approval_pubkey(&subscription_intent(), &account, "default").is_some());
     }
 
     fn fresh_ephemeral_account() -> Account {
@@ -915,6 +1302,48 @@ mod tests {
 
             assert_eq!(&*bytes, &expected);
         }
+    }
+
+    #[test]
+    fn ephemeral_subscription_uses_explicit_auth_override() {
+        let mut file = AccountsFile::default();
+        file.upsert("localnet", "default", fresh_ephemeral_account());
+        let store = MemoryAccountsStore::with_file(file);
+
+        let err = load_signer_for_network_subscription_with_intent_and_override(
+            "localnet",
+            &store,
+            None,
+            "$1.00",
+            &AuthIntent::default_payment(),
+            Some(Box::new(DenyAuth)),
+        )
+        .unwrap_err();
+
+        assert!(matches!(err, Error::PaymentRejected(_)));
+        assert!(err.to_string().contains("subscription authorization"));
+    }
+
+    #[test]
+    fn ephemeral_subscription_rejects_signer_that_differs_from_approved_pubkey() {
+        let mut account = fresh_ephemeral_account();
+        account.pubkey = Some("11111111111111111111111111111111".to_string());
+        let mut file = AccountsFile::default();
+        file.upsert("localnet", "default", account);
+        let store = MemoryAccountsStore::with_file(file);
+
+        let err = load_signer_for_network_subscription_with_intent_and_override(
+            "localnet",
+            &store,
+            None,
+            "$1.00",
+            &AuthIntent::default_payment(),
+            Some(Box::new(crate::keystore::auth::NoAuth)),
+        )
+        .unwrap_err();
+
+        assert!(matches!(err, Error::Config(_)));
+        assert!(err.to_string().contains("does not match the loaded signer"));
     }
 
     #[test]

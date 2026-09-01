@@ -1,0 +1,19 @@
+[package]
+name = "pay-auth-very"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+base64 = { workspace = true }
+ed25519-dalek = { workspace = true, features = ["rand_core"] }
+pay-keystore = { workspace = true }
+reqwest = { workspace = true, features = ["json"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true }
+sha2 = "0.10"
+
+[dev-dependencies]
+rand = { workspace = true }

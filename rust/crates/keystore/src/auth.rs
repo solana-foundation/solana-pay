@@ -1,6 +1,7 @@
 //! Authentication gates — biometric or password prompts before secret access.
 
 use crate::Result;
+use serde::{Deserialize, Serialize};
 
 pub(crate) const DEFAULT_AUTH_REASON: &str = "authorize pay to use your payment account";
 
@@ -15,6 +16,15 @@ pub enum AuthIntent {
     AuthorizePayment {
         message: String,
         limit: Option<PaymentLimit>,
+    },
+    /// Authorize creation of recurring MPP payment authority. Unlike a
+    /// display-only payment prompt, this variant carries the durable,
+    /// machine-readable terms that a remote auth backend can bind into its
+    /// signed approval.
+    AuthorizeSubscription {
+        message: String,
+        limit: Option<PaymentLimit>,
+        authorization: Box<SubscriptionAuthorization>,
     },
     CreateAccount(String),
     ImportAccount(String),
@@ -32,6 +42,60 @@ pub enum AuthIntent {
         message: String,
         limit: Option<PaymentLimit>,
     },
+}
+
+/// Canonical subscription-activation terms presented to an [`AuthGate`].
+///
+/// Liveness-only transaction data such as `recentBlockhash` is deliberately
+/// excluded: a remote approval can outlive Solana's short blockhash window,
+/// so the transaction must refresh that value immediately before signing.
+/// The challenge identity and all durable on-chain authority fields remain
+/// bound here.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SubscriptionAuthorization {
+    pub version: u8,
+    pub challenge_id: String,
+    pub challenge_realm: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub challenge_expires: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub challenge_digest: Option<String>,
+    pub network: String,
+    pub plan_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub plan_id_numeric: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub plan_bump: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub plan_created_at: Option<i64>,
+    pub recipient: String,
+    pub puller: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub merchant: Option<String>,
+    pub mint: String,
+    pub token_program: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub program_id: Option<String>,
+    pub amount_base_units: String,
+    pub decimals: u8,
+    pub period_unit: String,
+    pub period_count: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_period_hours: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subscription_expires: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub external_id: Option<String>,
+    pub fee_payer: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fee_payer_key: Option<String>,
+    /// Human-readable Pay account label, filled by the signer resolver.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub account: Option<String>,
+    /// Wallet pubkey cached in `accounts.yml`, filled before secret access.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subscriber: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -169,13 +233,49 @@ impl AuthIntent {
         }
     }
 
+    pub fn authorize_subscription(
+        amount: &str,
+        reason: &str,
+        operator: &str,
+        authorization: SubscriptionAuthorization,
+    ) -> Self {
+        Self::AuthorizeSubscription {
+            message: payment_authorization_message(
+                PaymentAmountKind::Exact,
+                amount,
+                Some(reason),
+                operator,
+            ),
+            limit: PaymentLimit::from_amount(amount),
+            authorization: Box::new(authorization),
+        }
+    }
+
     pub fn with_account_context(&self, account: &str) -> Self {
+        self.with_account_context_and_pubkey(account, None)
+    }
+
+    pub fn with_account_context_and_pubkey(&self, account: &str, pubkey: Option<&str>) -> Self {
         let account = prompt_detail(account);
         match self {
             Self::AuthorizePayment { message, limit } => Self::AuthorizePayment {
                 message: payment_message_with_account(message, &account),
                 limit: *limit,
             },
+            Self::AuthorizeSubscription {
+                message,
+                limit,
+                authorization,
+            } => {
+                let mut authorization = authorization.clone();
+                authorization.account = Some(account.clone());
+                authorization.subscriber = pubkey.map(str::to_string);
+                Self::AuthorizeSubscription {
+                    message: payment_message_with_account(message, &account),
+                    limit: *limit,
+                    authorization,
+                }
+            }
             other => other.clone(),
         }
     }
@@ -298,6 +398,7 @@ impl AuthIntent {
         match self {
             Self::AuthorizePayment { message, .. }
             | Self::AuthorizeBatch { message, .. }
+            | Self::AuthorizeSubscription { message, .. }
             | Self::CreateAccount(message)
             | Self::ImportAccount(message)
             | Self::ExportAccount(message)
@@ -310,7 +411,16 @@ impl AuthIntent {
 
     pub fn payment_limit(&self) -> Option<PaymentLimit> {
         match self {
-            Self::AuthorizePayment { limit, .. } | Self::AuthorizeBatch { limit, .. } => *limit,
+            Self::AuthorizePayment { limit, .. }
+            | Self::AuthorizeBatch { limit, .. }
+            | Self::AuthorizeSubscription { limit, .. } => *limit,
+            _ => None,
+        }
+    }
+
+    pub fn subscription_authorization(&self) -> Option<&SubscriptionAuthorization> {
+        match self {
+            Self::AuthorizeSubscription { authorization, .. } => Some(authorization),
             _ => None,
         }
     }
@@ -543,6 +653,38 @@ fn truncate_for_prompt(value: &str, max_chars: usize) -> String {
 mod tests {
     use super::*;
 
+    fn subscription_authorization() -> SubscriptionAuthorization {
+        SubscriptionAuthorization {
+            version: 1,
+            challenge_id: "challenge-1".to_string(),
+            challenge_realm: "api.example.com".to_string(),
+            challenge_expires: Some("2026-07-28T12:05:00Z".to_string()),
+            challenge_digest: None,
+            network: "mainnet".to_string(),
+            plan_id: "plan-pda".to_string(),
+            plan_id_numeric: Some(42),
+            plan_bump: Some(254),
+            plan_created_at: Some(1_770_000_000),
+            recipient: "recipient-wallet".to_string(),
+            puller: "puller-wallet".to_string(),
+            merchant: Some("merchant-wallet".to_string()),
+            mint: "usdc-mint".to_string(),
+            token_program: "token-program".to_string(),
+            program_id: Some("subscription-program".to_string()),
+            amount_base_units: "1000000".to_string(),
+            decimals: 6,
+            period_unit: "day".to_string(),
+            period_count: 30,
+            expected_period_hours: Some(720),
+            subscription_expires: Some("2027-07-28T12:00:00Z".to_string()),
+            external_id: Some("customer-plan".to_string()),
+            fee_payer: true,
+            fee_payer_key: Some("fee-payer".to_string()),
+            account: None,
+            subscriber: None,
+        }
+    }
+
     #[test]
     fn prompt_message_preserves_user_facing_reason() {
         assert_eq!(
@@ -604,6 +746,31 @@ mod tests {
                 .prompt_message(),
             "authorize a payment from test.\n\namount: $0.30\n\nreason: Send USDC\n\noperator: gateway-402.com"
         );
+    }
+
+    #[test]
+    fn subscription_intent_preserves_typed_terms_and_wallet_context() {
+        let intent = AuthIntent::authorize_subscription(
+            "$1.00",
+            "Recurring subscription — $1.00 USDC every 30 days",
+            "api.example.com",
+            subscription_authorization(),
+        )
+        .with_account_context_and_pubkey("primary", Some("subscriber-wallet"));
+
+        assert_eq!(intent.payment_limit(), Some(PaymentLimit::Usd1));
+        assert!(intent.message().contains("from primary"));
+        let authorization = intent
+            .subscription_authorization()
+            .expect("typed subscription authorization");
+        assert_eq!(authorization.account.as_deref(), Some("primary"));
+        assert_eq!(
+            authorization.subscriber.as_deref(),
+            Some("subscriber-wallet")
+        );
+        assert_eq!(authorization.recipient, "recipient-wallet");
+        assert_eq!(authorization.amount_base_units, "1000000");
+        assert_eq!(authorization.period_count, 30);
     }
 
     #[test]

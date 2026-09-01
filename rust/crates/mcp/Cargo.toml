@@ -4,10 +4,15 @@ edition.workspace = true
 version.workspace = true
 license.workspace = true
 
+[features]
+default = []
+very = ["dep:pay-auth-very"]
+
 [dependencies]
 pay-core = { workspace = true }
 pay-types = { workspace = true }
 pay-keystore = { workspace = true }
+pay-auth-very = { workspace = true, optional = true }
 base64 = { workspace = true }
 crc32fast = { workspace = true }
 flate2 = { workspace = true }
