@@ -91,6 +91,7 @@ async fn gate_adapter<S: PaymentState>(state: S, req: Request<Body>, next: Next)
             session,
             receipt,
             upto,
+            batch,
             paid_request,
         } => {
             let mut req = req;
@@ -206,6 +207,17 @@ async fn gate_adapter<S: PaymentState>(state: S, req: Request<Body>, next: Next)
                     uf.telemetry,
                 )
                 .await
+                {
+                    response.headers_mut().append(n, v);
+                }
+            }
+            // x402 `batch-settlement`: the voucher commits only now, and only
+            // for a response that actually served. A failure drops the outcome,
+            // leaving the client uncharged and free to retry it.
+            if let Some(bf) = batch {
+                let served_ok = response.status().is_success();
+                if let Some((n, v)) =
+                    crate::server::gate::settle_batch(&state, *bf, served_ok).await
                 {
                     response.headers_mut().append(n, v);
                 }

@@ -85,6 +85,19 @@ pub enum RunOutcome {
         advertised_challenges: DecodedPaymentChallenges,
         resource_url: String,
     },
+    /// The server returned 402 with an x402 `batch-settlement` challenge —
+    /// one escrow channel backs many cheap requests, each authorized by a
+    /// cumulative voucher rather than its own transaction.
+    ///
+    /// Like an MPP session, and unlike `upto`, this is stateful: the caller
+    /// keeps the channel in a [`crate::client::batch::BatchChannelCache`] and
+    /// reuses it across requests, so a long-lived host amortizes one deposit
+    /// over many calls.
+    X402BatchChallenge {
+        challenge: Box<x402::BatchChallenge>,
+        advertised_challenges: DecodedPaymentChallenges,
+        resource_url: String,
+    },
     /// The server returned 402 with an x402 `sign-in-with-x` challenge.
     ///
     /// When the same 402 also offered a payment option, `payment_fallback`
@@ -747,11 +760,12 @@ pub(crate) fn classify_402_with_preference(
         // alternative — otherwise the selector could pick an `exact` the server
         // never advertised and the payment would be rejected.
         let x402_upto_accepts = x402::parse_upto_accepts(headers, body);
-        let x402_alternative = if x402_upto_accepts.is_empty() {
-            x402_challenge.clone().map(Box::new)
-        } else {
-            None
-        };
+        let x402_alternative =
+            if x402_upto_accepts.is_empty() && x402::parse_batch(headers, body).is_none() {
+                x402_challenge.clone().map(Box::new)
+            } else {
+                None
+            };
         return RunOutcome::MppChallenge {
             challenge: Box::new(challenge),
             alternatives: charge_challenges,
@@ -796,6 +810,22 @@ pub(crate) fn classify_402_with_preference(
             );
             return RunOutcome::X402UptoChallenge {
                 challenge: Box::new(upto),
+                advertised_challenges,
+                resource_url: resource_url.to_string(),
+            };
+        }
+
+        // x402 `batch-settlement` — like `upto`, checked before exact: a
+        // batch-only challenge also parses leniently as exact, and paying it
+        // with an exact transfer would be rejected by a server that never
+        // advertised that scheme.
+        if let Some(batch) = x402::parse_batch(headers, body) {
+            debug!(
+                resource = resource_url,
+                "Detected x402 batch-settlement challenge (Solana)"
+            );
+            return RunOutcome::X402BatchChallenge {
+                challenge: Box::new(batch),
                 advertised_challenges,
                 resource_url: resource_url.to_string(),
             };
@@ -1743,6 +1773,93 @@ HTTP request sent, awaiting response...
 
         let outcome = classify_402(&headers, None, "https://example.com/resource");
         assert!(matches!(outcome, RunOutcome::SessionChallenge { .. }));
+    }
+
+    /// A `batch-settlement` offer carries the same core fields as `exact`
+    /// (scheme, network, amount, asset, payTo), so a lenient `exact` reader
+    /// accepts it. Paying it with an exact transfer would be rejected by a
+    /// server that never advertised that scheme, so classification must prefer
+    /// the batch reading — this pins that ordering.
+    #[test]
+    fn classify_402_prefers_batch_settlement_over_a_lenient_exact_reading() {
+        use base64::Engine;
+        use base64::engine::general_purpose::STANDARD;
+
+        let envelope = serde_json::json!({
+            "x402Version": 2,
+            "accepts": [{
+                "scheme": "batch-settlement",
+                "network": "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp",
+                "amount": "1000",
+                "asset": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+                "payTo": "CXhrFZJLKqjzmP3sjYLcF4dTeXWKCy9e2SXXZ2Yo6MPY",
+                "maxTimeoutSeconds": 300,
+                "extra": {
+                    "feePayer": "9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin",
+                    "withdrawDelay": 3600,
+                    "tokenProgram": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+                }
+            }]
+        });
+        let headers = vec![(
+            "payment-required".to_string(),
+            STANDARD.encode(serde_json::to_vec(&envelope).unwrap()),
+        )];
+
+        let outcome = classify_402(&headers, None, "https://example.com/resource");
+        assert!(
+            matches!(outcome, RunOutcome::X402BatchChallenge { .. }),
+            "expected a batch-settlement challenge, got: {outcome:?}"
+        );
+    }
+
+    /// The corrective 402 the server sends on a cumulative mismatch must reach
+    /// the client as a batch challenge carrying its error code — that is what
+    /// lets the client resynchronize instead of retrying a stale amount.
+    #[test]
+    fn classify_402_surfaces_the_corrective_batch_error() {
+        use base64::Engine;
+        use base64::engine::general_purpose::STANDARD;
+
+        let envelope = serde_json::json!({
+            "x402Version": 2,
+            "error": "invalid_batch_settlement_svm_cumulative_amount_mismatch",
+            "accepts": [{
+                "scheme": "batch-settlement",
+                "network": "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp",
+                "amount": "1000",
+                "asset": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+                "payTo": "CXhrFZJLKqjzmP3sjYLcF4dTeXWKCy9e2SXXZ2Yo6MPY",
+                "maxTimeoutSeconds": 300,
+                "extra": {
+                    "feePayer": "9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin",
+                    "withdrawDelay": 3600,
+                    "tokenProgram": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+                    "channelState": {
+                        "channelId": "Chan11111111111111111111111111111111111111",
+                        "balance": "100000",
+                        "totalClaimed": "2000",
+                        "withdrawRequestedAt": 0,
+                        "chargedCumulativeAmount": "3000"
+                    }
+                }
+            }]
+        });
+        let headers = vec![(
+            "payment-required".to_string(),
+            STANDARD.encode(serde_json::to_vec(&envelope).unwrap()),
+        )];
+
+        let RunOutcome::X402BatchChallenge { challenge, .. } =
+            classify_402(&headers, None, "https://example.com/resource")
+        else {
+            panic!("expected a batch-settlement challenge");
+        };
+        assert_eq!(
+            challenge.error.as_deref(),
+            Some("invalid_batch_settlement_svm_cumulative_amount_mismatch")
+        );
+        assert!(challenge.requirements.is_corrective());
     }
 
     #[test]

@@ -28,8 +28,8 @@ use futures_util::StreamExt;
 use http::{HeaderMap, HeaderName, HeaderValue, StatusCode, Uri};
 use pay_core::PaymentState;
 use pay_core::server::gate::{
-    GateDecision, GateRequest, GateResponse, PaidRequestTelemetry, PaymentGate, ReceiptAnnotation,
-    SessionForward, UptoPaymentTelemetry,
+    BatchForward, GateDecision, GateRequest, GateResponse, PaidRequestTelemetry, PaymentGate,
+    ReceiptAnnotation, SessionForward, UptoPaymentTelemetry, settle_batch,
     settle_delegated_session as settle_delegated_session_forward, settle_upto, settle_upto_metered,
 };
 use pay_core::server::metering::{self, UptoSettlementPlan};
@@ -72,6 +72,7 @@ pub struct Ctx {
     /// (debit on success) or `logging` (refund when the upstream never
     /// responded). Taken when settled, so it's never double-settled.
     upto: Option<PendingUpto>,
+    batch: Option<BatchForward>,
     /// A delegated MPP session opened pre-serve. Responses are buffered and
     /// rated with the same usage pipeline as x402 `upto`, then the gateway
     /// signs and persists the cumulative voucher before returning the body.
@@ -280,6 +281,11 @@ impl<S: PaymentState> Http402Gate<S> {
             && let Some((n, v)) = self
                 .settle_pending_upto(pending, served_ok, response_headers, response_body)
                 .await
+        {
+            extra.push((n, v));
+        }
+        if let Some(pending) = ctx.batch.take()
+            && let Some((n, v)) = settle_batch(&self.state, pending, served_ok).await
         {
             extra.push((n, v));
         }
@@ -594,6 +600,7 @@ impl<S: PaymentState> ProxyHttp for Http402Gate<S> {
             target: None,
             receipt: None,
             upto: None,
+            batch: None,
             session: None,
             paid_request: None,
             log: None,
@@ -678,10 +685,15 @@ impl<S: PaymentState> ProxyHttp for Http402Gate<S> {
                 session: session_forward,
                 receipt,
                 upto,
+                batch,
                 paid_request,
             } => {
                 ctx.receipt = receipt;
                 ctx.paid_request = paid_request;
+                // x402 `batch-settlement`: the voucher is verified and the
+                // channel reserved, but nothing is charged until the upstream
+                // has actually served.
+                ctx.batch = batch.map(|b| *b);
                 // x402 `upto`: the channel is open; hold it for post-response
                 // settlement (response_filter on success, logging on failure).
                 ctx.upto = upto.map(|u| {

@@ -24,7 +24,9 @@ use pay_kit::mpp::{
     format_www_authenticate, format_www_authenticate_many, parse_authorization,
 };
 use pay_kit::x402::PAYMENT_RESPONSE_HEADER;
-use pay_kit::x402::server::{ExactOptions, VerifiedUptoOpen, X402, X402BatchSettlement, X402Upto};
+use pay_kit::x402::server::{
+    BatchOutcome, ExactOptions, VerifiedUptoOpen, X402, X402BatchSettlement, X402Upto,
+};
 use pay_types::metering::Scheme;
 use serde_json::json;
 
@@ -290,6 +292,30 @@ pub struct UptoForward {
     pub telemetry: UptoPaymentTelemetry,
 }
 
+/// An x402 `batch-settlement` payment verified before the resource is served,
+/// carried to the adapter's post-response hook for commitment.
+///
+/// The scheme's `authorization` flow is verify-then-serve-then-commit:
+/// verification only reserves the channel, and the cumulative watermark
+/// advances — and any deposit transaction broadcasts — only after the upstream
+/// succeeds. A failed serve therefore leaves the client uncharged and free to
+/// retry the same voucher.
+///
+/// Holds the `!Clone` [`BatchOutcome`], whose in-flight guard serializes the
+/// channel until it is dropped or settled.
+pub struct BatchForward {
+    /// Boxed to keep the `GateDecision::Forward` variant small.
+    pub outcome: Box<BatchOutcome>,
+    /// Stable context for attributing the amount actually charged.
+    pub telemetry: BatchPaymentTelemetry,
+}
+
+pub struct BatchPaymentTelemetry {
+    pub subdomain: String,
+    pub path: String,
+    pub payment: Option<telemetry::PaymentAmount>,
+}
+
 pub struct UptoPaymentTelemetry {
     pub subdomain: String,
     pub path: String,
@@ -305,11 +331,13 @@ pub enum GateDecision {
     /// session credential opened/advanced a channel, `session` carries the
     /// stream-metering context the adapter attaches to the upstream request;
     /// `receipt` is applied to the response. For x402 `upto`, `upto` carries the
-    /// opened channel the adapter settles *after* the response.
+    /// opened channel the adapter settles *after* the response; `batch` does the
+    /// same for x402 `batch-settlement`, whose voucher commits post-serve.
     Forward {
         session: Option<Box<SessionForward>>,
         receipt: Option<ReceiptAnnotation>,
         upto: Option<Box<UptoForward>>,
+        batch: Option<Box<BatchForward>>,
         paid_request: Option<PaidRequestTelemetry>,
     },
     /// Not gated (discovery / free / unknown) — let normal routing handle it
@@ -892,6 +920,7 @@ impl<S: PaymentState> PaymentGate<S> {
                         reference: Some(reference),
                     }),
                     upto: None,
+                    batch: None,
                     paid_request: Some(PaidRequestTelemetry {
                         protocol: "x402/exact",
                         subdomain: subdomain.to_string(),
@@ -940,6 +969,7 @@ impl<S: PaymentState> PaymentGate<S> {
                 GateDecision::Forward {
                     session: None,
                     receipt: None,
+                    batch: None,
                     upto: Some(Box::new(UptoForward {
                         open: Box::new(open),
                         settle_amount,
@@ -976,10 +1006,16 @@ impl<S: PaymentState> PaymentGate<S> {
         }
     }
 
-    /// Verify an x402 `batch-settlement` payment. On `serve`, forward with the
-    /// settlement header; on a cooperative refund, acknowledge (200) without
-    /// serving; on failure, re-challenge. On-chain settlement is batched out of
-    /// band by the operator.
+    /// Verify an x402 `batch-settlement` payment before the resource is served.
+    ///
+    /// Verification is read-only: it checks the cumulative voucher and reserves
+    /// the channel, but does not charge. The commitment is made by
+    /// [`settle_batch`] after the upstream responds, so a failed serve leaves
+    /// the client uncharged and able to retry the same voucher. On-chain
+    /// redemption is batched out of band by the operator.
+    ///
+    /// A `refund` bypasses the upstream entirely — a channel close is a
+    /// payment-control operation, not a paid request.
     async fn x402_batch_verify(
         &self,
         batch: &X402BatchSettlement,
@@ -1004,68 +1040,103 @@ impl<S: PaymentState> PaymentGate<S> {
                 currency: "USD".to_string(),
                 ui_amount,
             });
-        match batch.verify_payment(pay_header, &amount).await {
-            Ok(outcome) => {
-                let mut headers = Vec::new();
-                if let Ok((name, value)) = batch.settlement_header(&outcome.response)
-                    && let (Ok(n), Ok(v)) = (
-                        HeaderName::from_bytes(name.as_bytes()),
-                        HeaderValue::from_str(&value),
-                    )
-                {
-                    headers.push((n, v));
-                }
-                let reference = outcome
-                    .response
-                    .channel_state
-                    .as_ref()
-                    .map(|c| c.channel_id.clone());
-                if outcome.serve {
-                    if let Some(r) = &reference {
-                        telemetry::record_payment_collected(
-                            "x402/batch",
-                            subdomain,
-                            path,
-                            payment.as_ref(),
-                            r,
-                        );
-                    }
-                    GateDecision::Forward {
-                        session: None,
-                        receipt: Some(ReceiptAnnotation { headers, reference }),
-                        upto: None,
-                        paid_request: Some(PaidRequestTelemetry {
-                            protocol: "x402/batch",
-                            subdomain: subdomain.to_string(),
-                            payment,
-                        }),
-                    }
-                } else {
-                    // Cooperative refund / channel close — acknowledge, don't serve.
-                    let mut resp = GateResponse::json(
-                        StatusCode::OK,
-                        Bytes::from_static(br#"{"status":"channel_closed"}"#),
-                    );
-                    resp.headers.extend(headers);
-                    GateDecision::Respond(resp)
-                }
-            }
+
+        let outcome = match batch.verify_payment(pay_header, &amount).await {
+            Ok(outcome) => outcome,
             Err(e) => {
-                telemetry::record_settlement_error(
-                    "x402/batch",
-                    subdomain,
-                    path,
-                    &e.to_string(),
-                    true,
-                );
-                GateDecision::Respond(GateResponse::json(
+                telemetry::record_challenge_error("x402/batch", subdomain, &e.to_string());
+                // A cumulative mismatch comes back as a corrective 402 carrying
+                // the server's snapshot plus the client's own signed voucher, so
+                // the client can resynchronize and retry rather than be stuck.
+                let mut resp = GateResponse::json(
                     StatusCode::PAYMENT_REQUIRED,
                     serde_json::to_vec(
                         &json!({"error":"verification_failed","message":e.to_string()}),
                     )
                     .unwrap_or_default(),
-                ))
+                );
+                if let Ok((name, value)) =
+                    batch.challenge_for_failure(pay_header, &amount, &e).await
+                    && let (Ok(n), Ok(v)) = (
+                        HeaderName::from_bytes(name.as_bytes()),
+                        HeaderValue::from_str(&value),
+                    )
+                {
+                    resp.headers.push((n, v));
+                }
+                return GateDecision::Respond(resp);
             }
+        };
+
+        // An idempotent retry of an already-accepted voucher. The scheme
+        // requires the cached response for this commitment and forbids
+        // re-running the handler; the proxy holds no response cache, so it
+        // reports the conflict rather than charge or serve twice.
+        if outcome.replay {
+            return GateDecision::Respond(GateResponse::json(
+                StatusCode::CONFLICT,
+                serde_json::to_vec(&json!({
+                    "error": "duplicate_settlement",
+                    "message": "payment authorization already used",
+                }))
+                .unwrap_or_default(),
+            ));
+        }
+
+        // A channel close: commit it now and acknowledge without serving.
+        if !outcome.serve {
+            let mut resp = GateResponse::json(
+                StatusCode::OK,
+                Bytes::from_static(br#"{"status":"channel_closing"}"#),
+            );
+            match batch.settle_payment(outcome).await {
+                Ok(settlement) => {
+                    if let Ok((name, value)) = batch.settlement_header(&settlement)
+                        && let (Ok(n), Ok(v)) = (
+                            HeaderName::from_bytes(name.as_bytes()),
+                            HeaderValue::from_str(&value),
+                        )
+                    {
+                        resp.headers.push((n, v));
+                    }
+                }
+                Err(e) => {
+                    telemetry::record_settlement_error(
+                        "x402/batch",
+                        subdomain,
+                        path,
+                        &e.to_string(),
+                        true,
+                    );
+                    return GateDecision::Respond(GateResponse::json(
+                        StatusCode::BAD_GATEWAY,
+                        serde_json::to_vec(
+                            &json!({"error":"close_failed","message":e.to_string()}),
+                        )
+                        .unwrap_or_default(),
+                    ));
+                }
+            }
+            return GateDecision::Respond(resp);
+        }
+
+        GateDecision::Forward {
+            session: None,
+            receipt: None,
+            upto: None,
+            batch: Some(Box::new(BatchForward {
+                outcome: Box::new(outcome),
+                telemetry: BatchPaymentTelemetry {
+                    subdomain: subdomain.to_string(),
+                    path: path.to_string(),
+                    payment: payment.clone(),
+                },
+            })),
+            paid_request: Some(PaidRequestTelemetry {
+                protocol: "x402/batch",
+                subdomain: subdomain.to_string(),
+                payment,
+            }),
         }
     }
 
@@ -1211,6 +1282,7 @@ impl<S: PaymentState> PaymentGate<S> {
                     session: None,
                     receipt: None,
                     upto: None,
+                    batch: None,
                     paid_request: Some(PaidRequestTelemetry {
                         protocol: "mpp/subscription",
                         subdomain: subdomain.to_string(),
@@ -1260,6 +1332,7 @@ impl<S: PaymentState> PaymentGate<S> {
                         reference: Some(receipt_kind.base().reference.clone()),
                     }),
                     upto: None,
+                    batch: None,
                     paid_request: Some(PaidRequestTelemetry {
                         protocol: "mpp/subscription",
                         subdomain: subdomain.to_string(),
@@ -1420,6 +1493,7 @@ impl<S: PaymentState> PaymentGate<S> {
                             reference: Some(reference),
                         }),
                         upto: None,
+                        batch: None,
                         paid_request: Some(PaidRequestTelemetry {
                             protocol: "mpp/charge",
                             subdomain: subdomain.to_string(),
@@ -1471,6 +1545,71 @@ fn upto_settle_amount(min_usd: Option<f64>, ceiling_usd: f64, max_amount: u64) -
             ((min_usd * units_per_usd).round() as u64).min(max_amount)
         }
         _ => max_amount,
+    }
+}
+
+/// Commit an x402 `batch-settlement` voucher after the resource was served
+/// (the adapter's post-response hook).
+///
+/// This is the step that charges the client, so it runs only on a successful
+/// serve. On failure the outcome is dropped instead: the watermark never
+/// advances, the channel's in-flight guard is released, and the client may
+/// retry the identical voucher.
+///
+/// No on-chain transaction is involved for a steady-state voucher — the
+/// operator redeems accumulated vouchers in batches out of band. A `deposit`
+/// broadcasts its `open`/`top_up` here, which is why this can fail after the
+/// resource was already served; that loss is logged, not surfaced.
+pub async fn settle_batch<S: PaymentState>(
+    state: &S,
+    forward: BatchForward,
+    served_ok: bool,
+) -> Option<(HeaderName, HeaderValue)> {
+    let batch = state.x402_batch()?;
+    let telemetry_context = forward.telemetry;
+    if !served_ok {
+        // Dropping the outcome releases the channel without committing.
+        return None;
+    }
+    let channel_id = forward.outcome.channel_id.clone();
+    match batch.settle_payment(*forward.outcome).await {
+        Ok(settlement) => {
+            telemetry::record_payment_collected(
+                "x402/batch",
+                &telemetry_context.subdomain,
+                &telemetry_context.path,
+                telemetry_context.payment.as_ref(),
+                &channel_id,
+            );
+            match batch.settlement_header(&settlement) {
+                Ok((name, value)) => Some((
+                    HeaderName::from_bytes(name.as_bytes()).ok()?,
+                    HeaderValue::from_str(&value).ok()?,
+                )),
+                Err(e) => {
+                    telemetry::record_settlement_error(
+                        "x402/batch",
+                        &telemetry_context.subdomain,
+                        &telemetry_context.path,
+                        &e.to_string(),
+                        true,
+                    );
+                    None
+                }
+            }
+        }
+        Err(e) => {
+            // The resource was already served; the uncommitted charge is the
+            // operator's loss and worth alerting on.
+            telemetry::record_settlement_error(
+                "x402/batch",
+                &telemetry_context.subdomain,
+                &telemetry_context.path,
+                &e.to_string(),
+                true,
+            );
+            None
+        }
     }
 }
 
@@ -1791,6 +1930,7 @@ async fn session_authorized(
                 receipt: signature
                     .map(|reference| session_receipt_annotation(sm.network(), reference)),
                 upto: None,
+                batch: None,
                 paid_request: Some(PaidRequestTelemetry {
                     protocol: "mpp/session",
                     subdomain: subdomain.to_string(),
@@ -1814,6 +1954,7 @@ async fn session_authorized(
             }),
             receipt: None,
             upto: None,
+            batch: None,
             paid_request: Some(PaidRequestTelemetry {
                 protocol: "mpp/session",
                 subdomain: subdomain.to_string(),

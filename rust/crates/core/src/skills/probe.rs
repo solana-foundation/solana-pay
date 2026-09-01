@@ -608,6 +608,30 @@ fn classify_outcome(outcome: RunOutcome, accepted: &[String]) -> ProbeStatus {
             }
         }
 
+        RunOutcome::X402BatchChallenge { challenge, .. } => {
+            let currency = normalize_currency(&challenge.requirements.asset);
+            // Like `upto`, the requirements carry only the CAIP-2 network.
+            let network =
+                pay_kit::x402::exact::cluster_for_caip2_network(&challenge.requirements.network)
+                    .unwrap_or("mainnet")
+                    .to_string();
+            let recipient = challenge.requirements.pay_to.clone();
+
+            if !accepted.iter().any(|a| a.eq_ignore_ascii_case(&currency)) {
+                return ProbeStatus::WrongCurrency {
+                    got: currency,
+                    accepted: accepted.to_vec(),
+                };
+            }
+
+            ProbeStatus::Ok {
+                protocol: "x402-batch-settlement".into(),
+                currency,
+                network,
+                recipient,
+            }
+        }
+
         RunOutcome::X402SignInChallenge { .. } => ProbeStatus::Ok {
             protocol: "x402-siwx".into(),
             currency: "sign-in".into(),

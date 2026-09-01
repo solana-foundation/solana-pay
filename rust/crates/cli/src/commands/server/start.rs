@@ -90,6 +90,60 @@ async fn session_channel_store()
     }
 }
 
+/// Resolve the channel store backing x402 `batch-settlement`.
+///
+/// The store holds the only record of what a client has been charged: an
+/// accepted voucher and its cumulative watermark cannot be reconstructed from
+/// the chain, so losing it means the operator either forfeits the revenue or
+/// invents a charge. Memory is fine for a local `pay serve`; a deployment that
+/// takes real money wants `PAY_BATCH_REDIS_URL` (falling back to the session
+/// Redis URL).
+///
+/// The key prefix is deliberately distinct from the session store's: both hold
+/// `ChannelState` rows keyed by channel id, and sharing a namespace would let
+/// one scheme read the other's channels.
+async fn batch_channel_store()
+-> pay_core::Result<(Arc<dyn pay_kit::mpp::store::ChannelStore>, bool)> {
+    let redis_url = std::env::var("PAY_BATCH_REDIS_URL")
+        .or_else(|_| std::env::var("PAY_SESSION_REDIS_URL"))
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+
+    let Some(redis_url) = redis_url else {
+        return Ok((
+            Arc::new(pay_kit::mpp::store::MemoryChannelStore::new()),
+            false,
+        ));
+    };
+
+    #[cfg(feature = "redis-session-store")]
+    {
+        let prefix = std::env::var("PAY_BATCH_REDIS_PREFIX")
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| "pay:batch:v1:".to_string());
+        let store = pay_kit::mpp::store::RedisChannelStore::connect(&redis_url, prefix)
+            .await
+            .map_err(|error| {
+                pay_core::Error::Config(format!("failed to connect batch Redis store: {error}"))
+            })?;
+        tracing::info!("using durable Redis channel store for x402 batch-settlement");
+        Ok((Arc::new(store), true))
+    }
+
+    #[cfg(not(feature = "redis-session-store"))]
+    {
+        let _ = redis_url;
+        Err(pay_core::Error::Config(
+            "a batch-settlement Redis URL is set, but this pay binary was built without the \
+             redis-session-store feature"
+                .to_string(),
+        ))
+    }
+}
+
 /// The gateway owns session close/settlement until a separately deployed
 /// durable-store reconciler exists. Redis still persists lifecycle deadlines;
 /// embedded reconciliation ensures those deadlines are actually processed by
@@ -178,6 +232,7 @@ struct AppState {
     fee_payer_signer: Option<Arc<dyn SolanaSigner>>,
     x402: Option<pay_kit::x402::server::X402>,
     x402_upto: Option<pay_kit::x402::server::X402Upto>,
+    x402_batch: Option<pay_kit::x402::server::X402BatchSettlement>,
     pdb: Option<pay_pdb::PdbState>,
 }
 
@@ -217,6 +272,9 @@ impl PaymentState for AppState {
     }
     fn x402_upto(&self) -> Option<&pay_kit::x402::server::X402Upto> {
         self.x402_upto.as_ref()
+    }
+    fn x402_batch(&self) -> Option<&pay_kit::x402::server::X402BatchSettlement> {
+        self.x402_batch.as_ref()
     }
     fn records_http_exchanges(&self) -> bool {
         self.pdb.is_some()
@@ -1571,6 +1629,68 @@ impl StartCommand {
                 _ => None,
             };
 
+            // x402 `batch-settlement` backend — one channel, many cheap
+            // requests. Like `upto` it needs the operator signer (it sponsors
+            // channel rent, co-signs the client's `open`, and signs redemption),
+            // but unlike `upto` it is stateful across requests, so it also needs
+            // a channel store that outlives the process to be safe in
+            // production.
+            let wants_batch = api.endpoints.iter().any(|e| {
+                e.metering.as_ref().is_some_and(|m| {
+                    m.accepted_schemes()
+                        .iter()
+                        .any(|s| matches!(s, pay_types::metering::Scheme::X402BatchSettlement))
+                })
+            });
+            let x402_batch = match (wants_batch, fee_payer_signer.clone()) {
+                (true, Some(signer)) => {
+                    let (batch_store, durable_batch_store) = batch_channel_store().await?;
+                    if !durable_batch_store {
+                        eprintln!(
+                            "{}",
+                            "warning: x402 batch-settlement is using an in-memory channel store; \
+                             set PAY_BATCH_REDIS_URL before taking real payments, or a restart \
+                             forfeits every unclaimed voucher"
+                                .yellow()
+                        );
+                    }
+                    let primary = x402_currencies
+                        .first()
+                        .expect("x402 currency configs are never empty");
+                    let cfg = pay_kit::x402::server::BatchConfig {
+                        pay_to: recipient.clone(),
+                        currency: primary.currency.clone(),
+                        decimals: primary.decimals,
+                        token_program: primary.token_program.clone(),
+                        cluster: network.slug().to_string(),
+                        rpc_url: Some(rpc_url.clone()),
+                        resource: api.subdomain.clone(),
+                        description: None,
+                        max_timeout_seconds: 300,
+                        // The client's escape hatch: it can force-close and
+                        // recover unspent escrow after this long. The scheme
+                        // bounds it to 15 minutes .. 30 days, never shorter than
+                        // the HTTP completion window above.
+                        withdraw_delay:
+                            pay_kit::x402::batch_settlement::MIN_WITHDRAW_DELAY_SECONDS,
+                        memo: None,
+                        // Advertised only when a server wants signed cooperative
+                        // closes; this build refuses them, so it stays unset.
+                        receiver_authorizer: None,
+                        fee_payer_signer: signer,
+                        program_id: None,
+                    };
+                    match pay_kit::x402::server::X402BatchSettlement::with_store(cfg, batch_store) {
+                        Ok(b) => Some(b),
+                        Err(e) => {
+                            eprintln!("x402 batch-settlement backend disabled ({e})");
+                            None
+                        }
+                    }
+                }
+                _ => None,
+            };
+
             let pdb_state = if debugger {
                 let pdb_config = build_pdb_config(&api, &recipient, network.slug(), &rpc_url);
                 let pdb = pay_pdb::PdbState::new(pdb_config);
@@ -1626,6 +1746,7 @@ impl StartCommand {
                 fee_payer_signer: fee_payer_signer.clone(),
                 x402,
                 x402_upto,
+                x402_batch,
                 // The gate calls `record_exchange` per proxied request to feed PDB.
                 pdb: pdb_state.clone(),
             };

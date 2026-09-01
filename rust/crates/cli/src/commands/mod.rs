@@ -753,6 +753,56 @@ fn handle_outcome(
             }
         }
 
+        RunOutcome::X402BatchChallenge {
+            challenge,
+            advertised_challenges,
+            resource_url,
+        } => {
+            print_verbose_challenges(&advertised_challenges, verbose, is_json);
+            if auto_pay {
+                enforce_payment_cap(
+                    &challenge.requirements.amount,
+                    &challenge.requirements.asset,
+                    payment_cap,
+                    "x402",
+                )?;
+                return pay_batch_and_retry(
+                    &challenge,
+                    &resource_url,
+                    PaymentRetryContext {
+                        tool,
+                        output_fmt,
+                        fetch_headers,
+                        network_override,
+                        account_override,
+                        verbose,
+                    },
+                );
+            }
+
+            if is_json {
+                output::print_json(&serde_json::json!({
+                    "status": 402,
+                    "protocol": "x402-batch-settlement",
+                    "challenge": {
+                        "amount": challenge.requirements.amount,
+                        "currency": challenge.requirements.asset,
+                        "recipient": challenge.requirements.pay_to,
+                    },
+                    "resource": resource_url,
+                }))?;
+            } else {
+                eprintln!(
+                    "{}",
+                    format!(
+                        "402 Payment Required (x402 batch-settlement) — {} {} per request",
+                        challenge.requirements.amount, challenge.requirements.asset
+                    )
+                    .dimmed()
+                );
+            }
+        }
+
         RunOutcome::X402SignInChallenge {
             challenge,
             advertised_challenges,
@@ -1658,6 +1708,73 @@ fn pay_upto_and_retry(
         ReceiptProvenance::PaidRetry(Some(ReceiptDisplayContext {
             asset: Some(&challenge.requirements.asset),
             scheme: Some("upto"),
+        })),
+    )
+}
+
+/// Pay an x402 `batch-settlement` challenge and retry the request.
+///
+/// A one-shot CLI run has nowhere to keep a channel between invocations, so it
+/// opens one, escrows exactly this request's price, and spends it. The scheme
+/// pays off in a long-lived host — the MCP server keeps its channels for the
+/// life of the connection and amortizes one deposit over many calls. The escrow
+/// is never stranded either way: the payer can force-close and recover whatever
+/// is unspent after the advertised `withdrawDelay`.
+fn pay_batch_and_retry(
+    challenge: &x402::BatchChallenge,
+    resource_url: &str,
+    ctx: PaymentRetryContext<'_, '_>,
+) -> pay_core::Result<()> {
+    let is_json = no_dna::should_json(ctx.output_fmt);
+    validate_tool_request_before_signing(ctx.tool)?;
+
+    if ctx.verbose && !is_json {
+        crate::components::print_notice(
+            crate::components::NoticeLevel::Success,
+            "Authorizing x402 payment",
+            &payment_authorization_notice_body(
+                &display_token_amount(
+                    &challenge.requirements.amount,
+                    &challenge.requirements.asset,
+                ),
+                None,
+            ),
+        );
+    }
+
+    let store = pay_core::accounts::FileAccountsStore::default_path();
+    let channels = pay_core::client::batch::BatchChannelCache::new();
+    let built = x402::build_batch_payment(
+        challenge,
+        &store,
+        &channels,
+        None,
+        ctx.network_override,
+        ctx.account_override,
+        Some(resource_url),
+        None,
+    )?;
+
+    if let Some(resolved) = built.payment.ephemeral_notice {
+        render_generated_wallet_notice(&resolved, is_json)?;
+    }
+
+    let receipt_network = x402_receipt_network(
+        ctx.network_override,
+        &challenge.requirements.network,
+        None,
+        challenge.requirements.extra.recent_blockhash.as_deref(),
+    );
+    let verbose = ctx.verbose;
+    let retry_outcome = retry_with_headers(ctx.tool, &built.payment.headers, ctx.fetch_headers)?;
+    handle_retry_outcome(
+        retry_outcome,
+        is_json,
+        verbose,
+        Some(&receipt_network),
+        ReceiptProvenance::PaidRetry(Some(ReceiptDisplayContext {
+            asset: Some(&challenge.requirements.asset),
+            scheme: Some("batch-settlement"),
         })),
     )
 }
