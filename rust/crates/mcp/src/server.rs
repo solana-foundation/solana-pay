@@ -160,14 +160,15 @@ a purchase; it only renders the QR PNG and returns the funding address.
 
 Use this when a developer wants to publish a payment-gated API in
 https://github.com/solana-foundation/pay-skills. Pass the complete provider
-markdown file as `content`: YAML frontmatter between `---` delimiters followed
+`PAY.md` file as `content`: YAML frontmatter between `---` delimiters followed
 by optional execution notes. The tool validates required metadata, endpoint
 shape, URL safety, pricing precision, and paid-endpoint expectations.
 
 Before calling, inspect real code, OpenAPI specs, deployed routes, or
 `pay gate api` YAML. Do not invent endpoints, prices, supported networks,
-or payment protocols. If runtime YAML exists, use `pay skills provider sync`
-as a starting point, then validate the generated markdown with this tool.
+or payment protocols. If an OpenAPI document exists, commit a reviewed copy
+beside `PAY.md` and use `openapi: { path: openapi.json }`; public registry
+entries must not depend on a remote OpenAPI URL.
 
 For detailed authoring guidance, use the Pay skill reference
 `references/monetize-api.md`.
