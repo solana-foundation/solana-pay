@@ -138,6 +138,15 @@ pub enum ToolKind {
 }
 
 impl Command {
+    /// Snapshot and validate buyer-controlled local inputs before config load,
+    /// account creation, payment handling, or signing.
+    pub fn preflight_local_inputs(&mut self) -> pay_core::Result<()> {
+        match self {
+            Command::Fetch(command) => command.preflight_local_inputs(),
+            _ => Ok(()),
+        }
+    }
+
     pub fn otlp_sidecar(&self) -> Option<&str> {
         match self {
             Command::Server { command } => command.otlp_sidecar(),
@@ -226,6 +235,7 @@ enum Tool<'a> {
         redirect_policy: pay_core::fetch::RedirectPolicy,
         validation_body: Option<&'a str>,
         content_type: Option<&'a str>,
+        output_schema: Option<&'a fetch::PreparedOutputSchema>,
     },
 }
 
@@ -349,6 +359,7 @@ impl Command {
                     redirect_policy: prepared.redirect_policy,
                     validation_body: prepared.validation_body.as_deref(),
                     content_type: prepared.content_type.as_deref(),
+                    output_schema: cmd.prepared_output_schema(),
                 };
                 return handle_outcome(
                     outcome,
@@ -847,9 +858,10 @@ fn handle_outcome(
         RunOutcome::Completed {
             exit_code,
             body,
+            content_type,
             response_headers,
-            ..
         } => {
+            validate_completed_output(tool, content_type.as_deref(), body.as_deref())?;
             print_verbose_receipt(
                 &response_headers,
                 network_override,
@@ -913,6 +925,21 @@ fn print_verbose_receipt(
             &rendered.body,
         );
     }
+}
+
+fn validate_completed_output(
+    tool: &Tool<'_>,
+    content_type: Option<&str>,
+    body: Option<&[u8]>,
+) -> pay_core::Result<()> {
+    let Tool::Fetch {
+        output_schema: Some(output_schema),
+        ..
+    } = tool
+    else {
+        return Ok(());
+    };
+    output_schema.validate_response(content_type, body)
 }
 
 struct ReceiptNotice {
@@ -1364,6 +1391,7 @@ fn pay_mpp_and_retry(
         retry_with_header(ctx.tool, "Authorization", &auth_header, ctx.fetch_headers)?;
     handle_retry_outcome(
         retry_outcome,
+        ctx.tool,
         is_json,
         verbose,
         receipt_network.as_deref(),
@@ -1413,7 +1441,17 @@ fn pay_subscription_and_retry(
         .map(str::to_string)
         .or_else(|| mpp_challenge_network(challenge));
 
-    // On any 2xx outcome, persist a best-effort local record. The
+    // Validate buffered fetch output before any local state records the
+    // subscription as active. The common completion handler validates again
+    // before stdout as defense in depth.
+    validate_subscription_delivery_before_persistence(
+        &retry_outcome,
+        ctx.tool,
+        is_json,
+        receipt_network.as_deref(),
+    )?;
+
+    // On any valid 2xx outcome, persist a best-effort local record. The
     // `subscription_id` is the deterministic SubscriptionDelegation PDA
     // (per spec §"Subscription Identifier"), so we can derive it without
     // round-tripping the Payment-Receipt header — which the curl/wget/httpie
@@ -1438,11 +1476,48 @@ fn pay_subscription_and_retry(
 
     handle_retry_outcome(
         retry_outcome,
+        ctx.tool,
         is_json,
         ctx.verbose,
         receipt_network.as_deref(),
         ReceiptProvenance::PaidRetry(None),
     )
+}
+
+fn validate_subscription_delivery_before_persistence(
+    outcome: &RunOutcome,
+    tool: &Tool<'_>,
+    is_json: bool,
+    receipt_network: Option<&str>,
+) -> pay_core::Result<()> {
+    let RunOutcome::Completed {
+        exit_code,
+        body,
+        content_type,
+        response_headers,
+    } = outcome
+    else {
+        return Ok(());
+    };
+    if *exit_code != 0 {
+        return Ok(());
+    }
+    if let Err(error) = validate_completed_output(tool, content_type.as_deref(), body.as_deref()) {
+        if !is_json {
+            print_verbose_receipt(
+                response_headers,
+                receipt_network,
+                ReceiptProvenance::PaidRetry(None),
+                true,
+                false,
+            );
+        }
+        return Err(delivery_error_with_receipt_evidence(
+            error,
+            response_headers,
+        ));
+    }
+    Ok(())
 }
 
 // `persist_local_subscription_after_activation` lives in
@@ -1597,6 +1672,7 @@ fn pay_x402_and_retry(
     let retry_outcome = retry_with_headers(ctx.tool, &built_payment.headers, ctx.fetch_headers)?;
     handle_retry_outcome(
         retry_outcome,
+        ctx.tool,
         is_json,
         verbose,
         Some(&receipt_network),
@@ -1652,6 +1728,7 @@ fn pay_upto_and_retry(
     let retry_outcome = retry_with_headers(ctx.tool, &built_payment.headers, ctx.fetch_headers)?;
     handle_retry_outcome(
         retry_outcome,
+        ctx.tool,
         is_json,
         verbose,
         Some(&receipt_network),
@@ -1726,6 +1803,7 @@ fn pay_x402_siwx_and_retry(
     let retry_outcome = retry_with_headers(ctx.tool, &built_payment.headers, ctx.fetch_headers)?;
     handle_retry_outcome(
         retry_outcome,
+        ctx.tool,
         is_json,
         verbose,
         receipt_network.as_deref(),
@@ -1784,6 +1862,7 @@ fn pay_session_and_retry(
     let retry_outcome = retry_with_header(tool, "Authorization", &auth_header, fetch_headers)?;
     handle_retry_outcome(
         retry_outcome,
+        tool,
         is_json,
         verbose,
         receipt_network.as_deref(),
@@ -1936,6 +2015,7 @@ fn retry_header_args_httpie(headers_to_add: &[(&str, String)]) -> Vec<String> {
 
 fn handle_retry_outcome(
     outcome: RunOutcome,
+    tool: &Tool<'_>,
     is_json: bool,
     verbose: bool,
     receipt_network: Option<&str>,
@@ -1945,9 +2025,29 @@ fn handle_retry_outcome(
         RunOutcome::Completed {
             exit_code,
             body,
+            content_type,
             response_headers,
-            ..
         } => {
+            if let Err(error) =
+                validate_completed_output(tool, content_type.as_deref(), body.as_deref())
+            {
+                if matches!(provenance, ReceiptProvenance::PaidRetry(_)) {
+                    if !is_json {
+                        print_verbose_receipt(
+                            &response_headers,
+                            receipt_network,
+                            provenance,
+                            true,
+                            false,
+                        );
+                    }
+                    return Err(delivery_error_with_receipt_evidence(
+                        error,
+                        &response_headers,
+                    ));
+                }
+                return Err(error);
+            }
             print_verbose_receipt(
                 &response_headers,
                 receipt_network,
@@ -1994,10 +2094,157 @@ fn handle_retry_outcome(
     }
 }
 
+fn delivery_error_with_receipt_evidence(
+    error: pay_core::Error,
+    response_headers: &[(String, String)],
+) -> pay_core::Error {
+    let detail = match error {
+        pay_core::Error::DeliveryValidation(detail) => detail,
+        other => return other,
+    };
+    let receipt = response_header(response_headers, "payment-receipt-url")
+        .map(str::trim)
+        .filter(|value| {
+            value.len() <= 2_048
+                && value.starts_with("https://")
+                && !value.chars().any(char::is_control)
+        })
+        .map_or_else(
+            || {
+                if receipt::decode_response_receipt(response_headers).is_some() {
+                    "payment receipt received".to_string()
+                } else {
+                    "payment completed but no decodable receipt header was returned".to_string()
+                }
+            },
+            |url| format!("payment receipt: {url}"),
+        );
+    pay_core::Error::DeliveryValidation(format!("{detail}; settlement evidence: {receipt}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use pay_kit::mpp::SessionMethodDetails;
+    use sha2::Digest;
+
+    fn prepared_output_schema() -> fetch::PreparedOutputSchema {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("output.schema.json");
+        let schema = serde_json::json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": { "ok": { "type": "boolean" } },
+            "required": ["ok"],
+            "additionalProperties": false
+        });
+        std::fs::write(&path, serde_json::to_vec(&schema).unwrap()).unwrap();
+        let canonical = r#"{"$schema":"https://json-schema.org/draft/2020-12/schema","additionalProperties":false,"properties":{"ok":{"type":"boolean"}},"required":["ok"],"type":"object"}"#;
+        let digest = format!("sha256:{:x}", sha2::Sha256::digest(canonical.as_bytes()));
+        let mut command = fetch::FetchCommand {
+            url: "https://example.com/data".to_string(),
+            method: None,
+            headers: Vec::new(),
+            body: None,
+            body_file: None,
+            form_fields: Vec::new(),
+            form_files: Vec::new(),
+            content_type: None,
+            output_schema: Some(path),
+            output_schema_sha256: Some(digest),
+            prepared_output_schema: None,
+        };
+        command.preflight_local_inputs().unwrap();
+        command.prepared_output_schema().unwrap().clone()
+    }
+
+    #[test]
+    fn completed_output_validation_is_fetch_only_and_suppresses_invalid_body() {
+        let contract = prepared_output_schema();
+        let tool = Tool::Fetch {
+            method: "GET",
+            url: "https://example.com/data",
+            body: None,
+            redirect_policy: pay_core::fetch::RedirectPolicy::Follow,
+            validation_body: None,
+            content_type: None,
+            output_schema: Some(&contract),
+        };
+        validate_completed_output(&tool, Some("application/json"), Some(br#"{"ok":true}"#))
+            .unwrap();
+        let error = validate_completed_output(
+            &tool,
+            Some("application/json"),
+            Some(br#"{"ok":"secret-invalid-body"}"#),
+        )
+        .unwrap_err();
+        assert!(!error.to_string().contains("secret-invalid-body"));
+
+        assert!(
+            validate_completed_output(&Tool::Curl(&[]), None, Some(b"arbitrary stream")).is_ok()
+        );
+    }
+
+    #[test]
+    fn paid_invalid_delivery_preserves_bounded_receipt_evidence() {
+        let error = delivery_error_with_receipt_evidence(
+            pay_core::Error::DeliveryValidation("invalid output".to_string()),
+            &[(
+                "Payment-Receipt-Url".to_string(),
+                "https://receipts.example/abc".to_string(),
+            )],
+        );
+        let message = error.to_string();
+        assert!(message.contains("invalid output"));
+        assert!(message.contains("https://receipts.example/abc"));
+
+        let invalid = delivery_error_with_receipt_evidence(
+            pay_core::Error::DeliveryValidation("invalid output".to_string()),
+            &[(
+                "Payment-Receipt-Url".to_string(),
+                "javascript:alert(1)".to_string(),
+            )],
+        );
+        assert!(!invalid.to_string().contains("javascript:"));
+    }
+
+    #[test]
+    fn invalid_subscription_delivery_stops_before_active_state_persistence() {
+        let contract = prepared_output_schema();
+        let tool = Tool::Fetch {
+            method: "GET",
+            url: "https://example.com/subscription",
+            body: None,
+            redirect_policy: pay_core::fetch::RedirectPolicy::Follow,
+            validation_body: None,
+            content_type: None,
+            output_schema: Some(&contract),
+        };
+        let outcome = RunOutcome::Completed {
+            exit_code: 0,
+            body: Some(br#"{"ok":"wrong-type"}"#.to_vec()),
+            content_type: Some("application/json".to_string()),
+            response_headers: vec![(
+                "Payment-Receipt-Url".to_string(),
+                "https://receipts.example/subscription".to_string(),
+            )],
+        };
+
+        let error = validate_subscription_delivery_before_persistence(
+            &outcome,
+            &tool,
+            true,
+            Some("mainnet"),
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, pay_core::Error::DeliveryValidation(_)));
+        assert!(
+            error
+                .to_string()
+                .contains("https://receipts.example/subscription")
+        );
+    }
 
     fn test_session_request_with_deposits(
         minimum_deposit: Option<&str>,

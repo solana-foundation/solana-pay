@@ -27,4 +27,7 @@ pub enum Error {
 
     #[error("Request validation error: {0}")]
     RequestValidation(String),
+
+    #[error("Delivery validation error: {0}")]
+    DeliveryValidation(String),
 }

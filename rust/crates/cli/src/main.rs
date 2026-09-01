@@ -106,10 +106,15 @@ fn main() {
         no_dna::enable_for_process();
     }
 
-    let Some(command) = opts.command.take() else {
+    let Some(mut command) = opts.command.take() else {
         handle_missing_command();
         return;
     };
+
+    if let Err(err) = command.preflight_local_inputs() {
+        print_command_error(&err);
+        std::process::exit(1);
+    }
 
     let config = Config::load().unwrap_or_else(|err| {
         eprintln!("{}", format!("Error: {err}").dimmed());
