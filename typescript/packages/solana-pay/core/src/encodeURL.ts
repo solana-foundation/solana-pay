@@ -1,5 +1,6 @@
 import { SOLANA_PROTOCOL } from './constants.js';
 import type { Amount, Label, Memo, Message, Recipient, References, SPLToken } from './types.js';
+import { decimalPlaces } from './utils/amount.js';
 import { normalizeReferences } from './utils/reference.js';
 
 /**
@@ -74,7 +75,14 @@ function encodeTransferRequestURL({
     const url = new URL(SOLANA_PROTOCOL + pathname);
 
     if (amount != null) {
-        url.searchParams.append('amount', amount.toFixed(10).replace(/0+$/, '').replace(/\.$/, ''));
+        // Encode at the value's own precision. `toFixed` renders the float64
+        // rounding error at 10 places and switches to scientific notation for
+        // values >= 1e21; formatting integers via BigInt keeps the amount
+        // decimal-only and exact across the whole range.
+        const encodedAmount = Number.isInteger(amount)
+            ? BigInt(amount).toString()
+            : amount.toFixed(decimalPlaces(amount));
+        url.searchParams.append('amount', encodedAmount);
     }
 
     if (splToken) {
