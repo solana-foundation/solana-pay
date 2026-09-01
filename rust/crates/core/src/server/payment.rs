@@ -389,12 +389,23 @@ async fn settle_axum_delegated_response(
 /// USD-pegged settlement tokens (1 whole token == $1). Server startup
 /// enforces that invariant by refusing non-pegged session currencies
 /// (`ensure_session_currencies_usd_pegged` in the CLI server start path).
-pub(crate) fn price_unit_base_amount(price: &metering::ResolvedPrice, decimals: u8) -> u64 {
-    let per_unit = price
+fn advertised_per_unit_usd(price: &metering::ResolvedPrice) -> f64 {
+    // Session challenge `amount` is a single per-unit figure. Settlement sums
+    // every dimension, so advertising `dimensions.first()` understates any
+    // later (typically output) rate. Use the max per-unit rate so the shown
+    // amount never understates a billed dimension (solana-foundation/pay#439).
+    price
         .dimensions
-        .first()
+        .iter()
         .map(|d| d.price_usd / d.scale.max(1) as f64)
-        .unwrap_or(0.01);
+        .fold(None, |acc: Option<f64>, v| {
+            Some(acc.map_or(v, |m| m.max(v)))
+        })
+        .unwrap_or(0.01)
+}
+
+pub(crate) fn price_unit_base_amount(price: &metering::ResolvedPrice, decimals: u8) -> u64 {
+    let per_unit = advertised_per_unit_usd(price);
     ((per_unit * 10f64.powi(i32::from(decimals))).round() as u64).max(1)
 }
 
@@ -404,11 +415,8 @@ pub(crate) fn price_unit_base_amount(price: &metering::ResolvedPrice, decimals: 
 /// always match.
 pub(crate) fn charge_amount_from_price(price: Option<&metering::ResolvedPrice>) -> String {
     price
-        .and_then(|p| p.dimensions.first())
-        .map(|d| {
-            let per_unit = d.price_usd / d.scale.max(1) as f64;
-            format!("{}", per_unit)
-        })
+        .map(advertised_per_unit_usd)
+        .map(|per_unit| format!("{}", per_unit))
         .unwrap_or_else(|| "0.01".to_string())
 }
 
@@ -752,6 +760,35 @@ mod tests {
             message,
             "Payment used the same account for the server and client. Restart the demo server, then retry the request."
         );
+    }
+
+    #[test]
+    fn advertised_session_amount_uses_max_dimension_not_first() {
+        let price = metering::ResolvedPrice {
+            dimensions: vec![
+                metering::ResolvedDimension {
+                    direction: "input".into(),
+                    unit: "tokens".into(),
+                    scale: 1_000_000,
+                    price_usd: 2.50,
+                },
+                metering::ResolvedDimension {
+                    direction: "output".into(),
+                    unit: "tokens".into(),
+                    scale: 1_000_000,
+                    price_usd: 7.50,
+                },
+            ],
+        };
+        // 7.50 / 1e6 — not the cheaper first dimension (2.50 / 1e6).
+        assert_eq!(charge_amount_from_price(Some(&price)), "0.0000075");
+        // 6-decimal USDC: 7.5e-6 * 1e6 = 7.5 → 8 after round().max(1)
+        assert_eq!(price_unit_base_amount(&price, 6), 8);
+    }
+
+    #[test]
+    fn advertised_session_amount_falls_back_when_no_price() {
+        assert_eq!(charge_amount_from_price(None), "0.01");
     }
 
     #[test]
