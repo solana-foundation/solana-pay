@@ -14,7 +14,9 @@ title: "My API"
 description: "API description"
 category: ai_ml
 version: v1
-forward_url: https://api.example.com
+routing:
+  type: proxy
+  url: https://api.example.com
 accounting: pooled
 
 endpoints:
@@ -56,5 +58,20 @@ impl ScaffoldCommand {
         eprintln!();
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::TEMPLATE;
+    use pay_types::metering::{ApiSpec, RoutingConfig};
+
+    #[test]
+    fn scaffold_template_uses_the_current_routing_schema() {
+        let spec: ApiSpec = serde_yml::from_str(TEMPLATE).expect("template must parse as ApiSpec");
+        assert!(matches!(
+            spec.routing,
+            RoutingConfig::Proxy { ref url, .. } if url == "https://api.example.com"
+        ));
     }
 }
