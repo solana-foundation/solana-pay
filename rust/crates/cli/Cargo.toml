@@ -27,6 +27,8 @@ glob = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yml = { workspace = true }
+jsonschema = { workspace = true }
+serde_json_canonicalizer = { workspace = true }
 schemars = { workspace = true }
 toml_edit = { workspace = true }
 tracing = { workspace = true }
@@ -66,6 +68,8 @@ qrcode = { workspace = true }
 pay-pdb = { workspace = true }
 urlencoding = "2.1.3"
 uuid = { workspace = true }
+sha2 = { workspace = true }
+libc = "0.2"
 webbrowser = { workspace = true }
 # Payer proxy: incremental OpenAI→Anthropic SSE translation stream.
 async-stream = "0.3"

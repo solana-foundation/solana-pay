@@ -118,6 +118,24 @@ Anyone can contribute a provider listing, improve endpoint metadata, or add usag
 
 Good catalog entries make paid APIs easier for both humans and agents to discover, compare, and use safely.
 
+### Buyer-owned output contracts
+
+`pay fetch` can bind a local JSON Schema 2020-12 contract to a buffered JSON
+response. Pay verifies the schema's canonical SHA-256 digest before account
+setup or signing, reuses the same compiled validator across x402 and MPP
+retries, and validates delivery before writing response bytes to stdout.
+
+```sh
+pay fetch https://api.example.com/data \
+  --output-schema ./expected-output.schema.json \
+  --output-schema-sha256 sha256:<canonical-digest>
+```
+
+The schema remains local and is never sent to the server. A paid response that
+does not satisfy it is reported as a delivery-validation failure while payment
+receipt evidence is preserved. Streaming `curl`, `wget`, and `http` behavior is
+unchanged.
+
 ## Installation
 
 ### Prebuilt Binaries
