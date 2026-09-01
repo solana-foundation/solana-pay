@@ -151,7 +151,7 @@ const instructions = await client.pay.createTransfer({ recipient, amount: 1 });
 
 ### Transaction Requests
 
-- **`fetchTransaction(rpc, account, link, options?)`** — Fetch a transaction from a transaction request endpoint.
+- **`fetchTransaction(rpc, account, link, options?)`** — Fetch a transaction from a transaction request endpoint. The merchant-supplied transaction is inspected before it is returned for signing: unsupported versions are rejected, the account may only appear in transfer and memo instructions, and the requested priority fee and compute unit limit are checked against ceilings whenever the account pays the fees (`options.maxPriorityFeeLamports`, default 0.001 SOL; `options.maxComputeUnitLimit`, default 1.4M CU). The returned transaction carries an `inspection` field with the decoded instructions, version, compute unit limit, and maximum priority fee so wallets can display them before signing.
 
 ### Clients
 
