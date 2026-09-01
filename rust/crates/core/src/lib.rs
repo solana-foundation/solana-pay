@@ -47,6 +47,12 @@ use std::sync::Arc;
 #[cfg(feature = "server")]
 pub trait PaymentState: Clone + Send + Sync + 'static {
     fn apis(&self) -> &[ApiSpec];
+    /// Filtered OpenAPI document served by this gateway, when available.
+    /// The payment gate uses it only to derive optional machine-discovery
+    /// metadata for the exact method and route being challenged.
+    fn openapi_document(&self) -> Option<&serde_json::Value> {
+        None
+    }
     fn mpp(&self) -> Option<&Mpp>;
     fn mpps(&self) -> Vec<&Mpp> {
         self.mpp().into_iter().collect()
