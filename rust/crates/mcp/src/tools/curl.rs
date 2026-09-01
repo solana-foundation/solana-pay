@@ -966,10 +966,11 @@ fn do_paid_fetch(
 
     // A reused authorization that receives a 402 is no longer trustworthy.
     // Drop it before negotiating a fresh session from the server challenge.
-    if cached_session.is_some() && !matches!(&outcome, RunOutcome::Completed { .. }) {
-        if let Some(key) = session_key.as_deref() {
-            session_cache.remove(key);
-        }
+    if cached_session.is_some()
+        && !matches!(&outcome, RunOutcome::Completed { .. })
+        && let Some(key) = session_key.as_deref()
+    {
+        session_cache.remove(key);
     }
 
     match outcome {
