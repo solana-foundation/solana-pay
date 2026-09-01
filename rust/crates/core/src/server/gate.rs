@@ -1863,6 +1863,8 @@ async fn session_authorized(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pay_kit::mpp::solana_keychain::{SolanaSigner, memory::MemorySigner};
+    use std::sync::Arc;
 
     // Ceiling $0.10 at 6 decimals == 100_000 base units (USDC).
     const CEILING_USD: f64 = 0.10;
@@ -2128,6 +2130,97 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
+    struct UptoState {
+        apis: Arc<Vec<pay_types::metering::ApiSpec>>,
+        x402_upto: pay_kit::x402::server::X402Upto,
+    }
+
+    impl PaymentState for UptoState {
+        fn apis(&self) -> &[pay_types::metering::ApiSpec] {
+            &self.apis
+        }
+
+        fn mpp(&self) -> Option<&pay_kit::mpp::server::Mpp> {
+            None
+        }
+
+        fn x402_upto(&self) -> Option<&pay_kit::x402::server::X402Upto> {
+            Some(&self.x402_upto)
+        }
+    }
+
+    fn test_signer() -> Arc<dyn SolanaSigner> {
+        use ed25519_dalek::SigningKey;
+
+        let sk = SigningKey::generate(&mut rand::thread_rng());
+        let vk = sk.verifying_key();
+        let mut kp = [0u8; 64];
+        kp[..32].copy_from_slice(sk.as_bytes());
+        kp[32..].copy_from_slice(vk.as_bytes());
+        Arc::new(MemorySigner::from_bytes(&kp).unwrap())
+    }
+
+    fn x402_upto_test_server(resource: &str) -> pay_kit::x402::server::X402Upto {
+        let cache = pay_kit::mpp::blockhash::BlockhashCache::new();
+        cache.set(
+            "SURFNETxSAFEHASHxxxxxxxxxxxxxxxxxxxxx11x".to_string(),
+            42,
+            123,
+        );
+
+        pay_kit::x402::server::X402Upto::new(pay_kit::x402::server::UptoConfig {
+            payout: pay_kit::x402::server::UptoPayout::OperatorKeepsAll,
+            currencies: vec![pay_kit::x402::server::CurrencyConfig {
+                currency: "4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU".to_string(),
+                decimals: 6,
+                token_program: None,
+            }],
+            cluster: "devnet".to_string(),
+            rpc_url: Some("http://localhost:8899".to_string()),
+            resource: resource.to_string(),
+            description: Some("Gemini generateContent".to_string()),
+            max_timeout_seconds: 300,
+            program_id: None,
+            operator_signer: test_signer(),
+        })
+        .unwrap()
+        .with_blockhash_cache(cache)
+    }
+
+    fn gemini_generate_content_api() -> pay_types::metering::ApiSpec {
+        serde_yml::from_str(
+            r#"
+name: gemini
+subdomain: gemini
+title: Gemini
+description: Gemini gateway
+category: ai_ml
+version: v1beta
+routing:
+  type: proxy
+  url: https://generativelanguage.googleapis.com/
+endpoints:
+  - method: POST
+    path: "v1beta/models/{modelsId}:generateContent"
+    description: "Generate content."
+    resource: models
+    metering:
+      schemes: [x402-upto]
+      dimensions:
+        - direction: output
+          unit: tokens
+          scale: 1000000
+          tiers:
+            - price_usd: 0.50
+      upto:
+        max_usd: 0.10
+        min_usd: 0.001
+"#,
+        )
+        .unwrap()
+    }
+
     #[tokio::test]
     async fn discovery_and_control_plane_passthrough() {
         let gate = PaymentGate::new(EmptyState);
@@ -2150,5 +2243,41 @@ mod tests {
             gate.evaluate(&req(&Method::GET, "v1/anything")).await,
             GateDecision::Passthrough
         ));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn gemini_generate_content_x402_upto_challenges_without_payment() {
+        let state = UptoState {
+            apis: Arc::new(vec![gemini_generate_content_api()]),
+            x402_upto: x402_upto_test_server("models"),
+        };
+        let gate = PaymentGate::new(state);
+
+        let decision = gate
+            .evaluate(&GateRequest {
+                method: &Method::POST,
+                path: "v1beta/models/gemini-2.5-flash:generateContent",
+                host: Some("gemini.gateway-402.test"),
+                accept: None,
+                authorization: None,
+                content_length: Some(64),
+                query: None,
+                x402_payment: None,
+            })
+            .await;
+
+        let GateDecision::Respond(resp) = decision else {
+            panic!("expected payment challenge response");
+        };
+
+        assert_eq!(resp.status, StatusCode::PAYMENT_REQUIRED);
+        let body: serde_json::Value = serde_json::from_slice(&resp.body).unwrap();
+        assert_eq!(body["error"], "payment_required");
+        assert_eq!(body["payment"]["schemes"], json!(["x402-upto"]));
+        assert!(
+            resp.headers
+                .iter()
+                .any(|(name, _)| name.as_str().eq_ignore_ascii_case("payment-required"))
+        );
     }
 }
