@@ -1114,7 +1114,6 @@ impl StartCommand {
                 let session_secret = std::env::var("PAY_SESSION_SECRET")
                     .unwrap_or_else(|_| challenge_binding_secret.clone());
                 let channel_program_id = std::env::var("PAY_PAYMENT_CHANNELS_PROGRAM_ID")
-                    .or_else(|_| std::env::var("PAY_FIBER_PROGRAM_ID"))
                     .ok()
                     .and_then(|value| solana_pubkey::Pubkey::from_str(&value).ok())
                     .unwrap_or_else(pay_kit::mpp::program::payment_channels::default_program_id);
