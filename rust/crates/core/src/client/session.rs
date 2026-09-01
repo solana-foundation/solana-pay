@@ -271,6 +271,33 @@ pub fn open_payment_channel_session_header(
     resource_url: &str,
     sandbox: bool,
 ) -> Result<(SessionHandle, String)> {
+    open_payment_channel_session_header_with_override(
+        challenge,
+        request,
+        store,
+        network_override,
+        account_override,
+        deposit,
+        resource_url,
+        sandbox,
+        None,
+    )
+}
+
+/// Variant of [`open_payment_channel_session_header`] that lets an MCP host
+/// route the wallet approval through its own authenticated approval surface.
+#[allow(clippy::too_many_arguments)]
+pub fn open_payment_channel_session_header_with_override(
+    challenge: &PaymentChallenge,
+    request: &SessionRequest,
+    store: &dyn crate::accounts::AccountsStore,
+    network_override: Option<&str>,
+    account_override: Option<&str>,
+    deposit: u64,
+    resource_url: &str,
+    sandbox: bool,
+    auth_override: crate::signer::AuthOverride,
+) -> Result<(SessionHandle, String)> {
     use pay_kit::mpp::client::{
         DerivePaymentChannelOpenParams, PaymentChannelOpenOptions,
         PaymentChannelSessionOpenOptions, create_payment_channel_session_opener,
@@ -291,12 +318,14 @@ pub fn open_payment_channel_session_header(
         &limit.display,
         &prompt_context.operator,
     );
-    let (signer, ephemeral_notice) = crate::signer::load_signer_for_network_with_intent(
-        &network,
-        store,
-        account_override,
-        &intent,
-    )?;
+    let (signer, ephemeral_notice) =
+        crate::signer::load_signer_for_network_with_intent_and_override(
+            &network,
+            store,
+            account_override,
+            &intent,
+            auth_override,
+        )?;
     let payer = signer.pubkey();
 
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -416,6 +445,80 @@ pub fn open_payment_channel_session_header(
     Ok((handle, auth_header))
 }
 
+/// Open an operator-metered MPP payment-channel session and return its first
+/// `open` authorization plus the reusable `use` authorization.
+///
+/// Agent runtimes use this form because the operator, rather than the client,
+/// meters each response. Client-voucher sessions require the caller to advance
+/// a voucher by the delivered usage on every request.
+pub fn open_operator_signed_session_authorizations(
+    challenge: &PaymentChallenge,
+    store: &dyn crate::accounts::AccountsStore,
+    network_override: Option<&str>,
+    account_override: Option<&str>,
+    resource_url: &str,
+    auth_override: crate::signer::AuthOverride,
+) -> Result<(String, String)> {
+    let request: SessionRequest = challenge
+        .request
+        .decode()
+        .map_err(|error| Error::Mpp(format!("invalid MPP session challenge: {error}")))?;
+    if request.method_details.voucher_signer != Some(SessionVoucherSigner::Operator) {
+        return Err(Error::Mpp(
+            "agent payer requires an operator-signed MPP session".to_string(),
+        ));
+    }
+    if let Some(forced) = network_override
+        && forced != request.method_details.network
+    {
+        return Err(Error::Mpp(format!(
+            "MPP session network mismatch: payer requires `{forced}`, gateway offered `{}`",
+            request.method_details.network
+        )));
+    }
+
+    let minimum = request
+        .minimum_deposit
+        .as_deref()
+        .map(parse_session_deposit)
+        .transpose()?
+        .unwrap_or(0);
+    let deposit = request
+        .suggested_deposit
+        .as_deref()
+        .map(parse_session_deposit)
+        .transpose()?
+        .unwrap_or(1_000_000)
+        .max(minimum)
+        .max(1);
+    let sandbox = network_override == Some("localnet");
+    let (handle, open_authorization) = open_payment_channel_session_header_with_override(
+        challenge,
+        &request,
+        store,
+        network_override,
+        account_override,
+        deposit,
+        resource_url,
+        sandbox,
+        auth_override,
+    )?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| Error::Mpp(format!("Failed to build runtime: {error}")))?;
+    let use_authorization = runtime.block_on(handle.use_header())?;
+    Ok((open_authorization, use_authorization))
+}
+
+fn parse_session_deposit(value: &str) -> Result<u64> {
+    value.parse::<u64>().map_err(|_| {
+        Error::Mpp(format!(
+            "MPP session challenge advertised a non-numeric deposit: {value}"
+        ))
+    })
+}
+
 /// Build a voucher header for a subsequent call on an open session.
 pub fn voucher_header_sync(handle: &SessionHandle, amount: u64) -> Result<String> {
     let rt = tokio::runtime::Builder::new_current_thread()
@@ -427,7 +530,10 @@ pub fn voucher_header_sync(handle: &SessionHandle, amount: u64) -> Result<String
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
-pub(crate) fn canonical_session_origin(resource_url: &str) -> Result<String> {
+/// Normalize an HTTP(S) resource URL to the origin used to scope a session.
+/// Credentials and paths are deliberately excluded so one session cannot be
+/// keyed by an unsafe or overly-specific URL representation.
+pub fn canonical_session_origin(resource_url: &str) -> Result<String> {
     let url = reqwest::Url::parse(resource_url)
         .map_err(|e| Error::Mpp(format!("invalid session authorization URL: {e}")))?;
     if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {

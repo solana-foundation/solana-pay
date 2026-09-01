@@ -5,10 +5,56 @@ use rmcp::schemars;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::Value;
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::Read;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
+
+/// Reusable MPP session authorizations for one MCP server connection.
+///
+/// The `PayMcp` instance is created for one stdio MCP connection. Keys are
+/// normalized HTTP method-and-path routes so sessions cannot cross providers,
+/// accounts, or metered endpoints.
+/// The mutex intentionally serializes session-backed requests: an operator
+/// meters each use against one channel's remaining capacity.
+#[derive(Default)]
+pub(crate) struct SessionCache {
+    authorizations: Mutex<HashMap<String, String>>,
+    request_lock: Mutex<()>,
+}
+
+impl SessionCache {
+    fn authorization(&self, origin: &str) -> Option<String> {
+        self.authorizations.lock().ok()?.get(origin).cloned()
+    }
+
+    fn store(&self, origin: String, authorization: String) {
+        if let Ok(mut authorizations) = self.authorizations.lock() {
+            authorizations.insert(origin, authorization);
+        }
+    }
+
+    fn remove(&self, origin: &str) {
+        if let Ok(mut authorizations) = self.authorizations.lock() {
+            authorizations.remove(origin);
+        }
+    }
+}
+
+/// Return the gateway route that owns an MPP session authorization.
+///
+/// Query parameters are excluded because the gateway resolves session pricing
+/// by the configured HTTP method and path. Including the method avoids the
+/// server's session-credential path fallback sharing a channel with another
+/// operation that happens to use the same path.
+fn session_cache_key(method: &str, resource_url: &str) -> Result<String, pay_core::Error> {
+    let origin = pay_core::session::canonical_session_origin(resource_url)?;
+    let url = reqwest::Url::parse(resource_url)
+        .map_err(|error| pay_core::Error::Mpp(format!("invalid MPP session URL: {error}")))?;
+    Ok(format!("{method} {origin}{}", url.path()))
+}
 
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -140,6 +186,7 @@ fn is_http_token_byte(byte: u8) -> bool {
 pub async fn run(
     params: Params,
     peer: rmcp::Peer<rmcp::service::RoleServer>,
+    session_cache: Arc<SessionCache>,
 ) -> Result<CallToolResult, rmcp::ErrorData> {
     if params.body.is_some() && params.body_file.is_some() {
         return Ok(super::tool_error(
@@ -189,6 +236,7 @@ pub async fn run(
             body.as_ref(),
             redirect_policy,
             Some(peer),
+            session_cache.as_ref(),
         )
     })
     .await
@@ -832,10 +880,18 @@ fn do_paid_fetch(
     body: Option<&RequestBody>,
     redirect_policy: RedirectPolicy,
     peer: Option<rmcp::Peer<rmcp::service::RoleServer>>,
+    session_cache: &SessionCache,
 ) -> Result<PaidFetchResult, pay_core::Error> {
     use pay_core::client::runner::RunOutcome;
 
     validate_cached_catalog_body(method, url, extra_headers, body)?;
+    // A channel's available capacity is consumed by each request. MCP clients
+    // may issue tool calls concurrently, so keep the full request/retry cycle
+    // serialized until the gateway has accepted and metered it.
+    let _session_request = session_cache
+        .request_lock
+        .lock()
+        .map_err(|_| pay_core::Error::Mpp("MPP session request lock poisoned".to_string()))?;
 
     let fetch_request = |headers: &[(String, String)]| {
         pay_core::client::fetch::fetch_request_with_body_for(
@@ -882,7 +938,7 @@ fn do_paid_fetch(
     // ID prompt, no extra round trip. On miss this is a no-op.
     let cached_auth_header =
         pay_core::client::authenticate::cached_header_for_resource(&store, url);
-    let initial_headers: Vec<(String, String)> = match cached_auth_header.as_deref() {
+    let mut initial_headers: Vec<(String, String)> = match cached_auth_header.as_deref() {
         Some(token)
             if !extra_headers
                 .iter()
@@ -894,8 +950,28 @@ fn do_paid_fetch(
         }
         _ => extra_headers.to_vec(),
     };
+    let session_key = session_cache_key(method, url).ok();
+    let cached_session = session_key.as_deref().and_then(|key| {
+        (!initial_headers
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case("authorization")))
+        .then(|| session_cache.authorization(key))
+        .flatten()
+    });
+    if let Some(authorization) = cached_session.as_ref() {
+        initial_headers.push(("Authorization".to_string(), authorization.clone()));
+    }
 
     let outcome = fetch_request(&initial_headers)?;
+
+    // A reused authorization that receives a 402 is no longer trustworthy.
+    // Drop it before negotiating a fresh session from the server challenge.
+    if cached_session.is_some()
+        && !matches!(&outcome, RunOutcome::Completed { .. })
+        && let Some(key) = session_key.as_deref()
+    {
+        session_cache.remove(key);
+    }
 
     match outcome {
         RunOutcome::MppChallenge {
@@ -951,8 +1027,7 @@ fn do_paid_fetch(
                     );
                 }
                 ChosenPayment::X402Upto(challenge) => {
-                    let built_payment =
-                        pay_core::client::x402::build_upto_payment_with_override(
+                    let built_payment = pay_core::client::x402::build_upto_payment_with_override(
                         challenge.as_ref(),
                         &store,
                         network_override.as_deref(),
@@ -1068,9 +1143,31 @@ fn do_paid_fetch(
                 ))
             }
         }
-        RunOutcome::SessionChallenge { .. } => Err(pay_core::Error::Mpp(
-            "402 Payment Required (MPP session) — session payments require a stateful client with a Fiber channel".to_string(),
-        )),
+        RunOutcome::SessionChallenge { challenge, .. } => {
+            let key = session_key.ok_or_else(|| {
+                pay_core::Error::Mpp(
+                    "MPP session payments require an absolute HTTP(S) URL".to_string(),
+                )
+            })?;
+            let (open_authorization, use_authorization) =
+                pay_core::session::open_operator_signed_session_authorizations(
+                    &challenge,
+                    &store,
+                    network_override.as_deref(),
+                    account_override.as_deref(),
+                    url,
+                    make_auth_override(),
+                )?;
+            let mut headers = extra_headers.to_vec();
+            headers.push(("Authorization".to_string(), open_authorization));
+            let retry = fetch_request(&headers)?;
+            if matches!(&retry, RunOutcome::Completed { .. }) {
+                // Only retain a session after the gateway accepted its open
+                // request; otherwise the channel may not exist remotely.
+                session_cache.store(key, use_authorization);
+            }
+            interpret_retry(retry)
+        }
         RunOutcome::SubscriptionChallenge {
             challenge,
             authenticate,
@@ -1119,9 +1216,7 @@ fn do_paid_fetch(
             "402 Payment Required but no recognized protocol".to_string(),
         )),
         RunOutcome::Completed {
-            body,
-            content_type,
-            ..
+            body, content_type, ..
         } => Ok((body.unwrap_or_default(), content_type)),
     }
 }
@@ -1482,8 +1577,31 @@ mod tests {
 
     #[test]
     fn do_paid_fetch_returns_error_for_invalid_url() {
-        let result = do_paid_fetch("GET", "not-a-url", &[], None, RedirectPolicy::Follow, None);
+        let cache = SessionCache::default();
+        let result = do_paid_fetch(
+            "GET",
+            "not-a-url",
+            &[],
+            None,
+            RedirectPolicy::Follow,
+            None,
+            &cache,
+        );
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn session_cache_key_isolated_by_method_and_endpoint() {
+        let first = session_cache_key("POST", "https://api.example.com/v1/models?model=a").unwrap();
+        let same_endpoint =
+            session_cache_key("POST", "https://api.example.com/v1/models?model=b").unwrap();
+        let other_endpoint =
+            session_cache_key("POST", "https://api.example.com/v1/images").unwrap();
+        let other_method = session_cache_key("GET", "https://api.example.com/v1/models").unwrap();
+
+        assert_eq!(first, same_endpoint);
+        assert_ne!(first, other_endpoint);
+        assert_ne!(first, other_method);
     }
 
     #[test]
