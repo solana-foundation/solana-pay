@@ -15,7 +15,8 @@ use std::time::SystemTime;
 /// Reusable MPP session authorizations for one MCP server connection.
 ///
 /// The `PayMcp` instance is created for one stdio MCP connection. Keys are
-/// normalized HTTP origins so sessions cannot cross providers or accounts.
+/// normalized HTTP method-and-path routes so sessions cannot cross providers,
+/// accounts, or metered endpoints.
 /// The mutex intentionally serializes session-backed requests: an operator
 /// meters each use against one channel's remaining capacity.
 #[derive(Default)]
@@ -40,6 +41,19 @@ impl SessionCache {
             authorizations.remove(origin);
         }
     }
+}
+
+/// Return the gateway route that owns an MPP session authorization.
+///
+/// Query parameters are excluded because the gateway resolves session pricing
+/// by the configured HTTP method and path. Including the method avoids the
+/// server's session-credential path fallback sharing a channel with another
+/// operation that happens to use the same path.
+fn session_cache_key(method: &str, resource_url: &str) -> Result<String, pay_core::Error> {
+    let origin = pay_core::session::canonical_session_origin(resource_url)?;
+    let url = reqwest::Url::parse(resource_url)
+        .map_err(|error| pay_core::Error::Mpp(format!("invalid MPP session URL: {error}")))?;
+    Ok(format!("{method} {origin}{}", url.path()))
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -936,12 +950,12 @@ fn do_paid_fetch(
         }
         _ => extra_headers.to_vec(),
     };
-    let session_origin = pay_core::session::canonical_session_origin(url).ok();
-    let cached_session = session_origin.as_deref().and_then(|origin| {
+    let session_key = session_cache_key(method, url).ok();
+    let cached_session = session_key.as_deref().and_then(|key| {
         (!initial_headers
             .iter()
             .any(|(name, _)| name.eq_ignore_ascii_case("authorization")))
-        .then(|| session_cache.authorization(origin))
+        .then(|| session_cache.authorization(key))
         .flatten()
     });
     if let Some(authorization) = cached_session.as_ref() {
@@ -953,8 +967,8 @@ fn do_paid_fetch(
     // A reused authorization that receives a 402 is no longer trustworthy.
     // Drop it before negotiating a fresh session from the server challenge.
     if cached_session.is_some() && !matches!(&outcome, RunOutcome::Completed { .. }) {
-        if let Some(origin) = session_origin.as_deref() {
-            session_cache.remove(origin);
+        if let Some(key) = session_key.as_deref() {
+            session_cache.remove(key);
         }
     }
 
@@ -1129,7 +1143,7 @@ fn do_paid_fetch(
             }
         }
         RunOutcome::SessionChallenge { challenge, .. } => {
-            let origin = session_origin.ok_or_else(|| {
+            let key = session_key.ok_or_else(|| {
                 pay_core::Error::Mpp(
                     "MPP session payments require an absolute HTTP(S) URL".to_string(),
                 )
@@ -1149,7 +1163,7 @@ fn do_paid_fetch(
             if matches!(&retry, RunOutcome::Completed { .. }) {
                 // Only retain a session after the gateway accepted its open
                 // request; otherwise the channel may not exist remotely.
-                session_cache.store(origin, use_authorization);
+                session_cache.store(key, use_authorization);
             }
             interpret_retry(retry)
         }
@@ -1573,6 +1587,20 @@ mod tests {
             &cache,
         );
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn session_cache_key_isolated_by_method_and_endpoint() {
+        let first = session_cache_key("POST", "https://api.example.com/v1/models?model=a").unwrap();
+        let same_endpoint =
+            session_cache_key("POST", "https://api.example.com/v1/models?model=b").unwrap();
+        let other_endpoint =
+            session_cache_key("POST", "https://api.example.com/v1/images").unwrap();
+        let other_method = session_cache_key("GET", "https://api.example.com/v1/models").unwrap();
+
+        assert_eq!(first, same_endpoint);
+        assert_ne!(first, other_endpoint);
+        assert_ne!(first, other_method);
     }
 
     #[test]
