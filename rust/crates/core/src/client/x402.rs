@@ -266,6 +266,118 @@ pub fn build_payment_with_override(
     })
 }
 
+/// The shared preamble every x402 payment-channel scheme needs before it can
+/// sign anything: resolve the cluster, load the wallet, and open an RPC client.
+///
+/// `upto` and `batch-settlement` differ only in what they build *after* this —
+/// a one-request channel open versus a cumulative voucher — so the wallet
+/// resolution, Surfpool detection, network-intent check and auto-funding are
+/// factored here rather than kept in step either side could drift out of.
+struct ChannelPaymentSetup {
+    signer: pay_kit::mpp::solana_keychain::MemorySigner,
+    ephemeral_notice: Option<ResolvedEphemeral>,
+    rpc: RpcClient,
+    rt: tokio::runtime::Runtime,
+}
+
+/// The offer terms a channel payment is prepared against, as advertised on the
+/// 402. Both schemes carry these under different requirement types.
+struct ChannelOffer<'a> {
+    /// CAIP-2 network identifier.
+    network: &'a str,
+    /// Price in atomic units.
+    amount: &'a str,
+    /// Mint address.
+    asset: &'a str,
+    /// The challenge's blockhash build hint. Beyond saving an RPC round trip it
+    /// is how a Surfpool sandbox is recognized, which pins the cluster to
+    /// localnet and enables auto-funding.
+    recent_blockhash: Option<&'a str>,
+}
+
+/// Prepare a channel payment against `offer`.
+fn prepare_channel_payment(
+    offer: ChannelOffer<'_>,
+    store: &dyn AccountsStore,
+    network_override: Option<&str>,
+    account_override: Option<&str>,
+    resource_url: Option<&str>,
+    auth_override: crate::signer::AuthOverride,
+) -> Result<ChannelPaymentSetup> {
+    let display_amount = format_amount(offer.amount, offer.asset);
+    let prompt_context = crate::client::prompt::payment_prompt_context(None, &[resource_url]);
+    let intent = crate::keystore::AuthIntent::authorize_payment_details(
+        &display_amount,
+        &prompt_context.reason,
+        &prompt_context.operator,
+    );
+
+    // Channel requirements carry only the CAIP-2 `network` (no `cluster`), so
+    // map it to one. Normalize to a pay slug ("mainnet-beta" -> "mainnet"):
+    // `cluster_for_caip2_network` returns the SDK cluster name, and the bare
+    // `to_string` arm used to win, so `check_client_network_intent` rejected
+    // `--mainnet` and `account_for_network` missed wallets keyed under
+    // "mainnet". A Surfpool blockhash overrides the mapping to localnet.
+    let cluster_raw = pay_kit::x402::exact::cluster_for_caip2_network(offer.network)
+        .map(normalize_network)
+        .unwrap_or_else(|| normalize_network(offer.network));
+    let surfpool_detected = offer
+        .recent_blockhash
+        .is_some_and(|h| h.starts_with(crate::client::mpp::SURFPOOL_BLOCKHASH_PREFIX));
+    let cluster = if surfpool_detected {
+        "localnet".to_string()
+    } else {
+        cluster_raw
+    };
+    crate::client::mpp::check_client_network_intent(
+        network_override,
+        &cluster,
+        offer.recent_blockhash,
+    )?;
+
+    let should_auto_fund_surfpool =
+        should_auto_fund_surfpool_for_x402(network_override, offer.recent_blockhash);
+    let network = network_override.map(str::to_string).unwrap_or(cluster);
+
+    let (signer, ephemeral_notice) =
+        crate::signer::load_signer_for_network_payment_with_intent_and_override(
+            &network,
+            store,
+            account_override,
+            &display_amount,
+            &intent,
+            auth_override,
+        )?;
+
+    let rpc_url = std::env::var("PAY_RPC_URL").unwrap_or_else(|_| {
+        if surfpool_detected {
+            crate::config::SANDBOX_RPC_URL.to_string()
+        } else {
+            default_rpc_url(&network).to_string()
+        }
+    });
+    let rpc = RpcClient::new(rpc_url.clone());
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| Error::Mpp(format!("Failed to create runtime: {e}")))?;
+
+    if should_auto_fund_surfpool {
+        let pubkey = signer.pubkey().to_string();
+        if let Err(e) = rt.block_on(crate::client::sandbox::fund_via_surfpool(&rpc_url, &pubkey)) {
+            warn!(error = %e, "Could not auto-fund ephemeral via Surfpool — channel open may fail if wallet is empty");
+        }
+    }
+
+    Ok(ChannelPaymentSetup {
+        signer,
+        ephemeral_notice,
+        rpc,
+        rt,
+    })
+}
+
 /// Try to parse an x402 `upto` challenge from headers and/or body — the first
 /// advertised `upto` currency, used to build the channel open.
 pub fn parse_upto(headers: &[(String, String)], body: Option<&str>) -> Option<UptoChallenge> {
@@ -317,75 +429,25 @@ pub fn build_upto_payment_with_override(
     auth_override: crate::signer::AuthOverride,
 ) -> Result<BuiltPayment> {
     let requirements = &challenge.requirements;
-    let amount = format_amount(&requirements.amount, &requirements.asset);
-    let prompt_context = crate::client::prompt::payment_prompt_context(None, &[resource_url]);
-    let intent = crate::keystore::AuthIntent::authorize_payment_details(
-        &amount,
-        &prompt_context.reason,
-        &prompt_context.operator,
-    );
-
-    // `UptoRequirements` carries only the CAIP-2 `network` (no `cluster`), so map
-    // it to a cluster; a Surfpool blockhash overrides to `localnet` (see the
-    // exact path for the rationale).
-    // Normalize the mapped cluster to a pay slug ("mainnet-beta" -> "mainnet"):
-    // `cluster_for_caip2_network` returns the SDK cluster name, and the bare
-    // `to_string` arm used to win, so `check_client_network_intent` rejected
-    // `--mainnet` and `account_for_network` missed wallets keyed under "mainnet".
-    let cluster_raw = pay_kit::x402::exact::cluster_for_caip2_network(&requirements.network)
-        .map(normalize_network)
-        .unwrap_or_else(|| normalize_network(&requirements.network));
-    let embedded_blockhash = requirements.extra.recent_blockhash.as_deref();
-    let surfpool_detected = embedded_blockhash
-        .is_some_and(|h| h.starts_with(crate::client::mpp::SURFPOOL_BLOCKHASH_PREFIX));
-    let cluster = if surfpool_detected {
-        "localnet".to_string()
-    } else {
-        cluster_raw
-    };
-    crate::client::mpp::check_client_network_intent(
+    let setup = prepare_channel_payment(
+        ChannelOffer {
+            network: &requirements.network,
+            amount: &requirements.amount,
+            asset: &requirements.asset,
+            recent_blockhash: requirements.extra.recent_blockhash.as_deref(),
+        },
+        store,
         network_override,
-        &cluster,
-        embedded_blockhash,
+        account_override,
+        resource_url,
+        auth_override,
     )?;
-
-    let should_auto_fund_surfpool =
-        should_auto_fund_surfpool_for_x402(network_override, embedded_blockhash);
-    let network = network_override.map(str::to_string).unwrap_or(cluster);
-
-    let (signer, ephemeral_notice) =
-        crate::signer::load_signer_for_network_payment_with_intent_and_override(
-            &network,
-            store,
-            account_override,
-            &amount,
-            &intent,
-            auth_override,
-        )?;
-
-    let rpc_url = std::env::var("PAY_RPC_URL").unwrap_or_else(|_| {
-        if surfpool_detected {
-            crate::config::SANDBOX_RPC_URL.to_string()
-        } else {
-            default_rpc_url(&network).to_string()
-        }
-    });
-    let rpc = RpcClient::new(rpc_url.clone());
-
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .map_err(|e| Error::Mpp(format!("Failed to create runtime: {e}")))?;
-
-    if should_auto_fund_surfpool {
-        let pubkey = signer.pubkey().to_string();
-        let fund_url = rpc_url.clone();
-        if let Err(e) = rt.block_on(crate::client::sandbox::fund_via_surfpool(
-            &fund_url, &pubkey,
-        )) {
-            warn!(error = %e, "Could not auto-fund ephemeral via Surfpool — channel open may fail if wallet is empty");
-        }
-    }
+    let ChannelPaymentSetup {
+        signer,
+        ephemeral_notice,
+        rpc,
+        rt,
+    } = setup;
 
     // Authorization window + a unique nonce.
     let now = std::time::SystemTime::now()
@@ -467,70 +529,24 @@ pub fn build_batch_payment(
     let price = requirements
         .amount()
         .map_err(|e| Error::Mpp(format!("invalid batch-settlement amount: {e}")))?;
-    let amount = format_amount(&requirements.amount, &requirements.asset);
-    let prompt_context = crate::client::prompt::payment_prompt_context(None, &[resource_url]);
-    let intent = crate::keystore::AuthIntent::authorize_payment_details(
-        &amount,
-        &prompt_context.reason,
-        &prompt_context.operator,
-    );
-
-    // Same cluster mapping as `upto`: the requirements carry only the CAIP-2
-    // network, and a Surfpool blockhash pins the cluster to localnet.
-    let cluster_raw = pay_kit::x402::exact::cluster_for_caip2_network(&requirements.network)
-        .map(normalize_network)
-        .unwrap_or_else(|| normalize_network(&requirements.network));
-    let embedded_blockhash = requirements.extra.recent_blockhash.as_deref();
-    let surfpool_detected = embedded_blockhash
-        .is_some_and(|h| h.starts_with(crate::client::mpp::SURFPOOL_BLOCKHASH_PREFIX));
-    let cluster = if surfpool_detected {
-        "localnet".to_string()
-    } else {
-        cluster_raw
-    };
-    crate::client::mpp::check_client_network_intent(
+    let ChannelPaymentSetup {
+        signer,
+        ephemeral_notice,
+        rpc,
+        rt,
+    } = prepare_channel_payment(
+        ChannelOffer {
+            network: &requirements.network,
+            amount: &requirements.amount,
+            asset: &requirements.asset,
+            recent_blockhash: requirements.extra.recent_blockhash.as_deref(),
+        },
+        store,
         network_override,
-        &cluster,
-        embedded_blockhash,
+        account_override,
+        resource_url,
+        auth_override,
     )?;
-
-    let should_auto_fund_surfpool =
-        should_auto_fund_surfpool_for_x402(network_override, embedded_blockhash);
-    let network = network_override.map(str::to_string).unwrap_or(cluster);
-
-    let (signer, ephemeral_notice) =
-        crate::signer::load_signer_for_network_payment_with_intent_and_override(
-            &network,
-            store,
-            account_override,
-            &amount,
-            &intent,
-            auth_override,
-        )?;
-
-    let rpc_url = std::env::var("PAY_RPC_URL").unwrap_or_else(|_| {
-        if surfpool_detected {
-            crate::config::SANDBOX_RPC_URL.to_string()
-        } else {
-            default_rpc_url(&network).to_string()
-        }
-    });
-    let rpc = RpcClient::new(rpc_url.clone());
-
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .map_err(|e| Error::Mpp(format!("Failed to create runtime: {e}")))?;
-
-    if should_auto_fund_surfpool {
-        let pubkey = signer.pubkey().to_string();
-        let fund_url = rpc_url.clone();
-        if let Err(e) = rt.block_on(crate::client::sandbox::fund_via_surfpool(
-            &fund_url, &pubkey,
-        )) {
-            warn!(error = %e, "Could not auto-fund ephemeral via Surfpool — channel open may fail if wallet is empty");
-        }
-    }
 
     // The advertised token program is checked against the mint's real owner:
     // every associated token address in the `open` derives from it, so trusting
@@ -553,7 +569,8 @@ pub fn build_batch_payment(
         Some(channel) => {
             // The next voucher would exceed the escrow: top up in the same
             // request that authorizes it.
-            let blockhash = resolve_blockhash(&rpc, embedded_blockhash)?;
+            let blockhash =
+                resolve_blockhash(&rpc, requirements.extra.recent_blockhash.as_deref())?;
             let top_up = deposit_amount.unwrap_or(price).max(price);
             let payload = rt
                 .block_on(batch_client::build_top_up(
@@ -567,7 +584,8 @@ pub fn build_batch_payment(
             (channel, payload, voucher)
         }
         None => {
-            let blockhash = resolve_blockhash(&rpc, embedded_blockhash)?;
+            let blockhash =
+                resolve_blockhash(&rpc, requirements.extra.recent_blockhash.as_deref())?;
             let open_slot = match requirements.extra.recent_slot {
                 Some(slot) => slot,
                 None => rpc

@@ -1657,10 +1657,19 @@ fn pay_x402_and_retry(
     )
 }
 
-fn pay_upto_and_retry(
-    challenge: &x402::UptoChallenge,
-    resource_url: &str,
+/// Notify, build the payment header, retry the request, and render the receipt.
+///
+/// Every x402 payment-channel scheme follows this shape; only the header it
+/// builds and the label on the receipt differ, so `build` supplies those and
+/// the rest stays in one place.
+fn pay_channel_and_retry(
+    scheme: &'static str,
+    amount: &str,
+    asset: &str,
+    network: &str,
+    recent_blockhash: Option<&str>,
     ctx: PaymentRetryContext<'_, '_>,
+    build: impl FnOnce(&pay_core::accounts::FileAccountsStore) -> pay_core::Result<x402::BuiltPayment>,
 ) -> pay_core::Result<()> {
     let is_json = no_dna::should_json(ctx.output_fmt);
     validate_tool_request_before_signing(ctx.tool)?;
@@ -1669,35 +1678,19 @@ fn pay_upto_and_retry(
         crate::components::print_notice(
             crate::components::NoticeLevel::Success,
             "Authorizing x402 payment",
-            &payment_authorization_notice_body(
-                &display_x402_upto_amount(
-                    &challenge.requirements.amount,
-                    &challenge.requirements.asset,
-                ),
-                None,
-            ),
+            &payment_authorization_notice_body(&display_token_amount(amount, asset), None),
         );
     }
 
     let store = pay_core::accounts::FileAccountsStore::default_path();
-    let built_payment = x402::build_upto_payment(
-        challenge,
-        &store,
-        ctx.network_override,
-        ctx.account_override,
-        Some(resource_url),
-    )?;
+    let built_payment = build(&store)?;
 
     if let Some(resolved) = built_payment.ephemeral_notice {
         render_generated_wallet_notice(&resolved, is_json)?;
     }
 
-    let receipt_network = x402_receipt_network(
-        ctx.network_override,
-        &challenge.requirements.network,
-        None,
-        challenge.requirements.extra.recent_blockhash.as_deref(),
-    );
+    let receipt_network =
+        x402_receipt_network(ctx.network_override, network, None, recent_blockhash);
     let verbose = ctx.verbose;
     let retry_outcome = retry_with_headers(ctx.tool, &built_payment.headers, ctx.fetch_headers)?;
     handle_retry_outcome(
@@ -1706,9 +1699,36 @@ fn pay_upto_and_retry(
         verbose,
         Some(&receipt_network),
         ReceiptProvenance::PaidRetry(Some(ReceiptDisplayContext {
-            asset: Some(&challenge.requirements.asset),
-            scheme: Some("upto"),
+            asset: Some(asset),
+            scheme: Some(scheme),
         })),
+    )
+}
+
+fn pay_upto_and_retry(
+    challenge: &x402::UptoChallenge,
+    resource_url: &str,
+    ctx: PaymentRetryContext<'_, '_>,
+) -> pay_core::Result<()> {
+    let requirements = &challenge.requirements;
+    let network_override = ctx.network_override;
+    let account_override = ctx.account_override;
+    pay_channel_and_retry(
+        "upto",
+        &requirements.amount,
+        &requirements.asset,
+        &requirements.network,
+        requirements.extra.recent_blockhash.as_deref(),
+        ctx,
+        |store| {
+            x402::build_upto_payment(
+                challenge,
+                store,
+                network_override,
+                account_override,
+                Some(resource_url),
+            )
+        },
     )
 }
 
@@ -1725,62 +1745,31 @@ fn pay_batch_and_retry(
     resource_url: &str,
     ctx: PaymentRetryContext<'_, '_>,
 ) -> pay_core::Result<()> {
-    let is_json = no_dna::should_json(ctx.output_fmt);
-    validate_tool_request_before_signing(ctx.tool)?;
-
-    if ctx.verbose && !is_json {
-        crate::components::print_notice(
-            crate::components::NoticeLevel::Success,
-            "Authorizing x402 payment",
-            &payment_authorization_notice_body(
-                &display_token_amount(
-                    &challenge.requirements.amount,
-                    &challenge.requirements.asset,
-                ),
+    let requirements = &challenge.requirements;
+    let network_override = ctx.network_override;
+    let account_override = ctx.account_override;
+    pay_channel_and_retry(
+        "batch-settlement",
+        &requirements.amount,
+        &requirements.asset,
+        &requirements.network,
+        requirements.extra.recent_blockhash.as_deref(),
+        ctx,
+        |store| {
+            let channels = pay_core::client::batch::BatchChannelCache::new();
+            x402::build_batch_payment(
+                challenge,
+                store,
+                &channels,
                 None,
-            ),
-        );
-    }
-
-    let store = pay_core::accounts::FileAccountsStore::default_path();
-    let channels = pay_core::client::batch::BatchChannelCache::new();
-    let built = x402::build_batch_payment(
-        challenge,
-        &store,
-        &channels,
-        None,
-        ctx.network_override,
-        ctx.account_override,
-        Some(resource_url),
-        None,
-    )?;
-
-    if let Some(resolved) = built.payment.ephemeral_notice {
-        render_generated_wallet_notice(&resolved, is_json)?;
-    }
-
-    let receipt_network = x402_receipt_network(
-        ctx.network_override,
-        &challenge.requirements.network,
-        None,
-        challenge.requirements.extra.recent_blockhash.as_deref(),
-    );
-    let verbose = ctx.verbose;
-    let retry_outcome = retry_with_headers(ctx.tool, &built.payment.headers, ctx.fetch_headers)?;
-    handle_retry_outcome(
-        retry_outcome,
-        is_json,
-        verbose,
-        Some(&receipt_network),
-        ReceiptProvenance::PaidRetry(Some(ReceiptDisplayContext {
-            asset: Some(&challenge.requirements.asset),
-            scheme: Some("batch-settlement"),
-        })),
+                network_override,
+                account_override,
+                Some(resource_url),
+                None,
+            )
+            .map(|built| built.payment)
+        },
     )
-}
-
-fn display_x402_upto_amount(amount: &str, asset: &str) -> String {
-    display_token_amount(amount, asset)
 }
 
 fn display_token_amount(amount: &str, asset: &str) -> String {
@@ -2478,10 +2467,13 @@ mod tests {
         );
     }
 
+    /// Both channel schemes render their authorization prompt through
+    /// `pay_channel_and_retry`, so this formatting is what a payer actually
+    /// reads before approving either one.
     #[test]
-    fn x402_upto_notice_uses_a_human_stablecoin_amount() {
+    fn x402_channel_notice_uses_a_human_stablecoin_amount() {
         assert_eq!(
-            display_x402_upto_amount("250000", pay_types::stablecoin_mints::USDC_MAINNET),
+            display_token_amount("250000", pay_types::stablecoin_mints::USDC_MAINNET),
             "0.25 USDC"
         );
     }
