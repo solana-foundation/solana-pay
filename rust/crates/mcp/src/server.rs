@@ -5,12 +5,14 @@
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, ProtocolVersion, ServerCapabilities, ServerInfo};
 use rmcp::{ServerHandler, tool, tool_handler, tool_router};
+use std::sync::Arc;
 
 use crate::tools;
 
 pub struct PayMcp {
     #[allow(dead_code)]
     tool_router: rmcp::handler::server::router::tool::ToolRouter<Self>,
+    session_cache: Arc<tools::curl::SessionCache>,
 }
 
 impl Default for PayMcp {
@@ -24,6 +26,7 @@ impl PayMcp {
     pub fn new() -> Self {
         Self {
             tool_router: Self::tool_router(),
+            session_cache: Arc::new(tools::curl::SessionCache::default()),
         }
     }
 
@@ -60,7 +63,7 @@ and does not submit the request or payment.
         Parameters(params): Parameters<tools::curl::Params>,
         peer: rmcp::Peer<rmcp::service::RoleServer>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        tools::curl::run(params, peer).await
+        tools::curl::run(params, peer, self.session_cache.clone()).await
     }
 
     #[tool(
