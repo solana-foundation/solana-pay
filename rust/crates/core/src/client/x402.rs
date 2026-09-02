@@ -289,6 +289,8 @@ struct ChannelOffer<'a> {
     amount: &'a str,
     /// Mint address.
     asset: &'a str,
+    /// Whether the approval funds channel escrow rather than one request.
+    channel_escrow: bool,
     /// The challenge's blockhash build hint. Beyond saving an RPC round trip it
     /// is how a Surfpool sandbox is recognized, which pins the cluster to
     /// localnet and enables auto-funding.
@@ -305,9 +307,14 @@ fn prepare_channel_payment(
     auth_override: crate::signer::AuthOverride,
 ) -> Result<ChannelPaymentSetup> {
     let display_amount = format_amount(offer.amount, offer.asset);
+    let approval_amount = if offer.channel_escrow {
+        format!("channel escrow: {display_amount}")
+    } else {
+        display_amount
+    };
     let prompt_context = crate::client::prompt::payment_prompt_context(None, &[resource_url]);
     let intent = crate::keystore::AuthIntent::authorize_payment_details(
-        &display_amount,
+        &approval_amount,
         &prompt_context.reason,
         &prompt_context.operator,
     );
@@ -344,7 +351,7 @@ fn prepare_channel_payment(
             &network,
             store,
             account_override,
-            &display_amount,
+            &approval_amount,
             &intent,
             auth_override,
         )?;
@@ -434,6 +441,7 @@ pub fn build_upto_payment_with_override(
             network: &requirements.network,
             amount: &requirements.amount,
             asset: &requirements.asset,
+            channel_escrow: false,
             recent_blockhash: requirements.extra.recent_blockhash.as_deref(),
         },
         store,
@@ -529,6 +537,12 @@ pub fn build_batch_payment(
     let price = requirements
         .amount()
         .map_err(|e| Error::Mpp(format!("invalid batch-settlement amount: {e}")))?;
+    let existing = cache.get(requirements)?;
+    let escrow_amount = match existing.as_ref() {
+        Some(channel) if channel.can_cover(price) => None,
+        Some(_) | None => Some(deposit_amount.unwrap_or(price).max(price)),
+    };
+    let authorization_amount = escrow_amount.unwrap_or(price).to_string();
     let ChannelPaymentSetup {
         signer,
         ephemeral_notice,
@@ -537,8 +551,9 @@ pub fn build_batch_payment(
     } = prepare_channel_payment(
         ChannelOffer {
             network: &requirements.network,
-            amount: &requirements.amount,
+            amount: &authorization_amount,
             asset: &requirements.asset,
+            channel_escrow: escrow_amount.is_some(),
             recent_blockhash: requirements.extra.recent_blockhash.as_deref(),
         },
         store,
@@ -554,7 +569,6 @@ pub fn build_batch_payment(
     let terms = batch_client::resolve_terms(&rpc, requirements)
         .map_err(|e| Error::Mpp(format!("batch-settlement terms rejected: {e}")))?;
 
-    let existing = cache.get(requirements)?;
     let (channel, payload, voucher) = match existing {
         Some(channel) if channel.can_cover(price) => {
             let voucher = rt
@@ -571,7 +585,7 @@ pub fn build_batch_payment(
             // request that authorizes it.
             let blockhash =
                 resolve_blockhash(&rpc, requirements.extra.recent_blockhash.as_deref())?;
-            let top_up = deposit_amount.unwrap_or(price).max(price);
+            let top_up = escrow_amount.expect("top-up requires escrow authorization");
             let payload = rt
                 .block_on(batch_client::build_top_up(
                     &signer, &channel, &terms, top_up, blockhash,
@@ -592,7 +606,7 @@ pub fn build_batch_payment(
                     .get_slot()
                     .map_err(|e| Error::Mpp(format!("Failed to fetch slot: {e}")))?,
             };
-            let deposit = deposit_amount.unwrap_or(price).max(price);
+            let deposit = escrow_amount.expect("open requires escrow authorization");
             let (channel, payload) = rt
                 .block_on(batch_client::build_deposit(
                     &signer,
