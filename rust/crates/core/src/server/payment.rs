@@ -605,6 +605,123 @@ pub(crate) fn extract_variant_hint(path: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const SPLIT_RECIPIENT: &str = "CNR1b172rotbSG6kCpfR76KB2ios2y7X4p8yEEc7pjLu";
+
+    fn configured_charge_splits() -> (pay_types::metering::ApiSpec, pay_types::metering::Metering) {
+        let spec: pay_types::metering::ProviderSpec = serde_yml::from_str(&format!(
+            r#"
+provider: test
+generated_at: "2026-09-02T00:00:00Z"
+apis:
+  - name: split-test
+    subdomain: split-test
+    title: "Split test"
+    description: "Exercises configured MPP charge splits."
+    category: ai_ml
+    version: v1
+    routing:
+      type: respond
+    recipients:
+      rounding:
+        account: "{SPLIT_RECIPIENT}"
+        label: "Rounding leg"
+      platform:
+        account: "{SPLIT_RECIPIENT}"
+        label: "Platform leg"
+    endpoints:
+      - method: POST
+        path: v1/test
+        metering:
+          dimensions:
+            - direction: usage
+              unit: requests
+              scale: 1
+              tiers:
+                - price_usd: 0.0015
+          splits:
+            # This rounds to zero USDC base units at six decimals.
+            - recipient: rounding
+              amount: 0.0000004
+              memo: "Rounding adjustment"
+            # A second leg to the same account is valid when its memo differs.
+            - recipient: platform
+              percent: 5
+              memo: "Platform fee"
+"#
+        ))
+        .expect("test YAML should parse");
+        let api = spec.apis.into_iter().next().expect("test API should exist");
+        let meter = api.endpoints[0]
+            .metering
+            .clone()
+            .expect("test endpoint should be metered");
+        (api, meter)
+    }
+
+    fn test_mpp() -> pay_kit::mpp::server::Mpp {
+        pay_kit::mpp::server::Mpp::new(pay_kit::mpp::server::Config {
+            recipient: SPLIT_RECIPIENT.to_string(),
+            // An unreachable local RPC keeps challenge construction offline.
+            rpc_url: Some("http://127.0.0.1:1".to_string()),
+            challenge_binding_secret: Some(
+                "test-challenge-binding-secret-must-be-32-bytes".to_string(),
+            ),
+            ..Default::default()
+        })
+        .expect("test MPP server should initialize")
+    }
+
+    fn challenge_splits_from_config() -> serde_json::Value {
+        let (api, meter) = configured_charge_splits();
+        let mpp = test_mpp();
+        let uri: axum::http::Uri = "/v1/test".parse().unwrap();
+        let splits = resolve_charge_splits(&mpp, &meter, &api, &uri, "0.0015");
+
+        let challenge = mpp
+            .charge_with_options(
+                "0.0015",
+                pay_kit::mpp::server::ChargeOptions {
+                    splits,
+                    ..Default::default()
+                },
+            )
+            .expect("PayKit should accept resolved charge splits");
+        let request: pay_kit::mpp::ChargeRequest = challenge
+            .request
+            .decode()
+            .expect("PayKit challenge should decode");
+        request
+            .method_details
+            .expect("PayKit charge challenge should include method details")
+    }
+
+    #[test]
+    fn configured_charge_split_that_rounds_to_zero_reaches_pay_kit() {
+        let details = challenge_splits_from_config();
+        let splits = details["splits"]
+            .as_array()
+            .expect("PayKit challenge should include splits");
+
+        assert_eq!(splits.len(), 2);
+        assert_eq!(splits[0]["recipient"], SPLIT_RECIPIENT);
+        assert_eq!(splits[0]["amount"], "0");
+        assert_eq!(splits[0]["memo"], "Rounding adjustment");
+    }
+
+    #[test]
+    fn configured_charge_splits_allow_same_recipient_with_distinct_memos() {
+        let details = challenge_splits_from_config();
+        let splits = details["splits"]
+            .as_array()
+            .expect("PayKit challenge should include splits");
+
+        assert_eq!(splits[0]["recipient"], splits[1]["recipient"]);
+        assert_eq!(splits[0]["memo"], "Rounding adjustment");
+        assert_eq!(splits[1]["memo"], "Platform fee");
+        assert_eq!(splits[1]["amount"], "75");
+    }
+
     #[test]
     fn extract_variant_hint_models() {
         assert_eq!(
