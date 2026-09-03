@@ -306,18 +306,26 @@ fn prepare_channel_payment(
     resource_url: Option<&str>,
     auth_override: crate::signer::AuthOverride,
 ) -> Result<ChannelPaymentSetup> {
+    // The escrow framing must not be folded into the amount string: a prefixed
+    // value like "channel escrow: $25.00" is unparseable by
+    // `PaymentLimit::from_amount`, which would drop the amount-specific spend
+    // limit and fall back to the generic authorization action. Keep the amount
+    // canonical and carry the escrow context in the intent kind instead.
     let display_amount = format_amount(offer.amount, offer.asset);
-    let approval_amount = if offer.channel_escrow {
-        format!("channel escrow: {display_amount}")
-    } else {
-        display_amount
-    };
     let prompt_context = crate::client::prompt::payment_prompt_context(None, &[resource_url]);
-    let intent = crate::keystore::AuthIntent::authorize_payment_details(
-        &approval_amount,
-        &prompt_context.reason,
-        &prompt_context.operator,
-    );
+    let intent = if offer.channel_escrow {
+        crate::keystore::AuthIntent::authorize_channel_escrow(
+            &display_amount,
+            &prompt_context.reason,
+            &prompt_context.operator,
+        )
+    } else {
+        crate::keystore::AuthIntent::authorize_payment_details(
+            &display_amount,
+            &prompt_context.reason,
+            &prompt_context.operator,
+        )
+    };
 
     // Channel requirements carry only the CAIP-2 `network` (no `cluster`), so
     // map it to one. Normalize to a pay slug ("mainnet-beta" -> "mainnet"):
@@ -351,7 +359,7 @@ fn prepare_channel_payment(
             &network,
             store,
             account_override,
-            &approval_amount,
+            &display_amount,
             &intent,
             auth_override,
         )?;
