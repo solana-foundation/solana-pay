@@ -94,8 +94,14 @@ pub async fn recover_batch(
     }
 
     let discovery = pay_api_core::RpcClient::new(Duration::from_secs(30))?;
+    // The default rpc_requests_per_second (20) is tuned to keep a live load
+    // run polite to devnet; left unset here it throttles this one-off,
+    // human-supervised recovery run to `concurrency` in name only. Scale it
+    // with `concurrency` so a large stranded-channel backlog actually drains
+    // in a supervised session instead of hours regardless of --concurrency.
     let execution = ExecutionConfig {
         submit_concurrency: concurrency,
+        rpc_requests_per_second: concurrency as u32,
         rpc_burst: concurrency.saturating_mul(2),
         ..ExecutionConfig::default()
     };
