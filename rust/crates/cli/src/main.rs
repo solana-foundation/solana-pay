@@ -1,3 +1,10 @@
+// Thread-local heaps: the x402 batch-settlement gate clones per-request state
+// (ChannelState with its serde_json map + delivery vecs) under load, and glibc
+// malloc's arena locks turned that churn into ~33% futex contention that capped
+// gateway throughput. mimalloc removes the global allocator lock.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 mod commands;
 pub mod components;
 pub mod debugger_proxy;
