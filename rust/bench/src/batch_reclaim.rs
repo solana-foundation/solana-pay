@@ -167,6 +167,15 @@ pub async fn recover_batch(
     Ok(())
 }
 
+/// `pay_api_core::RpcClient` has no retry policy of its own (unlike
+/// `FixtureRpc`), and a getProgramAccounts scan over ~500k channel accounts
+/// is a large enough single response that a transient connection reset from
+/// a public devnet RPC is routine, not exceptional. Retry a bounded number
+/// of times with a short fixed delay rather than aborting the whole recovery
+/// run over one dropped connection.
+const SCAN_MAX_ATTEMPTS: usize = 5;
+const SCAN_RETRY_DELAY: Duration = Duration::from_secs(5);
+
 /// Fetch every account of the shared payment-channels program at `status`,
 /// and keep only the ones whose `payer` is one of ours.
 async fn scan_owned(
@@ -176,16 +185,37 @@ async fn scan_owned(
     status: u8,
     wallets: &HashMap<Pubkey, Wallet>,
 ) -> Result<Vec<OwnedChannel>> {
-    let accounts = rpc
-        .get_program_accounts_filtered(
-            rpc_url,
-            &program_id.to_string(),
-            CHANNEL_ACCOUNT_SIZE,
-            CHANNEL_STATUS_OFFSET,
-            &[status],
-        )
-        .await
-        .with_context(|| format!("scanning channels at status {status}"))?;
+    let mut accounts = None;
+    for attempt in 1..=SCAN_MAX_ATTEMPTS {
+        match rpc
+            .get_program_accounts_filtered(
+                rpc_url,
+                &program_id.to_string(),
+                CHANNEL_ACCOUNT_SIZE,
+                CHANNEL_STATUS_OFFSET,
+                &[status],
+            )
+            .await
+        {
+            Ok(result) => {
+                accounts = Some(result);
+                break;
+            }
+            Err(error) if attempt < SCAN_MAX_ATTEMPTS => {
+                eprintln!(
+                    "scanning channels at status {status}: attempt {attempt}/{SCAN_MAX_ATTEMPTS} failed ({error:#}), retrying in {}s",
+                    SCAN_RETRY_DELAY.as_secs()
+                );
+                tokio::time::sleep(SCAN_RETRY_DELAY).await;
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("scanning channels at status {status} ({SCAN_MAX_ATTEMPTS} attempts)")
+                });
+            }
+        }
+    }
+    let accounts = accounts.expect("loop only exits via break(Some) or early return");
 
     let mut owned = Vec::new();
     for account in accounts {
