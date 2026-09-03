@@ -6603,7 +6603,7 @@ checksum = "2ee67f1008b1ba2321834326597b8e186293b049a023cdef258527550b9935b4"
 
 [[package]]
 name = "pay"
-version = "0.28.0"
+version = "0.29.0"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -6661,7 +6661,7 @@ dependencies = [
 
 [[package]]
 name = "pay-acp"
-version = "0.28.0"
+version = "0.29.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -6670,7 +6670,7 @@ dependencies = [
 
 [[package]]
 name = "pay-api"
-version = "0.28.0"
+version = "0.29.0"
 dependencies = [
  "axum",
  "base64 0.22.1",
@@ -6713,7 +6713,7 @@ dependencies = [
 
 [[package]]
 name = "pay-api-core"
-version = "0.28.0"
+version = "0.29.0"
 dependencies = [
  "base64 0.22.1",
  "bincode",
@@ -6741,7 +6741,7 @@ dependencies = [
 
 [[package]]
 name = "pay-api-types"
-version = "0.28.0"
+version = "0.29.0"
 dependencies = [
  "schemars 0.8.22",
  "serde",
@@ -6751,7 +6751,7 @@ dependencies = [
 
 [[package]]
 name = "pay-bench"
-version = "0.28.0"
+version = "0.29.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -6815,7 +6815,7 @@ dependencies = [
 
 [[package]]
 name = "pay-core"
-version = "0.28.0"
+version = "0.29.0"
 dependencies = [
  "async-stream",
  "axum",
@@ -6875,7 +6875,7 @@ dependencies = [
 
 [[package]]
 name = "pay-integration"
-version = "0.28.0"
+version = "0.29.0"
 dependencies = [
  "base64 0.22.1",
  "pay-core",
@@ -6886,7 +6886,7 @@ dependencies = [
 
 [[package]]
 name = "pay-keystore"
-version = "0.28.0"
+version = "0.29.0"
 dependencies = [
  "bs58",
  "secret-service",
@@ -6903,7 +6903,7 @@ dependencies = [
 
 [[package]]
 name = "pay-mcp"
-version = "0.28.0"
+version = "0.29.0"
 dependencies = [
  "base64 0.22.1",
  "crc32fast",
@@ -6928,7 +6928,7 @@ dependencies = [
 
 [[package]]
 name = "pay-pdb"
-version = "0.28.0"
+version = "0.29.0"
 dependencies = [
  "async-stream",
  "axum",
@@ -6950,7 +6950,7 @@ dependencies = [
 
 [[package]]
 name = "pay-proxy"
-version = "0.28.0"
+version = "0.29.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -6971,7 +6971,7 @@ dependencies = [
 
 [[package]]
 name = "pay-types"
-version = "0.28.0"
+version = "0.29.0"
 dependencies = [
  "schemars 0.8.22",
  "serde",
@@ -6982,7 +6982,7 @@ dependencies = [
 
 [[package]]
 name = "pay-worker"
-version = "0.28.0"
+version = "0.29.0"
 dependencies = [
  "axum",
  "base64 0.22.1",
@@ -11289,7 +11289,7 @@ dependencies = [
 [[package]]
 name = "solana-pay-kit"
 version = "0.6.0"
-source = "git+https://github.com/solana-foundation/pay-kit.git?rev=3924c8b202a264efa581b3effc13ace2bdcce8e8#3924c8b202a264efa581b3effc13ace2bdcce8e8"
+source = "git+https://github.com/solana-foundation/pay-kit.git?rev=1aa9333b#1aa9333b0d213791d5d1eb8d1c1242e45db2570f"
 dependencies = [
  "async-trait",
  "base64 0.22.1",

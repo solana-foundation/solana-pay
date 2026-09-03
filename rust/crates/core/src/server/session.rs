@@ -171,7 +171,9 @@ pub enum SessionOutcome {
     /// `open` or `topup` — channel state after the action and the on-chain
     /// transaction signature that authorized it.
     Active {
-        state: ChannelState,
+        /// Boxed: this is by far the largest payload in the enum, and every
+        /// other variant would otherwise be moved around at its size.
+        state: Box<ChannelState>,
         signature: Option<String>,
     },
     /// `voucher` accepted — channel id + new settled cumulative (base units).
@@ -179,7 +181,9 @@ pub enum SessionOutcome {
     /// `close` accepted — `SealParams` carries what's needed to submit the
     /// on-chain settle+seal + distribute transactions.
     Closed {
-        params: SealParams,
+        /// Boxed for the same reason as `Active`'s state: it is large enough
+        /// that carrying it inline would size the whole enum by it.
+        params: Box<SealParams>,
         signature: Option<String>,
     },
 }
@@ -1855,7 +1859,10 @@ impl SessionMpp {
 
                 self.record_committed_watermark(state.channel_id.clone(), state.cumulative);
                 self.touch_channel(state.channel_id.clone()).await?;
-                Ok(SessionOutcome::Active { state, signature })
+                Ok(SessionOutcome::Active {
+                    state: Box::new(state),
+                    signature,
+                })
             }
 
             SessionAction::Use(p) => {
@@ -1863,7 +1870,7 @@ impl SessionMpp {
                 self.record_committed_watermark(state.channel_id.clone(), state.cumulative);
                 self.touch_channel(state.channel_id.clone()).await?;
                 Ok(SessionOutcome::Active {
-                    state,
+                    state: Box::new(state),
                     signature: None,
                 })
             }
@@ -1905,7 +1912,10 @@ impl SessionMpp {
                 let state = acceptance.state;
                 self.record_committed_watermark(state.channel_id.clone(), state.cumulative);
                 self.touch_channel(state.channel_id.clone()).await?;
-                Ok(SessionOutcome::Active { state, signature })
+                Ok(SessionOutcome::Active {
+                    state: Box::new(state),
+                    signature,
+                })
             }
 
             SessionAction::Close(p) => {
@@ -1969,7 +1979,10 @@ impl SessionMpp {
                         &params.channel_id.to_string(),
                     );
                 }
-                Ok(SessionOutcome::Closed { params, signature })
+                Ok(SessionOutcome::Closed {
+                    params: Box::new(params),
+                    signature,
+                })
             }
         }
     }
@@ -2084,6 +2097,8 @@ impl SessionMpp {
             next_delivery_sequence: 0,
             pending_deliveries: vec![],
             committed_deliveries: vec![],
+            pending_setup: None,
+            onchain_checked_at: 0,
             lifecycle: None,
             schema_version: pay_kit::mpp::CHANNEL_STATE_SCHEMA_VERSION,
             extra: Default::default(),
@@ -2218,6 +2233,8 @@ pub fn test_channel_state(
         next_delivery_sequence: 0,
         pending_deliveries: vec![],
         committed_deliveries: vec![],
+        pending_setup: None,
+        onchain_checked_at: 0,
         lifecycle: None,
         schema_version: pay_kit::mpp::CHANNEL_STATE_SCHEMA_VERSION,
         extra: Default::default(),

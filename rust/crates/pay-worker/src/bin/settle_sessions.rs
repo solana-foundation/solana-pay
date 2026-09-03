@@ -1383,6 +1383,8 @@ mod tests {
             next_delivery_sequence: 0,
             pending_deliveries: vec![],
             committed_deliveries: vec![],
+            pending_setup: None,
+            onchain_checked_at: 0,
             lifecycle: None,
             schema_version: pay_kit::mpp::CHANNEL_STATE_SCHEMA_VERSION,
             extra: Default::default(),

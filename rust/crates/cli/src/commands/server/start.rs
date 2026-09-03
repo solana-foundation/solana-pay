@@ -1668,6 +1668,12 @@ impl StartCommand {
                         receiver_authorizer: None,
                         fee_payer_signer: signer,
                         program_id: None,
+                        // How long a confirmed channel snapshot is trusted
+                        // before the scheme re-reads it. The scheme requires
+                        // the channel to be confirmed open before a voucher is
+                        // accepted; kit's default keeps that off the hot path
+                        // without letting the snapshot go stale.
+                        channel_snapshot_max_age_seconds: 30,
                     };
                     match pay_kit::x402::server::X402BatchSettlement::with_store(cfg, batch_store) {
                         Ok(b) => Some(b),
