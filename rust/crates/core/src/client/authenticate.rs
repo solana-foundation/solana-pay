@@ -275,6 +275,7 @@ mod tests {
             "default".to_string(),
             Account {
                 keystore: Keystore::Ephemeral,
+                provider: None,
                 active: false,
                 auth_required: Some(false),
                 pubkey: Some("12YtVRbxyhBVceYVtALMeSyro5jTLEsqHgm78K721WH3".to_string()),

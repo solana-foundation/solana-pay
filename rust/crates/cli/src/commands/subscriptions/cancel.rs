@@ -400,7 +400,7 @@ async fn broadcast_direct(
 
 #[allow(clippy::too_many_arguments)]
 async fn broadcast_via_gateway(
-    signer: Arc<pay_kit::mpp::solana_keychain::MemorySigner>,
+    signer: Arc<dyn SolanaSigner>,
     instruction: solana_instruction::Instruction,
     gateway_fee_payer: &Pubkey,
     gateway_url: &str,

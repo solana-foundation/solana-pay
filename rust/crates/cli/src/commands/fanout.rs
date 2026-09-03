@@ -533,6 +533,7 @@ fn resolve_signing_account(
         let account_name = "fanout-keypair".to_string();
         let account = Account {
             keystore: Keystore::File,
+            provider: None,
             active: true,
             auth_required: Some(false),
             pubkey: Some(pubkey.to_string()),
@@ -559,7 +560,7 @@ fn resolve_signing_account(
             .named_account_for_network(network, name)
             .cloned()
             .ok_or_else(|| Error::Config(format!("account `{name}` not found on {network}")))?;
-        (name.to_string(), account)
+        (name.to_string(), Box::new(account))
     } else {
         match resolve_account_for_network(network, &file) {
             AccountChoice::Resolved { name, account } => (name, account),

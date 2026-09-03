@@ -13,7 +13,7 @@ use std::collections::HashMap;
 
 use base64::Engine;
 use chrono::{DateTime, Utc};
-use pay_kit::mpp::solana_keychain::{MemorySigner, SolanaSigner};
+use pay_kit::mpp::solana_keychain::SolanaSigner;
 use solana_hash::Hash;
 use solana_message::Message;
 use solana_pubkey::Pubkey;
@@ -31,7 +31,9 @@ use crate::client::push::planner::{
 };
 use crate::client::send::format_token_amount;
 use crate::keystore::AuthIntent;
-use crate::signer::{AuthOverride, load_signer_for_network_with_intent_and_override};
+use crate::signer::{
+    AuthOverride, ResolvedSigner, load_signer_for_network_with_intent_and_override,
+};
 use crate::{Error, Result};
 
 /// A chunk may be re-signed with a fresh blockhash a bounded number of times
@@ -168,9 +170,10 @@ pub struct SignedChunk {
 
 /// The live, in-memory, one-approval batch signing authority.
 ///
-/// Holds the loaded [`MemorySigner`] — nothing outside this module ever
-/// gets a reference to it. Dies with the process; there is no persistence
-/// and no serialization path for the signer itself.
+/// Holds the loaded [`ResolvedSigner`] — a local keypair or a remote
+/// backend, whichever the account resolves to — and nothing outside this
+/// module ever gets a reference to it. Dies with the process; there is no
+/// persistence and no serialization path for the signer itself.
 pub struct BatchSigningPermit {
     manifest_hash: [u8; 32],
     account_pubkey: Pubkey,
@@ -188,7 +191,7 @@ pub struct BatchSigningPermit {
     max_transactions: usize,
     expires_at: DateTime<Utc>,
 
-    signer: MemorySigner,
+    signer: ResolvedSigner,
     runtime: tokio::runtime::Runtime,
 
     signed_amount_raw: u64,
@@ -861,6 +864,7 @@ mod tests {
 
         let account = Account {
             keystore: Keystore::Ephemeral,
+            provider: None,
             active: false,
             auth_required: Some(false),
             pubkey: Some(bs58::encode(verifying_key.to_bytes()).into_string()),

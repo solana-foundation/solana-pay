@@ -817,6 +817,7 @@ mod tests {
 
         let account = Account {
             keystore: Keystore::Ephemeral,
+            provider: None,
             active: false,
             auth_required: Some(false),
             pubkey: Some(bs58::encode(verifying_key.to_bytes()).into_string()),

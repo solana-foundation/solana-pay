@@ -20,7 +20,8 @@ pub struct SetupCommand {
     pub force: bool,
 
     /// Storage backend: "keychain" (macOS), "gnome-keyring" (Linux),
-    /// "windows-hello" (Windows), or "file" (headless fallback).
+    /// "windows-hello" (Windows), "file" (headless fallback), or a remote
+    /// signing backend registered in `pay_core::remote` ("openfort").
     #[arg(long)]
     pub backend: Option<String>,
 
@@ -37,12 +38,29 @@ pub struct SetupCommand {
     /// from its hot wallet. Reuses an existing account when present.
     #[arg(long, value_name = "CODE")]
     pub redeem: Option<String>,
+
+    /// Remote-backend credential as `key=value`, repeatable (e.g.
+    /// `--credential secret_key=sk_live_…`). Each field also reads
+    /// `{PROVIDER}_{FIELD}` from the environment.
+    #[arg(long = "credential", value_name = "KEY=VALUE")]
+    pub credentials: Vec<String>,
+
+    /// Remote-backend wallet id (env: `{PROVIDER}_WALLET_ID`). Defaults to
+    /// the account's only Solana wallet, or prompts to pick.
+    #[arg(long)]
+    pub wallet_id: Option<String>,
 }
 
 /// Per-request timeout for the redemption POST.
 const REDEEM_TIMEOUT_SECS: u64 = 30;
 
 impl SetupCommand {
+    /// Remote-backend credentials from flags, falling back to the
+    /// environment.
+    fn remote_inputs(&self) -> pay_core::Result<super::account::new::RemoteInputs> {
+        super::account::new::RemoteInputs::resolve(&self.credentials, self.wallet_id.clone())
+    }
+
     pub fn run(self) -> pay_core::Result<()> {
         if self.update {
             return run_update();
@@ -105,6 +123,7 @@ impl SetupCommand {
             Some(&backend),
             self.vault.as_deref(),
             self.force,
+            &self.remote_inputs()?,
         )?;
         super::buzz_setup::maybe_configure();
 
@@ -157,6 +176,7 @@ impl SetupCommand {
                 self.backend.as_deref(),
                 self.vault.as_deref(),
                 self.force,
+                &self.remote_inputs()?,
             )?;
             (pk, false)
         };

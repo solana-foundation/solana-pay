@@ -1,14 +1,64 @@
-//! Resolve a signer from a keypair source — file path, Keychain, or 1Password.
+//! Resolve a signer from a keypair source — file path, Keychain, 1Password,
+//! or a remote signing backend (`pay_core::remote`).
 
 use pay_kit::mpp::solana_keychain::MemorySigner;
+use pay_kit::solana_keychain::{SignTransactionResult, SignerError, SolanaSigner};
 
 use crate::accounts::{
-    Account, AccountChoice, AccountsStore, Keystore, ResolvedEphemeral,
-    load_or_create_ephemeral_for_network, load_or_create_ephemeral_for_network_as,
-    resolve_account_for_network,
+    Account, AccountChoice, AccountsFile, AccountsStore, Keystore, MAINNET_NETWORK,
+    ResolvedEphemeral, load_or_create_ephemeral_for_network,
+    load_or_create_ephemeral_for_network_as, resolve_account_for_network,
 };
 use crate::keystore::{AuthGate, AuthIntent};
 use crate::{Error, Result};
+
+/// Signer resolved from a pay account — a local in-memory keypair or a
+/// remote backend's signer. Implements [`SolanaSigner`] by delegation, so
+/// both MPP and x402 payment paths accept it wherever a
+/// `&dyn SolanaSigner` is expected.
+pub enum ResolvedSigner {
+    Memory(Box<MemorySigner>),
+    /// Any provider registered in [`crate::remote`]; pay never needs to
+    /// know which one.
+    Remote(Box<dyn SolanaSigner>),
+}
+
+#[async_trait::async_trait]
+impl SolanaSigner for ResolvedSigner {
+    fn pubkey(&self) -> solana_pubkey::Pubkey {
+        match self {
+            ResolvedSigner::Memory(signer) => signer.pubkey(),
+            ResolvedSigner::Remote(signer) => signer.pubkey(),
+        }
+    }
+
+    async fn sign_transaction(
+        &self,
+        tx: &mut solana_transaction::Transaction,
+    ) -> std::result::Result<SignTransactionResult, SignerError> {
+        match self {
+            ResolvedSigner::Memory(signer) => signer.sign_transaction(tx).await,
+            ResolvedSigner::Remote(signer) => signer.sign_transaction(tx).await,
+        }
+    }
+
+    async fn sign_message(
+        &self,
+        message: &[u8],
+    ) -> std::result::Result<solana_signature::Signature, SignerError> {
+        match self {
+            ResolvedSigner::Memory(signer) => signer.sign_message(message).await,
+            ResolvedSigner::Remote(signer) => signer.sign_message(message).await,
+        }
+    }
+
+    async fn is_available(&self) -> bool {
+        match self {
+            ResolvedSigner::Memory(signer) => signer.is_available().await,
+            ResolvedSigner::Remote(signer) => signer.is_available().await,
+        }
+    }
+}
 
 /// Optional auth-gate override threaded through the signing path.
 ///
@@ -57,20 +107,30 @@ pub fn load_signer_for_payment(source: &str, amount: &str, desc: &str) -> Result
 ///    normal `load_signer_with_reason` path; ephemeral accounts have
 ///    their inline secret bytes loaded directly (no Touch ID, no prompt).
 ///
-/// 2. **Lazy ephemeral creation** — if no mapping exists AND the network
+/// 2. **Network-agnostic fallback** — if an explicitly named account has
+///    no mapping on this network but exists on `mainnet` with a remote
+///    signing backend (`keystore: remote`), use the mainnet entry. A
+///    remote signer signs raw bytes and carries no chain state, so it is
+///    valid on every network; without this fallback an explicit
+///    `--account` would silently shadow the remote signer with a lazy
+///    ephemeral of the same name. The mainnet entry's `auth_required`
+///    travels with it; add an explicit `accounts.<network>` entry to
+///    override per network.
+///
+/// 3. **Lazy ephemeral creation** — if no mapping exists AND the network
 ///    is one we consider "throwaway" (`localnet` / `devnet`), generate a
 ///    fresh ephemeral, persist it as `accounts.<network> + networks.<network>`,
 ///    and return it. The returned `Option<ResolvedEphemeral>` is `Some` only
 ///    in this case so the caller knows to print a notice.
 ///
-/// 3. **Mainnet without a wallet** — error. We never auto-create a wallet
+/// 4. **Mainnet without a wallet** — error. We never auto-create a wallet
 ///    for `mainnet`; the user must run `pay setup` to bind their real
 ///    wallet first. This is intentional — silently generating a mainnet
 ///    wallet would be a footgun.
 pub fn load_signer_for_network(
     network: &str,
     store: &dyn AccountsStore,
-) -> Result<(MemorySigner, Option<ResolvedEphemeral>)> {
+) -> Result<(ResolvedSigner, Option<ResolvedEphemeral>)> {
     load_signer_for_network_with_intent(network, store, None, &AuthIntent::default_payment())
 }
 
@@ -82,7 +142,7 @@ pub fn load_signer_for_network_with_reason(
     store: &dyn AccountsStore,
     account_override: Option<&str>,
     reason: &str,
-) -> Result<(MemorySigner, Option<ResolvedEphemeral>)> {
+) -> Result<(ResolvedSigner, Option<ResolvedEphemeral>)> {
     load_signer_for_network_with_intent(
         network,
         store,
@@ -98,7 +158,7 @@ pub fn load_signer_for_network_with_intent(
     store: &dyn AccountsStore,
     account_override: Option<&str>,
     intent: &AuthIntent,
-) -> Result<(MemorySigner, Option<ResolvedEphemeral>)> {
+) -> Result<(ResolvedSigner, Option<ResolvedEphemeral>)> {
     load_signer_for_network_with_intent_and_override(network, store, account_override, intent, None)
 }
 
@@ -110,10 +170,20 @@ pub fn load_signer_for_network_with_intent_and_override(
     account_override: Option<&str>,
     intent: &AuthIntent,
     auth_override: AuthOverride,
-) -> Result<(MemorySigner, Option<ResolvedEphemeral>)> {
+) -> Result<(ResolvedSigner, Option<ResolvedEphemeral>)> {
     let file = store.load()?;
     if let Some(name) = account_override {
         if let Some(account) = file.named_account_for_network(network, name).cloned() {
+            let signer = load_signer_from_account_with_intent_and_override(
+                &account,
+                name,
+                network,
+                intent,
+                auth_override,
+            )?;
+            return Ok((signer, None));
+        }
+        if let Some(account) = network_agnostic_fallback(&file, network, name).cloned() {
             let signer = load_signer_from_account_with_intent_and_override(
                 &account,
                 name,
@@ -158,6 +228,25 @@ pub fn load_signer_for_network_with_intent_and_override(
     }
 }
 
+/// Fall back to a same-named `mainnet` account when the current network
+/// has no mapping and the account signs remotely (`keystore: remote`).
+///
+/// Keypair-backed accounts never fall through: silently reusing a mainnet
+/// key on another network is a footgun. A remote signer signs raw bytes
+/// and carries no chain state, so the same account is valid on every
+/// network.
+fn network_agnostic_fallback<'a>(
+    file: &'a AccountsFile,
+    network: &str,
+    name: &str,
+) -> Option<&'a Account> {
+    if network == MAINNET_NETWORK {
+        return None;
+    }
+    file.named_account_for_network(MAINNET_NETWORK, name)
+        .filter(|account| account.keystore == Keystore::Remote)
+}
+
 /// Network-aware loader for a payment, with the same amount-prefixed
 /// rejection-error rewrap as [`load_signer_for_payment`].
 pub fn load_signer_for_network_payment(
@@ -166,7 +255,7 @@ pub fn load_signer_for_network_payment(
     account_override: Option<&str>,
     amount: &str,
     desc: &str,
-) -> Result<(MemorySigner, Option<ResolvedEphemeral>)> {
+) -> Result<(ResolvedSigner, Option<ResolvedEphemeral>)> {
     let intent = AuthIntent::authorize_payment(amount, desc);
     load_signer_for_network_payment_with_intent(network, store, account_override, amount, &intent)
 }
@@ -177,7 +266,7 @@ pub fn load_signer_for_network_payment_with_intent(
     account_override: Option<&str>,
     amount: &str,
     intent: &AuthIntent,
-) -> Result<(MemorySigner, Option<ResolvedEphemeral>)> {
+) -> Result<(ResolvedSigner, Option<ResolvedEphemeral>)> {
     load_signer_for_network_payment_with_intent_and_override(
         network,
         store,
@@ -197,7 +286,7 @@ pub fn load_signer_for_network_payment_with_intent_and_override(
     amount: &str,
     intent: &AuthIntent,
     auth_override: AuthOverride,
-) -> Result<(MemorySigner, Option<ResolvedEphemeral>)> {
+) -> Result<(ResolvedSigner, Option<ResolvedEphemeral>)> {
     load_signer_for_network_with_intent_and_override(
         network,
         store,
@@ -253,6 +342,14 @@ pub fn load_keypair_bytes_from_account_with_intent_and_override(
     auth_override: AuthOverride,
 ) -> Result<crate::keystore::Zeroizing<Vec<u8>>> {
     let account_intent = intent.with_account_context(name);
+    if account.keystore == Keystore::Remote {
+        let _ = auth_override;
+        let backend = account.provider.as_deref().unwrap_or("remote");
+        return Err(Error::Config(format!(
+            "Account `{name}` signs through the `{backend}` backend: its private key \
+             lives in the provider's custody and cannot be loaded or exported locally."
+        )));
+    }
     if account.keystore == Keystore::Ephemeral {
         let _ = auth_override;
         return account
@@ -379,7 +476,7 @@ pub fn load_keypair_bytes_from_account_with_intent_and_override(
             maybe_authenticate_file_account(account, network, &account_intent, auth_override)?;
             load_signer_keypair_bytes_with_intent(&source, &account_intent)
         }
-        Keystore::Ephemeral => unreachable!("handled above"),
+        Keystore::Ephemeral | Keystore::Remote => unreachable!("handled above"),
     }
 }
 
@@ -388,19 +485,8 @@ pub fn load_signer_from_account_with_reason(
     name: &str,
     network: &str,
     reason: &str,
-) -> Result<MemorySigner> {
-    let bytes = load_keypair_bytes_from_account_with_intent(
-        account,
-        name,
-        network,
-        &AuthIntent::from_reason(reason),
-    )?;
-    MemorySigner::from_bytes(&bytes).map_err(|e| {
-        Error::Config(format!(
-            "Storage corrupted: keypair for account `{name}` on `{network}` failed to decode ({e}). \
-             Re-import the account: `pay account destroy --name {name}` then `pay account new --name {name}`."
-        ))
-    })
+) -> Result<ResolvedSigner> {
+    load_signer_from_account_with_intent(account, name, network, &AuthIntent::from_reason(reason))
 }
 
 pub fn load_signer_from_account_with_intent(
@@ -408,7 +494,7 @@ pub fn load_signer_from_account_with_intent(
     name: &str,
     network: &str,
     intent: &AuthIntent,
-) -> Result<MemorySigner> {
+) -> Result<ResolvedSigner> {
     load_signer_from_account_with_intent_and_override(account, name, network, intent, None)
 }
 
@@ -420,7 +506,11 @@ pub fn load_signer_from_account_with_intent_and_override(
     network: &str,
     intent: &AuthIntent,
     auth_override: AuthOverride,
-) -> Result<MemorySigner> {
+) -> Result<ResolvedSigner> {
+    if account.keystore == Keystore::Remote {
+        return crate::remote::load_remote_signer(account, name, network, intent, auth_override);
+    }
+
     let bytes = load_keypair_bytes_from_account_with_intent_and_override(
         account,
         name,
@@ -428,19 +518,21 @@ pub fn load_signer_from_account_with_intent_and_override(
         intent,
         auth_override,
     )?;
-    MemorySigner::from_bytes(&bytes).map_err(|e| {
+    let memory = MemorySigner::from_bytes(&bytes).map_err(|e| {
         Error::Config(format!(
             "Storage corrupted: keypair for account `{name}` on `{network}` failed to decode ({e}). \
              Re-import the account: `pay account destroy --name {name}` then `pay account new --name {name}`."
         ))
-    })
+    })?;
+    Ok(ResolvedSigner::Memory(Box::new(memory)))
 }
 
-fn signer_from_ephemeral(account: &Account) -> Result<MemorySigner> {
+fn signer_from_ephemeral(account: &Account) -> Result<ResolvedSigner> {
     let bytes = account.ephemeral_keypair_bytes().ok_or_else(|| {
         Error::Config("Ephemeral account is missing its inline `secret_key_b58` field".to_string())
     })?;
     MemorySigner::from_bytes(&bytes)
+        .map(|s| ResolvedSigner::Memory(Box::new(s)))
         .map_err(|e| Error::Config(format!("Invalid ephemeral keypair bytes: {e}")))
 }
 
@@ -551,7 +643,7 @@ fn rejection_source(backend: &str) -> &'static str {
     }
 }
 
-fn map_keystore_backend_error(backend: &str, e: crate::keystore::Error) -> Error {
+pub(crate) fn map_keystore_backend_error(backend: &str, e: crate::keystore::Error) -> Error {
     if matches!(e, crate::keystore::Error::AuthDenied(_)) {
         Error::PaymentRejected(rejection_source(backend).to_string())
     } else {
@@ -790,6 +882,7 @@ mod tests {
 
         let account = Account {
             keystore: Keystore::File,
+            provider: None,
             active: false,
             auth_required,
             pubkey: Some(bs58::encode(verifying_key.to_bytes()).into_string()),
@@ -802,6 +895,72 @@ mod tests {
         };
 
         (temp_dir, account, keypair_bytes)
+    }
+
+    fn remote_account(account_id: Option<&str>) -> Account {
+        Account {
+            keystore: Keystore::Remote,
+            provider: Some("openfort".to_string()),
+            active: false,
+            auth_required: Some(true),
+            pubkey: Some("C78fUoBw1YDJDmzNx7viRZFnuhku3t3eiy9eiV2hafff".to_string()),
+            vault: None,
+            account: account_id.map(str::to_string),
+            path: None,
+            secret_key_b58: None,
+            created_at: None,
+            subscriptions: std::collections::BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn explicit_remote_account_falls_back_from_mainnet_on_other_networks() {
+        // Registered on mainnet only (what `pay account new` writes), but
+        // addressed explicitly on localnet: resolution must reach the
+        // remote loader instead of shadowing the name with a lazy
+        // ephemeral. The missing-account-id error proves which path ran
+        // without needing keystore credentials.
+        let mut file = AccountsFile::default();
+        file.upsert(MAINNET_NETWORK, "openfort", remote_account(None));
+        let store = MemoryAccountsStore::with_file(file);
+
+        let err = match load_signer_for_network_with_intent(
+            "localnet",
+            &store,
+            Some("openfort"),
+            &AuthIntent::default_payment(),
+        ) {
+            Err(err) => err,
+            Ok(_) => panic!("expected the remote loader to reject a missing wallet id"),
+        };
+
+        let Error::Config(msg) = err else {
+            panic!("expected Config error");
+        };
+        assert!(msg.contains("missing its `account` field"), "{msg}");
+        assert_eq!(store.save_count(), 0, "no ephemeral must be created");
+    }
+
+    #[test]
+    fn keypair_backed_mainnet_entry_does_not_fall_back() {
+        let (_temp_dir, account, _) = fresh_file_account(Some(false));
+        let mut file = AccountsFile::default();
+        file.upsert(MAINNET_NETWORK, "worker", account);
+        let store = MemoryAccountsStore::with_file(file);
+
+        let (signer, resolved) = load_signer_for_network_with_intent(
+            "localnet",
+            &store,
+            Some("worker"),
+            &AuthIntent::default_payment(),
+        )
+        .unwrap();
+
+        assert!(matches!(signer, ResolvedSigner::Memory(_)));
+        assert!(
+            resolved.is_some_and(|r| r.created),
+            "keypair-backed accounts must keep the lazy-ephemeral behavior"
+        );
     }
 
     #[test]
@@ -885,6 +1044,7 @@ mod tests {
         full.extend_from_slice(&verifying_key.to_bytes());
         Account {
             keystore: Keystore::Ephemeral,
+            provider: None,
             active: false,
             auth_required: Some(false),
             pubkey: Some(bs58::encode(verifying_key.to_bytes()).into_string()),
@@ -895,6 +1055,63 @@ mod tests {
             created_at: Some("2026-04-10T00:00:00Z".to_string()),
             subscriptions: std::collections::BTreeMap::new(),
         }
+    }
+
+    fn fresh_remote_account(account_id: Option<&str>) -> Account {
+        Account {
+            keystore: Keystore::Remote,
+            provider: Some("openfort".to_string()),
+            active: false,
+            auth_required: Some(false),
+            pubkey: None,
+            vault: None,
+            account: account_id.map(str::to_string),
+            path: None,
+            secret_key_b58: None,
+            created_at: None,
+            subscriptions: std::collections::BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn remote_account_refuses_raw_keypair_access() {
+        let account = fresh_remote_account(Some("acc_test"));
+
+        let err = load_keypair_bytes_from_account_with_intent(
+            &account,
+            "default",
+            MAINNET_NETWORK,
+            &AuthIntent::default_payment(),
+        )
+        .unwrap_err();
+
+        let msg = err.to_string();
+        // The message names the account's own backend, whichever it is.
+        assert!(msg.contains("`openfort` backend"), "wrong error: {msg}");
+        assert!(
+            msg.contains("cannot be loaded or exported"),
+            "wrong error: {msg}"
+        );
+    }
+
+    #[test]
+    fn load_signer_for_network_routes_remote_accounts() {
+        // A remote account missing its wallet id fails inside the remote
+        // resolution path — proving the network loader routes
+        // `keystore: remote` entries to the remote signer instead of
+        // the local keypair path.
+        let mut file = AccountsFile::default();
+        file.upsert(MAINNET_NETWORK, "default", fresh_remote_account(None));
+        let store = MemoryAccountsStore::with_file(file);
+
+        let err = load_signer_for_network(MAINNET_NETWORK, &store)
+            .map(|_| ())
+            .unwrap_err();
+
+        assert!(
+            err.to_string().contains("missing its `account` field"),
+            "wrong error: {err}"
+        );
     }
 
     #[test]
@@ -969,7 +1186,9 @@ mod tests {
     fn load_signer_for_network_refuses_to_create_mainnet() {
         // Real money: never silently create. User must run `pay setup`.
         let store = MemoryAccountsStore::new();
-        let err = load_signer_for_network(MAINNET_NETWORK, &store).unwrap_err();
+        let err = load_signer_for_network(MAINNET_NETWORK, &store)
+            .map(|_| ())
+            .unwrap_err();
         let msg = err.to_string();
         assert!(
             msg.contains("No account configured"),
@@ -1063,6 +1282,7 @@ mod tests {
         let store = MemoryAccountsStore::new();
         let err =
             load_signer_for_network_with_reason(MAINNET_NETWORK, &store, Some("alice"), "test")
+                .map(|_| ())
                 .unwrap_err();
 
         assert!(
@@ -1076,6 +1296,7 @@ mod tests {
     fn signer_from_ephemeral_rejects_missing_inline_secret() {
         let account = Account {
             keystore: Keystore::Ephemeral,
+            provider: None,
             active: false,
             auth_required: Some(false),
             pubkey: None,
@@ -1087,7 +1308,7 @@ mod tests {
             subscriptions: std::collections::BTreeMap::new(),
         };
 
-        let err = signer_from_ephemeral(&account).unwrap_err();
+        let err = signer_from_ephemeral(&account).map(|_| ()).unwrap_err();
         assert!(
             err.to_string()
                 .contains("Ephemeral account is missing its inline `secret_key_b58` field")
