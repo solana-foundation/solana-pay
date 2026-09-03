@@ -110,6 +110,42 @@ impl ChannelStore for ShardedMemoryChannelStore {
         Box::pin(async move { result })
     }
 
+    fn read_channel(
+        &self,
+        channel_id: &str,
+        reader: Box<dyn FnOnce(Option<&ChannelState>) -> Result<(), StoreError> + Send>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), StoreError>> + Send + '_>> {
+        // Borrow behind the key's shard read guard; the reader copies out only
+        // what it needs — no clone of the full state.
+        let result = {
+            let guard = self.data.get(channel_id);
+            reader(guard.as_deref())
+        };
+        Box::pin(async move { result })
+    }
+
+    fn mutate_channel(
+        &self,
+        channel_id: &str,
+        seed: Option<ChannelState>,
+        mutator: Box<dyn FnOnce(&mut ChannelState) -> Result<(), StoreError> + Send>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), StoreError>> + Send + '_>> {
+        use dashmap::mapref::entry::Entry;
+        // Mutate in place behind this key's shard write guard — no clone in or
+        // out. Same atomicity as `update_channel`, without the allocation.
+        let result = match self.data.entry(channel_id.to_string()) {
+            Entry::Occupied(mut entry) => mutator(entry.get_mut()),
+            Entry::Vacant(entry) => match seed {
+                Some(seed) => {
+                    let mut guard = entry.insert(seed);
+                    mutator(guard.value_mut())
+                }
+                None => Err(Self::missing()),
+            },
+        };
+        Box::pin(async move { result })
+    }
+
     fn touch_channel_lifecycle(
         &self,
         channel_id: &str,

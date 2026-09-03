@@ -5,8 +5,8 @@
 //! Per user (= one escrow channel):
 //!   - **provision** (on-chain, once): fetch the endpoint's 402 `batch-settlement`
 //!     challenge, resolve its terms, build a sponsored `deposit` (channel `open`
-//!     + first voucher), and send it under the `PAYMENT-SIGNATURE` header. The
-//!     sponsor (`extra.feePayer`) co-signs + broadcasts; the client pays no SOL.
+//!     plus the first voucher), and send it under the `PAYMENT-SIGNATURE` header.
+//!     The sponsor (`extra.feePayer`) co-signs and broadcasts; client pays no SOL.
 //!   - **prepare** (off-chain): pre-sign N ordered cumulative vouchers (monotonic
 //!     watermark, `expiresAt = 0`) → ready-to-fire `PAYMENT-SIGNATURE` headers.
 //!   - **unleash**: the driver fires the vouchers in order (cheap; the gateway
@@ -167,7 +167,12 @@ impl BatchSettlement {
     }
 
     /// Rebuild the immutable channel config from a priced challenge + payer.
-    fn config_for(&self, requirements: &BatchRequirements, payer: &Pubkey, open_slot: u64) -> BatchChannelConfig {
+    fn config_for(
+        &self,
+        requirements: &BatchRequirements,
+        payer: &Pubkey,
+        open_slot: u64,
+    ) -> BatchChannelConfig {
         BatchChannelConfig {
             payer: pc::pubkey_string(payer),
             payer_authorizer: pc::pubkey_string(payer),
@@ -208,7 +213,8 @@ fn batch_header_sync(
         channel_config: config.clone(),
         voucher,
     };
-    encode_payment_header(requirements, payload).map_err(|e| anyhow::anyhow!("encode payment header: {e}"))
+    encode_payment_header(requirements, payload)
+        .map_err(|e| anyhow::anyhow!("encode payment header: {e}"))
 }
 
 /// Send an unauthenticated request and collect the 402 challenge material: the
@@ -236,10 +242,7 @@ async fn fetch_challenge(ctx: &UserCtx) -> Result<(StatusCode, Vec<(String, Stri
                 .map(|v| (name.as_str().to_string(), v.to_string()))
         })
         .collect();
-    let body = resp
-        .text()
-        .await
-        .context("reading batch challenge body")?;
+    let body = resp.text().await.context("reading batch challenge body")?;
     Ok((status, headers, body))
 }
 
@@ -320,10 +323,17 @@ impl BenchScheme for BatchSettlement {
         endpoint: &Endpoint,
         host_override: Option<&str>,
     ) -> Result<ResolvedPrice> {
-        let resp = build_request(http, &endpoint.method, &endpoint.url, &endpoint.body, host_override, &[])
-            .send()
-            .await
-            .context("batch probe failed")?;
+        let resp = build_request(
+            http,
+            &endpoint.method,
+            &endpoint.url,
+            &endpoint.body,
+            host_override,
+            &[],
+        )
+        .send()
+        .await
+        .context("batch probe failed")?;
         let status = resp.status();
         let headers: Vec<(String, String)> = resp
             .headers()
@@ -365,13 +375,15 @@ impl BenchScheme for BatchSettlement {
     async fn provision_user(&self, ctx: &UserCtx) -> Result<UserSetup> {
         validate_payment_transport(&ctx.endpoint.url)?;
         if self.offline {
-            bail!("x402_batch_settlement has no offline seeded-fixture path; use an online gateway");
+            bail!(
+                "x402_batch_settlement has no offline seeded-fixture path; use an online gateway"
+            );
         }
 
         // 1. Fresh batch-settlement 402 → priced requirements.
         let (status, headers, body) = fetch_challenge(ctx).await?;
-        let requirements = parse_batch_challenge(status, &headers, &body)
-            .context("provision: batch challenge")?;
+        let requirements =
+            parse_batch_challenge(status, &headers, &body).context("provision: batch challenge")?;
         let base = requirements.amount().unwrap_or(self.voucher_base);
         let voucher_key = SigningKey::from_bytes(&ctx.wallet.seed());
         let payer = Pubkey::new_from_array(voucher_key.verifying_key().to_bytes());
