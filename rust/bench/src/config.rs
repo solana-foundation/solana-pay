@@ -18,6 +18,10 @@ pub enum Scheme {
     MppSession,
     /// x402 `exact` fixed-amount scheme.
     X402Exact,
+    /// x402 `batch-settlement` scheme: open one escrow channel, stream cumulative
+    /// off-chain vouchers, server batch-settles on-chain later. The x402 wire
+    /// analogue of `mpp_session`.
+    X402BatchSettlement,
     /// Generator ceiling check: no on-chain work — fires plain requests at a
     /// free proxy path to measure how many users/req-s the bench + proxy can
     /// sustain, decoupled from settlement.
@@ -392,8 +396,12 @@ impl RunConfig {
                 bail!("safety.{label} must be a finite number >= 0");
             }
         }
-        if self.run.scheme == Scheme::MppSession && self.session.is_none() {
-            bail!("scheme `mpp_session` requires a `session:` block");
+        if matches!(
+            self.run.scheme,
+            Scheme::MppSession | Scheme::X402BatchSettlement
+        ) && self.session.is_none()
+        {
+            bail!("scheme requires a `session:` block");
         }
         if let Some(session) = &self.session
             && session.offline

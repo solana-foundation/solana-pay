@@ -5,6 +5,7 @@
 //! driver fires [`PreparedRequest`]s generically, so the hot path is identical
 //! across schemes — only how a request is *built* differs.
 
+pub mod batch_settlement;
 pub mod mpp_charge;
 pub mod mpp_session;
 pub mod selftest;
@@ -203,6 +204,9 @@ pub fn build(cfg: &crate::config::RunConfig) -> Box<dyn BenchScheme> {
         crate::config::Scheme::MppCharge => Box::new(mpp_charge::MppCharge),
         crate::config::Scheme::MppSession => Box::new(mpp_session::MppSession::new(cfg)),
         crate::config::Scheme::X402Exact => Box::new(x402::X402Exact),
+        crate::config::Scheme::X402BatchSettlement => {
+            Box::new(batch_settlement::BatchSettlement::new(cfg))
+        }
         crate::config::Scheme::SelfTest => Box::new(selftest::SelfTest),
     }
 }

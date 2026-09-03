@@ -1672,8 +1672,17 @@ impl StartCommand {
                         // before the scheme re-reads it. The scheme requires
                         // the channel to be confirmed open before a voucher is
                         // accepted; kit's default keeps that off the hot path
-                        // without letting the snapshot go stale.
-                        channel_snapshot_max_age_seconds: 30,
+                        // without letting the snapshot go stale. Overridable via
+                        // PAY_BATCH_SNAPSHOT_MAX_AGE_SECS — raise it for
+                        // throughput benchmarks where channels are known-open and
+                        // per-refresh reconciles would otherwise add on-chain
+                        // reads to the measured window.
+                        channel_snapshot_max_age_seconds: std::env::var(
+                            "PAY_BATCH_SNAPSHOT_MAX_AGE_SECS",
+                        )
+                        .ok()
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(30),
                     };
                     match pay_kit::x402::server::X402BatchSettlement::with_store(cfg, batch_store) {
                         Ok(b) => Some(b),
