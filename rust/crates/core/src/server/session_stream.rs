@@ -292,7 +292,7 @@ impl DelegatedSessionStreamMeter {
             .authorize_delegated_usage(&self.forward.channel_id, amount)
             .await
             .map_err(box_error)?;
-        self.gate.record_commit(accepted);
+        self.gate.record_commit(accepted.cumulative);
         self.authorization_exhausted |= exhausted_by_reprice;
         Ok(())
     }

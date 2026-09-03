@@ -1,0 +1,24 @@
+# Generator/proxy ceiling check at 10k concurrent users. No on-chain work:
+# fires plain GETs at a free proxy path. Surfpool runs offline (no datasource
+# needed). Aggregate target ≈ users × requests_per_sec_per_user.
+#   cargo run -p pay-bench --release -- rehearse bench/configs/selftest-10k.yml
+run:
+  name: selftest-10k
+  scheme: self_test
+  network: fork
+  safety:
+    max_total_usdc: 0.0
+    max_total_sol: 0.0
+    require_confirmation: false
+
+load:
+  users: 10000
+  requests_per_sec_per_user: 2
+  prepare_secs: 2
+  unleash_secs: 5
+  max_concurrency: 4096
+
+endpoints:
+  - url: "http://placeholder.local/health"  # overridden in rehearsal
+    method: GET
+    body: ""

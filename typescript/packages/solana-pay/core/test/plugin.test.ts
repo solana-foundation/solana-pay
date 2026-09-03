@@ -3,6 +3,7 @@ import {
     type Instruction,
     address,
     type TransactionSigner,
+    decompileTransactionMessage,
     getBase64Encoder,
     getTransactionDecoder,
     getCompiledTransactionMessageDecoder,
@@ -157,6 +158,36 @@ describe('solanaPayMerchant plugin', () => {
                 if (sig === null) continue;
                 expect(sig.every((b: number) => b === 0)).toBe(true);
             }
+        });
+
+        it('should build a version 1 transaction carrying the provided config', () => {
+            const extended = solanaPayMerchant()(createMockClient());
+            const config = { computeUnitLimit: 200_000, priorityFeeLamports: 10_000n };
+            const base64 = extended.pay.buildTransaction(feePayer, [createMockInstruction()], {
+                version: 1,
+                config,
+            });
+
+            const bytes = getBase64Encoder().encode(base64);
+            const transaction = getTransactionDecoder().decode(bytes);
+            const compiledMessage = getCompiledTransactionMessageDecoder().decode(transaction.messageBytes);
+
+            expect(compiledMessage.version).toBe(1);
+            expect(compiledMessage.staticAccounts[0]).toBe(feePayer);
+            const message = decompileTransactionMessage(compiledMessage as any);
+            if (message.version !== 1) throw new Error('expected a v1 message');
+            expect(message.config).toEqual(config);
+        });
+
+        it('should throw when a config is provided for a non-v1 transaction', () => {
+            const extended = solanaPayMerchant()(createMockClient());
+
+            expect(() =>
+                extended.pay.buildTransaction(feePayer, [createMockInstruction()], {
+                    version: 0,
+                    config: { computeUnitLimit: 200_000 },
+                }),
+            ).toThrow('only valid for version 1');
         });
     });
 });

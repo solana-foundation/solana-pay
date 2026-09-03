@@ -28,5 +28,5 @@ tracing-subscriber = { workspace = true }
 # E2E tests pair the pay-mcp server with an in-process rmcp client over a
 # duplex transport. The `client` feature is only needed for tests; pulling
 # it in here keeps the production build lean.
-rmcp = { version = "0.9", features = ["server", "transport-io", "elicitation", "schemars", "client"] }
+rmcp = { version = "1.4", features = ["server", "transport-io", "elicitation", "schemars", "client"] }
 tempfile = { workspace = true }

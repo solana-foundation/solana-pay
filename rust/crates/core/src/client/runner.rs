@@ -47,7 +47,7 @@ pub enum RunOutcome {
         resource_url: String,
     },
     /// The server returned 402 with an MPP session challenge (intent="session").
-    /// Session payments require a stateful client with a Fiber channel.
+    /// Session payments require a stateful client with an MPP payment channel.
     SessionChallenge {
         challenge: Box<mpp::Challenge>,
         advertised_challenges: DecodedPaymentChallenges,

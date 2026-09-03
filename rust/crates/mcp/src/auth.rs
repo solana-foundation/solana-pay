@@ -31,7 +31,7 @@ use std::time::Duration;
 use pay_keystore::{AuthGate, AuthIntent, Error as KeystoreError};
 use rmcp::Peer;
 use rmcp::model::{
-    CreateElicitationRequestParam, CreateElicitationResult, ElicitationAction, ElicitationSchema,
+    CreateElicitationRequestParams, CreateElicitationResult, ElicitationAction, ElicitationSchema,
 };
 use rmcp::service::RoleServer;
 use tokio::runtime::Handle;
@@ -181,7 +181,7 @@ fn interpret_elicitation_outcome(
 ///   so clients that render forms can present a confirmation UI; clients
 ///   that fall back to yes/no still get the message text.
 /// - **Per-call only**: no server-side state binds approvals across calls.
-fn build_request(intent: &AuthIntent) -> CreateElicitationRequestParam {
+fn build_request(intent: &AuthIntent) -> CreateElicitationRequestParams {
     // Builder validates required fields against declared properties.
     // The combination below is statically sound; `expect` would only
     // fire if rmcp's validation contract changes in a future release.
@@ -190,7 +190,8 @@ fn build_request(intent: &AuthIntent) -> CreateElicitationRequestParam {
         .build()
         .expect("required_bool registers `approved` in properties");
 
-    CreateElicitationRequestParam {
+    CreateElicitationRequestParams::FormElicitationParams {
+        meta: None,
         message: intent.message().to_string(),
         requested_schema: schema,
     }
@@ -201,12 +202,13 @@ fn build_file_upload_request(
     bytes: u64,
     method: &str,
     destination: &str,
-) -> CreateElicitationRequestParam {
+) -> CreateElicitationRequestParams {
     let schema = ElicitationSchema::builder()
         .required_bool("approved")
         .build()
         .expect("required_bool registers `approved` in properties");
-    CreateElicitationRequestParam {
+    CreateElicitationRequestParams::FormElicitationParams {
+        meta: None,
         message: format!(
             "Allow Pay to read and send `{path}` ({bytes} bytes) in an HTTP {method} request to {destination}? The file is read once after approval; the exact snapshot may be reused only to retry this same request after a 402 payment challenge."
         ),
@@ -222,15 +224,16 @@ mod tests {
     fn build_request_carries_intent_message() {
         let intent = AuthIntent::authorize_payment("$0.50", "accessing API api.example.com");
         let req = build_request(&intent);
+        let CreateElicitationRequestParams::FormElicitationParams { message, .. } = req else {
+            panic!("expected a form elicitation request");
+        };
         assert!(
-            req.message.contains("$0.50"),
-            "message should include amount: {:?}",
-            req.message,
+            message.contains("$0.50"),
+            "message should include amount: {message:?}",
         );
         assert!(
-            req.message.contains("api.example.com"),
-            "message should include operator: {:?}",
-            req.message,
+            message.contains("api.example.com"),
+            "message should include operator: {message:?}",
         );
     }
 
@@ -238,9 +241,15 @@ mod tests {
     fn build_request_includes_approved_boolean_field() {
         let intent = AuthIntent::default_payment();
         let req = build_request(&intent);
+        let CreateElicitationRequestParams::FormElicitationParams {
+            requested_schema, ..
+        } = req
+        else {
+            panic!("expected a form elicitation request");
+        };
         // The schema must include an `approved` property so even
         // form-rendering clients have a concrete confirmation field.
-        let json = serde_json::to_value(&req.requested_schema).expect("schema should serialize");
+        let json = serde_json::to_value(&requested_schema).expect("schema should serialize");
         let props = json.get("properties").expect("schema has properties");
         assert!(
             props.get("approved").is_some(),
@@ -256,17 +265,24 @@ mod tests {
             "POST",
             "https://api.example.com/upload",
         );
-        assert!(req.message.contains("/workspace/photo.png"));
-        assert!(req.message.contains("1024 bytes"));
-        assert!(req.message.contains("POST"));
-        assert!(req.message.contains("https://api.example.com/upload"));
+        let CreateElicitationRequestParams::FormElicitationParams { message, .. } = req else {
+            panic!("expected a form elicitation request");
+        };
+        assert!(message.contains("/workspace/photo.png"));
+        assert!(message.contains("1024 bytes"));
+        assert!(message.contains("POST"));
+        assert!(message.contains("https://api.example.com/upload"));
     }
 
     fn result(
         action: ElicitationAction,
         content: Option<serde_json::Value>,
     ) -> CreateElicitationResult {
-        CreateElicitationResult { action, content }
+        CreateElicitationResult {
+            action,
+            content,
+            meta: None,
+        }
     }
 
     #[test]

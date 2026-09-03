@@ -212,6 +212,7 @@ fn sandbox_operator(recipient: &str) -> OperatorConfig {
         currencies: [("usd".to_string(), vec!["USDC".to_string()])]
             .into_iter()
             .collect(),
+        session_benchmark_test_mints: vec![],
         rpc_url: None,
         network: Some("localnet".to_string()),
         fee_payer: true,

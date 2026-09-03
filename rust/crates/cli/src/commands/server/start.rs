@@ -14,11 +14,13 @@ use pay_core::server::telemetry::FeePayerWallet;
 use pay_kit::mpp::server::Mpp;
 use pay_kit::mpp::solana_keychain::SolanaSigner;
 use pay_types::Stablecoin;
-use pay_types::metering::{ApiSpec, OperatorConfig, RoutingConfig, SignerConfig};
+use pay_types::metering::{
+    ApiSpec, OperatorConfig, RoutingConfig, SessionBenchmarkTestMint, SignerConfig,
+};
 use tokio::time::{Duration, Instant};
 
 use super::payments::{
-    self, PayoutRecipientTarget, lamports_to_sol, resolve_currency,
+    self, PayoutRecipientTarget, lamports_to_sol, resolve_currency_checked,
     should_use_auto_fee_payer_signer, stable_token_account_requirements, surfpool_funding_targets,
 };
 use crate::components::{PAY_SH_TAGLINE, render_pay_banner, solana_explorer_cluster_query};
@@ -114,6 +116,14 @@ pub struct StartCommand {
     #[arg(long, default_value_t = default_bind())]
     pub bind: String,
 
+    /// PEM certificate chain for native TLS termination.
+    #[arg(long, value_name = "PATH", requires = "tls_key")]
+    pub tls_cert: Option<String>,
+
+    /// PEM private key for native TLS termination.
+    #[arg(long, value_name = "PATH", requires = "tls_cert")]
+    pub tls_key: Option<String>,
+
     /// Recipient wallet address for payments.
     #[arg(long)]
     pub recipient: Option<String>,
@@ -208,6 +218,9 @@ impl PaymentState for AppState {
     fn x402_upto(&self) -> Option<&pay_kit::x402::server::X402Upto> {
         self.x402_upto.as_ref()
     }
+    fn records_http_exchanges(&self) -> bool {
+        self.pdb.is_some()
+    }
     fn record_exchange(&self, exchange: pay_core::HttpExchange) {
         let Some(pdb) = &self.pdb else {
             return;
@@ -273,20 +286,98 @@ fn x402_currency_configs(
 /// non-pegged session currency (e.g. `SOL`) would advertise and settle a
 /// `$0.01` price as `0.01 SOL`, so refuse to boot instead of mispricing
 /// every voucher.
+fn benchmark_test_mints_enabled() -> bool {
+    matches!(
+        std::env::var("PAY_ALLOW_BENCHMARK_TEST_MINTS").as_deref(),
+        Ok("1") | Ok("true") | Ok("TRUE")
+    )
+}
+
+fn session_benchmark_test_mint<'a>(
+    mint: &str,
+    test_mints: &'a [SessionBenchmarkTestMint],
+) -> Option<&'a SessionBenchmarkTestMint> {
+    test_mints.iter().find(|candidate| candidate.mint == mint)
+}
+
 fn ensure_session_currencies_usd_pegged(
     currency_configs: &[(String, String, u8)],
+    test_mints: &[SessionBenchmarkTestMint],
 ) -> pay_core::Result<()> {
     for (symbol, mint, _decimals) in currency_configs {
-        if Stablecoin::parse_symbol(symbol).is_none() && Stablecoin::from_mint(mint).is_none() {
+        let is_benchmark_test_mint = session_benchmark_test_mint(mint, test_mints).is_some();
+        if is_benchmark_test_mint && !benchmark_test_mints_enabled() {
+            return Err(pay_core::Error::Config(format!(
+                "session benchmark mint `{mint}` requires PAY_ALLOW_BENCHMARK_TEST_MINTS=1"
+            )));
+        }
+        if Stablecoin::parse_symbol(symbol).is_none()
+            && !pay_kit::mpp::protocol::solana::is_known_stablecoin_mint(mint)
+            && !is_benchmark_test_mint
+        {
             return Err(pay_core::Error::Config(format!(
                 "session currency `{symbol}` is not a recognized USD-pegged stablecoin: \
                  session prices are USD amounts settled 1:1 in token base units, so a \
-                 non-pegged asset would be mispriced; use {}",
+                 non-pegged asset would be mispriced; use {} or explicitly configure a \
+                 benchmark test mint",
                 Stablecoin::SYMBOL_LIST
             )));
         }
     }
     Ok(())
+}
+
+/// Resolve the program for each advertised session currency. Canonical assets
+/// use PayKit's static table; an explicitly configured benchmark mint is read
+/// from RPC so Token-2022 cannot silently be mistaken for legacy SPL Token.
+fn resolve_session_currency_token_programs(
+    currency_configs: &[(String, String, u8)],
+    test_mints: &[SessionBenchmarkTestMint],
+    rpc_url: &str,
+) -> pay_core::Result<Vec<solana_pubkey::Pubkey>> {
+    use pay_kit::mpp::protocol::solana::programs;
+    use pay_kit::mpp::solana_rpc_client::rpc_client::RpcClient;
+
+    let rpc = RpcClient::new(rpc_url.to_string());
+    currency_configs
+        .iter()
+        .map(|(symbol, mint, decimals)| {
+            if Stablecoin::parse_symbol(symbol).is_some() || Stablecoin::from_mint(mint).is_some() {
+                return solana_pubkey::Pubkey::from_str(
+                    pay_kit::mpp::protocol::solana::default_token_program_for_currency(
+                        mint,
+                        None,
+                    ),
+                )
+                .map_err(|error| pay_core::Error::Config(format!("invalid canonical token program: {error}")));
+            }
+
+            let configured = session_benchmark_test_mint(mint, test_mints).ok_or_else(|| {
+                pay_core::Error::Config(format!("session benchmark mint `{mint}` is not configured"))
+            })?;
+            if configured.decimals != *decimals {
+                return Err(pay_core::Error::Config(format!(
+                    "session benchmark mint `{mint}` declares {} decimals, but session currency `{symbol}` resolves to {decimals}",
+                    configured.decimals
+                )));
+            }
+            let mint_pubkey = solana_pubkey::Pubkey::from_str(mint).map_err(|error| {
+                pay_core::Error::Config(format!("session benchmark mint `{mint}` is invalid: {error}"))
+            })?;
+            let account = rpc.get_account(&mint_pubkey).map_err(|error| {
+                pay_core::Error::Config(format!("failed to fetch session benchmark mint `{mint}`: {error}"))
+            })?;
+            let owner = account.owner.to_string();
+            if owner != programs::TOKEN_2022_PROGRAM {
+                return Err(pay_core::Error::Config(format!(
+                    "session benchmark mint `{mint}` must be owned by Token-2022, found {owner}"
+                )));
+            }
+            solana_pubkey::Pubkey::from_str(programs::TOKEN_2022_PROGRAM).map_err(|error| {
+                pay_core::Error::Config(format!("invalid Token-2022 program id: {error}"))
+            })
+        })
+        .collect()
 }
 
 fn resolve_session_splits(
@@ -583,6 +674,32 @@ impl StartCommand {
         account_override: Option<&str>,
         sandbox: bool,
     ) -> pay_core::Result<()> {
+        let tls_paths = match (self.tls_cert.as_deref(), self.tls_key.as_deref()) {
+            (Some(cert), Some(key)) => {
+                let cert = shellexpand::tilde(cert).into_owned();
+                let key = shellexpand::tilde(key).into_owned();
+                for (label, path) in [("TLS certificate", &cert), ("TLS private key", &key)] {
+                    let metadata = std::fs::metadata(path).map_err(|error| {
+                        pay_core::Error::Config(format!("failed to read {label} {path}: {error}"))
+                    })?;
+                    if !metadata.is_file() {
+                        return Err(pay_core::Error::Config(format!(
+                            "{label} is not a regular file: {path}"
+                        )));
+                    }
+                    std::fs::File::open(path).map_err(|error| {
+                        pay_core::Error::Config(format!("failed to read {label} {path}: {error}"))
+                    })?;
+                }
+                Some((cert, key))
+            }
+            (None, None) => None,
+            _ => {
+                return Err(pay_core::Error::Config(
+                    "--tls-cert and --tls-key must be provided together".to_string(),
+                ));
+            }
+        };
         let debugger = self.debugger || sandbox;
         let expanded = shellexpand::tilde(&self.paywall);
         let contents = std::fs::read_to_string(expanded.as_ref()).map_err(|e| {
@@ -722,6 +839,9 @@ impl StartCommand {
         let signer_cfg = op.and_then(|o| o.signer.clone());
         let legacy_signer_source = legacy_signer_source.map(str::to_string);
         let account_override = account_override.map(str::to_string);
+        let has_explicit_recipient = op.and_then(|o| o.recipient.as_ref()).is_some()
+            || self.recipient.is_some()
+            || std::env::var("PAY_PAYMENT_RECIPIENT").is_ok();
 
         // Create the runtime first — everything async runs inside it so
         // background tasks (like GCP auth token refresh) stay alive. Worker
@@ -755,12 +875,13 @@ impl StartCommand {
             //      (named entry in accounts.yml), and File (JSON keypair
             //      on disk).
             //
-            //   3. **Throwaway network slug** (`localnet` / `devnet`)**
+            //   3. **Fee-sponsoring throwaway network** (`localnet` / `devnet`)
             //      with no explicit signer** — smart default: route
             //      through the network-aware loader so users running
-            //      `pay gate api` against a localnet/devnet paywall
-            //      don't have to think about signers. Same code path as
-            //      the sandbox flag.
+            //      a fee-sponsoring `pay gate api` don't have to think about
+            //      signers. Client-funded sessions deliberately skip this:
+            //      creating an unused signer would make a devnet gateway
+            //      require SOL before it could serve a challenge.
             //
             //   4. **None** — leaves fee_payer_signer empty. Caught by
             //      the early-validation guard below if `fee_payer: true`.
@@ -769,18 +890,21 @@ impl StartCommand {
                 sandbox,
                 &network,
                 signer_cfg.as_ref(),
+                fee_payer,
             ) {
                 let (signer, generated) = payments::load_auto_fee_payer_signer(&network)?;
                 generated_gateway_account = generated;
                 Some(signer)
             } else if let Some(ref cfg) = signer_cfg {
                 Some(resolve_signer(cfg).await?)
-            } else if let Some(signer) = super::load_account_or_legacy_signer(
-                network.slug(),
-                account_override.as_deref(),
-                legacy_signer_source.as_deref(),
-                &pay_core::keystore::AuthIntent::use_gateway_fee_payer(),
-            )? {
+            } else if (fee_payer || !has_explicit_recipient || api.session.is_some())
+                && let Some(signer) = super::load_account_or_legacy_signer(
+                    network.slug(),
+                    account_override.as_deref(),
+                    legacy_signer_source.as_deref(),
+                    &pay_core::keystore::AuthIntent::use_gateway_fee_payer(),
+                )?
+            {
                 // Mainnet (or unknown network) with no `operator.signer`
                 // block but a default keypair from `pay setup` —
                 // typically `keychain:default`. Load it once at startup
@@ -840,6 +964,13 @@ impl StartCommand {
                 ));
             }
 
+            if api.session.is_some() && fee_payer_signer.is_none() {
+                return Err(pay_core::Error::Config(
+                    "live MPP sessions require an operator signer so the gateway can settle and close channels; configure operator.signer or a pay account"
+                        .to_string(),
+                ));
+            }
+
             // ── Ensure each subscription endpoint has its on-chain Plan ─
             //
             // A subscription endpoint can't emit a usable 402 challenge
@@ -890,10 +1021,14 @@ impl StartCommand {
             let currency_configs: Vec<_> = currencies
                 .iter()
                 .map(|currency| {
-                    let (mpp_currency, decimals) = resolve_currency(currency, network.slug());
-                    (currency.clone(), mpp_currency, decimals)
+                    let (mpp_currency, decimals) =
+                        resolve_currency_checked(currency, network.slug())?;
+                    Ok((currency.clone(), mpp_currency, decimals))
                 })
-                .collect();
+                .collect::<pay_core::Result<_>>()?;
+            let session_benchmark_test_mints = op
+                .map(|operator| operator.session_benchmark_test_mints.clone())
+                .unwrap_or_default();
             let operator_pubkey = fee_payer_signer
                 .as_ref()
                 .map(|signer| signer.pubkey().to_string());
@@ -966,12 +1101,19 @@ impl StartCommand {
                 use pay_types::metering::SessionVoucherSigner as ConfigVoucherSigner;
                 use std::str::FromStr;
 
-                ensure_session_currencies_usd_pegged(&currency_configs)?;
+                ensure_session_currencies_usd_pegged(
+                    &currency_configs,
+                    &session_benchmark_test_mints,
+                )?;
+                let session_token_programs = resolve_session_currency_token_programs(
+                    &currency_configs,
+                    &session_benchmark_test_mints,
+                    &rpc_url,
+                )?;
 
                 let session_secret = std::env::var("PAY_SESSION_SECRET")
                     .unwrap_or_else(|_| challenge_binding_secret.clone());
                 let channel_program_id = std::env::var("PAY_PAYMENT_CHANNELS_PROGRAM_ID")
-                    .or_else(|_| std::env::var("PAY_FIBER_PROGRAM_ID"))
                     .ok()
                     .and_then(|value| solana_pubkey::Pubkey::from_str(&value).ok())
                     .unwrap_or_else(pay_kit::mpp::program::payment_channels::default_program_id);
@@ -1015,11 +1157,22 @@ impl StartCommand {
                     } else {
                         (recipient.clone(), session_splits)
                     };
+                let settlement_signer = fee_payer_signer
+                    .as_ref()
+                    .expect("live MPP session signer validated above");
+                if settlement_signer.pubkey().to_string() != session_recipient {
+                    return Err(pay_core::Error::Config(
+                        "session settlement signer must match the configured payment recipient"
+                            .to_string(),
+                    ));
+                }
 
                 let (session_channel_store, durable_session_store) =
                     session_channel_store().await?;
                 let mut session_mpps = Vec::with_capacity(currency_configs.len());
-                for (_currency, session_mpp_currency, session_decimals) in &currency_configs {
+                for ((_, session_mpp_currency, session_decimals), token_program) in
+                    currency_configs.iter().zip(session_token_programs)
+                {
                     let cap_base =
                         (sess.cap_usdc * 10f64.powi(i32::from(*session_decimals))).round() as u64;
                     let config = SessionConfig {
@@ -1037,13 +1190,18 @@ impl StartCommand {
                         min_voucher_delta: sess.min_voucher_delta,
                         voucher_signer,
                         operator_signing_key: None,
+                        fee_payer_signer: if fee_payer {
+                            fee_payer_signer.clone()
+                        } else {
+                            None
+                        },
                         idle_timeout_options_seconds: sess.idle_timeout_options_seconds.clone(),
                         idle_timeout_seconds,
                         grace_period_seconds:
                             pay_kit::mpp::program::payment_channels::DEFAULT_GRACE_PERIOD_SECONDS,
                         rpc_url: Some(rpc_url.clone()),
                         channel_program: Some(channel_program_id),
-                        token_program: None,
+                        token_program: Some(token_program),
                     };
 
                     let mut smpp = SessionMpp::new_with_channel_store(
@@ -1052,10 +1210,11 @@ impl StartCommand {
                         Arc::clone(&session_channel_store),
                     )
                         .with_realm(api.title.clone())
-                        .with_blockhash_cache(blockhash_cache.clone());
-                    if let Some(operator_signer) = fee_payer_signer.clone() {
-                        smpp = smpp.with_payment_channel_signer(operator_signer);
-                    }
+                        .with_blockhash_cache(blockhash_cache.clone())
+                        .with_reuse_from_chain(sess.reuse_from_chain);
+                    smpp = smpp.with_payment_channel_signer(fee_payer_signer
+                        .clone()
+                        .expect("live MPP session signer validated above"));
 
                     let smpp = Arc::new(smpp);
                     smpp.start_lifecycle_runloop_with_settlement_and_batching(
@@ -1650,7 +1809,8 @@ impl StartCommand {
                 pay_core::Error::Config(format!("control-plane local_addr: {e}"))
             })?;
             let display_addr = self.bind.replace("0.0.0.0", "127.0.0.1");
-            let url = format!("http://{}", display_addr);
+            let scheme = if tls_paths.is_some() { "https" } else { "http" };
+            let url = format!("{scheme}://{display_addr}");
             if debugger {
                 eprintln!(
                     "  {} {}",
@@ -1714,8 +1874,18 @@ impl StartCommand {
         // the main thread, now that `block_on` has returned.
         let (internal_addr, gate_state) = gateway;
         let cores = std::thread::available_parallelism().map(|n| n.get()).ok();
-        pay_proxy::run(gate_state, &self.bind, internal_addr.to_string(), cores)
-            .map_err(|e| pay_core::Error::Config(format!("gateway: {e}")))
+        match tls_paths {
+            Some((cert, key)) => pay_proxy::run_tls(
+                gate_state,
+                &self.bind,
+                internal_addr.to_string(),
+                cores,
+                &cert,
+                &key,
+            ),
+            None => pay_proxy::run(gate_state, &self.bind, internal_addr.to_string(), cores),
+        }
+        .map_err(|e| pay_core::Error::Config(format!("gateway: {e}")))
     }
 }
 
@@ -2884,12 +3054,7 @@ async fn gateway_verify(
                         // Pull the underlying Receipt out for the legacy
                         // PDB logging path that still operates on the
                         // intent-agnostic shape.
-                        let receipt = match &kind {
-                            pay_kit::mpp::ReceiptKind::Charge(r) => r.clone(),
-                            // The charge verify path never produces a
-                            // Subscription kind; this arm is unreachable.
-                            pay_kit::mpp::ReceiptKind::Subscription { base, .. } => base.clone(),
-                        };
+                        let receipt = kind.base().clone();
 
                         // Log successful payment to PDB
                         if let Some(pdb) = pdb {
@@ -2984,8 +3149,8 @@ fn gateway_charge_challenges(
 mod tests {
     use super::payments::{
         PayoutRecipientTarget, create_associated_token_account_idempotent_ix, resolve_currency,
-        should_use_auto_fee_payer_signer, stable_token_account_requirements,
-        surfpool_funding_targets, surfpool_prep_notice_body,
+        resolve_currency_checked, should_use_auto_fee_payer_signer,
+        stable_token_account_requirements, surfpool_funding_targets, surfpool_prep_notice_body,
     };
     use super::{
         build_pdb_config, default_bind, delegated_session_channel_payout,
@@ -3189,15 +3354,16 @@ currencies:
             resolve_currency("USDC", "localnet"),
             resolve_currency("PYUSD", "localnet"),
             resolve_currency("SOL", "localnet"),
+            resolve_currency_checked("USDtest", "devnet").unwrap(),
         ]
         .into_iter()
-        .zip(["USDC", "PYUSD", "SOL"])
+        .zip(["USDC", "PYUSD", "SOL", "USDtest"])
         .map(|((mint, decimals), label)| (label.to_string(), mint, decimals))
         .collect::<Vec<_>>();
 
-        let requirements = stable_token_account_requirements(&configs, "localnet").unwrap();
+        let requirements = stable_token_account_requirements(&configs, "devnet").unwrap();
 
-        assert_eq!(requirements.len(), 2);
+        assert_eq!(requirements.len(), 3);
         assert!(requirements.iter().any(|req| {
             req.label == "USDC"
                 && req.mint == pay_types::Stablecoin::Usdc.mint(Some("localnet"))
@@ -3206,6 +3372,11 @@ currencies:
         assert!(requirements.iter().any(|req| {
             req.label == "PYUSD"
                 && req.mint == pay_types::Stablecoin::Pyusd.mint(Some("localnet"))
+                && req.token_program == pay_kit::mpp::protocol::solana::programs::TOKEN_2022_PROGRAM
+        }));
+        assert!(requirements.iter().any(|req| {
+            req.label == "USDtest"
+                && req.mint == pay_types::stablecoin_mints::USDTEST_DEVNET
                 && req.token_program == pay_kit::mpp::protocol::solana::programs::TOKEN_2022_PROGRAM
         }));
     }
@@ -3505,23 +3676,34 @@ endpoints:
     }
 
     #[test]
+    fn resolve_currency_enforces_usdtest_devnet_only() {
+        assert_eq!(
+            resolve_currency_checked("USDtest", "devnet").unwrap(),
+            (pay_types::stablecoin_mints::USDTEST_DEVNET.to_string(), 6)
+        );
+        let error = resolve_currency_checked("USDtest", "mainnet").unwrap_err();
+        assert!(error.to_string().contains("USDtest is devnet-only"));
+    }
+
+    #[test]
     fn session_currencies_require_usd_pegged_stablecoins() {
         // Stablecoin symbols and recognized stablecoin mints pass.
         let pegged: Vec<(String, String, u8)> = vec![
             resolve_currency_config("USDC", "mainnet"),
             resolve_currency_config("usdt", "mainnet"),
+            resolve_currency_config("USDtest", "devnet"),
             (
                 pay_types::stablecoin_mints::PYUSD_MAINNET.to_string(),
                 pay_types::stablecoin_mints::PYUSD_MAINNET.to_string(),
                 6,
             ),
         ];
-        assert!(ensure_session_currencies_usd_pegged(&pegged).is_ok());
+        assert!(ensure_session_currencies_usd_pegged(&pegged, &[]).is_ok());
 
         // SOL resolves (9 decimals) for other schemes but must not open
         // sessions: $0.01 would be advertised and settled as 0.01 SOL.
         let sol = vec![resolve_currency_config("SOL", "mainnet")];
-        let err = ensure_session_currencies_usd_pegged(&sol).unwrap_err();
+        let err = ensure_session_currencies_usd_pegged(&sol, &[]).unwrap_err();
         assert!(err.to_string().contains("not a recognized USD-pegged"));
         assert!(err.to_string().contains("SOL"));
 
@@ -3531,11 +3713,11 @@ endpoints:
             "BonkMintAddress111111111111111111111111111".to_string(),
             6,
         )];
-        assert!(ensure_session_currencies_usd_pegged(&unknown).is_err());
+        assert!(ensure_session_currencies_usd_pegged(&unknown, &[]).is_err());
     }
 
     fn resolve_currency_config(symbol: &str, network: &str) -> (String, String, u8) {
-        let (mint, decimals) = resolve_currency(symbol, network);
+        let (mint, decimals) = resolve_currency_checked(symbol, network).unwrap();
         (symbol.to_string(), mint, decimals)
     }
 
@@ -3691,16 +3873,25 @@ endpoints:
             true,
             &SolanaNetwork::Localnet,
             Some(&signer),
+            false,
         ));
         assert!(!should_use_auto_fee_payer_signer(
             false,
             &SolanaNetwork::Mainnet,
             Some(&signer),
+            true,
         ));
         assert!(should_use_auto_fee_payer_signer(
             false,
             &SolanaNetwork::Devnet,
-            None
+            None,
+            true,
+        ));
+        assert!(!should_use_auto_fee_payer_signer(
+            false,
+            &SolanaNetwork::Devnet,
+            None,
+            false,
         ));
     }
 

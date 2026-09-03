@@ -17,6 +17,7 @@ import {
     getBase64Codec,
     getCompiledTransactionMessageCodec,
     getTransactionCodec,
+    MAX_SUPPORTED_TRANSACTION_VERSION,
 } from '@solana/kit';
 import { parseAddMemoInstruction } from '@solana-program/memo';
 import {
@@ -126,7 +127,7 @@ export async function validateTransfer(
     const response = await rpc
         .getTransaction(signature, {
             commitment: options?.commitment ?? 'confirmed',
-            maxSupportedTransactionVersion: 0,
+            maxSupportedTransactionVersion: MAX_SUPPORTED_TRANSACTION_VERSION,
             encoding: 'base64',
         })
         .send();

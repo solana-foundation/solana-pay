@@ -192,8 +192,9 @@ fn decode_memo_hex(value: &str) -> pay_core::Result<Option<String>> {
     }
 
     let mut bytes = Vec::with_capacity(hex.len() / 2);
-    let mut chars = hex.as_bytes().chunks_exact(2);
-    for pair in &mut chars {
+    let (pairs, remainder) = hex.as_bytes().as_chunks::<2>();
+    debug_assert!(remainder.is_empty());
+    for pair in pairs {
         let high = hex_digit(pair[0])?;
         let low = hex_digit(pair[1])?;
         bytes.push((high << 4) | low);

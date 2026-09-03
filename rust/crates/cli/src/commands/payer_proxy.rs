@@ -994,71 +994,15 @@ fn build_session_authorization(
     state: &PayerState,
     challenge: &pay_core::mpp::Challenge,
 ) -> pay_core::Result<(PaidHeaders, String)> {
-    use pay_kit::mpp::{SessionRequest, SessionVoucherSigner};
-
-    let request: SessionRequest = challenge
-        .request
-        .decode()
-        .map_err(|error| pay_core::Error::Mpp(format!("invalid MPP session challenge: {error}")))?;
-    if request.method_details.voucher_signer != Some(SessionVoucherSigner::Operator) {
-        return Err(pay_core::Error::Mpp(
-            "agent payer requires an operator-signed MPP session".to_string(),
-        ));
-    }
-    if let Some(forced) = state.network_override.as_deref()
-        && forced != request.method_details.network
-    {
-        return Err(pay_core::Error::Mpp(format!(
-            "MPP session network mismatch: payer requires `{forced}`, gateway offered `{}`",
-            request.method_details.network
-        )));
-    }
-
-    let minimum = request
-        .minimum_deposit
-        .as_deref()
-        .map(|value| {
-            value.parse::<u64>().map_err(|_| {
-                pay_core::Error::Mpp(format!(
-                    "MPP session challenge advertised a non-numeric minimumDeposit: {value}"
-                ))
-            })
-        })
-        .transpose()?
-        .unwrap_or(0);
-    let deposit = request
-        .suggested_deposit
-        .as_deref()
-        .map(|value| {
-            value.parse::<u64>().map_err(|_| {
-                pay_core::Error::Mpp(format!(
-                    "MPP session challenge advertised a non-numeric suggestedDeposit: {value}"
-                ))
-            })
-        })
-        .transpose()?
-        .unwrap_or(1_000_000)
-        .max(minimum)
-        .max(1);
-    let sandbox = state.network_override.as_deref() == Some("localnet");
-    let (handle, open_authorization) = pay_core::session::open_payment_channel_session_header(
-        challenge,
-        &request,
-        state.store.as_ref(),
-        state.network_override.as_deref(),
-        state.account_override.as_deref(),
-        deposit,
-        &state.authorization_url,
-        sandbox,
-    )?;
-
-    // Subsequent requests authenticate with the reusable payer proof bound at
-    // open; the operator meters delivered service and signs the vouchers.
-    let use_authorization = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|error| pay_core::Error::Mpp(format!("Failed to build runtime: {error}")))?
-        .block_on(handle.use_header())?;
+    let (open_authorization, use_authorization) =
+        pay_core::session::open_operator_signed_session_authorizations(
+            challenge,
+            state.store.as_ref(),
+            state.network_override.as_deref(),
+            state.account_override.as_deref(),
+            &state.authorization_url,
+            None,
+        )?;
 
     Ok((PaidHeaders::mpp(open_authorization), use_authorization))
 }

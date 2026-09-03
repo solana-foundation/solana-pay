@@ -1,0 +1,25 @@
+# 10k concurrent users → proxy HTTP-serving ceiling, for proxy-only profiling.
+# self_test hits a free passthrough path (no on-chain provisioning), so it
+# reaches 10k users immediately. Longer unleash = denser flamegraph.
+#   bench --otlp localhost:4318 --pyroscope=http://localhost:4040 serve bench/configs/selftest-10k-proxy.yml
+#   bench load bench/configs/selftest-10k-proxy.yml --proxy <PROXY_URL> --rpc <RPC_URL>
+run:
+  name: selftest-10k-proxy
+  scheme: self_test
+  network: fork
+  safety:
+    max_total_usdc: 1.0
+    max_total_sol: 1.0
+    require_confirmation: false
+
+load:
+  users: 10000
+  requests_per_sec_per_user: 3
+  prepare_secs: 3
+  unleash_secs: 20
+  max_concurrency: 4096
+
+endpoints:
+  - url: "http://placeholder.local/health"  # overridden at runtime
+    method: GET
+    body: ""

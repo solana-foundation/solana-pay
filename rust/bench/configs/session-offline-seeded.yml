@@ -1,0 +1,27 @@
+# Benchmark-only gate fixture. It seeds confirmed channel state in the
+# pay-bench process, then sends ordinary challenge-bound client vouchers through
+# the standard SessionMpp verifier. It does not create a production import API.
+run:
+  name: seeded-session-smoke
+  scheme: mpp_session
+  network: fork
+  safety:
+    max_total_usdc: 0.0
+    max_total_sol: 0.0
+
+load:
+  users: 100
+  requests_per_sec_per_user: 5
+  unleash_secs: 15
+  max_concurrency: 256
+
+endpoints:
+  - url: http://127.0.0.1:1/v1/charge
+    method: POST
+    body: "{}"
+
+session:
+  deposit_usdc: 0.01
+  voucher_usdc: 0.000001
+  offline: true
+  offline_seeded_channels: 100

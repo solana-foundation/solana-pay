@@ -251,6 +251,7 @@ fn main() {
                 | Command::Catalog { .. }
                 | Command::Install(_)
                 | Command::Send(_)
+                | Command::Fanout(_)
                 | Command::Claude(_)
                 | Command::Codex(_)
                 | Command::Goose(_)
@@ -665,6 +666,48 @@ mod tests {
             }) => assert_eq!(cmd.paywall, "paywall.yml"),
             _ => panic!("expected legacy server start command"),
         }
+    }
+
+    #[test]
+    fn server_start_accepts_native_tls_paths() {
+        let opts = Opts::try_parse_from([
+            "pay",
+            "server",
+            "start",
+            "paywall.yml",
+            "--tls-cert",
+            "/etc/pay/tls/server.crt",
+            "--tls-key",
+            "/etc/pay/tls/server.key",
+        ])
+        .unwrap();
+
+        match opts.command {
+            Some(Command::Server {
+                command: commands::server::ServerCommand::Start(cmd),
+            }) => {
+                assert_eq!(cmd.tls_cert.as_deref(), Some("/etc/pay/tls/server.crt"));
+                assert_eq!(cmd.tls_key.as_deref(), Some("/etc/pay/tls/server.key"));
+            }
+            _ => panic!("expected legacy server start command"),
+        }
+    }
+
+    #[test]
+    fn server_start_rejects_incomplete_tls_paths() {
+        let err = match Opts::try_parse_from([
+            "pay",
+            "server",
+            "start",
+            "paywall.yml",
+            "--tls-cert",
+            "/etc/pay/tls/server.crt",
+        ]) {
+            Ok(_) => panic!("expected incomplete TLS arguments to fail"),
+            Err(err) => err,
+        };
+
+        assert!(err.to_string().contains("--tls-key"));
     }
 
     #[test]

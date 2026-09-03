@@ -1,0 +1,30 @@
+# 10k-user session load for proxy-only profiling (two-process split):
+#   bench --otlp localhost:4318 --pyroscope=http://localhost:4040 serve bench/configs/session-10k.yml
+#   bench load bench/configs/session-10k.yml --proxy <PROXY_URL> --rpc <RPC_URL>
+#
+# 10k channels open on the fork (provision is confirmation-bound, give it time),
+# then ~20k aggregate voucher RPS at the proxy during unleash.
+run:
+  name: session-10k
+  scheme: mpp_session
+  network: fork
+  safety:
+    max_total_usdc: 100000.0
+    max_total_sol: 100000.0
+    require_confirmation: false
+
+load:
+  users: 10000
+  requests_per_sec_per_user: 2
+  prepare_secs: 25
+  unleash_secs: 15
+  max_concurrency: 4096
+
+endpoints:
+  - url: "http://placeholder.local/v1/charge"  # overridden at runtime
+    method: POST
+    body: "{}"
+
+session:
+  deposit_usdc: 1.0
+  voucher_usdc: 0.001

@@ -1,0 +1,28 @@
+# Short gate-only regression ramp: 10k synthetic confirmed channels and normal
+# client-signed vouchers through Pingora. No RPC, Redis, TLS, or upstream work.
+run:
+  name: session-offline-10k
+  scheme: mpp_session
+  network: fork
+  safety:
+    max_total_usdc: 0.0
+    max_total_sol: 0.0
+    require_confirmation: false
+
+load:
+  users: 10000
+  requests_per_sec_per_user: 5
+  unleash_secs: 15
+  max_concurrency: 4096
+  workers: 32
+
+endpoints:
+  - url: http://127.0.0.1:1/v1/charge
+    method: POST
+    body: "{}"
+
+session:
+  deposit_usdc: 1.0
+  voucher_usdc: 0.000001
+  offline: true
+  offline_seeded_channels: 10000

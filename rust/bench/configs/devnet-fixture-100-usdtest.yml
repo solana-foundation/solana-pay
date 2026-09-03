@@ -1,0 +1,37 @@
+# Bounded USDtest smoke fixture for the first 100 wallets in the retained
+# devnet cohort. `wallet_set_id` preserves the existing wallet addresses while
+# this setup ID owns an independent USDtest lifecycle journal.
+setup:
+  name: devnet-100-usdtest
+  wallet_set_id: devnet-100k-usdg
+  network: devnet
+  rpc_url_env: BENCH_DEVNET_RPC_URL
+  funder:
+    keypair_env: BENCH_FUNDER_KEYPAIR
+  users: 100
+  # Payment-channel open requires rent plus a fee margin. The retained wallets
+  # already carry 0.005 SOL each, so reconciliation adds up to 0.02 SOL each.
+  sol_lamports_per_user: 25000000
+  max_total_sol: 3.0
+
+execution:
+  window_users: 10
+  reconcile_concurrency: 8
+  submit_concurrency: 1
+  rpc_requests_per_second: 20
+  rpc_burst: 5
+  request_timeout_seconds: 15
+  confirmation_timeout_seconds: 90
+  max_attempts: 8
+  initial_backoff_ms: 250
+  max_backoff_ms: 10000
+  jitter_ratio: 0.20
+
+assets:
+  # 0.01 x 100 requires exactly 1 USDtest.
+  - label: USDtest
+    mint: 6MJyWHwFpPsaTEuYarEz49ngtsSKPYn6yHqtJUW2a9St
+    token_program: TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb
+    decimals: 6
+    amount_per_user: "0.01"
+    max_total_amount: "1"

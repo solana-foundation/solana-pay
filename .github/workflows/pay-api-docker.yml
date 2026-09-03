@@ -1,0 +1,50 @@
+name: Publish pay-api to GHCR
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/pay-api-docker.yml"
+      - "rust/crates/pay-api/**"
+      - "rust/crates/pay-api-core/**"
+      - "rust/crates/pay-api-types/**"
+      - "rust/Cargo.toml"
+      - "rust/Cargo.lock"
+  workflow_dispatch:
+    inputs:
+      push:
+        description: "Push image to GHCR"
+        required: true
+        default: false
+        type: boolean
+
+env:
+  IMAGE: ghcr.io/solana-foundation/pay-api
+
+jobs:
+  docker:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
+        id: meta
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=sha,prefix=sha-
+            type=raw,value=latest,enable={{is_default_branch}}
+      - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: ./rust
+          file: ./rust/crates/pay-api/Dockerfile
+          push: ${{ github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.push) }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}

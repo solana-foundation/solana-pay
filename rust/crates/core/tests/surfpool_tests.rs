@@ -553,6 +553,7 @@ async fn push_session_full_flow() {
             async move {
                 use base64::Engine as _;
                 let result = match body["method"].as_str().unwrap_or_default() {
+                    "getSlot" => serde_json::json!(challenged_slot + 1),
                     "sendTransaction" => serde_json::json!(
                         pay_kit::mpp::program::payment_channels::decode_transaction(
                             body["params"][0].as_str().unwrap()
@@ -571,20 +572,24 @@ async fn push_session_full_flow() {
                             "status": { "Ok": null }
                         }]
                     }),
-                    "getAccountInfo" => serde_json::json!({
-                        "context": { "slot": 34 },
-                        "value": {
-                            "data": [
-                                base64::engine::general_purpose::STANDARD.encode(&channel_data),
-                                "base64"
-                            ],
-                            "executable": false,
-                            "lamports": 1_000_000u64,
-                            "owner": owner,
-                            "rentEpoch": 0,
-                            "space": channel_data.len()
-                        }
-                    }),
+                    "getMultipleAccounts" => {
+                        assert_eq!(body["params"][0].as_array().map(Vec::len), Some(1));
+                        assert_eq!(body["params"][1]["minContextSlot"], 34);
+                        serde_json::json!({
+                            "context": { "slot": 34 },
+                            "value": [{
+                                "data": [
+                                    base64::engine::general_purpose::STANDARD.encode(&channel_data),
+                                    "base64"
+                                ],
+                                "executable": false,
+                                "lamports": 1_000_000u64,
+                                "owner": owner,
+                                "rentEpoch": 0,
+                                "space": channel_data.len()
+                            }]
+                        })
+                    }
                     other => panic!("unexpected RPC method {other}"),
                 };
                 axum::Json(serde_json::json!({

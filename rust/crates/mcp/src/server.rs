@@ -5,12 +5,14 @@
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, ProtocolVersion, ServerCapabilities, ServerInfo};
 use rmcp::{ServerHandler, tool, tool_handler, tool_router};
+use std::sync::Arc;
 
 use crate::tools;
 
 pub struct PayMcp {
     #[allow(dead_code)]
     tool_router: rmcp::handler::server::router::tool::ToolRouter<Self>,
+    session_cache: Arc<tools::curl::SessionCache>,
 }
 
 impl Default for PayMcp {
@@ -24,6 +26,7 @@ impl PayMcp {
     pub fn new() -> Self {
         Self {
             tool_router: Self::tool_router(),
+            session_cache: Arc::new(tools::curl::SessionCache::default()),
         }
     }
 
@@ -60,7 +63,7 @@ and does not submit the request or payment.
         Parameters(params): Parameters<tools::curl::Params>,
         peer: rmcp::Peer<rmcp::service::RoleServer>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        tools::curl::run(params, peer).await
+        tools::curl::run(params, peer, self.session_cache.clone()).await
     }
 
     #[tool(
@@ -157,14 +160,15 @@ a purchase; it only renders the QR PNG and returns the funding address.
 
 Use this when a developer wants to publish a payment-gated API in
 https://github.com/solana-foundation/pay-skills. Pass the complete provider
-markdown file as `content`: YAML frontmatter between `---` delimiters followed
+`PAY.md` file as `content`: YAML frontmatter between `---` delimiters followed
 by optional execution notes. The tool validates required metadata, endpoint
 shape, URL safety, pricing precision, and paid-endpoint expectations.
 
 Before calling, inspect real code, OpenAPI specs, deployed routes, or
 `pay gate api` YAML. Do not invent endpoints, prices, supported networks,
-or payment protocols. If runtime YAML exists, use `pay skills provider sync`
-as a starting point, then validate the generated markdown with this tool.
+or payment protocols. If an OpenAPI document exists, commit a reviewed copy
+beside `PAY.md` and use `openapi: { path: openapi.json }`; public registry
+entries must not depend on a remote OpenAPI URL.
 
 For detailed authoring guidance, use the Pay skill reference
 `references/monetize-api.md`.
@@ -180,12 +184,10 @@ For detailed authoring guidance, use the Pay skill reference
 #[tool_handler]
 impl ServerHandler for PayMcp {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo {
-            protocol_version: ProtocolVersion::V_2025_06_18,
-            capabilities: ServerCapabilities::builder().enable_tools().build(),
-            server_info: rmcp::model::Implementation::from_build_env(),
-            instructions: Some(pay_core::instructions::INSTRUCTIONS.to_string()),
-        }
+        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+            .with_protocol_version(ProtocolVersion::V_2025_06_18)
+            .with_server_info(rmcp::model::Implementation::from_build_env())
+            .with_instructions(pay_core::instructions::INSTRUCTIONS)
     }
 }
 

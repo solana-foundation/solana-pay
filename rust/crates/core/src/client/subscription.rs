@@ -490,6 +490,9 @@ pub fn parse_subscription_receipt(header: &str) -> Result<ParsedSubscriptionRece
         pay_kit::mpp::ReceiptKind::Charge(_) => Err(Error::Mpp(
             "Receipt is a charge receipt, not subscription".into(),
         )),
+        pay_kit::mpp::ReceiptKind::Session { .. } => Err(Error::Mpp(
+            "Receipt is a session receipt, not subscription".into(),
+        )),
     }
 }
 
@@ -939,6 +942,23 @@ mod tests {
         });
         let header = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&payload).unwrap());
         assert!(parse_subscription_receipt(&header).is_err());
+    }
+
+    #[test]
+    fn parse_subscription_receipt_rejects_session_receipt() {
+        let payload = serde_json::json!({
+            "method": "solana",
+            "status": "success",
+            "timestamp": "2026-01-15T12:03:10Z",
+            "reference": "5J8signature",
+            "intent": "session",
+            "acceptedCumulative": "25",
+            "spent": "25",
+            "idleTimeoutSeconds": 60,
+        });
+        let header = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&payload).unwrap());
+        let err = parse_subscription_receipt(&header).unwrap_err();
+        assert!(format!("{err}").contains("session receipt"));
     }
 
     #[test]

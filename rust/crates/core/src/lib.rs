@@ -99,6 +99,16 @@ pub trait PaymentState: Clone + Send + Sync + 'static {
     /// bypasses the old axum `logging_middleware`).
     fn record_exchange(&self, _exchange: HttpExchange) {}
 
+    /// Whether the host consumes completed HTTP exchanges.
+    ///
+    /// Defaults to `true` to preserve logging for external implementations
+    /// that override [`Self::record_exchange`]. Hosts that can determine at
+    /// runtime that logging is disabled should return `false`, allowing the
+    /// proxy to skip request/response header materialization entirely.
+    fn records_http_exchanges(&self) -> bool {
+        true
+    }
+
     /// Called at request time, before the upstream responds. A host that
     /// tracks in-flight requests (`pay gate inference`) returns a log id;
     /// the gate echoes it in [`HttpExchange::log_id`] and in

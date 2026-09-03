@@ -1,4 +1,4 @@
-import type { Address, Signature } from '@solana/kit';
+import type { Signature } from '@solana/kit';
 import type { LogsNotificationsApi } from '@solana/rpc-subscriptions-api';
 import type { RpcSubscriptions } from '@solana/rpc-subscriptions-spec';
 
@@ -52,7 +52,7 @@ export async function watchReference(
 
     try {
         const subscription = await rpcSubscriptions
-            .logsNotifications({ mentions: [reference as Address] }, { commitment })
+            .logsNotifications({ mentions: [reference] }, { commitment })
             .subscribe({ abortSignal: abortController.signal });
 
         for await (const notification of subscription) {
