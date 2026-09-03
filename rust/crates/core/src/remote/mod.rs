@@ -328,7 +328,9 @@ pub fn load_remote_signer(
     let account_intent = intent.with_account_context(name);
     let credentials = load_credentials(name, provider.id(), gated, auth_override, &account_intent)?;
 
-    let signer = provider.connect(&credentials, &wallet_id)?;
+    let signer = provider
+        .connect(&credentials, &wallet_id)
+        .map_err(|e| explain_connect_failure(provider, &credentials, &wallet_id, name, e))?;
 
     let address = signer.pubkey().to_string();
     if let Some(expected) = account.pubkey.as_deref()
@@ -344,6 +346,61 @@ pub fn load_remote_signer(
     }
 
     Ok(ResolvedSigner::Remote(signer))
+}
+
+/// Explain a failed [`RemoteProvider::connect`] in terms of what is
+/// actually wrong.
+///
+/// `connect` can only report what its HTTP call said — typically a bare
+/// 401 — but the two everyday causes are distinguishable, and both are
+/// invisible in that status: credentials that no longer authenticate at
+/// all (rotated, revoked), and credentials that authenticate fine but
+/// belong to a different project than the one holding this wallet.
+/// Discovery separates them: it takes the same stored credentials and
+/// lists the wallets they can sign for.
+fn explain_connect_failure(
+    provider: &dyn RemoteProvider,
+    credentials: &Credentials,
+    wallet_id: &str,
+    name: &str,
+    original: Error,
+) -> Error {
+    let id = provider.id();
+    let display_name = provider.display_name();
+    let reconnect = format!("pay account new {name} --backend {id} --force");
+
+    let Ok(wallets) = provider.discover(credentials) else {
+        return Error::Config(format!(
+            "The {display_name} credentials stored for account `{name}` neither signed nor \
+             listed the project's wallets, so they were most likely rotated or revoked.\n\
+             {original}\nRe-connect it:\n  {reconnect}"
+        ));
+    };
+
+    if wallets.is_empty() {
+        return Error::Config(format!(
+            "The {display_name} credentials stored for account `{name}` can sign with no \
+             Solana wallet.\n{}",
+            provider.no_wallets_hint()
+        ));
+    }
+
+    if wallets.iter().any(|w| w.id == wallet_id) {
+        return original;
+    }
+
+    let listed = wallets
+        .iter()
+        .map(|w| format!("{} ({})", w.id, w.address))
+        .collect::<Vec<_>>()
+        .join("\n  ");
+
+    Error::Config(format!(
+        "Account `{name}` points at wallet `{wallet_id}`, which the {display_name} \
+         credentials stored on this machine cannot see. They can sign with:\n  {listed}\n\
+         The credentials were replaced, or they belong to a different project than the \
+         wallet.\nRe-connect it:\n  {reconnect}"
+    ))
 }
 
 #[cfg(test)]
@@ -424,6 +481,95 @@ mod tests {
         .map(|_| ())
         .unwrap_err();
         assert!(err.to_string().contains("missing its `account` field"));
+    }
+
+    /// A provider whose discovery result the test controls; `Err` stands
+    /// for credentials the provider rejects outright.
+    struct FakeProvider(std::result::Result<Vec<&'static str>, ()>);
+
+    impl RemoteProvider for FakeProvider {
+        fn id(&self) -> &'static str {
+            "fake"
+        }
+        fn display_name(&self) -> &'static str {
+            "Fake custody"
+        }
+        fn credential_fields(&self) -> &'static [CredentialField] {
+            &[]
+        }
+        fn credentials_hint(&self) -> &'static str {
+            "hint"
+        }
+        fn no_wallets_hint(&self) -> &'static str {
+            "Create one first."
+        }
+        fn discover(&self, _credentials: &Credentials) -> Result<Vec<RemoteWallet>> {
+            match &self.0 {
+                Ok(ids) => Ok(ids
+                    .iter()
+                    .map(|id| RemoteWallet {
+                        id: (*id).to_string(),
+                        address: format!("addr-for-{id}"),
+                    })
+                    .collect()),
+                Err(()) => Err(Error::Config("credentials rejected".to_string())),
+            }
+        }
+        fn connect(&self, _c: &Credentials, _w: &str) -> Result<Box<dyn SolanaSigner>> {
+            unimplemented!("tests only exercise the failure path")
+        }
+    }
+
+    fn explain(discovery: std::result::Result<Vec<&'static str>, ()>, wallet: &str) -> String {
+        explain_connect_failure(
+            &FakeProvider(discovery),
+            &Credentials::new(),
+            wallet,
+            "demo",
+            Error::Config("Remote API error".to_string()),
+        )
+        .to_string()
+    }
+
+    /// The failure that costs the most time to diagnose: the stored
+    /// credentials work, but against a project without this wallet.
+    #[test]
+    fn wallet_outside_the_credentials_project_is_named() {
+        let msg = explain(Ok(vec!["acc_live"]), "acc_stale");
+        assert!(msg.contains("acc_stale"), "{msg}");
+        assert!(msg.contains("acc_live (addr-for-acc_live)"), "{msg}");
+        assert!(
+            msg.contains("pay account new demo --backend fake --force"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn rejected_credentials_are_reported_as_such() {
+        let msg = explain(Err(()), "acc_live");
+        assert!(msg.contains("rotated or revoked"), "{msg}");
+        assert!(msg.contains("Remote API error"), "{msg}");
+        assert!(
+            msg.contains("pay account new demo --backend fake --force"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn empty_project_points_at_wallet_creation() {
+        let msg = explain(Ok(vec![]), "acc_live");
+        assert!(msg.contains("Create one first."), "{msg}");
+    }
+
+    /// When the wallet *is* there, the provider's own error is the real
+    /// story and must not be replaced by a guess.
+    #[test]
+    fn reachable_wallet_keeps_the_original_error() {
+        let msg = explain(Ok(vec!["acc_live"]), "acc_live");
+        assert_eq!(
+            msg,
+            Error::Config("Remote API error".to_string()).to_string()
+        );
     }
 
     #[test]
