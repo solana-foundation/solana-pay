@@ -9,24 +9,19 @@ use futures::stream::{self, StreamExt};
 use pay_core::client::session::SessionHandle;
 use pay_kit::generated::payment_channels::generated::accounts::Channel;
 use pay_kit::mpp::program::payment_channels::{default_program_id, from_address};
-use pay_kit::mpp::solana_keychain::SolanaSigner;
 use pay_kit::mpp::solana_keychain::memory::MemorySigner;
 use pay_worker::channel::STATUS_DISTRIBUTED;
 use sha2::{Digest, Sha256};
-use solana_hash::Hash;
-use solana_instruction::Instruction;
-use solana_message::Message;
 use solana_pubkey::Pubkey;
-use solana_signature::Signature;
-use solana_transaction::Transaction;
 
+use crate::channel_recovery::{
+    CHANNEL_ACCOUNT_SIZE, CHANNEL_STATUS_OFFSET, signed_transaction, submit_transactions,
+};
 use crate::config::{Network, RunConfig, Scheme};
 use crate::fixture_rpc::{ExecutionConfig, FixtureRpc};
 use crate::scheme::{build_request, validate_payment_transport, www_authenticate};
 use crate::wallet::{self, Wallet};
 
-const CHANNEL_ACCOUNT_SIZE: usize = 256;
-const CHANNEL_STATUS_OFFSET: usize = 3;
 const CHANNEL_STATUS_OPEN: u8 = 0;
 const CHANNEL_STATUS_SEALED: u8 = 1;
 
@@ -270,8 +265,12 @@ async fn recover_without_gateway_state(
             for channel in batch {
                 let instruction =
                     pay_worker::channel::build_settle_and_seal_ix(&channel.address, &channel.payee);
-                let transaction = signed_transaction(funder, vec![instruction], blockhash).await?;
-                transactions.push((channel.index, channel.address, transaction));
+                let transaction =
+                    signed_transaction(funder, &[], vec![instruction], blockhash).await?;
+                transactions.push((
+                    format!("user {} channel {}", channel.index, channel.address),
+                    transaction,
+                ));
             }
             submit_transactions(
                 &rpc,
@@ -324,8 +323,12 @@ async fn recover_without_gateway_state(
                     &token_program,
                     &empty_preimage,
                 );
-                let transaction = signed_transaction(funder, vec![instruction], blockhash).await?;
-                transactions.push((channel.index, channel.address, transaction));
+                let transaction =
+                    signed_transaction(funder, &[], vec![instruction], blockhash).await?;
+                transactions.push((
+                    format!("user {} channel {}", channel.index, channel.address),
+                    transaction,
+                ));
             }
             submit_transactions(
                 &rpc,
@@ -378,8 +381,12 @@ async fn recover_without_gateway_state(
                 let rent_payer = from_address(&channel.channel.rent_payer);
                 let instruction =
                     pay_worker::channel::build_reclaim_ix(&channel.address, &rent_payer);
-                let transaction = signed_transaction(funder, vec![instruction], blockhash).await?;
-                transactions.push((channel.index, channel.address, transaction));
+                let transaction =
+                    signed_transaction(funder, &[], vec![instruction], blockhash).await?;
+                transactions.push((
+                    format!("user {} channel {}", channel.index, channel.address),
+                    transaction,
+                ));
             }
             submit_transactions(
                 &rpc,
@@ -473,62 +480,6 @@ fn validate_rent_reclaim_destination(channel: Pubkey, rent_payer: Pubkey) -> Res
         rent_payer != Pubkey::default(),
         "refusing rent reclaim: channel {channel} has an invalid zero rent payer"
     );
-    Ok(())
-}
-
-async fn signed_transaction(
-    fee_payer: &Wallet,
-    instructions: Vec<Instruction>,
-    blockhash: Hash,
-) -> Result<Transaction> {
-    let message = Message::new_with_blockhash(&instructions, Some(&fee_payer.pubkey), &blockhash);
-    let mut transaction = Transaction::new_unsigned(message);
-    let signer = MemorySigner::from_bytes(&fee_payer.keypair).context("loading recovery signer")?;
-    let signature = signer
-        .sign_message(&transaction.message_data())
-        .await
-        .context("signing recovery transaction")?;
-    let index = transaction
-        .message
-        .account_keys
-        .iter()
-        .position(|key| *key == fee_payer.pubkey)
-        .context("recovery signer is absent from transaction")?;
-    transaction.signatures[index] = Signature::from(<[u8; 64]>::from(signature));
-    Ok(transaction)
-}
-
-async fn submit_transactions(
-    rpc: &FixtureRpc,
-    transactions: Vec<(u32, Pubkey, Transaction)>,
-    concurrency: usize,
-    operation: &str,
-) -> Result<()> {
-    let mut submitting = stream::iter(transactions.into_iter().map(
-        |(index, channel, tx)| async move { (index, channel, rpc.submit_and_confirm(&tx).await) },
-    ))
-    .buffer_unordered(concurrency);
-    let mut confirmed = 0usize;
-    let mut failures = Vec::new();
-    while let Some((index, channel, result)) = submitting.next().await {
-        match result {
-            Ok(_) => confirmed += 1,
-            Err(error) => failures.push(format!("user {index} channel {channel}: {error:#}")),
-        }
-    }
-    println!(
-        "{operation}: {confirmed} confirmed, {} failed",
-        failures.len()
-    );
-    if !failures.is_empty() {
-        let shown = failures.iter().take(20).cloned().collect::<Vec<_>>();
-        bail!(
-            "{operation} failed for {} channels (first {}):\n{}",
-            failures.len(),
-            shown.len(),
-            shown.join("\n")
-        );
-    }
     Ok(())
 }
 
@@ -719,7 +670,7 @@ pub async fn top_up(
                 delta,
             );
             let transaction =
-                signed_transaction(&channel.wallet, vec![instruction], blockhash).await?;
+                signed_transaction(&channel.wallet, &[], vec![instruction], blockhash).await?;
             transactions.push((channel.index, channel.address, transaction));
         }
         let rpc_ref = &rpc;
