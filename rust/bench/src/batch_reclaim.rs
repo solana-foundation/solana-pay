@@ -35,6 +35,7 @@ use crate::channel_recovery::{
 };
 use crate::config::RunConfig;
 use crate::fixture_rpc::{ExecutionConfig, FixtureRpc};
+use crate::fixtures;
 use crate::wallet::{self, Wallet};
 
 const STATUS_OPEN: u8 = 0;
@@ -78,10 +79,17 @@ pub async fn recover_batch(
         .context("config.run.mint is required (the channel token)")?;
     let program_id = pc::default_program_id();
 
-    println!("deriving {users} fixture wallets for `{fixture_id}`...");
+    // The fixture's wallet-derivation namespace can differ from `fixture_id`
+    // itself (`setup.wallet_set_id` in the journal) — the same resolution
+    // `bench run` applies, or every derived key here is silently wrong and
+    // the on-chain scan below matches nothing.
+    let wallet_set_id = fixtures::validate_ready_fixture(fixture_id, &cfg, &funder)?;
+    println!(
+        "deriving {users} fixture wallets for `{fixture_id}` (wallet set `{wallet_set_id}`)..."
+    );
     let mut wallets: HashMap<Pubkey, Wallet> = HashMap::with_capacity(users);
     for i in 0..users as u32 {
-        let w = wallet::derive_user(&funder.seed(), fixture_id, i);
+        let w = wallet::derive_user(&funder.seed(), &wallet_set_id, i);
         wallets.insert(w.pubkey, w);
     }
 
