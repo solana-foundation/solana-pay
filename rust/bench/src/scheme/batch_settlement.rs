@@ -27,14 +27,14 @@ use crossbeam_queue::ArrayQueue;
 use ed25519_dalek::{Signer as _, SigningKey};
 use pay_kit::core::payment_channels as pc;
 use pay_kit::mpp::solana_keychain::memory::MemorySigner;
-use pay_kit::x402::PAYMENT_SIGNATURE_HEADER;
 use pay_kit::x402::client::batch_settlement::{
     BatchChannel, build_deposit, build_refund, encode_payment_header, parse_challenge,
     resolve_terms_with_token_program,
 };
 use pay_kit::x402::protocol::schemes::batch_settlement::{
-    BatchChannelConfig, BatchPayload, BatchRequirements, BatchVoucher, VOUCHER_EXPIRES_AT,
+    BatchChannelConfig, BatchPayload, BatchRequirements, BatchVoucher, VOUCHER_EXPIRES_AT, errors,
 };
+use pay_kit::x402::{PAYMENT_REQUIRED_HEADER, PAYMENT_SIGNATURE_HEADER};
 use reqwest::StatusCode;
 use solana_hash::Hash;
 use solana_pubkey::Pubkey;
@@ -77,6 +77,25 @@ struct BatchHandle {
     charged_cumulative: u64,
 }
 
+/// Per-channel signing state shared between the background signer thread
+/// (the producer, which advances `cumulative`) and the request source (the
+/// consumer, and the writer on a resync). `epoch` is bumped whenever a
+/// corrective response resyncs `cumulative`, so vouchers already queued under
+/// the stale baseline can be told apart from fresh ones without draining the
+/// lock-free queue directly — see [`ChannelQueueEntry`].
+#[derive(Default)]
+struct ChannelSignState {
+    cumulative: u64,
+    epoch: u64,
+}
+
+/// One signer-pool queue entry: the epoch `cumulative` was read under when
+/// this header was signed, alongside the header itself. The consumer
+/// discards entries whose epoch no longer matches the channel's current
+/// epoch instead of sending a voucher signed under a baseline the server has
+/// since corrected.
+type ChannelQueueEntry = (u64, String);
+
 /// One channel's slot in the background signer pipeline: a single producer, so
 /// vouchers stay monotonic, and the bounded queue lanes drain.
 struct SignerTask {
@@ -84,11 +103,9 @@ struct SignerTask {
     channel_id: Pubkey,
     config: BatchChannelConfig,
     requirements: BatchRequirements,
-    /// Advanced by `base` before each voucher is signed; single-owner, so the
-    /// cumulative watermark stays strictly monotonic without coordination.
-    cumulative: u64,
     base: u64,
-    queue: Arc<ArrayQueue<String>>,
+    state: Arc<Mutex<ChannelSignState>>,
+    queue: Arc<ArrayQueue<ChannelQueueEntry>>,
 }
 
 pub struct BatchSettlement {
@@ -492,15 +509,22 @@ impl BenchScheme for BatchSettlement {
 
         // Background-signer mode: a shared bounded queue is filled by the signer
         // pool (started in `spawn_hot_path`) and drained by this source's lane.
+        // `state` is shared between the two so a resync (see
+        // `BatchSource::on_response`) is visible to the signer thread's next
+        // refill pass without any extra coordination.
         if self.background_signers > 0 {
             let queue = Arc::new(ArrayQueue::new(self.queue_depth()));
+            let state = Arc::new(Mutex::new(ChannelSignState {
+                cumulative: handle.charged_cumulative,
+                epoch: 0,
+            }));
             self.signer_registry.lock().unwrap().push(SignerTask {
                 voucher_key: handle.voucher_key.clone(),
                 channel_id: handle.channel_id,
                 config: handle.config.clone(),
                 requirements: handle.requirements.clone(),
-                cumulative: handle.charged_cumulative,
                 base: handle.base,
+                state: state.clone(),
                 queue: queue.clone(),
             });
             return Ok(Box::new(BatchSource {
@@ -517,6 +541,7 @@ impl BenchScheme for BatchSettlement {
                 body: ctx.endpoint.body.clone(),
                 presigned: None,
                 queue: Some(queue),
+                state: Some(state),
                 stats: self.hot_stats.clone(),
             }));
         }
@@ -564,6 +589,7 @@ impl BenchScheme for BatchSettlement {
             body: ctx.endpoint.body.clone(),
             presigned: (self.pre_sign_requests_per_user > 0).then_some(presigned),
             queue: None,
+            state: None,
             stats: self.hot_stats.clone(),
         }))
     }
@@ -670,11 +696,14 @@ fn signer_thread(mut bucket: Vec<SignerTask>, stop: Arc<AtomicBool>, stats: Arc<
             // Top this channel back up to capacity, then move on so every
             // channel gets refilled each pass (fair across the bucket).
             while task.queue.len() < task.queue.capacity() {
-                let next = match task.cumulative.checked_add(task.base) {
-                    Some(next) => next,
-                    None => {
-                        tracing::error!("batch signer: cumulative overflow");
-                        break;
+                let (next, epoch) = {
+                    let state = task.state.lock().unwrap();
+                    match state.cumulative.checked_add(task.base) {
+                        Some(next) => (next, state.epoch),
+                        None => {
+                            tracing::error!("batch signer: cumulative overflow");
+                            break;
+                        }
                     }
                 };
                 match batch_header_sync(
@@ -685,10 +714,19 @@ fn signer_thread(mut bucket: Vec<SignerTask>, stop: Arc<AtomicBool>, stats: Arc<
                     &task.requirements,
                 ) {
                     Ok(header) => {
-                        if task.queue.push(header).is_err() {
+                        let mut state = task.state.lock().unwrap();
+                        if state.epoch != epoch {
+                            // A resync landed while this header was being signed —
+                            // it was built against a baseline the server has since
+                            // corrected. Drop it and re-read the fresh state next
+                            // pass instead of queuing a voucher we know is wrong.
+                            continue;
+                        }
+                        if task.queue.push((epoch, header)).is_err() {
                             break; // filled concurrently; watermark not advanced
                         }
-                        task.cumulative = next;
+                        state.cumulative = next;
+                        drop(state);
                         produced_local += 1;
                         progressed = true;
                         if produced_local.is_multiple_of(8192) {
@@ -722,7 +760,9 @@ struct BatchSource {
     channel_id: Pubkey,
     config: BatchChannelConfig,
     requirements: BatchRequirements,
-    /// Last cumulative watermark signed; advanced by `base` per request.
+    /// Last cumulative watermark signed; advanced by `base` per request. Only
+    /// meaningful in the direct/presigned paths (no `state`) — background-signer
+    /// mode tracks this in the shared `state` instead.
     cumulative: u64,
     base: u64,
     method: String,
@@ -732,7 +772,12 @@ struct BatchSource {
     presigned: Option<VecDeque<String>>,
     /// Background-signer mode: pop pre-signed headers the pool fills. When set,
     /// this source never signs (single producer per channel is the pool).
-    queue: Option<Arc<ArrayQueue<String>>>,
+    queue: Option<Arc<ArrayQueue<ChannelQueueEntry>>>,
+    /// Shared with this channel's `SignerTask` in background-signer mode; a
+    /// resync (see `on_response`) writes the server's corrected cumulative
+    /// here and bumps the epoch so stale queued vouchers are discarded
+    /// instead of sent. `None` outside background-signer mode.
+    state: Option<Arc<Mutex<ChannelSignState>>>,
     stats: Arc<HotPathStats>,
 }
 
@@ -747,12 +792,28 @@ impl RequestSource for BatchSource {
             // Vouchers are FIFO within a channel, so popping in order preserves
             // the monotonic watermark. If momentarily empty the pool fell behind
             // — wait rather than signing here (which would race its watermark).
+            // An entry signed before the last resync (stale epoch) is discarded
+            // instead of sent — it was built against a baseline the server has
+            // since corrected, so sending it would just repeat the mismatch.
             loop {
-                if let Some(header) = queue.pop() {
-                    break header;
+                match queue.pop() {
+                    Some((epoch, header)) => {
+                        let current = self
+                            .state
+                            .as_ref()
+                            .expect("queue implies state")
+                            .lock()
+                            .unwrap()
+                            .epoch;
+                        if epoch == current {
+                            break header;
+                        }
+                    }
+                    None => {
+                        self.stats.stalls.fetch_add(1, Ordering::Relaxed);
+                        tokio::task::yield_now().await;
+                    }
                 }
-                self.stats.stalls.fetch_add(1, Ordering::Relaxed);
-                tokio::task::yield_now().await;
             }
         } else {
             match &mut self.presigned {
@@ -785,5 +846,53 @@ impl RequestSource for BatchSource {
             body: self.body.clone(),
             logical_payment: true,
         })
+    }
+
+    fn resync_header(&self) -> Option<&'static str> {
+        Some(PAYMENT_REQUIRED_HEADER)
+    }
+
+    /// A cumulative-amount mismatch means our local watermark drifted from the
+    /// server's (e.g. a deposit's implicit first charge silently failed to
+    /// record server-side — a known, documented gap: "that loss is logged,
+    /// not surfaced"). The mismatch response carries the server's real
+    /// watermark specifically so a client can resynchronize instead of
+    /// repeating the same wrong voucher forever. Benchmark-only: unlike a real
+    /// payer, we adopt the corrected value without re-verifying its signature
+    /// against our own `payerAuthorizer` key, since the gateway under test is
+    /// already trusted infrastructure here.
+    fn on_response(&mut self, status: u16, header: Option<&str>) {
+        if status != 402 {
+            return;
+        }
+        let Some(header_value) = header else {
+            return;
+        };
+        let Some((requirements, error)) = parse_challenge(
+            &[(
+                PAYMENT_REQUIRED_HEADER.to_string(),
+                header_value.to_string(),
+            )],
+            None,
+        ) else {
+            return;
+        };
+        if error.as_deref() != Some(errors::INVALID_CUMULATIVE_AMOUNT_MISMATCH) {
+            return;
+        }
+        let Some(voucher_state) = requirements.extra.voucher_state.as_ref() else {
+            return;
+        };
+        let Ok(corrected) = voucher_state.signed_max_claimable() else {
+            return;
+        };
+        match &self.state {
+            Some(state) => {
+                let mut guard = state.lock().unwrap();
+                guard.cumulative = corrected;
+                guard.epoch += 1;
+            }
+            None => self.cumulative = corrected,
+        }
     }
 }

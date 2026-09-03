@@ -88,6 +88,20 @@ pub struct PreparedRequest {
 pub trait RequestSource: Send {
     fn user_index(&self) -> u32;
     async fn next_request(&mut self) -> Result<PreparedRequest>;
+
+    /// Response header name this source wants captured on a non-2xx status
+    /// (e.g. a scheme's corrective-challenge header), so it can resynchronize
+    /// signing state that drifted from the server. `None` by default — most
+    /// schemes don't carry state that can desync this way.
+    fn resync_header(&self) -> Option<&'static str> {
+        None
+    }
+
+    /// Report a completed response. `header` is the value of
+    /// `resync_header()`'s named header when present on this response.
+    /// Default no-op; only sources that override `resync_header` need to act
+    /// on this.
+    fn on_response(&mut self, _status: u16, _header: Option<&str>) {}
 }
 
 /// RAII handle for a scheme's background hot-path pipeline (e.g. the session

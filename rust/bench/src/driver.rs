@@ -26,26 +26,43 @@ enum Transport {
 }
 
 impl Transport {
-    /// Send one request, returning `Ok(status)` or `Err(error-bucket)` so both
-    /// paths feed the driver's status/error accounting identically.
+    /// Send one request, returning `Ok((status, header))` or `Err(error-bucket)`
+    /// so both paths feed the driver's status/error accounting identically.
+    /// `header` is the value of the `capture_header_on_error`-named response
+    /// header, captured only on a non-2xx status — cheap enough to always
+    /// check since it only matters (and only costs anything) on the rare
+    /// failure path, letting a scheme resynchronize from a corrective
+    /// response without paying for header capture on every success.
     async fn send(
         &self,
         method: &str,
         url: &str,
         body: &str,
         headers: &[(String, String)],
-    ) -> Result<u16, String> {
+        capture_header_on_error: &str,
+    ) -> Result<(u16, Option<String>), String> {
         match self {
             Transport::Reqwest(client) => {
                 match build_request(client, method, url, body, None, headers)
                     .send()
                     .await
                 {
-                    Ok(resp) => Ok(resp.status().as_u16()),
+                    Ok(resp) => {
+                        let status = resp.status().as_u16();
+                        let captured = (!(200..300).contains(&status))
+                            .then(|| resp.headers().get(capture_header_on_error))
+                            .flatten()
+                            .and_then(|v| v.to_str().ok())
+                            .map(str::to_owned);
+                        Ok((status, captured))
+                    }
                     Err(e) => Err(classify_error(&e)),
                 }
             }
-            Transport::Stable(pool) => pool.send(method, url, body, headers).await,
+            Transport::Stable(pool) => {
+                pool.send(method, url, body, headers, capture_header_on_error)
+                    .await
+            }
         }
     }
 }
@@ -584,20 +601,24 @@ async fn run_lane(
                         &request.url,
                         &request.body,
                         &request.headers,
+                        source.resync_header().unwrap_or(""),
                     )
                     .await;
                 let completed_at = Instant::now();
                 let service = completed_at.saturating_duration_since(dispatched);
                 match result {
-                    Ok(status) => m.record_simple(
-                        service,
-                        signing,
-                        Some(status),
-                        None,
-                        request.logical_payment,
-                        completed_at,
-                        started,
-                    ),
+                    Ok((status, header)) => {
+                        source.on_response(status, header.as_deref());
+                        m.record_simple(
+                            service,
+                            signing,
+                            Some(status),
+                            None,
+                            request.logical_payment,
+                            completed_at,
+                            started,
+                        )
+                    }
                     Err(error) => m.record_simple(
                         service,
                         signing,
@@ -698,22 +719,26 @@ async fn run_worker(sources: Vec<Box<dyn RequestSource>>, context: WorkerContext
                                     &request.url,
                                     &request.body,
                                     &request.headers,
+                                    state.source.resync_header().unwrap_or(""),
                                 )
                                 .await;
                             let completed_at = Instant::now();
                             match result {
-                                Ok(status) => Completion {
-                                    slot,
-                                    source: state.source,
-                                    scheduled,
-                                    next_scheduled,
-                                    dispatched: Some(dispatched),
-                                    signing,
-                                    logical_payment: request.logical_payment,
-                                    status: Some(status),
-                                    error: None,
-                                    completed_at,
-                                },
+                                Ok((status, header)) => {
+                                    state.source.on_response(status, header.as_deref());
+                                    Completion {
+                                        slot,
+                                        source: state.source,
+                                        scheduled,
+                                        next_scheduled,
+                                        dispatched: Some(dispatched),
+                                        signing,
+                                        logical_payment: request.logical_payment,
+                                        status: Some(status),
+                                        error: None,
+                                        completed_at,
+                                    }
+                                }
                                 Err(error) => Completion {
                                     slot,
                                     source: state.source,
