@@ -7008,6 +7008,7 @@ dependencies = [
  "bincode",
  "bs58",
  "figment",
+ "futures 0.3.34",
  "opentelemetry 0.31.0",
  "opentelemetry-otlp",
  "opentelemetry-semantic-conventions 0.31.0",
@@ -11308,7 +11309,7 @@ dependencies = [
 [[package]]
 name = "solana-pay-kit"
 version = "0.6.0"
-source = "git+https://github.com/solana-foundation/pay-kit.git?rev=367bfed0#367bfed03d309a666a65e014e84c3dd947f9a58c"
+source = "git+https://github.com/solana-foundation/pay-kit.git?rev=4fcff087#4fcff087f90884b3f3aac26689b05b0f213ffbb9"
 dependencies = [
  "async-trait",
  "base64 0.22.1",

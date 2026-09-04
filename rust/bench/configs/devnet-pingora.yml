@@ -7,7 +7,7 @@
 # Required runtime environment (do not commit these values):
 #   PAY_PAYMENT_RECIPIENT  a devnet recipient public key
 #   PAY_RPC_URL            a devnet Solana RPC URL
-#   PAY_SESSION_SECRET     stable random hex secret; preserves session tokens
+#   PAY_MPP_SECRET         stable random hex secret; preserves MPP session tokens
 #                           across service restarts
 #   PAY_SETTLEMENT_KEYPAIR_PATH
 #                           path to the recipient's devnet keypair; it sponsors
@@ -36,7 +36,7 @@ operator:
   # Exercise draft-00 sponsorship: the client signs the stablecoin authority;
   # the gateway pays the transaction fee + channel rent and broadcasts.
   fee_payer: true
-  challenge_binding_secret: "${PAY_SESSION_SECRET}"
+  challenge_binding_secret: "${PAY_MPP_SECRET}"
 
 session:
   # Keep enough headroom for sustained reuse runs without reopening channels.

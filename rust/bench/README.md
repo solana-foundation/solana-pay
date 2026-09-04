@@ -31,7 +31,7 @@ session challenge and returns `200` only after voucher verification; its
 gateway measurement.
 
 Supply `PAY_PAYMENT_RECIPIENT`, `PAY_RPC_URL`,
-`PAY_SETTLEMENT_KEYPAIR_PATH`, and a persistent random `PAY_SESSION_SECRET`
+`PAY_SETTLEMENT_KEYPAIR_PATH`, and a persistent random `PAY_MPP_SECRET`
 through the service environment. The settlement keypair is the configured
 operator signer: the gateway advertises `feePayer: true`, co-signs each
 validated open, pays the transaction fee plus channel-account rent, and later

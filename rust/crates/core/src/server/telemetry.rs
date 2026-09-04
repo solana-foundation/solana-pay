@@ -423,9 +423,30 @@ pub fn record_payment_channel_opened(
     network: &str,
     escrowed: u64,
 ) {
+    record_payment_channel_opened_for_protocol(
+        "mpp/session",
+        signature,
+        channel,
+        client_id,
+        currency,
+        network,
+        escrowed,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn record_payment_channel_opened_for_protocol(
+    protocol: &str,
+    signature: &str,
+    channel: &str,
+    client_id: &str,
+    currency: &str,
+    network: &str,
+    escrowed: u64,
+) {
     tracing::info!(
         monotonic_counter.pay_payment_channels_opened_total = 1_u64,
-        protocol = "mpp/session",
+        protocol,
         channel_kind = "payment_channel",
         verification = "account_confirmed",
         metric = METRIC_PAYMENT_CHANNELS_OPENED,
@@ -436,14 +457,14 @@ pub fn record_payment_channel_opened(
         channel_id = channel,
         currency,
         network,
-        protocol = "mpp/session",
+        protocol,
         metric = METRIC_PAYMENT_CHANNEL_ESCROWED,
         "payment-channel escrow confirmed",
     );
     tracing::info!(
         gauge.pay_payment_channel_client = 1_u64,
         client_id,
-        protocol = "mpp/session",
+        protocol,
         metric = METRIC_PAYMENT_CHANNEL_CLIENT,
         "payment-channel client confirmed",
     );
@@ -464,12 +485,28 @@ pub fn record_payment_channel_voucher_cumulative(
     network: &str,
     cumulative: u64,
 ) {
+    record_payment_channel_voucher_cumulative_for_protocol(
+        "mpp/session",
+        channel_id,
+        currency,
+        network,
+        cumulative,
+    );
+}
+
+pub fn record_payment_channel_voucher_cumulative_for_protocol(
+    protocol: &str,
+    channel_id: &str,
+    currency: &str,
+    network: &str,
+    cumulative: u64,
+) {
     tracing::info!(
         gauge.pay_payment_channel_voucher_cumulative_base_units = cumulative,
         channel_id,
         currency,
         network,
-        protocol = "mpp/session",
+        protocol,
         metric = METRIC_PAYMENT_CHANNEL_VOUCHER_CUMULATIVE,
         "payment-channel voucher persisted",
     );

@@ -65,7 +65,7 @@ docker-build-pay-worker:
 close-channels:
     cargo run --release -p pay-worker --bin close-channels
 
-# Preview durable session watermark reconciliation (DRY_RUN defaults true).
+# Preview durable session + x402 batch lifecycle reconciliation (DRY_RUN defaults true).
 settle-sessions:
     cargo run --release -p pay-worker --bin settle-sessions
 

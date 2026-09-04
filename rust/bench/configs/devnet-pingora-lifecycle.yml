@@ -23,7 +23,7 @@ operator:
   network: devnet
   rpc_url: "${PAY_RPC_URL}"
   fee_payer: true
-  challenge_binding_secret: "${PAY_SESSION_SECRET}"
+  challenge_binding_secret: "${PAY_MPP_SECRET}"
 
 session:
   # 10 requests/s × 1 micro-USD × 20 minutes = 0.012 USD per channel.

@@ -106,8 +106,8 @@ async fn channel_store(
 async fn session_channel_store()
 -> pay_core::Result<(Arc<dyn pay_kit::mpp::store::ChannelStore>, bool)> {
     channel_store(
-        &["PAY_SESSION_REDIS_URL"],
-        "PAY_SESSION_REDIS_PREFIX",
+        &["PAY_MPP_REDIS_URL"],
+        "PAY_MPP_REDIS_PREFIX",
         "pay:session:v1:",
         "MPP sessions",
     )
@@ -120,13 +120,13 @@ async fn session_channel_store()
 /// accepted voucher and its cumulative watermark cannot be reconstructed from
 /// the chain, so losing it means the operator either forfeits the revenue or
 /// invents a charge. Memory is fine for a local `pay serve`; a deployment that
-/// takes real money wants `PAY_BATCH_REDIS_URL` (falling back to the session
+/// takes real money wants `PAY_X402_REDIS_URL` (falling back to the MPP
 /// Redis URL).
 async fn batch_channel_store()
 -> pay_core::Result<(Arc<dyn pay_kit::mpp::store::ChannelStore>, bool)> {
     channel_store(
-        &["PAY_BATCH_REDIS_URL", "PAY_SESSION_REDIS_URL"],
-        "PAY_BATCH_REDIS_PREFIX",
+        &["PAY_X402_REDIS_URL", "PAY_MPP_REDIS_URL"],
+        "PAY_X402_REDIS_PREFIX",
         "pay:batch:v1:",
         "x402 batch-settlement",
     )
@@ -1158,7 +1158,7 @@ impl StartCommand {
                     &rpc_url,
                 )?;
 
-                let session_secret = std::env::var("PAY_SESSION_SECRET")
+                let session_secret = std::env::var("PAY_MPP_SECRET")
                     .unwrap_or_else(|_| challenge_binding_secret.clone());
                 let channel_program_id = std::env::var("PAY_PAYMENT_CHANNELS_PROGRAM_ID")
                     .ok()
@@ -1638,7 +1638,7 @@ impl StartCommand {
                         eprintln!(
                             "{}",
                             "warning: x402 batch-settlement is using an in-memory channel store; \
-                             set PAY_BATCH_REDIS_URL before taking real payments, or a restart \
+                             set PAY_X402_REDIS_URL before taking real payments, or a restart \
                              forfeits every unclaimed voucher"
                                 .yellow()
                         );
@@ -1673,12 +1673,12 @@ impl StartCommand {
                         // the channel to be confirmed open before a voucher is
                         // accepted; kit's default keeps that off the hot path
                         // without letting the snapshot go stale. Overridable via
-                        // PAY_BATCH_SNAPSHOT_MAX_AGE_SECS — raise it for
+                        // PAY_X402_SNAPSHOT_MAX_AGE_SECS — raise it for
                         // throughput benchmarks where channels are known-open and
                         // per-refresh reconciles would otherwise add on-chain
                         // reads to the measured window.
                         channel_snapshot_max_age_seconds: std::env::var(
-                            "PAY_BATCH_SNAPSHOT_MAX_AGE_SECS",
+                            "PAY_X402_SNAPSHOT_MAX_AGE_SECS",
                         )
                         .ok()
                         .and_then(|v| v.parse().ok())

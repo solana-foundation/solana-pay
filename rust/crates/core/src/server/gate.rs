@@ -1077,10 +1077,13 @@ impl<S: PaymentState> PaymentGate<S> {
             // the payment, so it gets the original settlement result back
             // rather than a conflict — the scheme requires the recorded
             // response for this commitment, and refusing it would leave a paid
-            // request unrecoverable. The upstream body is not replayed: a
-            // proxy caches payment state, not representations.
-            BatchAccess::Replay(settlement) => {
-                return GateDecision::Respond(batch_replay_response(batch, &settlement));
+            // request unrecoverable.
+            BatchAccess::Replay(settlement, cached) => {
+                return GateDecision::Respond(batch_replay_response(
+                    batch,
+                    &settlement,
+                    cached.as_ref(),
+                ));
             }
             // Another in-flight request owns this authorization. This is the
             // one case that is genuinely a conflict, and it is retryable.
@@ -1105,7 +1108,7 @@ impl<S: PaymentState> PaymentGate<S> {
             BatchAccess::Resume(outcome) => {
                 return match batch.finish_commit(&outcome).await {
                     Ok(settlement) => {
-                        GateDecision::Respond(batch_replay_response(batch, &settlement))
+                        GateDecision::Respond(batch_replay_response(batch, &settlement, None))
                     }
                     Err(e) => {
                         telemetry::record_settlement_error(
@@ -1597,21 +1600,30 @@ fn upto_settle_amount(min_usd: Option<f64>, ceiling_usd: f64, max_amount: u64) -
 ///
 /// The settlement result is returned verbatim, so a client that lost the
 /// original response learns what it was charged and can carry on from the
-/// right cumulative base. The upstream body is not replayed — a proxy caches
-/// payment state, not representations — so the marker header tells the client
-/// which it is holding.
+/// right cumulative base.
 fn batch_replay_response(
     batch: &X402BatchSettlement,
     settlement: &pay_kit::x402::batch_settlement::BatchSettlementResponse,
+    cached: Option<&pay_kit::core::store::CachedUpstreamResponse>,
 ) -> GateResponse {
-    let mut resp = GateResponse::json(
-        StatusCode::OK,
-        serde_json::to_vec(&json!({
-            "status": "already_settled",
-            "message": "this authorization was already charged; its payment result is attached",
-        }))
-        .unwrap_or_default(),
-    );
+    let mut resp = if let Some(cached) = cached {
+        let mut response =
+            GateResponse::new(StatusCode::from_u16(cached.status).unwrap_or(StatusCode::OK))
+                .body(cached.body.clone());
+        if let Some(content_type) = &cached.content_type {
+            response = response.header(header::CONTENT_TYPE, content_type);
+        }
+        response
+    } else {
+        GateResponse::json(
+            StatusCode::OK,
+            serde_json::to_vec(&json!({
+                "status": "already_settled",
+                "message": "this authorization was already charged; its payment result is attached",
+            }))
+            .unwrap_or_default(),
+        )
+    };
     if let Ok(v) = HeaderValue::from_str("true") {
         resp.headers
             .push((HeaderName::from_static("payment-replay"), v));
@@ -1647,6 +1659,21 @@ pub async fn settle_batch<S: PaymentState>(
     let batch = state.x402_batch()?;
     let telemetry_context = forward.telemetry;
     let channel_id = forward.outcome.channel_id.clone();
+    let channel_config = forward.outcome.payload().channel_config();
+    let currency = channel_config.token.clone();
+    let client_id = channel_config.payer.clone();
+    let opens_channel = match forward.outcome.payload() {
+        pay_kit::x402::batch_settlement::BatchPayload::Deposit { deposit, .. } => {
+            matches!(
+                pay_kit::x402::batch_settlement::setup_form_from_transaction(
+                    &deposit.transaction,
+                    &pay_kit::core::payment_channels::default_program_id(),
+                ),
+                Ok(pay_kit::x402::batch_settlement::SetupForm::Open)
+            )
+        }
+        _ => false,
+    };
     if !served_ok {
         // The reservation is durable, so dropping the outcome only frees the
         // in-process guard. Release it, or the client's retry of the same
@@ -1686,6 +1713,36 @@ pub async fn settle_batch<S: PaymentState>(
                 telemetry_context.payment.as_ref(),
                 &channel_id,
             );
+            if let Some(channel_state) = settlement
+                .extra
+                .as_ref()
+                .and_then(|extra| extra.channel_state.as_ref())
+            {
+                if let Some(cumulative) = channel_state
+                    .charged_cumulative_amount
+                    .as_deref()
+                    .and_then(|value| value.parse().ok())
+                {
+                    telemetry::record_payment_channel_voucher_cumulative_for_protocol(
+                        "x402/batch",
+                        &channel_id,
+                        &currency,
+                        &settlement.network,
+                        cumulative,
+                    );
+                }
+                if opens_channel && let Ok(escrowed) = channel_state.balance.parse() {
+                    telemetry::record_payment_channel_opened_for_protocol(
+                        "x402/batch",
+                        &settlement.transaction,
+                        &channel_id,
+                        &client_id,
+                        &currency,
+                        &settlement.network,
+                        escrowed,
+                    );
+                }
+            }
             match batch.settlement_header(&settlement) {
                 Ok((name, value)) => Some((
                     HeaderName::from_bytes(name.as_bytes()).ok()?,
@@ -2145,7 +2202,7 @@ mod tests {
             None => return,
         };
 
-        let resp = batch_replay_response(&batch, &settlement);
+        let resp = batch_replay_response(&batch, &settlement, None);
 
         assert_eq!(
             resp.status,
@@ -2171,6 +2228,38 @@ mod tests {
         assert_eq!(parsed["extra"]["commitmentId"], "chan:5000");
         // And the client is told the body is not the resource.
         assert_eq!(header("payment-replay").as_deref(), Some("true"));
+    }
+
+    #[test]
+    fn a_replayed_batch_authorization_restores_the_cached_resource() {
+        use pay_kit::core::store::CachedUpstreamResponse;
+        use pay_kit::x402::batch_settlement::BatchSettlementResponse;
+
+        let Some(batch) = test_batch_handler() else {
+            return;
+        };
+        let settlement = BatchSettlementResponse {
+            success: true,
+            error_reason: None,
+            payer: None,
+            transaction: String::new(),
+            network: "solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1".to_string(),
+            amount: "1".to_string(),
+            extra: None,
+        };
+        let cached = CachedUpstreamResponse {
+            status: 201,
+            content_type: Some("application/json".to_string()),
+            body: br#"{"result":42}"#.to_vec(),
+        };
+
+        let resp = batch_replay_response(&batch, &settlement, Some(&cached));
+
+        assert_eq!(resp.status, StatusCode::CREATED);
+        assert_eq!(resp.body, Bytes::from_static(br#"{"result":42}"#));
+        assert!(resp.headers.iter().any(|(name, value)| {
+            name == header::CONTENT_TYPE && value == HeaderValue::from_static("application/json")
+        }));
     }
 
     /// A batch handler over an in-memory store, or `None` when this build

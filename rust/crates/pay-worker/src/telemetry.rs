@@ -29,6 +29,7 @@ impl Drop for TelemetryGuard {
 
 #[derive(Debug, Default)]
 pub struct SettleSessionsMetrics {
+    pub scheme: &'static str,
     pub outcome: &'static str,
     pub channels_scanned: usize,
     pub watermark_planned: usize,
@@ -48,6 +49,10 @@ pub struct SettleSessionsMetrics {
     pub redis_chain_mismatches: usize,
     pub lease_contended: usize,
     pub duration_seconds: f64,
+    pub claims: usize,
+    pub payouts: usize,
+    pub closes_finalized: usize,
+    pub reclaims: usize,
 }
 
 pub fn init(service_name: &str) -> TelemetryGuard {
@@ -84,6 +89,27 @@ pub fn init(service_name: &str) -> TelemetryGuard {
 }
 
 pub fn record_settle_sessions(metrics: &SettleSessionsMetrics) {
+    tracing::info!(
+        gauge.pay_jobs_settle_channels_runs = 1_u64,
+        gauge.pay_jobs_settle_channels_duration_seconds = metrics.duration_seconds,
+        gauge.pay_jobs_settle_channels_channels_scanned = metrics.channels_scanned as u64,
+        gauge.pay_jobs_settle_channels_transactions = metrics.transactions as u64,
+        gauge.pay_jobs_settle_channels_failures = metrics.failures as u64,
+        gauge.pay_jobs_settle_channels_claim_channels = metrics.claims as u64,
+        gauge.pay_jobs_settle_channels_payout_channels = metrics.payouts as u64,
+        gauge.pay_jobs_settle_channels_close_channels = metrics.closes_finalized as u64,
+        gauge.pay_jobs_settle_channels_reclaim_channels = metrics.reclaims as u64,
+        scheme = metrics.scheme,
+        outcome = metrics.outcome,
+        metric_group = "pay_jobs_settle_channels",
+        "payment-channel lifecycle metrics",
+    );
+
+    // Preserve the existing session instruments while dashboards migrate to
+    // the scheme-labelled, channel-generic metrics above.
+    if metrics.scheme != "mpp/session" {
+        return;
+    }
     tracing::info!(
         gauge.pay_jobs_settle_sessions_runs = 1_u64,
         gauge.pay_jobs_settle_sessions_duration_seconds = metrics.duration_seconds,
@@ -122,6 +148,20 @@ pub fn record_settle_sessions(metrics: &SettleSessionsMetrics) {
 /// The channel id is intentionally a metric attribute: Grafana joins this
 /// worker-side watermark to the proxy's latest accepted voucher watermark.
 pub fn record_settle_sessions_channel_settled(channel_id: &str, settled_base_units: u64) {
+    record_channel_settled("mpp/session", channel_id, settled_base_units);
+}
+
+pub fn record_channel_settled(scheme: &str, channel_id: &str, settled_base_units: u64) {
+    tracing::info!(
+        gauge.pay_jobs_settle_channels_channel_settled_base_units = settled_base_units,
+        channel_id,
+        scheme,
+        metric_group = "pay_jobs_settle_channels",
+        "payment-channel watermark",
+    );
+    if scheme != "mpp/session" {
+        return;
+    }
     tracing::info!(
         gauge.pay_jobs_settle_sessions_channel_settled_base_units = settled_base_units,
         channel_id,
@@ -133,6 +173,20 @@ pub fn record_settle_sessions_channel_settled(channel_id: &str, settled_base_uni
 /// Record the authoritative on-chain distributed payout watermark for one
 /// supported stablecoin channel.
 pub fn record_settle_sessions_channel_distributed(channel_id: &str, distributed_base_units: u64) {
+    record_channel_distributed("mpp/session", channel_id, distributed_base_units);
+}
+
+pub fn record_channel_distributed(scheme: &str, channel_id: &str, distributed_base_units: u64) {
+    tracing::info!(
+        gauge.pay_jobs_settle_channels_channel_distributed_base_units = distributed_base_units,
+        channel_id,
+        scheme,
+        metric_group = "pay_jobs_settle_channels",
+        "payment-channel payout watermark",
+    );
+    if scheme != "mpp/session" {
+        return;
+    }
     tracing::info!(
         gauge.pay_jobs_settle_sessions_channel_distributed_base_units = distributed_base_units,
         channel_id,
@@ -143,6 +197,20 @@ pub fn record_settle_sessions_channel_distributed(channel_id: &str, distributed_
 
 /// Record whether a channel still holds escrowed funds on-chain.
 pub fn record_settle_sessions_channel_escrow_active(channel_id: &str, active: bool) {
+    record_channel_escrow_active("mpp/session", channel_id, active);
+}
+
+pub fn record_channel_escrow_active(scheme: &str, channel_id: &str, active: bool) {
+    tracing::info!(
+        gauge.pay_jobs_settle_channels_channel_escrow_active = u64::from(active),
+        channel_id,
+        scheme,
+        metric_group = "pay_jobs_settle_channels",
+        "payment-channel escrow state",
+    );
+    if scheme != "mpp/session" {
+        return;
+    }
     tracing::info!(
         gauge.pay_jobs_settle_sessions_channel_escrow_active = u64::from(active),
         channel_id,

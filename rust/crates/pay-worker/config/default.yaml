@@ -20,10 +20,10 @@ networks:
   sandbox:
     rpc_url: "https://402.surfnet.dev"
 
-# Owner of the treasury ATA the payment-channels program pays protocol fees to.
-# Mainnet value baked into the deployed program. Overridable per-network via
-# JOBS_TREASURY_OWNER for non-mainnet deployments.
-treasury_owner: "Cs2zdfUNonRdRGsiZUQQLdTxzxVvJZmgiX2mpLYKuEqP"
+# Optional owner override for a custom payment-channels deployment. Empty uses
+# pay-kit's cluster-specific deployed-program owner. Devnet and mainnet have
+# different baked-in owners.
+treasury_owner: ""
 
 # Per-RPC-call timeout (ms).
 rpc_timeout_ms: 15000

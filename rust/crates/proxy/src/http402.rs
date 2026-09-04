@@ -876,6 +876,17 @@ impl<S: PaymentState> ProxyHttp for Http402Gate<S> {
                 ctx.logged_payment_headers.push((name, value));
             }
         }
+        // Batch authorization is also post-response. Unlike `upto`, its hot
+        // path commits only Redis state; on-chain claim/distribution belongs
+        // to pay-worker. This must happen here (before headers are sent) so a
+        // successful proxied response cannot drop its reservation uncharged.
+        if let Some(pending) = ctx.batch.take() {
+            let served_ok = upstream_response.status.is_success();
+            if let Some((name, value)) = settle_batch(&self.state, pending, served_ok).await {
+                let _ = upstream_response.insert_header(name.clone(), value.clone());
+                ctx.logged_payment_headers.push((name, value));
+            }
+        }
         Ok(())
     }
 

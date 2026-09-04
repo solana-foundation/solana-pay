@@ -22,6 +22,7 @@ base64 = "0.22"
 axum = { workspace = true }
 bs58 = "0.5"
 figment = { workspace = true, features = ["yaml"] }
+futures = "0.3"
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = "0.10"
