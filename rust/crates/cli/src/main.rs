@@ -150,6 +150,33 @@ fn main() {
     let otlp_sidecar = command.otlp_sidecar().map(str::to_owned);
     let _otel_guard = init_logging(config.log_format, opts.verbose, otlp_sidecar.as_deref());
 
+    #[cfg(feature = "profiling")]
+    let profiler = std::env::var("PAY_PYROSCOPE_URL").ok().and_then(|url| {
+        use pyroscope::PyroscopeAgent;
+        use pyroscope_pprofrs::{PprofConfig, pprof_backend};
+
+        let agent = match PyroscopeAgent::builder(url.as_str(), "pay-gateway")
+            .backend(pprof_backend(PprofConfig::new().sample_rate(100)))
+            .build()
+        {
+            Ok(agent) => agent,
+            Err(error) => {
+                tracing::warn!(%error, "failed to configure Pyroscope profiler");
+                return None;
+            }
+        };
+        match agent.start() {
+            Ok(agent) => {
+                tracing::info!(%url, service = "pay-gateway", "Pyroscope profiling enabled");
+                Some(agent)
+            }
+            Err(error) => {
+                tracing::warn!(%error, "failed to start Pyroscope profiler");
+                None
+            }
+        }
+    });
+
     // ── Debugger proxy ─────────────────────────────────────────────────────
     //
     // When `--debugger` is set, spin up a forward proxy + PDB on port 1402
@@ -327,7 +354,7 @@ fn main() {
         }
     }
 
-    if let Err(err) = command.execute(
+    let result = command.execute(
         auto_pay,
         output_fmt,
         opts.yolo_upto,
@@ -337,7 +364,14 @@ fn main() {
         verbose,
         sandbox_mode,
         opts.alt,
-    ) {
+    );
+    #[cfg(feature = "profiling")]
+    if let Some(running) = profiler
+        && let Ok(ready) = running.stop()
+    {
+        ready.shutdown();
+    }
+    if let Err(err) = result {
         if no_dna::should_json(output_fmt) {
             output::error_json(&err.to_string());
         } else {
