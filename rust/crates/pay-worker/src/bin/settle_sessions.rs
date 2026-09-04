@@ -5,7 +5,7 @@
 //! delegating batch claim, payout, forced-close finalization, and rent reclaim
 //! to pay-kit's scheme implementation.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -925,15 +925,78 @@ async fn run_batch(runtime: &SettlementRuntime) -> Result<SettleSessionsMetrics,
         }
         due_channels.push(state);
     }
-    let reconciliations = stream::iter(due_channels.into_iter().map(|state| {
+    let channel_batches = due_channels
+        .chunks(100)
+        .map(<[ChannelState]>::to_vec)
+        .collect::<Vec<_>>();
+    let fetched_batches = stream::iter(channel_batches.into_iter().map(|states| async move {
+        let count = states.len();
+        let fetched = async {
+            let addresses = states
+                .iter()
+                .map(|state| {
+                    Pubkey::from_str(&state.channel_id)
+                        .map_err(|_| JobError::InvalidAddress(state.channel_id.clone()))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let channels =
+                channel::fetch_channels(&runtime.rpc, &runtime.rpc_url, &addresses).await?;
+            Ok::<_, JobError>(states.into_iter().zip(channels).collect::<Vec<_>>())
+        }
+        .await;
+        (count, fetched)
+    }))
+    // Each request reads 100 accounts. A smaller request-level fanout avoids
+    // overwhelming RPC providers while still keeping the account scan broad.
+    .buffer_unordered(batch.reconciliation_concurrency.clamp(1, 32))
+    .collect::<Vec<_>>()
+    .await;
+    let mut fetched_channels = Vec::with_capacity(metrics.channels_scanned);
+    for (batch_size, fetched_batch) in fetched_batches {
+        match fetched_batch {
+            Ok(channels) => fetched_channels.extend(channels),
+            Err(error) => {
+                metrics.failures += batch_size;
+                metrics.skipped += batch_size;
+                warn!(%error, "batch channel account fetch failed; skipping batch");
+            }
+        }
+    }
+
+    let mints = fetched_channels
+        .iter()
+        .filter_map(|(_, channel)| channel.as_ref().map(channel::DecodedChannel::mint))
+        .collect::<HashSet<_>>();
+    let resolved_token_programs = stream::iter(mints.into_iter().map(|mint| async move {
+        (
+            mint,
+            channel::resolve_token_program(&runtime.rpc, &runtime.rpc_url, &mint).await,
+        )
+    }))
+    .buffer_unordered(8)
+    .collect::<Vec<_>>()
+    .await;
+    let mut token_programs = HashMap::new();
+    for (mint, resolved) in resolved_token_programs {
+        match resolved {
+            Ok(token_program) => {
+                token_programs.insert(mint, token_program);
+            }
+            Err(error) => warn!(%mint, %error, "failed to resolve batch channel token program"),
+        }
+    }
+
+    let reconciliations = stream::iter(fetched_channels.into_iter().map(|(state, onchain)| {
         reconcile_batch_channel(
             &runtime.rpc,
             &runtime.rpc_url,
             state,
+            onchain,
             now,
             current_slot,
             &runtime.operator,
             &runtime.treasury_owner,
+            &token_programs,
         )
     }))
     .buffer_unordered(batch.reconciliation_concurrency)
@@ -1463,15 +1526,15 @@ async fn reconcile_batch_channel(
     rpc: &RpcClient,
     rpc_url: &str,
     state: ChannelState,
+    onchain: Option<channel::DecodedChannel>,
     now: i64,
     current_slot: u64,
     operator: &Pubkey,
     treasury_owner: &Pubkey,
+    token_programs: &HashMap<Pubkey, Pubkey>,
 ) -> Result<BatchReconcileResult, JobError> {
     let state_channel_id = state.channel_id.clone();
-    let channel_id = Pubkey::from_str(&state.channel_id)
-        .map_err(|_| JobError::InvalidAddress(state.channel_id.clone()))?;
-    let Some(onchain) = channel::fetch_channel(rpc, rpc_url, &channel_id).await? else {
+    let Some(onchain) = onchain else {
         return Ok(BatchReconcileResult {
             channel_id: state_channel_id,
             candidate: None,
@@ -1483,6 +1546,7 @@ async fn reconcile_batch_channel(
             observed_settled_on_chain: None,
         });
     };
+    let channel_id = onchain.address;
     if onchain.payee() != *operator || onchain.rent_payer() != *operator {
         return Err(JobError::Config(format!(
             "batch channel {} lifecycle authority differs from worker {operator}",
@@ -1559,8 +1623,15 @@ async fn reconcile_batch_channel(
                     observed_settled_on_chain: Some(onchain.channel.settlement.settled),
                 });
             }
-            let token_program =
-                channel::resolve_token_program(rpc, rpc_url, &onchain.mint()).await?;
+            let token_program = token_programs
+                .get(&onchain.mint())
+                .copied()
+                .ok_or_else(|| {
+                    JobError::TxBuild(format!(
+                        "token program unavailable for batch channel mint {}",
+                        onchain.mint()
+                    ))
+                })?;
             let preimage = channel::recover_distribution_preimage(rpc, rpc_url, &onchain).await?;
             instructions.push(
                 channel::build_distribute_ix(&onchain, treasury_owner, &token_program, &preimage).0,
@@ -1581,8 +1652,15 @@ async fn reconcile_batch_channel(
         }
         STATUS_CLOSING if now >= onchain.close_deadline() => {
             instructions.push(channel::build_seal_ix(&channel_id));
-            let token_program =
-                channel::resolve_token_program(rpc, rpc_url, &onchain.mint()).await?;
+            let token_program = token_programs
+                .get(&onchain.mint())
+                .copied()
+                .ok_or_else(|| {
+                    JobError::TxBuild(format!(
+                        "token program unavailable for batch channel mint {}",
+                        onchain.mint()
+                    ))
+                })?;
             let preimage = channel::recover_distribution_preimage(rpc, rpc_url, &onchain).await?;
             instructions.push(
                 channel::build_distribute_ix(&onchain, treasury_owner, &token_program, &preimage).0,
@@ -1602,8 +1680,15 @@ async fn reconcile_batch_channel(
             )
         }
         STATUS_SEALED => {
-            let token_program =
-                channel::resolve_token_program(rpc, rpc_url, &onchain.mint()).await?;
+            let token_program = token_programs
+                .get(&onchain.mint())
+                .copied()
+                .ok_or_else(|| {
+                    JobError::TxBuild(format!(
+                        "token program unavailable for batch channel mint {}",
+                        onchain.mint()
+                    ))
+                })?;
             let preimage = channel::recover_distribution_preimage(rpc, rpc_url, &onchain).await?;
             instructions.push(
                 channel::build_distribute_ix(&onchain, treasury_owner, &token_program, &preimage).0,

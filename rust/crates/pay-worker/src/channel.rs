@@ -134,25 +134,51 @@ pub async fn fetch_channel(
     rpc_url: &str,
     address: &Pubkey,
 ) -> Result<Option<DecodedChannel>, JobError> {
+    Ok(fetch_channels(rpc, rpc_url, &[*address])
+        .await?
+        .into_iter()
+        .next()
+        .flatten())
+}
+
+/// Fetch and decode up to 100 channels with one `getMultipleAccounts` call.
+///
+/// Solana RPC accepts 100 addresses per request. Settlement workers should use
+/// this instead of issuing one HTTP request per stored channel.
+pub async fn fetch_channels(
+    rpc: &RpcClient,
+    rpc_url: &str,
+    addresses: &[Pubkey],
+) -> Result<Vec<Option<DecodedChannel>>, JobError> {
+    if addresses.len() > 100 {
+        return Err(JobError::TxBuild(format!(
+            "channel account batch has {} addresses; maximum is 100",
+            addresses.len()
+        )));
+    }
     let program_id = default_program_id();
     let accounts = rpc
-        .get_multiple_accounts_with_owner(rpc_url, &[address.to_string()])
+        .get_multiple_accounts_with_owner(
+            rpc_url,
+            &addresses
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+        )
         .await?;
-    let Some(account) = accounts.into_iter().next().flatten() else {
-        return Ok(None);
-    };
-    if account.owner != program_id.to_string() {
-        return Ok(None);
-    }
-    // Tombstoned / closed channels are a different (short) account shape; the
-    // borsh decode fails cleanly and we treat them as "not a live channel".
-    match Channel::from_bytes(&account.data) {
-        Ok(channel) => Ok(Some(DecodedChannel {
-            address: *address,
-            channel,
-        })),
-        Err(_) => Ok(None),
-    }
+    Ok(addresses
+        .iter()
+        .copied()
+        .zip(accounts)
+        .map(|(address, account)| {
+            let account = account.filter(|account| account.owner == program_id.to_string())?;
+            // Tombstoned / closed channels are a different (short) account
+            // shape; a decode failure means this is not a live channel.
+            Channel::from_bytes(&account.data)
+                .ok()
+                .map(|channel| DecodedChannel { address, channel })
+        })
+        .collect())
 }
 
 /// The recovered distribution preimage: the raw `count || entries` bytes that
@@ -180,6 +206,16 @@ pub async fn recover_distribution_preimage(
     rpc_url: &str,
     channel: &DecodedChannel,
 ) -> Result<DistributionPreimage, JobError> {
+    // Empty distribution plans are by far the common case and their preimage
+    // is canonical. Avoid two historical RPC reads per channel when the hash
+    // itself proves that this is the correct preimage.
+    const EMPTY_PREIMAGE: [u8; 4] = [0; 4];
+    if Sha256::digest(EMPTY_PREIMAGE).as_slice() == channel.channel.distribution_hash {
+        return Ok(DistributionPreimage {
+            preimage_bytes: EMPTY_PREIMAGE.to_vec(),
+            recipients: Vec::new(),
+        });
+    }
     let open_sig = find_open_signature(rpc, rpc_url, &channel.address).await?;
     let tx_b64 = rpc
         .get_transaction_base64(rpc_url, &open_sig)
