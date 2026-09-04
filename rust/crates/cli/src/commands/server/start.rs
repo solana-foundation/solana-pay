@@ -38,6 +38,8 @@ const DEFAULT_X402_SETTLEMENT_MAX_IDLE_SECONDS: u64 = 300;
 const DEFAULT_X402_RECONCILIATION_STARTUP_DELAY_SECONDS: u64 = 0;
 const DEFAULT_X402_RECONCILIATION_CONCURRENCY: usize = 64;
 const DEFAULT_X402_RECONCILIATION_MAX_PER_CYCLE: usize = 4_096;
+const DEFAULT_X402_SETTLEMENT_CONFIRMATION_TIMEOUT_SECONDS: u64 = 90;
+const DEFAULT_X402_VALUE_METRICS_INTERVAL_SECONDS: u64 = 15;
 const X402_RECONCILIATION_CHUNK_SIZE: usize = 100;
 const BROWSER_RPC_ALLOWED_METHODS: &[&str] = &[
     "getLatestBlockhash",
@@ -178,6 +180,8 @@ struct BatchLifecycleConfig {
     max_idle: Duration,
     concurrency: usize,
     max_per_cycle: usize,
+    confirmation_timeout: Duration,
+    value_metrics_interval: Duration,
 }
 
 fn env_u64(name: &str, default: u64) -> pay_core::Result<u64> {
@@ -228,6 +232,14 @@ fn batch_lifecycle_config() -> pay_core::Result<BatchLifecycleConfig> {
         )?),
         concurrency: usize::try_from(concurrency).unwrap_or(usize::MAX),
         max_per_cycle: usize::try_from(max_per_cycle).unwrap_or(usize::MAX),
+        confirmation_timeout: Duration::from_secs(positive_env_u64(
+            "PAY_X402_SETTLEMENT_CONFIRMATION_TIMEOUT_SECONDS",
+            DEFAULT_X402_SETTLEMENT_CONFIRMATION_TIMEOUT_SECONDS,
+        )?),
+        value_metrics_interval: Duration::from_secs(positive_env_u64(
+            "PAY_X402_VALUE_METRICS_INTERVAL_SECONDS",
+            DEFAULT_X402_VALUE_METRICS_INTERVAL_SECONDS,
+        )?),
     })
 }
 
@@ -306,6 +318,72 @@ impl BatchValueInventory {
             .saturating_sub(previous.distributed)
             .saturating_add(snapshot.distributed);
     }
+}
+
+fn record_batch_value_inventory(inventory: &BatchValueInventory) {
+    tracing::info!(
+        gauge.pay_x402_batch_value_escrowed_base_units = inventory.totals.escrowed,
+        gauge.pay_x402_batch_value_authorized_base_units = inventory.totals.authorized,
+        gauge.pay_x402_batch_value_settled_base_units = inventory.totals.settled,
+        gauge.pay_x402_batch_value_distributed_base_units = inventory.totals.distributed,
+        protocol = "x402/batch",
+        metric_group = "pay_x402_batch_value",
+        "embedded x402 batch-settlement value inventory"
+    );
+}
+
+async fn collect_batch_value_inventory(
+    batch: &pay_kit::x402::server::X402BatchSettlement,
+) -> Result<BatchValueInventory, String> {
+    let channel_ids = batch
+        .store()
+        .list_channel_ids()
+        .await
+        .map_err(|error| error.to_string())?;
+    let totals = Arc::new(Mutex::new(BatchChannelValueSnapshot::default()));
+    for channel_id in channel_ids {
+        let out = Arc::clone(&totals);
+        batch
+            .store()
+            .read_channel(
+                &channel_id,
+                Box::new(move |state| {
+                    if let Some(state) = state {
+                        let snapshot = BatchChannelValueSnapshot::from_state(state);
+                        let mut totals = out.lock().unwrap_or_else(|error| error.into_inner());
+                        totals.escrowed = totals.escrowed.saturating_add(snapshot.escrowed);
+                        totals.authorized = totals.authorized.saturating_add(snapshot.authorized);
+                        totals.settled = totals.settled.saturating_add(snapshot.settled);
+                        totals.distributed =
+                            totals.distributed.saturating_add(snapshot.distributed);
+                    }
+                    Ok(())
+                }),
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+    }
+    let totals = *totals.lock().unwrap_or_else(|error| error.into_inner());
+    Ok(BatchValueInventory {
+        channels: HashMap::new(),
+        totals,
+    })
+}
+
+fn spawn_batch_value_metrics(batch: pay_kit::x402::server::X402BatchSettlement, period: Duration) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(period);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            interval.tick().await;
+            match collect_batch_value_inventory(&batch).await {
+                Ok(inventory) => record_batch_value_inventory(&inventory),
+                Err(error) => {
+                    tracing::warn!(%error, "failed to collect embedded batch value inventory")
+                }
+            }
+        }
+    });
 }
 
 async fn run_batch_lifecycle_chunks(
@@ -428,6 +506,29 @@ fn spawn_batch_lifecycle(
                 }
             }
             let due_count = due.len();
+            let lifecycle_channels = due
+                .iter()
+                .chain(&closing)
+                .chain(&sealed)
+                .cloned()
+                .collect::<Vec<_>>();
+            // Publish the scan immediately. A 100k-channel redemption can take
+            // minutes; dashboards must distinguish an active sweep from a
+            // worker that never started.
+            tracing::info!(
+                gauge.pay_x402_batch_lifecycle_last_run_unixtime = now,
+                gauge.pay_x402_batch_lifecycle_channels_available = channels_available as u64,
+                gauge.pay_x402_batch_lifecycle_channels_scanned = channels_scanned as u64,
+                gauge.pay_x402_batch_lifecycle_channels_due = due_count as u64,
+                gauge.pay_x402_batch_lifecycle_channels_closing = closing.len() as u64,
+                gauge.pay_x402_batch_lifecycle_channels_reclaimable = sealed.len() as u64,
+                gauge.pay_x402_batch_lifecycle_failures = 0_u64,
+                protocol = "x402/batch",
+                outcome = "running",
+                metric_group = "pay_x402_batch_lifecycle",
+                "embedded x402 batch-settlement metrics"
+            );
+            record_batch_value_inventory(&value_inventory);
             let failures =
                 run_batch_lifecycle_chunks(&batch, due, config, BatchLifecycleAction::Settle).await;
             for error in &failures {
@@ -452,6 +553,32 @@ fn spawn_batch_lifecycle(
                 tracing::warn!(%error, "embedded batch rent-reclaim chunk failed");
             }
             let failure_count = failures.len() + close_failures.len() + reclaim_failures.len();
+            // Lifecycle operations update the in-memory watermarks. Refresh
+            // affected snapshots so the completion event reflects this sweep,
+            // rather than the state observed before it began.
+            for channel_id in lifecycle_channels {
+                let snapshot = Arc::new(Mutex::new(None));
+                let out = Arc::clone(&snapshot);
+                if batch
+                    .store()
+                    .read_channel(
+                        &channel_id,
+                        Box::new(move |state| {
+                            *out.lock().unwrap_or_else(|error| error.into_inner()) =
+                                state.map(BatchChannelValueSnapshot::from_state);
+                            Ok(())
+                        }),
+                    )
+                    .await
+                    .is_ok()
+                    && let Some(snapshot) = snapshot
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .take()
+                {
+                    value_inventory.observe(channel_id, snapshot);
+                }
+            }
             let outcome = if failure_count == 0 {
                 "succeeded"
             } else {
@@ -472,17 +599,7 @@ fn spawn_batch_lifecycle(
                 metric_group = "pay_x402_batch_lifecycle",
                 "embedded x402 batch-settlement metrics"
             );
-            tracing::info!(
-                gauge.pay_x402_batch_value_escrowed_base_units = value_inventory.totals.escrowed,
-                gauge.pay_x402_batch_value_authorized_base_units =
-                    value_inventory.totals.authorized,
-                gauge.pay_x402_batch_value_settled_base_units = value_inventory.totals.settled,
-                gauge.pay_x402_batch_value_distributed_base_units =
-                    value_inventory.totals.distributed,
-                protocol = "x402/batch",
-                metric_group = "pay_x402_batch_value",
-                "embedded x402 batch-settlement value inventory"
-            );
+            record_batch_value_inventory(&value_inventory);
             tracing::info!(
                 channels_available,
                 channels_scanned,
@@ -2039,10 +2156,20 @@ impl StartCommand {
                         .unwrap_or(30),
                     };
                     match pay_kit::x402::server::X402BatchSettlement::with_store(cfg, batch_store) {
-                        Ok(b) => {
+                        Ok(mut b) => {
                             match batch_lifecycle_reconciliation(durable_batch_store) {
                                 BatchLifecycleReconciliation::Embedded => {
                                     let lifecycle_config = batch_lifecycle_config()?;
+                                    let mut pipeline_config =
+                                        pay_kit::core::tx_pipeline::TxPipelineConfig::default();
+                                    pipeline_config.confirmation_timeout =
+                                        lifecycle_config.confirmation_timeout;
+                                    b = b.with_tx_pipeline(
+                                        pay_kit::core::tx_pipeline::TxPipeline::new(
+                                            rpc_url.clone(),
+                                            pipeline_config,
+                                        ),
+                                    );
                                     tracing::info!(
                                         interval_seconds = lifecycle_config.interval.as_secs(),
                                         startup_delay_seconds =
@@ -2051,7 +2178,15 @@ impl StartCommand {
                                         max_idle_seconds = lifecycle_config.max_idle.as_secs(),
                                         concurrency = lifecycle_config.concurrency,
                                         max_per_cycle = lifecycle_config.max_per_cycle,
+                                        confirmation_timeout_seconds =
+                                            lifecycle_config.confirmation_timeout.as_secs(),
+                                        value_metrics_interval_seconds =
+                                            lifecycle_config.value_metrics_interval.as_secs(),
                                         "gateway owns x402 batch-settlement reconciliation"
+                                    );
+                                    spawn_batch_value_metrics(
+                                        b.clone(),
+                                        lifecycle_config.value_metrics_interval,
                                     );
                                     spawn_batch_lifecycle(b.clone(), lifecycle_config);
                                 }
