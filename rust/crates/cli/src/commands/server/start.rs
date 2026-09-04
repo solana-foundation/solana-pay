@@ -1,5 +1,6 @@
 //! `pay gate api` — start a payment gateway proxy.
 
+use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -240,6 +241,62 @@ enum BatchLifecycleAction {
     Reclaim,
 }
 
+#[derive(Clone, Copy, Default)]
+struct BatchChannelValueSnapshot {
+    escrowed: u64,
+    authorized: u64,
+    settled: u64,
+    distributed: u64,
+}
+
+impl BatchChannelValueSnapshot {
+    fn from_state(state: &pay_kit::mpp::store::ChannelState) -> Self {
+        Self {
+            escrowed: if state.sealed { 0 } else { state.deposit },
+            authorized: state.cumulative.saturating_sub(state.settled_on_chain),
+            settled: state
+                .settled_on_chain
+                .saturating_sub(state.distributed_on_chain),
+            distributed: state.distributed_on_chain,
+        }
+    }
+}
+
+#[derive(Default)]
+struct BatchValueInventory {
+    channels: HashMap<String, BatchChannelValueSnapshot>,
+    totals: BatchChannelValueSnapshot,
+}
+
+impl BatchValueInventory {
+    fn observe(&mut self, channel_id: String, snapshot: BatchChannelValueSnapshot) {
+        let previous = self
+            .channels
+            .insert(channel_id, snapshot)
+            .unwrap_or_default();
+        self.totals.escrowed = self
+            .totals
+            .escrowed
+            .saturating_sub(previous.escrowed)
+            .saturating_add(snapshot.escrowed);
+        self.totals.authorized = self
+            .totals
+            .authorized
+            .saturating_sub(previous.authorized)
+            .saturating_add(snapshot.authorized);
+        self.totals.settled = self
+            .totals
+            .settled
+            .saturating_sub(previous.settled)
+            .saturating_add(snapshot.settled);
+        self.totals.distributed = self
+            .totals
+            .distributed
+            .saturating_sub(previous.distributed)
+            .saturating_add(snapshot.distributed);
+    }
+}
+
 async fn run_batch_lifecycle_chunks(
     batch: &pay_kit::x402::server::X402BatchSettlement,
     channel_ids: Vec<String>,
@@ -284,6 +341,7 @@ fn spawn_batch_lifecycle(
         // make the first full store snapshot part of gateway startup.
         interval.tick().await;
         let mut cursor = 0usize;
+        let mut value_inventory = BatchValueInventory::default();
         loop {
             interval.tick().await;
             let started = Instant::now();
@@ -326,6 +384,7 @@ fn spawn_batch_lifecycle(
                                             && state.close_requested_at.is_some()
                                             && state.pending_setup.is_none(),
                                         state.sealed && state.pending_setup.is_none(),
+                                        BatchChannelValueSnapshot::from_state(state),
                                     )
                                 });
                             Ok(())
@@ -341,9 +400,16 @@ fn spawn_batch_lifecycle(
                     .unwrap_or_else(|error| error.into_inner())
                     .take();
                 match classification {
-                    Some((true, _, _)) => due.push(channel_id),
-                    Some((_, true, _)) => closing.push(channel_id),
-                    Some((_, _, true)) => sealed.push(channel_id),
+                    Some((is_due, is_closing, is_sealed, snapshot)) => {
+                        value_inventory.observe(channel_id.clone(), snapshot);
+                        if is_due {
+                            due.push(channel_id);
+                        } else if is_closing {
+                            closing.push(channel_id);
+                        } else if is_sealed {
+                            sealed.push(channel_id);
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -371,14 +437,41 @@ fn spawn_batch_lifecycle(
             for error in &reclaim_failures {
                 tracing::warn!(%error, "embedded batch rent-reclaim chunk failed");
             }
+            let failure_count = failures.len() + close_failures.len() + reclaim_failures.len();
+            let outcome = if failure_count == 0 {
+                "succeeded"
+            } else {
+                "failed"
+            };
+            let duration_seconds = started.elapsed().as_secs_f64();
+            tracing::info!(
+                gauge.pay_x402_batch_lifecycle_last_run_unixtime = now,
+                gauge.pay_x402_batch_lifecycle_channels_available = channels_available as u64,
+                gauge.pay_x402_batch_lifecycle_channels_scanned = channels_scanned as u64,
+                gauge.pay_x402_batch_lifecycle_channels_due = due_count as u64,
+                gauge.pay_x402_batch_lifecycle_channels_closing = close_count as u64,
+                gauge.pay_x402_batch_lifecycle_channels_reclaimable = reclaim_count as u64,
+                gauge.pay_x402_batch_lifecycle_failures = failure_count as u64,
+                histogram.pay_x402_batch_lifecycle_duration_seconds = duration_seconds,
+                gauge.pay_x402_batch_value_escrowed_base_units = value_inventory.totals.escrowed,
+                gauge.pay_x402_batch_value_authorized_base_units =
+                    value_inventory.totals.authorized,
+                gauge.pay_x402_batch_value_settled_base_units = value_inventory.totals.settled,
+                gauge.pay_x402_batch_value_distributed_base_units =
+                    value_inventory.totals.distributed,
+                protocol = "x402/batch",
+                outcome,
+                metric_group = "pay_x402_batch_lifecycle",
+                "embedded x402 batch-settlement metrics"
+            );
             tracing::info!(
                 channels_available,
                 channels_scanned,
                 channels_due = due_count,
                 channels_closing = close_count,
                 channels_reclaimable = reclaim_count,
-                failures = failures.len() + close_failures.len() + reclaim_failures.len(),
-                duration_seconds = started.elapsed().as_secs_f64(),
+                failures = failure_count,
+                duration_seconds,
                 "embedded x402 batch-settlement reconciliation completed"
             );
         }
@@ -3535,8 +3628,9 @@ mod tests {
         stable_token_account_requirements, surfpool_funding_targets, surfpool_prep_notice_body,
     };
     use super::{
-        BatchLifecycleReconciliation, batch_lifecycle_reconciliation, build_pdb_config,
-        default_bind, delegated_session_channel_payout, ensure_session_currencies_usd_pegged,
+        BatchChannelValueSnapshot, BatchLifecycleReconciliation, BatchValueInventory,
+        batch_lifecycle_reconciliation, build_pdb_config, default_bind,
+        delegated_session_channel_payout, ensure_session_currencies_usd_pegged,
         payout_recipient_pubkeys, payout_recipient_targets, resolve_operator_currencies,
         session_lifecycle_reconciliation, validate_browser_rpc_request, x402_currency_configs,
         x402_upto_beneficiary_pubkey, x402_upto_payout_for_recipient,
@@ -3568,6 +3662,35 @@ mod tests {
             batch_lifecycle_reconciliation(true),
             BatchLifecycleReconciliation::External
         );
+    }
+
+    #[test]
+    fn batch_value_inventory_replaces_a_channels_previous_snapshot() {
+        let mut inventory = BatchValueInventory::default();
+        inventory.observe(
+            "channel-a".to_string(),
+            BatchChannelValueSnapshot {
+                escrowed: 5_000_000,
+                authorized: 10_000,
+                settled: 0,
+                distributed: 0,
+            },
+        );
+        inventory.observe(
+            "channel-a".to_string(),
+            BatchChannelValueSnapshot {
+                escrowed: 5_000_000,
+                authorized: 0,
+                settled: 2_000,
+                distributed: 8_000,
+            },
+        );
+
+        assert_eq!(inventory.channels.len(), 1);
+        assert_eq!(inventory.totals.escrowed, 5_000_000);
+        assert_eq!(inventory.totals.authorized, 0);
+        assert_eq!(inventory.totals.settled, 2_000);
+        assert_eq!(inventory.totals.distributed, 8_000);
     }
 
     #[test]
