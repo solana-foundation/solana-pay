@@ -2250,6 +2250,7 @@ mod tests {
         let cached = CachedUpstreamResponse {
             status: 201,
             content_type: Some("application/json".to_string()),
+            headers: Vec::new(),
             body: br#"{"result":42}"#.to_vec(),
         };
 
