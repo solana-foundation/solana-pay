@@ -2177,7 +2177,7 @@ mod tests {
             processed_topup_signatures: vec![],
             next_delivery_sequence: 0,
             pending_deliveries: vec![],
-            committed_deliveries: vec![],
+            committed_deliveries: Default::default(),
             pending_setup: None,
             onchain_checked_at: 0,
             lifecycle: None,
