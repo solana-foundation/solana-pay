@@ -35,6 +35,7 @@ const DEFAULT_SERVER_BIND: &str = "0.0.0.0:1402";
 const DEFAULT_X402_SETTLEMENT_INTERVAL_SECONDS: u64 = 10;
 const DEFAULT_X402_SETTLEMENT_MIN_DELTA_BASE_UNITS: u64 = 10_000;
 const DEFAULT_X402_SETTLEMENT_MAX_IDLE_SECONDS: u64 = 300;
+const DEFAULT_X402_RECONCILIATION_STARTUP_DELAY_SECONDS: u64 = 0;
 const DEFAULT_X402_RECONCILIATION_CONCURRENCY: usize = 64;
 const DEFAULT_X402_RECONCILIATION_MAX_PER_CYCLE: usize = 4_096;
 const X402_RECONCILIATION_CHUNK_SIZE: usize = 100;
@@ -172,19 +173,25 @@ fn batch_lifecycle_reconciliation(durable_store: bool) -> BatchLifecycleReconcil
 #[derive(Clone, Copy)]
 struct BatchLifecycleConfig {
     interval: Duration,
+    startup_delay: Duration,
     min_delta_base_units: u64,
     max_idle: Duration,
     concurrency: usize,
     max_per_cycle: usize,
 }
 
-fn positive_env_u64(name: &str, default: u64) -> pay_core::Result<u64> {
+fn env_u64(name: &str, default: u64) -> pay_core::Result<u64> {
     let value = std::env::var(name)
         .ok()
         .map(|value| value.trim().parse::<u64>())
         .transpose()
         .map_err(|error| pay_core::Error::Config(format!("invalid {name}: {error}")))?
         .unwrap_or(default);
+    Ok(value)
+}
+
+fn positive_env_u64(name: &str, default: u64) -> pay_core::Result<u64> {
+    let value = env_u64(name, default)?;
     if value == 0 {
         return Err(pay_core::Error::Config(format!(
             "{name} must be greater than zero"
@@ -206,6 +213,10 @@ fn batch_lifecycle_config() -> pay_core::Result<BatchLifecycleConfig> {
         interval: Duration::from_secs(positive_env_u64(
             "PAY_X402_RECONCILIATION_INTERVAL_SECONDS",
             DEFAULT_X402_SETTLEMENT_INTERVAL_SECONDS,
+        )?),
+        startup_delay: Duration::from_secs(env_u64(
+            "PAY_X402_RECONCILIATION_STARTUP_DELAY_SECONDS",
+            DEFAULT_X402_RECONCILIATION_STARTUP_DELAY_SECONDS,
         )?),
         min_delta_base_units: positive_env_u64(
             "PAY_X402_SETTLEMENT_MIN_DELTA_BASE_UNITS",
@@ -335,6 +346,9 @@ fn spawn_batch_lifecycle(
     config: BatchLifecycleConfig,
 ) {
     tokio::spawn(async move {
+        if !config.startup_delay.is_zero() {
+            tokio::time::sleep(config.startup_delay).await;
+        }
         let mut interval = tokio::time::interval(config.interval);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         // Construction happens after provisioning-related startup work. Do not
@@ -2031,6 +2045,8 @@ impl StartCommand {
                                     let lifecycle_config = batch_lifecycle_config()?;
                                     tracing::info!(
                                         interval_seconds = lifecycle_config.interval.as_secs(),
+                                        startup_delay_seconds =
+                                            lifecycle_config.startup_delay.as_secs(),
                                         min_delta_base_units = lifecycle_config.min_delta_base_units,
                                         max_idle_seconds = lifecycle_config.max_idle.as_secs(),
                                         concurrency = lifecycle_config.concurrency,
