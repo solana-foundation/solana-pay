@@ -1610,6 +1610,12 @@ impl SessionMpp {
             self.network(),
             accepted.cumulative,
         );
+        telemetry::record_payment_channel_voucher_accepted_for_protocol(
+            "mpp/session",
+            self.currency(),
+            self.network(),
+            accepted.charged,
+        );
         self.record_committed_watermark(channel_id.to_string(), accepted.cumulative);
         self.touch_channel(channel_id.to_string()).await?;
         Ok(DelegatedUsageAuthorization {
@@ -1881,18 +1887,24 @@ impl SessionMpp {
                 // instead of rejected as unknown.
                 self.ensure_channel_loaded(&p.voucher.data.channel_id)
                     .await?;
-                let cumulative = self
+                let acceptance = self
                     .server
                     .verify_voucher(p)
                     .await
-                    .map_err(|e| Error::PaymentRejected(e.to_string()))?
-                    .cumulative;
+                    .map_err(|e| Error::PaymentRejected(e.to_string()))?;
+                let cumulative = acceptance.cumulative;
                 let channel_id = p.voucher.data.channel_id.clone();
                 telemetry::record_payment_channel_voucher_cumulative(
                     &channel_id,
                     self.currency(),
                     self.network(),
                     cumulative,
+                );
+                telemetry::record_payment_channel_voucher_accepted_for_protocol(
+                    "mpp/session",
+                    self.currency(),
+                    self.network(),
+                    acceptance.charged,
                 );
                 self.record_committed_watermark(channel_id.clone(), cumulative);
                 self.touch_channel(channel_id.clone()).await?;

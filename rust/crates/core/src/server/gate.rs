@@ -1731,6 +1731,19 @@ pub async fn settle_batch<S: PaymentState>(
                         cumulative,
                     );
                 }
+                if let Some(charged) = settlement
+                    .extra
+                    .as_ref()
+                    .and_then(|extra| extra.charged_amount.as_deref())
+                    .and_then(|value| value.parse().ok())
+                {
+                    telemetry::record_payment_channel_voucher_accepted_for_protocol(
+                        "x402/batch",
+                        &currency,
+                        &settlement.network,
+                        charged,
+                    );
+                }
                 if opens_channel && let Ok(escrowed) = channel_state.balance.parse() {
                     telemetry::record_payment_channel_opened_for_protocol(
                         "x402/batch",

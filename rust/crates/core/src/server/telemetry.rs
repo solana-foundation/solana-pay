@@ -4,8 +4,8 @@
 //! When the CLI installs the OTLP subscriber, these become exported metrics.
 //! Without that subscriber they remain ordinary structured logs.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 
 use axum::http::StatusCode;
 use serde_json::json;
@@ -27,27 +27,39 @@ pub const METRIC_PAYMENT_CHANNEL_ESCROWED: &str = "pay_payment_channel_escrowed_
 pub const METRIC_PAYMENT_CHANNEL_CLIENT: &str = "pay_payment_channel_client";
 pub const METRIC_PAYMENT_CHANNEL_VOUCHER_CUMULATIVE: &str =
     "pay_payment_channel_voucher_cumulative_base_units";
+pub const METRIC_PAYMENT_CHANNEL_VOUCHER_ACCEPTED: &str =
+    "pay_payment_channel_voucher_accepted_base_units_total";
+
+static PER_CHANNEL_METRICS_ENABLED: OnceLock<bool> = OnceLock::new();
 
 /// Create the bounded session-lifecycle counter series before the server
 /// accepts traffic. The CLI force-flushes these zero values so Prometheus has
 /// a real baseline even when the first request opens a channel immediately.
 pub fn record_metric_baselines() {
-    tracing::info!(
-        monotonic_counter.pay_payment_channels_opened_total = 0_u64,
-        protocol = "mpp/session",
-        channel_kind = "payment_channel",
-        verification = "account_confirmed",
-        metric = METRIC_PAYMENT_CHANNELS_OPENED,
-        "payment-channel open confirmed",
-    );
-    for retryable in [true, false] {
+    for protocol in ["mpp/session", "x402/batch"] {
         tracing::info!(
-            monotonic_counter.pay_payment_settlement_errors_total = 0_u64,
-            protocol = "mpp/session",
-            retryable,
-            metric = METRIC_SETTLEMENT_ERRORS,
-            "payment settlement failed",
+            monotonic_counter.pay_payment_channels_opened_total = 0_u64,
+            protocol,
+            channel_kind = "payment_channel",
+            verification = "account_confirmed",
+            metric = METRIC_PAYMENT_CHANNELS_OPENED,
+            "payment-channel open confirmed",
         );
+        tracing::info!(
+            monotonic_counter.pay_payment_channel_voucher_accepted_base_units_total = 0_u64,
+            protocol,
+            metric = METRIC_PAYMENT_CHANNEL_VOUCHER_ACCEPTED,
+            "payment-channel voucher accepted",
+        );
+        for retryable in [true, false] {
+            tracing::info!(
+                monotonic_counter.pay_payment_settlement_errors_total = 0_u64,
+                protocol,
+                retryable,
+                metric = METRIC_SETTLEMENT_ERRORS,
+                "payment settlement failed",
+            );
+        }
     }
 }
 
@@ -507,6 +519,15 @@ pub fn record_payment_channel_voucher_cumulative_for_protocol(
     network: &str,
     cumulative: u64,
 ) {
+    // A synchronous OTel last-value gauge serializes every update for this
+    // instrument through one SDK value-map lock. At payment-channel rates that
+    // consumed roughly 40% of gateway CPU, while the collector dropped most of
+    // the per-channel series at its cardinality limit anyway. Keep the detailed
+    // gauge as an explicit diagnostic opt-in; aggregate accepted value uses the
+    // low-cardinality additive counter below.
+    if !per_channel_metrics_enabled() {
+        return;
+    }
     tracing::event!(
         target: "pay::metrics",
         tracing::Level::INFO,
@@ -518,6 +539,34 @@ pub fn record_payment_channel_voucher_cumulative_for_protocol(
         metric = METRIC_PAYMENT_CHANNEL_VOUCHER_CUMULATIVE,
         "payment-channel voucher persisted",
     );
+}
+
+pub fn record_payment_channel_voucher_accepted_for_protocol(
+    protocol: &str,
+    currency: &str,
+    network: &str,
+    amount: u64,
+) {
+    tracing::event!(
+        target: "pay::metrics",
+        tracing::Level::INFO,
+        monotonic_counter.pay_payment_channel_voucher_accepted_base_units_total = amount,
+        currency,
+        network,
+        protocol,
+        metric = METRIC_PAYMENT_CHANNEL_VOUCHER_ACCEPTED,
+        "payment-channel voucher accepted",
+    );
+}
+
+fn per_channel_metrics_enabled() -> bool {
+    *PER_CHANNEL_METRICS_ENABLED.get_or_init(|| {
+        std::env::var("PAY_OTEL_PER_CHANNEL_METRICS")
+            .ok()
+            .is_some_and(|value| {
+                matches!(value.to_ascii_lowercase().as_str(), "1" | "true" | "yes")
+            })
+    })
 }
 
 pub fn is_paid_request_success(status: StatusCode) -> bool {
