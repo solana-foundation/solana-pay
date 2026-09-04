@@ -20,6 +20,7 @@ use std::collections::{HashMap, VecDeque};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
@@ -282,6 +283,33 @@ async fn fetch_challenge(ctx: &UserCtx) -> Result<(StatusCode, Vec<(String, Stri
     Ok((status, headers, body))
 }
 
+async fn fetch_batch_requirements(ctx: &UserCtx) -> Result<BatchRequirements> {
+    const ATTEMPTS: usize = 3;
+    for attempt in 1..=ATTEMPTS {
+        match fetch_challenge(ctx).await {
+            Ok((status, headers, body)) => match parse_batch_challenge(status, &headers, &body) {
+                Ok(requirements) => return Ok(requirements),
+                Err(error) if status.is_server_error() && attempt < ATTEMPTS => {
+                    tracing::warn!(
+                        attempt,
+                        status = %status,
+                        "retrying transient batch challenge failure"
+                    );
+                    tokio::time::sleep(Duration::from_millis(50 * attempt as u64)).await;
+                    let _ = error;
+                }
+                Err(error) => return Err(error).context("provision: batch challenge"),
+            },
+            Err(error) if attempt < ATTEMPTS => {
+                tracing::warn!(attempt, %error, "retrying transient batch challenge transport failure");
+                tokio::time::sleep(Duration::from_millis(50 * attempt as u64)).await;
+            }
+            Err(error) => return Err(error).context("provision: batch challenge"),
+        }
+    }
+    unreachable!("the bounded challenge retry loop always returns on its final attempt")
+}
+
 fn parse_batch_challenge(
     status: StatusCode,
     headers: &[(String, String)],
@@ -428,9 +456,7 @@ impl BenchScheme for BatchSettlement {
         }
 
         // 1. Fresh batch-settlement 402 → priced requirements.
-        let (status, headers, body) = fetch_challenge(ctx).await?;
-        let requirements =
-            parse_batch_challenge(status, &headers, &body).context("provision: batch challenge")?;
+        let requirements = fetch_batch_requirements(ctx).await?;
         let base = requirements.amount().unwrap_or(self.voucher_base);
         let voucher_key = SigningKey::from_bytes(&ctx.wallet.seed());
         let payer = Pubkey::new_from_array(voucher_key.verifying_key().to_bytes());
