@@ -19,6 +19,7 @@ use pay_kit::core::settlement::worker::{RpcBroadcaster, SettlementConfig, spawn}
 use pay_kit::core::store::{
     ChannelState, ChannelStore, DEFAULT_FINALIZED_CHANNEL_RETENTION, RedisChannelStore, StoreError,
 };
+use pay_kit::core::tx_pipeline::{TxPipeline, TxPipelineConfig};
 use pay_kit::mpp::solana_keychain::SolanaSigner;
 use pay_worker::channel::{self, STATUS_CLOSING, STATUS_DISTRIBUTED, STATUS_OPEN, STATUS_SEALED};
 use pay_worker::config::Config;
@@ -26,6 +27,7 @@ use pay_worker::error::JobError;
 use pay_worker::signer::build_fee_payer_signer;
 use pay_worker::telemetry::{self, SettleSessionsMetrics};
 use solana_pubkey::Pubkey;
+use solana_signature::Signature;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
@@ -1020,9 +1022,10 @@ async fn run_batch(runtime: &SettlementRuntime) -> Result<SettleSessionsMetrics,
         return Ok(metrics);
     }
 
+    let pipeline = TxPipeline::new(runtime.rpc_url.clone(), TxPipelineConfig::default());
     let handle = spawn(
         SettlementConfig::new(runtime.operator, Arc::clone(&runtime.signer)),
-        Arc::new(RpcBroadcaster::new(runtime.rpc_url.clone())),
+        Arc::new(RpcBroadcaster::with_pipeline(pipeline.clone())),
     );
     let mut submissions = JoinSet::new();
     for candidate in candidates {
@@ -1056,12 +1059,28 @@ async fn run_batch(runtime: &SettlementRuntime) -> Result<SettleSessionsMetrics,
         }
     }
 
-    for (signature, submitted) in submissions_by_signature {
-        if let Err(error) = runtime
-            .rpc
-            .confirm_signature(&runtime.rpc_url, &signature, runtime.confirm_timeout)
-            .await
-        {
+    let confirmations = stream::iter(submissions_by_signature.into_iter().map(
+        |(signature, submitted)| {
+            let pipeline = pipeline.clone();
+            async move {
+                let confirmation = match Signature::from_str(&signature) {
+                    Ok(signature) => pipeline
+                        .confirm(signature)
+                        .await
+                        .map(|_| ())
+                        .map_err(|error| error.to_string()),
+                    Err(error) => Err(format!("invalid settlement signature: {error}")),
+                };
+                (signature, submitted, confirmation)
+            }
+        },
+    ))
+    .buffer_unordered(256)
+    .collect::<Vec<_>>()
+    .await;
+
+    for (signature, submitted, confirmation) in confirmations {
+        if let Err(error) = confirmation {
             metrics.failures += submitted.len();
             warn!(%signature, %error, channels = submitted.len(), "batch lifecycle confirmation failed");
             continue;
