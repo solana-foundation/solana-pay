@@ -453,6 +453,12 @@ fn spawn_batch_lifecycle(
                 gauge.pay_x402_batch_lifecycle_channels_reclaimable = reclaim_count as u64,
                 gauge.pay_x402_batch_lifecycle_failures = failure_count as u64,
                 histogram.pay_x402_batch_lifecycle_duration_seconds = duration_seconds,
+                protocol = "x402/batch",
+                outcome,
+                metric_group = "pay_x402_batch_lifecycle",
+                "embedded x402 batch-settlement metrics"
+            );
+            tracing::info!(
                 gauge.pay_x402_batch_value_escrowed_base_units = value_inventory.totals.escrowed,
                 gauge.pay_x402_batch_value_authorized_base_units =
                     value_inventory.totals.authorized,
@@ -460,9 +466,8 @@ fn spawn_batch_lifecycle(
                 gauge.pay_x402_batch_value_distributed_base_units =
                     value_inventory.totals.distributed,
                 protocol = "x402/batch",
-                outcome,
-                metric_group = "pay_x402_batch_lifecycle",
-                "embedded x402 batch-settlement metrics"
+                metric_group = "pay_x402_batch_value",
+                "embedded x402 batch-settlement value inventory"
             );
             tracing::info!(
                 channels_available,
