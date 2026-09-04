@@ -6650,6 +6650,8 @@ dependencies = [
  "pay-pdb",
  "pay-proxy",
  "pay-types",
+ "pyroscope",
+ "pyroscope_pprofrs",
  "qrcode",
  "rand 0.8.8",
  "ratatui",
