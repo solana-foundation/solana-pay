@@ -69,6 +69,18 @@ pub struct UserSetup {
     pub open_sig: Option<String>,
 }
 
+/// Immutable on-chain information needed to resume a fixture channel without
+/// paying to open another one. MPP needs only the address and watermark;
+/// x402 batch settlement also reconstructs the PDA-bound channel config from
+/// the original salt and open slot.
+#[derive(Clone, Debug)]
+pub struct ReusableChannel {
+    pub channel_id: String,
+    pub settled: u64,
+    pub salt: u64,
+    pub open_slot: u64,
+}
+
 /// A fully-formed request, built off-chain during prepare, fired during unleash.
 #[derive(Clone, Debug)]
 pub struct PreparedRequest {
@@ -172,11 +184,10 @@ pub trait BenchScheme: Send + Sync {
     /// How much to fund each user, given the load and resolved price.
     fn funding_plan(&self, load: &Load, price: &ResolvedPrice) -> PerUserFunding;
 
-    /// Supply pre-discovered reusable channels (user index → (channel address,
-    /// on-chain settled watermark)) so `provision_user` can drive an existing
-    /// channel instead of opening a new one. Called once before provisioning
-    /// when `session.reuse` is set. Default: ignored.
-    fn set_reuse_channels(&self, _channels: HashMap<u32, (String, u64)>) {}
+    /// Supply pre-discovered reusable channels so `provision_user` can drive an
+    /// existing channel instead of opening a new one. Called once before
+    /// provisioning when `session.reuse` is set. Default: ignored.
+    fn set_reuse_channels(&self, _channels: HashMap<u32, ReusableChannel>) {}
 
     /// On-chain (or registration) setup for one user. Charge: no-op.
     async fn provision_user(&self, ctx: &UserCtx) -> Result<UserSetup>;

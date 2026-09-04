@@ -30,8 +30,8 @@ use solana_pubkey::Pubkey;
 
 use super::{
     BenchScheme, Endpoint, HotPathGuard, HotPathStats, Load, PerUserFunding, PreparedRequest,
-    RequestSource, ResolvedPrice, UserCtx, UserSetup, build_request, validate_payment_transport,
-    www_authenticate,
+    RequestSource, ResolvedPrice, ReusableChannel, UserCtx, UserSetup, build_request,
+    validate_payment_transport, www_authenticate,
 };
 use crate::config::RunConfig;
 use crate::seeded_session;
@@ -78,7 +78,7 @@ pub struct MppSession {
     /// Reuse mode: user index → (existing channel address, on-chain settled).
     /// Populated once before provisioning; `provision_user` drives these instead
     /// of opening new channels. Empty unless `session.reuse` is set.
-    reuse_channels: Mutex<HashMap<u32, (String, u64)>>,
+    reuse_channels: Mutex<HashMap<u32, ReusableChannel>>,
     /// Opens for which the authorization was constructed and is about to be
     /// sent. If the request/response fails ambiguously, retain the deterministic
     /// channel address so the engine can journal and close it before sweeping.
@@ -144,7 +144,7 @@ impl MppSession {
         self.handles.lock().unwrap().get(&index).cloned()
     }
 
-    fn reuse_lookup(&self, index: u32) -> Option<(String, u64)> {
+    fn reuse_lookup(&self, index: u32) -> Option<ReusableChannel> {
         self.reuse_channels.lock().unwrap().get(&index).cloned()
     }
 
@@ -261,7 +261,7 @@ impl BenchScheme for MppSession {
         }
     }
 
-    fn set_reuse_channels(&self, channels: HashMap<u32, (String, u64)>) {
+    fn set_reuse_channels(&self, channels: HashMap<u32, ReusableChannel>) {
         *self.reuse_channels.lock().unwrap() = channels;
     }
 
@@ -324,9 +324,9 @@ impl BenchScheme for MppSession {
         // address, resuming from its settled watermark, instead of opening (and
         // paying rent for) a new one. The gateway loads it from chain on the
         // first voucher (see `session.load_from_chain`).
-        if let Some((channel_id, settled)) = self.reuse_lookup(ctx.index) {
-            let channel = Pubkey::from_str(&channel_id)
-                .map_err(|e| anyhow::anyhow!("reuse: bad channel id {channel_id}: {e}"))?;
+        if let Some(reused) = self.reuse_lookup(ctx.index) {
+            let channel = Pubkey::from_str(&reused.channel_id)
+                .map_err(|e| anyhow::anyhow!("reuse: bad channel id {}: {e}", reused.channel_id))?;
             let session_kp = wallet::subkey(&ctx.wallet.seed(), "session");
             let signer = Box::new(
                 MemorySigner::from_bytes(&session_kp.keypair)
@@ -336,12 +336,12 @@ impl BenchScheme for MppSession {
             // Continue the monotonic voucher watermark above what is already
             // settled on-chain, so the first reuse voucher is accepted and
             // settlement advances rather than rejecting a stale amount.
-            raw.cumulative = settled;
+            raw.cumulative = reused.settled;
             let voucher_key = ed25519_dalek::SigningKey::from_bytes(&session_kp.seed());
             let handle = SessionHandle::from_active(raw, challenge).with_voucher_key(voucher_key);
             self.handles.lock().unwrap().insert(ctx.index, handle);
             return Ok(UserSetup {
-                channel_id: Some(channel_id),
+                channel_id: Some(reused.channel_id),
                 open_sig: None,
                 ata: None,
             });

@@ -210,8 +210,9 @@ pub struct SessionCfg {
     /// provisioning, the engine discovers each fixture wallet's open channel and
     /// the scheme drives it by address (resuming from its on-chain settled
     /// watermark), skipping the open. Wallets with no existing channel fall back
-    /// to opening one (bootstrap). Avoids re-paying channel rent every run.
-    /// Requires the gateway to run with `session.load_from_chain: true`.
+    /// to opening one (bootstrap). Avoids re-paying channel rent every run. MPP
+    /// requires `session.load_from_chain: true`; x402 batch settlement rebuilds
+    /// a missing gateway record from the confirmed channel on first use.
     #[serde(default)]
     pub reuse: bool,
     /// Pure off-chain benchmark mode (no surfpool/fork): deterministic,

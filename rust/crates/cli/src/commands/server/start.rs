@@ -1,7 +1,7 @@
 //! `pay gate api` — start a payment gateway proxy.
 
 use std::str::FromStr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::middleware;
@@ -287,43 +287,65 @@ fn spawn_batch_lifecycle(
         loop {
             interval.tick().await;
             let started = Instant::now();
-            let channels = match batch.store().list_channels().await {
-                Ok(channels) => channels,
+            let mut channel_ids = match batch.store().list_channel_ids().await {
+                Ok(channel_ids) => channel_ids,
                 Err(error) => {
                     tracing::warn!(%error, "failed to enumerate embedded batch lifecycle state");
                     continue;
                 }
             };
+            let channels_available = channel_ids.len();
+            if channel_ids.len() > config.max_per_cycle {
+                channel_ids.rotate_left(cursor % channels_available);
+                channel_ids.truncate(config.max_per_cycle);
+                cursor = (cursor + config.max_per_cycle) % channels_available;
+            } else {
+                cursor = 0;
+            }
             let now = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs();
-            let mut due: Vec<_> = channels
-                .iter()
-                .filter(|state| batch_settlement_due(state, now, config))
-                .map(|state| state.channel_id.clone())
-                .collect();
-            let closing: Vec<_> = channels
-                .iter()
-                .filter(|state| {
-                    !state.sealed
-                        && state.close_requested_at.is_some()
-                        && state.pending_setup.is_none()
-                })
-                .map(|state| state.channel_id.clone())
-                .collect();
-            let sealed: Vec<_> = channels
-                .iter()
-                .filter(|state| state.sealed && state.pending_setup.is_none())
-                .map(|state| state.channel_id.clone())
-                .collect();
-            if due.len() > config.max_per_cycle {
-                let due_len = due.len();
-                due.rotate_left(cursor % due_len);
-                due.truncate(config.max_per_cycle);
-                cursor = cursor.wrapping_add(config.max_per_cycle);
-            } else {
-                cursor = 0;
+            let channels_scanned = channel_ids.len();
+            let mut due = Vec::new();
+            let mut closing = Vec::new();
+            let mut sealed = Vec::new();
+            for channel_id in channel_ids {
+                let classification = Arc::new(Mutex::new(None));
+                let out = Arc::clone(&classification);
+                if let Err(error) = batch
+                    .store()
+                    .read_channel(
+                        &channel_id,
+                        Box::new(move |state| {
+                            *out.lock().unwrap_or_else(|error| error.into_inner()) =
+                                state.map(|state| {
+                                    (
+                                        batch_settlement_due(state, now, config),
+                                        !state.sealed
+                                            && state.close_requested_at.is_some()
+                                            && state.pending_setup.is_none(),
+                                        state.sealed && state.pending_setup.is_none(),
+                                    )
+                                });
+                            Ok(())
+                        }),
+                    )
+                    .await
+                {
+                    tracing::warn!(%error, %channel_id, "failed to inspect embedded batch lifecycle state");
+                    continue;
+                }
+                let classification = classification
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .take();
+                match classification {
+                    Some((true, _, _)) => due.push(channel_id),
+                    Some((_, true, _)) => closing.push(channel_id),
+                    Some((_, _, true)) => sealed.push(channel_id),
+                    _ => {}
+                }
             }
             let due_count = due.len();
             let failures =
@@ -350,7 +372,8 @@ fn spawn_batch_lifecycle(
                 tracing::warn!(%error, "embedded batch rent-reclaim chunk failed");
             }
             tracing::info!(
-                channels_scanned = channels.len(),
+                channels_available,
+                channels_scanned,
                 channels_due = due_count,
                 channels_closing = close_count,
                 channels_reclaimable = reclaim_count,

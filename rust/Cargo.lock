@@ -11309,7 +11309,7 @@ dependencies = [
 [[package]]
 name = "solana-pay-kit"
 version = "0.6.0"
-source = "git+https://github.com/solana-foundation/pay-kit.git?rev=8fcd62be#8fcd62be3738ebda1a1bbd3925c46b13b7b85272"
+source = "git+https://github.com/solana-foundation/pay-kit.git?rev=a5682e55#a5682e55a89f88a79c1ef4e3256dfd11bc6218d2"
 dependencies = [
  "async-trait",
  "base64 0.22.1",

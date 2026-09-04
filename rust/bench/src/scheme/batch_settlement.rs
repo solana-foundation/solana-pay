@@ -41,7 +41,8 @@ use solana_pubkey::Pubkey;
 
 use super::{
     BenchScheme, Endpoint, HotPathGuard, HotPathStats, Load, PerUserFunding, PreparedRequest,
-    RequestSource, ResolvedPrice, UserCtx, UserSetup, build_request, validate_payment_transport,
+    RequestSource, ResolvedPrice, ReusableChannel, UserCtx, UserSetup, build_request,
+    validate_payment_transport,
 };
 use crate::config::RunConfig;
 
@@ -58,6 +59,10 @@ fn open_sol_lamports(offline: bool, fee_sponsored: bool) -> u64 {
     } else {
         PER_USER_SOL_LAMPORTS
     }
+}
+
+fn token_funding_base(deposit_base: u64, offline: bool, reuse: bool) -> u64 {
+    if offline || reuse { 0 } else { deposit_base }
 }
 
 pub(crate) fn voucher_base_units(voucher_usdc: f64) -> u64 {
@@ -114,6 +119,7 @@ pub struct BatchSettlement {
     deposit_base: u64,
     voucher_base: u64,
     offline: bool,
+    reuse: bool,
     pre_sign_requests_per_user: usize,
     /// A positive value uses dedicated signer threads to fill per-channel
     /// queues off the hot path for the whole run (see [`SessionCfg::background_signers`]).
@@ -122,7 +128,7 @@ pub struct BatchSettlement {
     /// Live channel state, keyed by user index.
     handles: Mutex<HashMap<u32, BatchHandle>>,
     /// Reuse mode: user index → (existing channel address, on-chain settled).
-    reuse_channels: Mutex<HashMap<u32, (String, u64)>>,
+    reuse_channels: Mutex<HashMap<u32, ReusableChannel>>,
     /// Opens whose payload was constructed and is about to be sent; retained so
     /// an ambiguous transport failure still yields the deterministic channel ID.
     ambiguous_opens: Mutex<HashMap<u32, UserSetup>>,
@@ -139,6 +145,7 @@ impl BatchSettlement {
             .map(|s| (s.deposit_usdc, s.voucher_usdc))
             .unwrap_or((1.0, 0.001));
         let offline = cfg.session.as_ref().map(|s| s.offline).unwrap_or(false);
+        let reuse = cfg.session.as_ref().map(|s| s.reuse).unwrap_or(false);
         let pre_sign_requests_per_user = cfg
             .session
             .as_ref()
@@ -158,6 +165,7 @@ impl BatchSettlement {
             deposit_base: (deposit_usdc * 1e6) as u64,
             voucher_base: voucher_base_units(voucher_usdc),
             offline,
+            reuse,
             pre_sign_requests_per_user,
             background_signers,
             close_after_run,
@@ -181,13 +189,12 @@ impl BatchSettlement {
         self.handles.lock().unwrap().get(&index).cloned()
     }
 
-    fn reuse_lookup(&self, index: u32) -> Option<(String, u64)> {
+    fn reuse_lookup(&self, index: u32) -> Option<ReusableChannel> {
         self.reuse_channels.lock().unwrap().get(&index).cloned()
     }
 
     /// Rebuild the immutable channel config from a priced challenge + payer.
     fn config_for(
-        &self,
         requirements: &BatchRequirements,
         payer: &Pubkey,
         open_slot: u64,
@@ -206,6 +213,16 @@ impl BatchSettlement {
             salt: "0".to_string(),
             open_slot,
         }
+    }
+
+    fn config_for_reuse(
+        requirements: &BatchRequirements,
+        payer: &Pubkey,
+        reused: &ReusableChannel,
+    ) -> BatchChannelConfig {
+        let mut config = Self::config_for(requirements, payer, reused.open_slot);
+        config.salt = reused.salt.to_string();
+        config
     }
 }
 
@@ -394,11 +411,11 @@ impl BenchScheme for BatchSettlement {
         // the payment token.
         PerUserFunding {
             sol_lamports: open_sol_lamports(self.offline, price.fee_sponsored),
-            token_base: if self.offline { 0 } else { self.deposit_base },
+            token_base: token_funding_base(self.deposit_base, self.offline, self.reuse),
         }
     }
 
-    fn set_reuse_channels(&self, channels: HashMap<u32, (String, u64)>) {
+    fn set_reuse_channels(&self, channels: HashMap<u32, ReusableChannel>) {
         *self.reuse_channels.lock().unwrap() = channels;
     }
 
@@ -421,21 +438,82 @@ impl BenchScheme for BatchSettlement {
         // Reuse: this wallet already owns an open channel on-chain. Drive it by
         // address, resuming from its settled watermark, instead of opening (and
         // depositing into) a new one.
-        if let Some((channel_id, settled)) = self.reuse_lookup(ctx.index) {
-            let channel = Pubkey::from_str(&channel_id)
-                .map_err(|e| anyhow::anyhow!("reuse: bad channel id {channel_id}: {e}"))?;
-            let (_, open_slot) = open_hints(&requirements).unwrap_or((Hash::default(), 0));
+        if let Some(reused) = self.reuse_lookup(ctx.index) {
+            let channel = Pubkey::from_str(&reused.channel_id)
+                .map_err(|e| anyhow::anyhow!("reuse: bad channel id {}: {e}", reused.channel_id))?;
+            let config = Self::config_for_reuse(&requirements, &payer, &reused);
+            let charged_cumulative = reused
+                .settled
+                .checked_add(base)
+                .context("reuse: cumulative voucher overflow")?;
+            let header = batch_header_sync(
+                &voucher_key,
+                &channel,
+                charged_cumulative,
+                &config,
+                &requirements,
+            )?;
+
+            // Hydrate a restarted gateway's store before the measured window.
+            // Its recovery path verifies this voucher, reads the existing
+            // channel from chain, and commits the new watermark without
+            // opening or funding another channel.
+            let mut last_error = None;
+            for attempt in 0..OPEN_MAX_ATTEMPTS {
+                let result = build_request(
+                    &ctx.http,
+                    &ctx.endpoint.method,
+                    &ctx.endpoint.url,
+                    &ctx.endpoint.body,
+                    ctx.host_override.as_deref(),
+                    &[(PAYMENT_SIGNATURE_HEADER.to_string(), header.clone())],
+                )
+                .send()
+                .await;
+                match result {
+                    Ok(resp) => {
+                        let status = resp.status();
+                        let has_receipt = resp.headers().contains_key(PAYMENT_RESPONSE_HEADER);
+                        let body = resp
+                            .bytes()
+                            .await
+                            .context("reuse: failed to read warm-up response")?;
+                        match validate_open_response(status, has_receipt, &body) {
+                            Ok(()) => {
+                                last_error = None;
+                                break;
+                            }
+                            Err(error) => last_error = Some(error),
+                        }
+                    }
+                    Err(error) => {
+                        last_error = Some(anyhow::anyhow!(
+                            "reuse: channel warm-up request failed: {error}"
+                        ));
+                    }
+                }
+                if attempt + 1 < OPEN_MAX_ATTEMPTS {
+                    let delay = OPEN_RETRY_BASE_DELAY_MS << attempt;
+                    tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                }
+            }
+            if let Some(error) = last_error {
+                return Err(error).context(format!(
+                    "reuse: channel {} did not hydrate after {OPEN_MAX_ATTEMPTS} attempts",
+                    reused.channel_id
+                ));
+            }
             let handle = BatchHandle {
                 channel_id: channel,
-                config: self.config_for(&requirements, &payer, open_slot),
+                config,
                 requirements: requirements.clone(),
                 voucher_key,
                 base,
-                charged_cumulative: settled,
+                charged_cumulative,
             };
             self.handles.lock().unwrap().insert(ctx.index, handle);
             return Ok(UserSetup {
-                channel_id: Some(channel_id),
+                channel_id: Some(reused.channel_id),
                 open_sig: None,
                 ata: None,
             });
@@ -940,8 +1018,71 @@ impl RequestSource for BatchSource {
 
 #[cfg(test)]
 mod tests {
-    use super::validate_open_response;
+    use super::{BatchSettlement, ReusableChannel, token_funding_base, validate_open_response};
+    use pay_kit::core::payment_channels as pc;
+    use pay_kit::x402::protocol::schemes::batch_settlement::{
+        BatchExtra, BatchRequirements, derive_channel_id,
+    };
     use reqwest::StatusCode;
+    use solana_pubkey::Pubkey;
+
+    #[test]
+    fn reuse_does_not_refund_wallets_that_already_escrowed_their_deposit() {
+        assert_eq!(token_funding_base(5_000_000, false, true), 0);
+        assert_eq!(token_funding_base(5_000_000, false, false), 5_000_000);
+    }
+
+    #[test]
+    fn reuse_reconstructs_the_original_pda_bound_config() {
+        let payer = Pubkey::from([2u8; 32]);
+        let fee_payer = Pubkey::from([3u8; 32]);
+        let requirements = BatchRequirements {
+            scheme: "batch-settlement".to_string(),
+            network: "solana:devnet".to_string(),
+            amount: "1".to_string(),
+            asset: pc::pubkey_string(&Pubkey::from([4u8; 32])),
+            pay_to: pc::pubkey_string(&Pubkey::from([5u8; 32])),
+            max_timeout_seconds: 60,
+            extra: BatchExtra {
+                payment_flow: None,
+                fee_payer: pc::pubkey_string(&fee_payer),
+                receiver_authorizer: None,
+                withdraw_delay: 3_600,
+                token_program: pc::pubkey_string(&Pubkey::from([6u8; 32])),
+                memo: None,
+                recent_blockhash: None,
+                recent_slot: None,
+                channel_state: None,
+                voucher_state: None,
+            },
+        };
+        let mut original = BatchSettlement::config_for(&requirements, &payer, 123_456);
+        original.salt = "987654321".to_string();
+        let channel_id = derive_channel_id(
+            &original,
+            &requirements.extra.fee_payer,
+            &pc::default_program_id(),
+        )
+        .expect("original channel derives");
+        let reused = ReusableChannel {
+            channel_id: pc::pubkey_string(&channel_id),
+            settled: 42,
+            salt: 987_654_321,
+            open_slot: 123_456,
+        };
+
+        let reconstructed = BatchSettlement::config_for_reuse(&requirements, &payer, &reused);
+        assert_eq!(reconstructed, original);
+        assert_eq!(
+            derive_channel_id(
+                &reconstructed,
+                &requirements.extra.fee_payer,
+                &pc::default_program_id(),
+            )
+            .unwrap(),
+            channel_id
+        );
+    }
 
     #[test]
     fn open_requires_settlement_receipt() {
