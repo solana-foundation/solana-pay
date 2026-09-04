@@ -845,13 +845,19 @@ async fn prepare_setup_user(
     allow_existing_above_target: bool,
 ) -> Result<Vec<Instruction>> {
     let mut instructions = Vec::new();
-    let current_sol = rpc_balance(rpc, &user.pubkey).await?;
-    if current_sol < sol_lamports {
-        instructions.push(system_instruction::transfer(
-            &funder.pubkey,
-            &user.pubkey,
-            sol_lamports - current_sol,
-        ));
+    // Asset-only overlays deliberately set the SOL target to zero. Avoid an
+    // otherwise pointless per-wallet balance RPC: on large retained cohorts
+    // it doubles reconciliation traffic and cuts token refresh throughput in
+    // half without changing the resulting instruction set.
+    if sol_lamports > 0 {
+        let current_sol = rpc_balance(rpc, &user.pubkey).await?;
+        if current_sol < sol_lamports {
+            instructions.push(system_instruction::transfer(
+                &funder.pubkey,
+                &user.pubkey,
+                sol_lamports - current_sol,
+            ));
+        }
     }
     for asset in assets {
         let user_ata = associated_token_address(&user.pubkey, asset)?;
