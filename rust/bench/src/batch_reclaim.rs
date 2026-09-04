@@ -114,8 +114,17 @@ pub async fn recover_batch(
         request_close_all(&rpc, &program_id, &opened, &wallets, &funder, concurrency).await?;
     }
 
-    println!("waiting {GRACE_WAIT_SECS}s for the close grace period...");
-    tokio::time::sleep(Duration::from_secs(GRACE_WAIT_SECS)).await;
+    if opened.is_empty() {
+        // Nothing here started a fresh grace period this run — any CLOSING
+        // channels were already closed by an earlier invocation (crash
+        // recovery, or a previous run of this tool). finalize_close skips
+        // whatever isn't past its own on-chain due time yet, so there's
+        // nothing this fixed wait would protect against.
+        println!("phase 1 closed nothing new; skipping the grace-period wait");
+    } else {
+        println!("waiting {GRACE_WAIT_SECS}s for the close grace period...");
+        tokio::time::sleep(Duration::from_secs(GRACE_WAIT_SECS)).await;
+    }
 
     // Phase 2: finalize_close (seal + distribute) on due CLOSING channels.
     let operator_signer: Arc<dyn SolanaSigner> =
