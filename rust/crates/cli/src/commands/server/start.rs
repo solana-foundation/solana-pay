@@ -2,10 +2,12 @@
 
 use std::str::FromStr;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::middleware;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{any, get, post};
+use futures_util::StreamExt;
 use owo_colors::OwoColorize;
 use pay_core::PaymentState;
 use pay_core::accounts::AccountsStore;
@@ -29,6 +31,12 @@ use crate::network::SolanaNetwork;
 const BROWSER_RPC_PROXY_PATH: &str = "/__402/rpc";
 const FEE_PAYER_BALANCE_OBSERVE_INTERVAL: Duration = Duration::from_secs(300);
 const DEFAULT_SERVER_BIND: &str = "0.0.0.0:1402";
+const DEFAULT_X402_SETTLEMENT_INTERVAL_SECONDS: u64 = 10;
+const DEFAULT_X402_SETTLEMENT_MIN_DELTA_BASE_UNITS: u64 = 10_000;
+const DEFAULT_X402_SETTLEMENT_MAX_IDLE_SECONDS: u64 = 300;
+const DEFAULT_X402_RECONCILIATION_CONCURRENCY: usize = 64;
+const DEFAULT_X402_RECONCILIATION_MAX_PER_CYCLE: usize = 4_096;
+const X402_RECONCILIATION_CHUNK_SIZE: usize = 128;
 const BROWSER_RPC_ALLOWED_METHODS: &[&str] = &[
     "getLatestBlockhash",
     "surfnet_setAccount",
@@ -141,6 +149,217 @@ fn session_lifecycle_reconciliation(
     _durable_session_store: bool,
 ) -> SessionLifecycleReconciliation {
     SessionLifecycleReconciliation::Embedded
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BatchLifecycleReconciliation {
+    Embedded,
+    External,
+}
+
+/// Memory-backed batch channels cannot be seen by `pay-worker`, so the
+/// gateway owns their settlement clock. A Redis-backed gateway leaves the
+/// clock to the externally leased worker, avoiding two competing reconcilers.
+fn batch_lifecycle_reconciliation(durable_store: bool) -> BatchLifecycleReconciliation {
+    if durable_store {
+        BatchLifecycleReconciliation::External
+    } else {
+        BatchLifecycleReconciliation::Embedded
+    }
+}
+
+#[derive(Clone, Copy)]
+struct BatchLifecycleConfig {
+    interval: Duration,
+    min_delta_base_units: u64,
+    max_idle: Duration,
+    concurrency: usize,
+    max_per_cycle: usize,
+}
+
+fn positive_env_u64(name: &str, default: u64) -> pay_core::Result<u64> {
+    let value = std::env::var(name)
+        .ok()
+        .map(|value| value.trim().parse::<u64>())
+        .transpose()
+        .map_err(|error| pay_core::Error::Config(format!("invalid {name}: {error}")))?
+        .unwrap_or(default);
+    if value == 0 {
+        return Err(pay_core::Error::Config(format!(
+            "{name} must be greater than zero"
+        )));
+    }
+    Ok(value)
+}
+
+fn batch_lifecycle_config() -> pay_core::Result<BatchLifecycleConfig> {
+    let concurrency = positive_env_u64(
+        "PAY_X402_RECONCILIATION_CONCURRENCY",
+        DEFAULT_X402_RECONCILIATION_CONCURRENCY as u64,
+    )?;
+    let max_per_cycle = positive_env_u64(
+        "PAY_X402_RECONCILIATION_MAX_PER_CYCLE",
+        DEFAULT_X402_RECONCILIATION_MAX_PER_CYCLE as u64,
+    )?;
+    Ok(BatchLifecycleConfig {
+        interval: Duration::from_secs(positive_env_u64(
+            "PAY_X402_RECONCILIATION_INTERVAL_SECONDS",
+            DEFAULT_X402_SETTLEMENT_INTERVAL_SECONDS,
+        )?),
+        min_delta_base_units: positive_env_u64(
+            "PAY_X402_SETTLEMENT_MIN_DELTA_BASE_UNITS",
+            DEFAULT_X402_SETTLEMENT_MIN_DELTA_BASE_UNITS,
+        )?,
+        max_idle: Duration::from_secs(positive_env_u64(
+            "PAY_X402_SETTLEMENT_MAX_IDLE_SECONDS",
+            DEFAULT_X402_SETTLEMENT_MAX_IDLE_SECONDS,
+        )?),
+        concurrency: usize::try_from(concurrency).unwrap_or(usize::MAX),
+        max_per_cycle: usize::try_from(max_per_cycle).unwrap_or(usize::MAX),
+    })
+}
+
+fn batch_settlement_due(
+    state: &pay_kit::mpp::store::ChannelState,
+    now: u64,
+    config: BatchLifecycleConfig,
+) -> bool {
+    if state.sealed || state.close_requested_at.is_some() || state.pending_setup.is_some() {
+        return false;
+    }
+    let unsettled = state.cumulative.saturating_sub(state.settled_on_chain);
+    unsettled > 0
+        && (unsettled >= config.min_delta_base_units
+            || now.saturating_sub(state.last_activity_at) >= config.max_idle.as_secs())
+}
+
+#[derive(Clone, Copy)]
+enum BatchLifecycleAction {
+    Settle,
+    FinalizeClose,
+    Reclaim,
+}
+
+async fn run_batch_lifecycle_chunks(
+    batch: &pay_kit::x402::server::X402BatchSettlement,
+    channel_ids: Vec<String>,
+    config: BatchLifecycleConfig,
+    action: BatchLifecycleAction,
+) -> Vec<String> {
+    let chunks: Vec<Vec<String>> = channel_ids
+        .chunks(X402_RECONCILIATION_CHUNK_SIZE)
+        .map(<[String]>::to_vec)
+        .collect();
+    futures_util::stream::iter(chunks)
+        .map(|channel_ids| {
+            let batch = batch.clone();
+            async move {
+                let result = match action {
+                    BatchLifecycleAction::Settle => match batch.claim(&channel_ids).await {
+                        Ok(_) => batch.settle(&channel_ids).await.map(|_| ()),
+                        Err(error) => Err(error),
+                    },
+                    BatchLifecycleAction::FinalizeClose => {
+                        batch.finalize_close(&channel_ids).await.map(|_| ())
+                    }
+                    BatchLifecycleAction::Reclaim => batch.reclaim(&channel_ids).await.map(|_| ()),
+                };
+                result.err().map(|error| error.to_string())
+            }
+        })
+        .buffer_unordered(config.concurrency)
+        .filter_map(|error| async move { error })
+        .collect()
+        .await
+}
+
+fn spawn_batch_lifecycle(
+    batch: pay_kit::x402::server::X402BatchSettlement,
+    config: BatchLifecycleConfig,
+) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(config.interval);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // Construction happens after provisioning-related startup work. Do not
+        // make the first full store snapshot part of gateway startup.
+        interval.tick().await;
+        let mut cursor = 0usize;
+        loop {
+            interval.tick().await;
+            let started = Instant::now();
+            let channels = match batch.store().list_channels().await {
+                Ok(channels) => channels,
+                Err(error) => {
+                    tracing::warn!(%error, "failed to enumerate embedded batch lifecycle state");
+                    continue;
+                }
+            };
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            let mut due: Vec<_> = channels
+                .iter()
+                .filter(|state| batch_settlement_due(state, now, config))
+                .map(|state| state.channel_id.clone())
+                .collect();
+            let closing: Vec<_> = channels
+                .iter()
+                .filter(|state| {
+                    !state.sealed
+                        && state.close_requested_at.is_some()
+                        && state.pending_setup.is_none()
+                })
+                .map(|state| state.channel_id.clone())
+                .collect();
+            let sealed: Vec<_> = channels
+                .iter()
+                .filter(|state| state.sealed && state.pending_setup.is_none())
+                .map(|state| state.channel_id.clone())
+                .collect();
+            if due.len() > config.max_per_cycle {
+                let due_len = due.len();
+                due.rotate_left(cursor % due_len);
+                due.truncate(config.max_per_cycle);
+                cursor = cursor.wrapping_add(config.max_per_cycle);
+            } else {
+                cursor = 0;
+            }
+            let due_count = due.len();
+            let failures =
+                run_batch_lifecycle_chunks(&batch, due, config, BatchLifecycleAction::Settle).await;
+            for error in &failures {
+                tracing::warn!(%error, "embedded batch settlement chunk failed");
+            }
+            let close_count = closing.len();
+            let close_failures = run_batch_lifecycle_chunks(
+                &batch,
+                closing,
+                config,
+                BatchLifecycleAction::FinalizeClose,
+            )
+            .await;
+            for error in &close_failures {
+                tracing::warn!(%error, "embedded batch close-finalization chunk failed");
+            }
+            let reclaim_count = sealed.len();
+            let reclaim_failures =
+                run_batch_lifecycle_chunks(&batch, sealed, config, BatchLifecycleAction::Reclaim)
+                    .await;
+            for error in &reclaim_failures {
+                tracing::warn!(%error, "embedded batch rent-reclaim chunk failed");
+            }
+            tracing::info!(
+                channels_scanned = channels.len(),
+                channels_due = due_count,
+                channels_closing = close_count,
+                channels_reclaimable = reclaim_count,
+                failures = failures.len() + close_failures.len() + reclaim_failures.len(),
+                duration_seconds = started.elapsed().as_secs_f64(),
+                "embedded x402 batch-settlement reconciliation completed"
+            );
+        }
+    });
 }
 
 /// Start the payment gateway proxy.
@@ -1685,7 +1904,28 @@ impl StartCommand {
                         .unwrap_or(30),
                     };
                     match pay_kit::x402::server::X402BatchSettlement::with_store(cfg, batch_store) {
-                        Ok(b) => Some(b),
+                        Ok(b) => {
+                            match batch_lifecycle_reconciliation(durable_batch_store) {
+                                BatchLifecycleReconciliation::Embedded => {
+                                    let lifecycle_config = batch_lifecycle_config()?;
+                                    tracing::info!(
+                                        interval_seconds = lifecycle_config.interval.as_secs(),
+                                        min_delta_base_units = lifecycle_config.min_delta_base_units,
+                                        max_idle_seconds = lifecycle_config.max_idle.as_secs(),
+                                        concurrency = lifecycle_config.concurrency,
+                                        max_per_cycle = lifecycle_config.max_per_cycle,
+                                        "gateway owns x402 batch-settlement reconciliation"
+                                    );
+                                    spawn_batch_lifecycle(b.clone(), lifecycle_config);
+                                }
+                                BatchLifecycleReconciliation::External => {
+                                    tracing::info!(
+                                        "pay-worker owns x402 batch-settlement reconciliation"
+                                    );
+                                }
+                            }
+                            Some(b)
+                        }
                         Err(e) => {
                             eprintln!("x402 batch-settlement backend disabled ({e})");
                             None
@@ -3272,11 +3512,11 @@ mod tests {
         stable_token_account_requirements, surfpool_funding_targets, surfpool_prep_notice_body,
     };
     use super::{
-        build_pdb_config, default_bind, delegated_session_channel_payout,
-        ensure_session_currencies_usd_pegged, payout_recipient_pubkeys, payout_recipient_targets,
-        resolve_operator_currencies, session_lifecycle_reconciliation,
-        validate_browser_rpc_request, x402_currency_configs, x402_upto_beneficiary_pubkey,
-        x402_upto_payout_for_recipient,
+        BatchLifecycleReconciliation, batch_lifecycle_reconciliation, build_pdb_config,
+        default_bind, delegated_session_channel_payout, ensure_session_currencies_usd_pegged,
+        payout_recipient_pubkeys, payout_recipient_targets, resolve_operator_currencies,
+        session_lifecycle_reconciliation, validate_browser_rpc_request, x402_currency_configs,
+        x402_upto_beneficiary_pubkey, x402_upto_payout_for_recipient,
     };
     use crate::network::SolanaNetwork;
     use serial_test::serial;
@@ -3292,6 +3532,18 @@ mod tests {
         assert_eq!(
             session_lifecycle_reconciliation(true),
             super::SessionLifecycleReconciliation::Embedded
+        );
+    }
+
+    #[test]
+    fn batch_lifecycle_owner_follows_store_durability() {
+        assert_eq!(
+            batch_lifecycle_reconciliation(false),
+            BatchLifecycleReconciliation::Embedded
+        );
+        assert_eq!(
+            batch_lifecycle_reconciliation(true),
+            BatchLifecycleReconciliation::External
         );
     }
 

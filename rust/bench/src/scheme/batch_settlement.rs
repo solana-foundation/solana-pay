@@ -34,7 +34,7 @@ use pay_kit::x402::client::batch_settlement::{
 use pay_kit::x402::protocol::schemes::batch_settlement::{
     BatchChannelConfig, BatchPayload, BatchRequirements, BatchVoucher, VOUCHER_EXPIRES_AT, errors,
 };
-use pay_kit::x402::{PAYMENT_REQUIRED_HEADER, PAYMENT_SIGNATURE_HEADER};
+use pay_kit::x402::{PAYMENT_REQUIRED_HEADER, PAYMENT_RESPONSE_HEADER, PAYMENT_SIGNATURE_HEADER};
 use reqwest::StatusCode;
 use solana_hash::Hash;
 use solana_pubkey::Pubkey;
@@ -49,6 +49,8 @@ use crate::config::RunConfig;
 /// always sponsored (the challenge names an `extra.feePayer` that pays fees and
 /// channel rent), so this is only reached if a challenge omits a sponsor.
 const PER_USER_SOL_LAMPORTS: u64 = 25_000_000;
+const OPEN_MAX_ATTEMPTS: usize = 6;
+const OPEN_RETRY_BASE_DELAY_MS: u64 = 100;
 
 fn open_sol_lamports(offline: bool, fee_sponsored: bool) -> u64 {
     if offline || fee_sponsored {
@@ -293,11 +295,22 @@ fn open_hints(requirements: &BatchRequirements) -> Result<(Hash, u64)> {
     Ok((blockhash, open_slot))
 }
 
-fn validate_open_response(status: StatusCode, body: &[u8]) -> Result<()> {
+fn validate_open_response(
+    status: StatusCode,
+    has_settlement_receipt: bool,
+    body: &[u8],
+) -> Result<()> {
     // A `deposit` payload both opens the channel and pays for this first
-    // request, so the gateway serves the resource (2xx) on success.
-    if status.is_success() {
+    // request. A 2xx alone is insufficient: the upstream can succeed before
+    // the post-response open/commit fails. PAYMENT-RESPONSE is the proof that
+    // the gateway actually finished the setup transaction and watermark.
+    if status.is_success() && has_settlement_receipt {
         return Ok(());
+    }
+    if status.is_success() {
+        bail!(
+            "provision: batch channel open returned {status} without {PAYMENT_RESPONSE_HEADER}; setup was not committed"
+        );
     }
     let message = serde_json::from_slice::<serde_json::Value>(body)
         .ok()
@@ -472,25 +485,55 @@ impl BenchScheme for BatchSettlement {
             .unwrap()
             .insert(ctx.index, setup.clone());
 
-        // 3. Send the deposit under the x402 payment header. Success serves the
-        // first request (2xx).
-        let resp = build_request(
-            &ctx.http,
-            &ctx.endpoint.method,
-            &ctx.endpoint.url,
-            &ctx.endpoint.body,
-            ctx.host_override.as_deref(),
-            &[(PAYMENT_SIGNATURE_HEADER.to_string(), header)],
-        )
-        .send()
-        .await
-        .context("provision: batch open request failed")?;
-        let status = resp.status();
-        let body = resp
-            .bytes()
-            .await
-            .context("provision: failed to read batch open response")?;
-        validate_open_response(status, &body)?;
+        // 3. Send the same deterministic deposit until the gateway returns a
+        // settlement receipt. Retrying is safe: a request whose handler ran
+        // resumes its durable commit, while a committed request replays it.
+        // This closes the post-response failure window where a bare 2xx used
+        // to admit a channel that was still stuck in `pending_setup`.
+        let mut last_error = None;
+        for attempt in 0..OPEN_MAX_ATTEMPTS {
+            let result = build_request(
+                &ctx.http,
+                &ctx.endpoint.method,
+                &ctx.endpoint.url,
+                &ctx.endpoint.body,
+                ctx.host_override.as_deref(),
+                &[(PAYMENT_SIGNATURE_HEADER.to_string(), header.clone())],
+            )
+            .send()
+            .await;
+            match result {
+                Ok(resp) => {
+                    let status = resp.status();
+                    let has_receipt = resp.headers().contains_key(PAYMENT_RESPONSE_HEADER);
+                    let body = resp
+                        .bytes()
+                        .await
+                        .context("provision: failed to read batch open response")?;
+                    match validate_open_response(status, has_receipt, &body) {
+                        Ok(()) => {
+                            last_error = None;
+                            break;
+                        }
+                        Err(error) => last_error = Some(error),
+                    }
+                }
+                Err(error) => {
+                    last_error = Some(anyhow::anyhow!(
+                        "provision: batch open request failed: {error}"
+                    ));
+                }
+            }
+            if attempt + 1 < OPEN_MAX_ATTEMPTS {
+                let delay = OPEN_RETRY_BASE_DELAY_MS << attempt;
+                tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+            }
+        }
+        if let Some(error) = last_error {
+            return Err(error).context(format!(
+                "provision: batch open did not commit after {OPEN_MAX_ATTEMPTS} attempts"
+            ));
+        }
 
         self.handles.lock().unwrap().insert(ctx.index, handle);
         self.ambiguous_opens.lock().unwrap().remove(&ctx.index);
@@ -894,5 +937,36 @@ impl RequestSource for BatchSource {
             }
             None => self.cumulative = corrected,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_open_response;
+    use reqwest::StatusCode;
+
+    #[test]
+    fn open_requires_settlement_receipt() {
+        let error = validate_open_response(StatusCode::OK, false, b"upstream response")
+            .expect_err("a bare upstream success must not commit provisioning");
+
+        assert!(error.to_string().contains("PAYMENT-RESPONSE"));
+    }
+
+    #[test]
+    fn open_accepts_success_with_settlement_receipt() {
+        validate_open_response(StatusCode::OK, true, b"upstream response").unwrap();
+    }
+
+    #[test]
+    fn open_preserves_gateway_rejection_message() {
+        let error = validate_open_response(
+            StatusCode::BAD_GATEWAY,
+            false,
+            br#"{"message":"open confirmation failed"}"#,
+        )
+        .expect_err("a rejected open must fail provisioning");
+
+        assert!(error.to_string().contains("open confirmation failed"));
     }
 }
