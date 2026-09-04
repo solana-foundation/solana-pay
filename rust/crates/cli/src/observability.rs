@@ -47,7 +47,10 @@ pub(crate) fn init_otlp(sidecar: &str, filter: EnvFilter) -> Result<OtelGuard, S
     let tracer = tracer_provider.tracer("pay-server");
     let console_filter = std::env::var("PAY_CONSOLE_LOG")
         .map(EnvFilter::new)
-        .unwrap_or_else(|_| EnvFilter::new(filter.to_string()));
+        .unwrap_or_else(|_| EnvFilter::new(filter.to_string()))
+        // Metric carrier events must reach `MetricsLayer`, but serializing them
+        // to stderr adds several synchronous writes to every paid request.
+        .add_directive("pay::metrics=off".parse().expect("valid log directive"));
 
     tracing_subscriber::registry()
         .with(filter)

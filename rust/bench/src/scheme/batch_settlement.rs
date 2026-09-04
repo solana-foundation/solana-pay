@@ -18,7 +18,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::str::FromStr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, bail};
@@ -561,6 +561,7 @@ impl BenchScheme for BatchSettlement {
                 cumulative: handle.charged_cumulative,
                 epoch: 0,
             }));
+            let epoch = Arc::new(AtomicU64::new(0));
             self.signer_registry.lock().unwrap().push(SignerTask {
                 voucher_key: handle.voucher_key.clone(),
                 channel_id: handle.channel_id,
@@ -585,6 +586,7 @@ impl BenchScheme for BatchSettlement {
                 presigned: None,
                 queue: Some(queue),
                 state: Some(state),
+                epoch: Some(epoch),
                 stats: self.hot_stats.clone(),
             }));
         }
@@ -633,6 +635,7 @@ impl BenchScheme for BatchSettlement {
             presigned: (self.pre_sign_requests_per_user > 0).then_some(presigned),
             queue: None,
             state: None,
+            epoch: None,
             stats: self.hot_stats.clone(),
         }))
     }
@@ -739,16 +742,16 @@ fn signer_thread(mut bucket: Vec<SignerTask>, stop: Arc<AtomicBool>, stats: Arc<
             // Top this channel back up to capacity, then move on so every
             // channel gets refilled each pass (fair across the bucket).
             while task.queue.len() < task.queue.capacity() {
-                let (next, epoch) = {
-                    let state = task.state.lock().unwrap();
-                    match state.cumulative.checked_add(task.base) {
-                        Some(next) => (next, state.epoch),
-                        None => {
-                            tracing::error!("batch signer: cumulative overflow");
-                            break;
-                        }
-                    }
+                // Hold this only across the signer operation. There is one
+                // producer per channel, so this lock is uncontended except for
+                // a rare corrective 402 resync. Request lanes read the mirrored
+                // atomic epoch and never bounce this mutex between CPU cores.
+                let mut state = task.state.lock().unwrap();
+                let Some(next) = state.cumulative.checked_add(task.base) else {
+                    tracing::error!("batch signer: cumulative overflow");
+                    break;
                 };
+                let epoch = state.epoch;
                 match batch_header_sync(
                     &task.voucher_key,
                     &task.channel_id,
@@ -757,19 +760,10 @@ fn signer_thread(mut bucket: Vec<SignerTask>, stop: Arc<AtomicBool>, stats: Arc<
                     &task.requirements,
                 ) {
                     Ok(header) => {
-                        let mut state = task.state.lock().unwrap();
-                        if state.epoch != epoch {
-                            // A resync landed while this header was being signed —
-                            // it was built against a baseline the server has since
-                            // corrected. Drop it and re-read the fresh state next
-                            // pass instead of queuing a voucher we know is wrong.
-                            continue;
-                        }
                         if task.queue.push((epoch, header)).is_err() {
                             break; // filled concurrently; watermark not advanced
                         }
                         state.cumulative = next;
-                        drop(state);
                         produced_local += 1;
                         progressed = true;
                         if produced_local.is_multiple_of(8192) {
@@ -821,6 +815,8 @@ struct BatchSource {
     /// here and bumps the epoch so stale queued vouchers are discarded
     /// instead of sent. `None` outside background-signer mode.
     state: Option<Arc<Mutex<ChannelSignState>>>,
+    /// Atomic mirror of `state.epoch` for the per-request stale-entry check.
+    epoch: Option<Arc<AtomicU64>>,
     stats: Arc<HotPathStats>,
 }
 
@@ -842,12 +838,10 @@ impl RequestSource for BatchSource {
                 match queue.pop() {
                     Some((epoch, header)) => {
                         let current = self
-                            .state
+                            .epoch
                             .as_ref()
-                            .expect("queue implies state")
-                            .lock()
-                            .unwrap()
-                            .epoch;
+                            .expect("queue implies epoch")
+                            .load(Ordering::Acquire);
                         if epoch == current {
                             break header;
                         }
@@ -934,6 +928,10 @@ impl RequestSource for BatchSource {
                 let mut guard = state.lock().unwrap();
                 guard.cumulative = corrected;
                 guard.epoch += 1;
+                self.epoch
+                    .as_ref()
+                    .expect("state implies epoch")
+                    .store(guard.epoch, Ordering::Release);
             }
             None => self.cumulative = corrected,
         }

@@ -285,14 +285,16 @@ pub fn record_payment_collected(
 ) {
     match payment {
         Some(payment) => {
-            tracing::info!(
+            tracing::event!(
+                target: "pay::metrics",
+                tracing::Level::INFO,
                 monotonic_counter.pay_payments_collected_usd_total = payment.ui_amount,
                 protocol,
                 subdomain = %subdomain,
                 metric = METRIC_PAYMENTS_COLLECTED_USD,
                 "payment collected",
             );
-            tracing::info!(
+            tracing::debug!(
                 protocol,
                 subdomain = %subdomain,
                 path = %path,
@@ -302,7 +304,7 @@ pub fn record_payment_collected(
                 "payment collection details",
             );
         }
-        None => tracing::info!(
+        None => tracing::debug!(
             protocol,
             subdomain = %subdomain,
             path = %path,
@@ -321,7 +323,9 @@ pub fn record_paid_request_completed(
 ) {
     if is_paid_request_success(status) {
         match payment {
-            Some(payment) => tracing::info!(
+            Some(payment) => tracing::event!(
+                target: "pay::metrics",
+                tracing::Level::INFO,
                 monotonic_counter.pay_402_requests_successful_total = 1_u64,
                 protocol,
                 subdomain = %subdomain,
@@ -330,7 +334,9 @@ pub fn record_paid_request_completed(
                 metric = METRIC_402_SUCCESS,
                 "paid request completed",
             ),
-            None => tracing::info!(
+            None => tracing::event!(
+                target: "pay::metrics",
+                tracing::Level::INFO,
                 monotonic_counter.pay_402_requests_successful_total = 1_u64,
                 protocol,
                 subdomain = %subdomain,
@@ -501,7 +507,9 @@ pub fn record_payment_channel_voucher_cumulative_for_protocol(
     network: &str,
     cumulative: u64,
 ) {
-    tracing::info!(
+    tracing::event!(
+        target: "pay::metrics",
+        tracing::Level::INFO,
         gauge.pay_payment_channel_voucher_cumulative_base_units = cumulative,
         channel_id,
         currency,
