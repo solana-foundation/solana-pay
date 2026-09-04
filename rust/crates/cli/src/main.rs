@@ -167,7 +167,7 @@ fn main() {
         };
         match agent.start() {
             Ok(agent) => {
-                tracing::info!(%url, service = "pay-gateway", "Pyroscope profiling enabled");
+                tracing::info!(service = "pay-gateway", "Pyroscope profiling enabled");
                 Some(agent)
             }
             Err(error) => {
