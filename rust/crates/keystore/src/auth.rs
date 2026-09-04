@@ -456,9 +456,16 @@ fn batch_authorization_message(
 
 fn payment_message_with_account(message: &str, account: &str) -> String {
     let trimmed = message.trim_start();
+    // Recognizes every current `PaymentAmountKind` headline plus one older,
+    // no-longer-produced phrasing kept for defensiveness. A headline added
+    // here without a matching arm silently drops the funding account from
+    // the approval prompt — as `Escrow`'s did until this fix — so match
+    // against the enum's own headline constants rather than duplicating the
+    // wording as an independent literal.
     if !trimmed.starts_with("authorize a payment of ")
-        && !trimmed.starts_with("authorize a payment.")
-        && !trimmed.starts_with("authorize a series of payments.")
+        && !trimmed.starts_with(PaymentAmountKind::Exact.headline())
+        && !trimmed.starts_with(PaymentAmountKind::Maximum.headline())
+        && !trimmed.starts_with(PaymentAmountKind::Escrow.headline())
     {
         return message.to_string();
     }
@@ -847,6 +854,24 @@ mod tests {
         assert!(
             message.contains("escrow deposit: $25.00"),
             "escrow context should be in the headline/field, not the amount; got: {message:?}"
+        );
+    }
+
+    #[test]
+    fn authorize_channel_escrow_identifies_the_funding_account() {
+        // Regression: payment_message_with_account's headline allowlist did
+        // not include Escrow's, so with_account_context silently dropped the
+        // funding account from every channel-escrow approval prompt — a
+        // payer could not see which account was being drained before
+        // approving.
+        let intent = AuthIntent::authorize_channel_escrow("$25.00", "channel", "api.example.com")
+            .with_account_context("trading");
+        let AuthIntent::AuthorizePayment { message, .. } = intent else {
+            panic!("expected AuthorizePayment");
+        };
+        assert!(
+            message.contains("from trading"),
+            "escrow approval should name the funding account; got: {message:?}"
         );
     }
 }
