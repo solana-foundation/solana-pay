@@ -1,7 +1,7 @@
 import { address } from '@solana/kit';
 import { describe, expect, it } from 'vitest';
 
-import { findReference } from '../src/index.js';
+import { FindReferenceError, findReference } from '../src/index.js';
 
 const reference = address('9aE476sH92Vz7DMPyq5WLPkrKWivxeuTKEFKd2sZZcde');
 
@@ -34,5 +34,42 @@ describe('findReference', () => {
         const unknownRef = address('2jDmYQMRCBnXUQeFRvQABcU6hLcvjVTdG7AoHravxWJX');
 
         await expect(findReference(rpc, unknownRef)).rejects.toThrow('not found');
+    });
+
+    it('should set code to "inconclusive" when the RPC returns no signatures', async () => {
+        expect.assertions(2);
+
+        const unknownRef = address('2jDmYQMRCBnXUQeFRvQABcU6hLcvjVTdG7AoHravxWJX');
+
+        const error = await findReference(rpc, unknownRef).catch((thrown: unknown) => thrown);
+
+        expect(error).toBeInstanceOf(FindReferenceError);
+        // An empty result carries no verdict on why: never paid, not indexed yet, or aged out.
+        expect((error as FindReferenceError).code).toBe('inconclusive');
+    });
+});
+
+describe('FindReferenceError', () => {
+    it('should keep the Error-compatible constructor surface', () => {
+        const noArg = new FindReferenceError();
+        const customMessage = new FindReferenceError('terminal offline, retry later');
+        const withCause = new FindReferenceError('rpc down', { cause: new Error('socket closed') });
+        class RetriedFindReferenceError extends FindReferenceError {
+            attempts: number;
+            constructor(attempts: number) {
+                super(`gave up after ${attempts} attempts`);
+                this.attempts = attempts;
+            }
+        }
+        const subclass = new RetriedFindReferenceError(3);
+
+        expect(noArg.message).toBe('');
+        expect(customMessage.code).toBeUndefined();
+        expect((withCause.cause as Error).message).toBe('socket closed');
+        expect(subclass).toBeInstanceOf(FindReferenceError);
+        expect(subclass.attempts).toBe(3);
+        expect(subclass.code).toBeUndefined();
+        expect(new FindReferenceError('not found').code).toBe('inconclusive');
+        expect(new FindReferenceError('aborted').code).toBe('aborted');
     });
 });

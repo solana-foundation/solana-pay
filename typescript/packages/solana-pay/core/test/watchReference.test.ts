@@ -146,4 +146,43 @@ describe('watchReference', () => {
             FindReferenceError,
         );
     });
+
+    it('should set code to "aborted" when the subscription is aborted', async () => {
+        expect.assertions(2);
+
+        const abortController = new AbortController();
+        const rpcSubscriptions = {
+            logsNotifications() {
+                return {
+                    async subscribe({ abortSignal }: { abortSignal: AbortSignal }) {
+                        return new Promise((_resolve, reject) => {
+                            abortSignal.addEventListener('abort', () => reject(abortSignal.reason));
+                        });
+                    },
+                };
+            },
+        } as any;
+
+        const promise = watchReference(rpcSubscriptions, reference, { abortSignal: abortController.signal });
+        abortController.abort();
+
+        const error = await promise.catch((thrown: unknown) => thrown);
+
+        expect(error).toBeInstanceOf(FindReferenceError);
+        // An abort is a caller action, not an inconclusive read; it must not read as 'not found'.
+        expect((error as FindReferenceError).code).toBe('aborted');
+    });
+
+    it('should set code to "inconclusive" when the subscription ends without a notification', async () => {
+        expect.assertions(2);
+
+        const rpcSubscriptions = createMockRpcSubscriptions([]);
+
+        const error = await watchReference(rpcSubscriptions, reference).catch((thrown: unknown) => thrown);
+
+        expect(error).toBeInstanceOf(FindReferenceError);
+        // A subscription that ends normally saw no transaction; it is the same inconclusive read as
+        // an empty getSignaturesForAddress response, not a caller abort.
+        expect((error as FindReferenceError).code).toBe('inconclusive');
+    });
 });

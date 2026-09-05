@@ -4,10 +4,42 @@ import type { Commitment, Signature } from '@solana/kit';
 import type { Reference } from './types.js';
 
 /**
+ * A machine-readable reason for a {@link FindReferenceError}.
+ *
+ * `'inconclusive'` means no transaction was seen: `findReference` got an RPC
+ * response with no signatures, or a `watchReference` subscription ended
+ * before any notification arrived. Both reads carry no verdict on why: the
+ * customer may never have paid, the transaction may not be indexed by this
+ * node yet, or it may have aged out of a non-archival node's history — the
+ * RPC response cannot distinguish them, so the code claims nothing further.
+ * `'aborted'` means a `watchReference` subscription was cancelled before a
+ * transaction was seen.
+ */
+export type FindReferenceErrorCode = 'aborted' | 'inconclusive';
+
+/**
  * Thrown when no transaction signature can be found referencing a given address.
  */
 export class FindReferenceError extends Error {
     name = 'FindReferenceError';
+
+    /**
+     * Machine-readable reason, so callers can branch without string-matching {@link Error.message}.
+     * `'inconclusive'` for the library's `'not found'` message — an empty read that cannot
+     * distinguish never-paid from not-yet-indexed or aged-out — `'aborted'` for a cancelled
+     * `watchReference` subscription. Only set when the library itself threw the error; instances
+     * constructed with any other message carry no code.
+     */
+    readonly code: FindReferenceErrorCode | undefined;
+
+    constructor(message?: string, options?: ErrorOptions) {
+        super(message, options);
+        if (message === 'not found' || message === 'aborted') {
+            this.code = message === 'not found' ? 'inconclusive' : 'aborted';
+        } else {
+            this.code = undefined;
+        }
+    }
 }
 
 /** Options for {@link findReference}. */

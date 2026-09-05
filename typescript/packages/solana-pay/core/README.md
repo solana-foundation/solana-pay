@@ -146,7 +146,7 @@ const instructions = await client.pay.createTransfer({ recipient, amount: 1 });
 ### Transfers
 
 - **`createTransfer(rpc, sender, fields)`** — Create transfer `Instruction[]` for a payment.
-- **`findReference(rpc, reference, options?)`** — Find a transaction signature by reference address.
+- **`findReference(rpc, reference, options?)`** — Find a transaction signature by reference address. Throws `FindReferenceError` with machine-readable `code` (`'inconclusive'` when no transaction was seen — the RPC returned no signatures, or a `watchReference` subscription ended before any notification arrived; an empty read that can't tell "never paid" from "not indexed yet" or "aged out of a non-archival node", so the code claims nothing further — or `'aborted'` when a `watchReference` subscription is cancelled) so callers never have to string-match the message.
 - **`validateTransfer(rpc, signature, fields, options?)`** — Validate that a confirmed transaction matches the expected payment.
 
 ### Transaction Requests
