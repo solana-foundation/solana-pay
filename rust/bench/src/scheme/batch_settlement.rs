@@ -323,7 +323,10 @@ fn parse_batch_challenge(
     Ok(requirements)
 }
 
-fn corrected_cumulative_from_challenge(status: u16, header: Option<&str>) -> Option<u64> {
+fn corrective_requirements_from_challenge(
+    status: u16,
+    header: Option<&str>,
+) -> Option<BatchRequirements> {
     if status != StatusCode::PAYMENT_REQUIRED.as_u16() {
         return None;
     }
@@ -338,12 +341,7 @@ fn corrected_cumulative_from_challenge(status: u16, header: Option<&str>) -> Opt
     if error.as_deref() != Some(errors::INVALID_CUMULATIVE_AMOUNT_MISMATCH) {
         return None;
     }
-    requirements
-        .extra
-        .voucher_state
-        .as_ref()?
-        .signed_max_claimable()
-        .ok()
+    Some(requirements)
 }
 
 /// The construction hints a fresh open needs: a blockhash and slot. The
@@ -538,10 +536,23 @@ impl BenchScheme for BatchSettlement {
                                 break;
                             }
                             Err(error) => {
-                                if let Some(corrected) = corrected_cumulative_from_challenge(
+                                if let Some(corrective) = corrective_requirements_from_challenge(
                                     status.as_u16(),
                                     corrective_header.as_deref(),
                                 ) {
+                                    let mut proof_channel = BatchChannel::new(
+                                        channel,
+                                        config.clone(),
+                                        charged_cumulative,
+                                        self.deposit_base,
+                                    );
+                                    let corrected = proof_channel
+                                        .adopt_corrective_state(&corrective)
+                                        .map_err(|error| {
+                                            anyhow::anyhow!(
+                                                "reuse: corrective watermark proof rejected: {error}"
+                                            )
+                                        })?;
                                     charged_cumulative = corrected
                                         .checked_add(base)
                                         .context("reuse: corrected cumulative voucher overflow")?;
@@ -1043,13 +1054,21 @@ impl RequestSource for BatchSource {
     /// record server-side — a known, documented gap: "that loss is logged,
     /// not surfaced"). The mismatch response carries the server's real
     /// watermark specifically so a client can resynchronize instead of
-    /// repeating the same wrong voucher forever. Benchmark-only: unlike a real
-    /// payer, we adopt the corrected value without re-verifying its signature
-    /// against our own `payerAuthorizer` key, since the gateway under test is
-    /// already trusted infrastructure here.
+    /// repeating the same wrong voucher forever. The shared channel verifier
+    /// authenticates the carried voucher against this benchmark wallet before
+    /// the signing watermark can move.
     fn on_response(&mut self, status: u16, header: Option<&str>) {
-        let Some(corrected) = corrected_cumulative_from_challenge(status, header) else {
+        let Some(corrective) = corrective_requirements_from_challenge(status, header) else {
             return;
+        };
+        let mut proof_channel =
+            BatchChannel::new(self.channel_id, self.config.clone(), self.cumulative, 0);
+        let corrected = match proof_channel.adopt_corrective_state(&corrective) {
+            Ok(corrected) => corrected,
+            Err(error) => {
+                tracing::error!(%error, "batch corrective watermark proof rejected");
+                return;
+            }
         };
         match &self.state {
             Some(state) => {
@@ -1102,7 +1121,7 @@ impl RequestSource for BatchSource {
 mod tests {
     use super::{
         BatchSettlement, BatchSource, HotPathStats, RequestSource, ReusableChannel,
-        corrected_cumulative_from_challenge, token_funding_base, validate_open_response,
+        corrective_requirements_from_challenge, token_funding_base, validate_open_response,
     };
     use base64::Engine as _;
     use base64::engine::general_purpose::STANDARD;
@@ -1146,13 +1165,12 @@ mod tests {
         let header = STANDARD.encode(serde_json::to_vec(&envelope).unwrap());
 
         assert_eq!(
-            corrected_cumulative_from_challenge(402, Some(&header)),
-            Some(43_551)
+            corrective_requirements_from_challenge(402, Some(&header))
+                .and_then(|requirements| requirements.extra.voucher_state)
+                .and_then(|voucher| voucher.signed_max_claimable().ok()),
+            Some(43_551),
         );
-        assert_eq!(
-            corrected_cumulative_from_challenge(200, Some(&header)),
-            None
-        );
+        assert!(corrective_requirements_from_challenge(200, Some(&header)).is_none());
     }
 
     #[test]
@@ -1160,7 +1178,7 @@ mod tests {
         use std::collections::VecDeque;
         use std::sync::Arc;
 
-        use ed25519_dalek::SigningKey;
+        use ed25519_dalek::{Signer as _, SigningKey};
 
         let payer = SigningKey::from_bytes(&[7_u8; 32]);
         let fee_payer = Pubkey::from([3_u8; 32]);
@@ -1192,6 +1210,8 @@ mod tests {
             &pc::default_program_id(),
         )
         .expect("channel id");
+        let proof_message = pc::voucher_message_bytes(&channel_id, 100, 0).expect("voucher bytes");
+        let proof_signature = bs58::encode(payer.sign(&proof_message).to_bytes()).into_string();
         let mut source = BatchSource {
             index: 0,
             voucher_key: payer,
@@ -1214,7 +1234,7 @@ mod tests {
             stats: Arc::new(HotPathStats::default()),
         };
 
-        let envelope = serde_json::json!({
+        let mut envelope = serde_json::json!({
             "x402Version": 2,
             "error": "invalid_batch_settlement_svm_cumulative_amount_mismatch",
             "accepts": [{
@@ -1228,14 +1248,35 @@ mod tests {
                     "feePayer": fee_payer.to_string(),
                     "withdrawDelay": 3600,
                     "tokenProgram": Pubkey::from([6_u8; 32]).to_string(),
+                    "channelState": {
+                        "channelId": channel_id.to_string(),
+                        "balance": "5000000",
+                        "totalClaimed": "0",
+                        "withdrawRequestedAt": 0,
+                        "chargedCumulativeAmount": "100"
+                    },
                     "voucherState": {
                         "signedMaxClaimable": "100",
                         "expiresAt": 0,
-                        "signature": "benchmark-trusts-the-gateway"
+                        "signature": "not-a-valid-payer-signature"
                     }
                 }
             }]
         });
+        let rejected = STANDARD.encode(serde_json::to_vec(&envelope).unwrap());
+        RequestSource::on_response(&mut source, 402, Some(&rejected));
+        assert_eq!(source.cumulative, 12);
+        assert_eq!(
+            source
+                .presigned
+                .as_ref()
+                .and_then(|queue| queue.front())
+                .map(String::as_str),
+            Some("stale-1")
+        );
+
+        envelope["accepts"][0]["extra"]["voucherState"]["signature"] =
+            serde_json::Value::String(proof_signature);
         let header = STANDARD.encode(serde_json::to_vec(&envelope).unwrap());
 
         RequestSource::on_response(&mut source, 402, Some(&header));
