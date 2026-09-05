@@ -1,3 +1,0 @@
-window	from_unix	until_unix	wall_seconds	total_cpu_nanoseconds	avg_total_cores	encode_self_pct	decode_self_pct	base58_self_pct	avg_base58_cores
-request-only	1788571820	1788571940	120	1103520000000	9.196000	6.98	1.82	8.80	0.809248
-settlement	1788571946	1788572187	241	2043190000000	8.477967	6.46	1.65	8.11	0.687563
