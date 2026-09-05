@@ -1,7 +1,7 @@
 import { address } from '@solana/kit';
 import { describe, expect, it } from 'vitest';
 
-import { findReference } from '../src/index.js';
+import { FindReferenceError, findReference } from '../src/index.js';
 
 const reference = address('9aE476sH92Vz7DMPyq5WLPkrKWivxeuTKEFKd2sZZcde');
 
@@ -34,5 +34,17 @@ describe('findReference', () => {
         const unknownRef = address('2jDmYQMRCBnXUQeFRvQABcU6hLcvjVTdG7AoHravxWJX');
 
         await expect(findReference(rpc, unknownRef)).rejects.toThrow('not found');
+    });
+
+    it('should set code to "not found" when the RPC returns no signatures', async () => {
+        expect.assertions(2);
+
+        const unknownRef = address('2jDmYQMRCBnXUQeFRvQABcU6hLcvjVTdG7AoHravxWJX');
+
+        const error = await findReference(rpc, unknownRef).catch((thrown: unknown) => thrown);
+
+        expect(error).toBeInstanceOf(FindReferenceError);
+        // An empty result is inconclusive, but it is reported as 'not found', never as 'aborted'.
+        expect((error as FindReferenceError).code).toBe('not found');
     });
 });

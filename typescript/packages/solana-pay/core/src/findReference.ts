@@ -4,10 +4,29 @@ import type { Commitment, Signature } from '@solana/kit';
 import type { Reference } from './types.js';
 
 /**
+ * A machine-readable reason for a {@link FindReferenceError}.
+ *
+ * `'not found'` means the RPC returned no signatures for the reference, which is
+ * inconclusive: the customer may never have paid, the transaction may not be
+ * indexed by this node yet, or it may have aged out of a non-archival node's
+ * history. `'aborted'` means the subscription was cancelled before any
+ * transaction was seen.
+ */
+export type FindReferenceErrorCode = 'aborted' | 'not found';
+
+/**
  * Thrown when no transaction signature can be found referencing a given address.
  */
 export class FindReferenceError extends Error {
     name = 'FindReferenceError';
+
+    /** Machine-readable reason, so callers can branch without string-matching {@link Error.message}. */
+    readonly code: FindReferenceErrorCode;
+
+    constructor(message: FindReferenceErrorCode) {
+        super(message);
+        this.code = message;
+    }
 }
 
 /** Options for {@link findReference}. */
