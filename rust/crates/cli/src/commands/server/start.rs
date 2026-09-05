@@ -39,6 +39,7 @@ const DEFAULT_X402_RECONCILIATION_STARTUP_DELAY_SECONDS: u64 = 0;
 const DEFAULT_X402_RECONCILIATION_CONCURRENCY: usize = 64;
 const DEFAULT_X402_RECONCILIATION_MAX_PER_CYCLE: usize = 4_096;
 const DEFAULT_X402_SETTLEMENT_CONFIRMATION_TIMEOUT_SECONDS: u64 = 90;
+const DEFAULT_X402_SETTLEMENT_SEND_CONCURRENCY: usize = 64;
 const DEFAULT_X402_SETTLEMENT_SEND_INTERVAL_MICROS: u64 = 1_000;
 const DEFAULT_X402_VALUE_METRICS_INTERVAL_SECONDS: u64 = 15;
 const X402_RECONCILIATION_CHUNK_SIZE: usize = 100;
@@ -182,6 +183,7 @@ struct BatchLifecycleConfig {
     concurrency: usize,
     max_per_cycle: usize,
     confirmation_timeout: Duration,
+    send_concurrency: usize,
     send_interval: Duration,
     value_metrics_interval: Duration,
 }
@@ -215,6 +217,10 @@ fn batch_lifecycle_config() -> pay_core::Result<BatchLifecycleConfig> {
         "PAY_X402_RECONCILIATION_MAX_PER_CYCLE",
         DEFAULT_X402_RECONCILIATION_MAX_PER_CYCLE as u64,
     )?;
+    let send_concurrency = positive_env_u64(
+        "PAY_X402_SETTLEMENT_SEND_CONCURRENCY",
+        DEFAULT_X402_SETTLEMENT_SEND_CONCURRENCY as u64,
+    )?;
     Ok(BatchLifecycleConfig {
         interval: Duration::from_secs(positive_env_u64(
             "PAY_X402_RECONCILIATION_INTERVAL_SECONDS",
@@ -238,6 +244,7 @@ fn batch_lifecycle_config() -> pay_core::Result<BatchLifecycleConfig> {
             "PAY_X402_SETTLEMENT_CONFIRMATION_TIMEOUT_SECONDS",
             DEFAULT_X402_SETTLEMENT_CONFIRMATION_TIMEOUT_SECONDS,
         )?),
+        send_concurrency: usize::try_from(send_concurrency).unwrap_or(usize::MAX),
         send_interval: Duration::from_micros(env_u64(
             "PAY_X402_SETTLEMENT_SEND_INTERVAL_MICROS",
             DEFAULT_X402_SETTLEMENT_SEND_INTERVAL_MICROS,
@@ -2170,6 +2177,8 @@ impl StartCommand {
                                         pay_kit::core::tx_pipeline::TxPipelineConfig::default();
                                     pipeline_config.confirmation_timeout =
                                         lifecycle_config.confirmation_timeout;
+                                    pipeline_config.max_send_concurrency =
+                                        lifecycle_config.send_concurrency;
                                     pipeline_config.send_interval = lifecycle_config.send_interval;
                                     b = b.with_tx_pipeline(
                                         pay_kit::core::tx_pipeline::TxPipeline::new(
@@ -2187,6 +2196,7 @@ impl StartCommand {
                                         max_per_cycle = lifecycle_config.max_per_cycle,
                                         confirmation_timeout_seconds =
                                             lifecycle_config.confirmation_timeout.as_secs(),
+                                        send_concurrency = lifecycle_config.send_concurrency,
                                         send_interval_micros =
                                             lifecycle_config.send_interval.as_micros(),
                                         value_metrics_interval_seconds =
