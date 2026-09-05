@@ -591,11 +591,24 @@ fn spawn_batch_lifecycle(
                 "embedded x402 batch-settlement metrics"
             );
             record_batch_value_inventory(&value_inventory);
+            let claim_started = Instant::now();
             let claim_failures =
                 run_batch_lifecycle_chunks(&batch, due, config, BatchLifecycleAction::Claim).await;
+            let claim_duration = claim_started.elapsed();
             for error in &claim_failures {
                 tracing::warn!(%error, "embedded batch claim chunk failed");
             }
+            tracing::info!(
+                histogram.pay_x402_batch_lifecycle_claim_duration_seconds =
+                    claim_duration.as_secs_f64(),
+                channels = due_count,
+                failures = claim_failures.len(),
+                protocol = "x402/batch",
+                phase = "claim",
+                metric_group = "pay_x402_batch_lifecycle_phase",
+                "embedded batch lifecycle phase completed"
+            );
+            let distribution_started = Instant::now();
             let distribution_failures = run_batch_lifecycle_chunks(
                 &batch,
                 distributable,
@@ -603,9 +616,20 @@ fn spawn_batch_lifecycle(
                 BatchLifecycleAction::Distribute,
             )
             .await;
+            let distribution_duration = distribution_started.elapsed();
             for error in &distribution_failures {
                 tracing::warn!(%error, "embedded batch distribution chunk failed");
             }
+            tracing::info!(
+                histogram.pay_x402_batch_lifecycle_distribution_duration_seconds =
+                    distribution_duration.as_secs_f64(),
+                channels = distribution_count,
+                failures = distribution_failures.len(),
+                protocol = "x402/batch",
+                phase = "distribution",
+                metric_group = "pay_x402_batch_lifecycle_phase",
+                "embedded batch lifecycle phase completed"
+            );
             let close_count = closing.len();
             let close_failures = run_batch_lifecycle_chunks(
                 &batch,
