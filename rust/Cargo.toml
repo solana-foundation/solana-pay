@@ -106,6 +106,7 @@ blake3 = "1"
 qrcode = { version = "0.14", default-features = false }
 mime_guess = { version = "2.0", default-features = false, features = ["rev-mappings"] }
 same-file = "1.0"
+http-body = "1"
 
 # Solana payment SDK umbrella — one dep that re-exports MPP (`pay_kit::mpp`),
 # x402 (`pay_kit::x402`), and the cross-protocol, balance-aware selection API

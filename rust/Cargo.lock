@@ -6856,6 +6856,7 @@ dependencies = [
  "futures-util",
  "hmac 0.12.1",
  "http 1.5.0",
+ "http-body 1.1.0",
  "libc",
  "md-5",
  "mime_guess",

@@ -47,6 +47,11 @@ const PAYMENT_PAGE_CSP: &str = "\
     connect-src 'self' http://localhost:* http://127.0.0.1:* https:; \
     worker-src 'self'";
 
+/// Match pay-kit's bounded representation cache. Larger or streaming bodies
+/// keep settlement-only replay semantics instead of growing channel state
+/// without bound.
+pub const MAX_BATCH_CACHED_RESPONSE_BYTES: usize = 1024 * 1024;
+
 /// Everything the gate needs from a request. No body — the decision is made
 /// from metadata alone, so the body can stream straight to the upstream.
 pub struct GateRequest<'a> {
@@ -1613,6 +1618,14 @@ fn batch_replay_response(
         if let Some(content_type) = &cached.content_type {
             response = response.header(header::CONTENT_TYPE, content_type);
         }
+        for (name, value) in &cached.headers {
+            if let (Ok(name), Ok(value)) = (
+                HeaderName::from_bytes(name.as_bytes()),
+                HeaderValue::from_str(value),
+            ) {
+                response.headers.push((name, value));
+            }
+        }
         response
     } else {
         GateResponse::json(
@@ -1639,6 +1652,66 @@ fn batch_replay_response(
     resp
 }
 
+/// Build the bounded, end-to-end portion of an upstream response that is safe
+/// to reproduce for an idempotent batch authorization replay.
+pub fn batch_cached_response(
+    status: StatusCode,
+    headers: &HeaderMap,
+    body: &[u8],
+) -> pay_kit::core::store::CachedUpstreamResponse {
+    let content_type = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(ToOwned::to_owned);
+    let headers = headers
+        .iter()
+        .filter(|(name, _)| is_replayable_batch_response_header(name))
+        .filter_map(|(name, value)| {
+            value
+                .to_str()
+                .ok()
+                .map(|value| (name.as_str().to_owned(), value.to_owned()))
+        })
+        .collect();
+    pay_kit::core::store::CachedUpstreamResponse {
+        status: status.as_u16(),
+        content_type,
+        headers,
+        body: body.to_vec(),
+    }
+}
+
+fn is_replayable_batch_response_header(name: &HeaderName) -> bool {
+    matches!(
+        name.as_str(),
+        "accept-ranges"
+            | "cache-control"
+            | "content-security-policy"
+            | "content-security-policy-report-only"
+            | "content-disposition"
+            | "content-encoding"
+            | "content-language"
+            | "content-location"
+            | "content-range"
+            | "cross-origin-embedder-policy"
+            | "cross-origin-opener-policy"
+            | "cross-origin-resource-policy"
+            | "etag"
+            | "expires"
+            | "last-modified"
+            | "location"
+            | "permissions-policy"
+            | "referrer-policy"
+            | "reporting-endpoints"
+            | "strict-transport-security"
+            | "vary"
+            | "x-content-type-options"
+            | "x-frame-options"
+            | "x-permitted-cross-domain-policies"
+            | "x-xss-protection"
+    )
+}
+
 /// Commit an x402 `batch-settlement` voucher after the resource was served
 /// (the adapter's post-response hook).
 ///
@@ -1655,9 +1728,27 @@ pub async fn settle_batch<S: PaymentState>(
     state: &S,
     forward: BatchForward,
     served_ok: bool,
+    cached: Option<pay_kit::core::store::CachedUpstreamResponse>,
+) -> Option<(HeaderName, HeaderValue)> {
+    if !served_ok {
+        release_batch(state, forward).await;
+        return None;
+    }
+    let header = commit_batch(state, &forward).await;
+    if let Some(cached) = cached {
+        cache_batch_response(state, &forward, cached).await;
+    }
+    header
+}
+
+/// Commit a successfully served batch authorization while retaining its
+/// outcome long enough for a streaming adapter to cache the completed body.
+pub async fn commit_batch<S: PaymentState>(
+    state: &S,
+    forward: &BatchForward,
 ) -> Option<(HeaderName, HeaderValue)> {
     let batch = state.x402_batch()?;
-    let telemetry_context = forward.telemetry;
+    let telemetry_context = &forward.telemetry;
     let channel_id = forward.outcome.channel_id.clone();
     let channel_config = forward.outcome.payload().channel_config();
     let currency = channel_config.token.clone();
@@ -1674,23 +1765,6 @@ pub async fn settle_batch<S: PaymentState>(
         }
         _ => false,
     };
-    if !served_ok {
-        // The reservation is durable, so dropping the outcome only frees the
-        // in-process guard. Release it, or the client's retry of the same
-        // voucher is turned away as in-flight and then refused outright once
-        // the lease lapses — a request that was never served and never
-        // charged would take its channel down with it.
-        if let Err(e) = batch.release_authorization(*forward.outcome).await {
-            telemetry::record_settlement_error(
-                "x402/batch",
-                &telemetry_context.subdomain,
-                &telemetry_context.path,
-                &e.to_string(),
-                false,
-            );
-        }
-        return None;
-    }
     // The crash boundary: recorded before the charge so a retry can only
     // finish it, never serve again. A failure to record is not a reason to
     // abandon the charge — the upstream already answered — so it is logged and
@@ -1704,7 +1778,7 @@ pub async fn settle_batch<S: PaymentState>(
             false,
         );
     }
-    match batch.settle_payment(*forward.outcome).await {
+    match batch.finish_commit(&forward.outcome).await {
         Ok(settlement) => {
             telemetry::record_payment_collected(
                 "x402/batch",
@@ -1785,6 +1859,41 @@ pub async fn settle_batch<S: PaymentState>(
             );
             None
         }
+    }
+}
+
+/// Release an authorization whose resource response was unsuccessful.
+pub async fn release_batch<S: PaymentState>(state: &S, forward: BatchForward) {
+    let Some(batch) = state.x402_batch() else {
+        return;
+    };
+    if let Err(e) = batch.release_authorization(*forward.outcome).await {
+        telemetry::record_settlement_error(
+            "x402/batch",
+            &forward.telemetry.subdomain,
+            &forward.telemetry.path,
+            &e.to_string(),
+            false,
+        );
+    }
+}
+
+/// Persist a completed upstream representation after its payment commitment.
+/// This is best effort: the client already received the original response.
+pub async fn cache_batch_response<S: PaymentState>(
+    state: &S,
+    forward: &BatchForward,
+    cached: pay_kit::core::store::CachedUpstreamResponse,
+) {
+    let Some(batch) = state.x402_batch() else {
+        return;
+    };
+    if let Err(error) = batch.cache_response(&forward.outcome, cached).await {
+        tracing::warn!(
+            %error,
+            channel_id = %forward.outcome.channel_id,
+            "failed to cache x402 batch response"
+        );
     }
 }
 
@@ -2263,7 +2372,13 @@ mod tests {
         let cached = CachedUpstreamResponse {
             status: 201,
             content_type: Some("application/json".to_string()),
-            headers: Vec::new(),
+            headers: vec![
+                (
+                    "content-security-policy".to_string(),
+                    "default-src 'none'".to_string(),
+                ),
+                ("etag".to_string(), "\"result-42\"".to_string()),
+            ],
             body: br#"{"result":42}"#.to_vec(),
         };
 
@@ -2274,6 +2389,38 @@ mod tests {
         assert!(resp.headers.iter().any(|(name, value)| {
             name == header::CONTENT_TYPE && value == HeaderValue::from_static("application/json")
         }));
+        assert!(resp.headers.iter().any(|(name, value)| {
+            name == header::CONTENT_SECURITY_POLICY
+                && value == HeaderValue::from_static("default-src 'none'")
+        }));
+        assert!(resp.headers.iter().any(|(name, value)| {
+            name == header::ETAG && value == HeaderValue::from_static("\"result-42\"")
+        }));
+    }
+
+    #[test]
+    fn cached_batch_response_keeps_end_to_end_headers_only() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        );
+        headers.insert(header::ETAG, HeaderValue::from_static("\"v1\""));
+        headers.insert(header::CONNECTION, HeaderValue::from_static("keep-alive"));
+        headers.insert(
+            HeaderName::from_static("payment-response"),
+            HeaderValue::from_static("attempt-specific"),
+        );
+
+        let cached = batch_cached_response(StatusCode::CREATED, &headers, b"resource");
+
+        assert_eq!(cached.status, StatusCode::CREATED.as_u16());
+        assert_eq!(cached.content_type.as_deref(), Some("application/json"));
+        assert_eq!(
+            cached.headers,
+            vec![("etag".to_string(), "\"v1\"".to_string())]
+        );
+        assert_eq!(cached.body, b"resource");
     }
 
     /// A batch handler over an in-memory store, or `None` when this build

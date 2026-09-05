@@ -1061,7 +1061,39 @@ impl RequestSource for BatchSource {
                     .expect("state implies epoch")
                     .store(guard.epoch, Ordering::Release);
             }
-            None => self.cumulative = corrected,
+            None => {
+                self.cumulative = corrected;
+                if let Some(presigned) = &mut self.presigned {
+                    // The rejected voucher was already popped, and every
+                    // remaining entry was signed from the same stale base.
+                    // Replace both it and the remaining window from the
+                    // corrective watermark so the finite pre-sign path can
+                    // still deliver its configured number of successes.
+                    let count = presigned.len().saturating_add(1);
+                    let mut rebuilt = VecDeque::with_capacity(count);
+                    for _ in 0..count {
+                        let Some(next) = self.cumulative.checked_add(self.base) else {
+                            tracing::error!("batch pre-sign resync: cumulative overflow");
+                            return;
+                        };
+                        match batch_header_sync(
+                            &self.voucher_key,
+                            &self.channel_id,
+                            next,
+                            &self.config,
+                            &self.requirements,
+                        ) {
+                            Ok(header) => rebuilt.push_back(header),
+                            Err(error) => {
+                                tracing::error!(%error, "batch pre-sign resync failed");
+                                return;
+                            }
+                        }
+                        self.cumulative = next;
+                    }
+                    *presigned = rebuilt;
+                }
+            }
         }
     }
 }
@@ -1069,8 +1101,8 @@ impl RequestSource for BatchSource {
 #[cfg(test)]
 mod tests {
     use super::{
-        BatchSettlement, ReusableChannel, corrected_cumulative_from_challenge, token_funding_base,
-        validate_open_response,
+        BatchSettlement, BatchSource, HotPathStats, RequestSource, ReusableChannel,
+        corrected_cumulative_from_challenge, token_funding_base, validate_open_response,
     };
     use base64::Engine as _;
     use base64::engine::general_purpose::STANDARD;
@@ -1121,6 +1153,97 @@ mod tests {
             corrected_cumulative_from_challenge(200, Some(&header)),
             None
         );
+    }
+
+    #[test]
+    fn corrective_response_rebuilds_finite_presigned_window() {
+        use std::collections::VecDeque;
+        use std::sync::Arc;
+
+        use ed25519_dalek::SigningKey;
+
+        let payer = SigningKey::from_bytes(&[7_u8; 32]);
+        let fee_payer = Pubkey::from([3_u8; 32]);
+        let requirements = BatchRequirements {
+            scheme: "batch-settlement".to_string(),
+            network: "solana:devnet".to_string(),
+            amount: "1".to_string(),
+            asset: Pubkey::from([4_u8; 32]).to_string(),
+            pay_to: Pubkey::from([5_u8; 32]).to_string(),
+            max_timeout_seconds: 60,
+            extra: BatchExtra {
+                payment_flow: None,
+                fee_payer: fee_payer.to_string(),
+                receiver_authorizer: None,
+                withdraw_delay: 3_600,
+                token_program: Pubkey::from([6_u8; 32]).to_string(),
+                memo: None,
+                recent_blockhash: None,
+                recent_slot: None,
+                channel_state: None,
+                voucher_state: None,
+            },
+        };
+        let payer_pubkey = Pubkey::new_from_array(payer.verifying_key().to_bytes());
+        let config = BatchSettlement::config_for(&requirements, &payer_pubkey, 9);
+        let channel_id = derive_channel_id(
+            &config,
+            &requirements.extra.fee_payer,
+            &pc::default_program_id(),
+        )
+        .expect("channel id");
+        let mut source = BatchSource {
+            index: 0,
+            voucher_key: payer,
+            channel_id,
+            config,
+            requirements,
+            cumulative: 12,
+            base: 1,
+            method: "GET".to_string(),
+            url: "https://example.test".to_string(),
+            host_override: None,
+            body: String::new(),
+            presigned: Some(VecDeque::from([
+                "stale-1".to_string(),
+                "stale-2".to_string(),
+            ])),
+            queue: None,
+            state: None,
+            epoch: None,
+            stats: Arc::new(HotPathStats::default()),
+        };
+
+        let envelope = serde_json::json!({
+            "x402Version": 2,
+            "error": "invalid_batch_settlement_svm_cumulative_amount_mismatch",
+            "accepts": [{
+                "scheme": "batch-settlement",
+                "network": "solana:devnet",
+                "amount": "1",
+                "asset": Pubkey::from([4_u8; 32]).to_string(),
+                "payTo": Pubkey::from([5_u8; 32]).to_string(),
+                "maxTimeoutSeconds": 60,
+                "extra": {
+                    "feePayer": fee_payer.to_string(),
+                    "withdrawDelay": 3600,
+                    "tokenProgram": Pubkey::from([6_u8; 32]).to_string(),
+                    "voucherState": {
+                        "signedMaxClaimable": "100",
+                        "expiresAt": 0,
+                        "signature": "benchmark-trusts-the-gateway"
+                    }
+                }
+            }]
+        });
+        let header = STANDARD.encode(serde_json::to_vec(&envelope).unwrap());
+
+        RequestSource::on_response(&mut source, 402, Some(&header));
+
+        let rebuilt = source.presigned.expect("finite window");
+        assert_eq!(rebuilt.len(), 3, "replace rejected voucher plus remainder");
+        assert!(rebuilt.iter().all(|header| !header.starts_with("stale")));
+        assert_eq!(source.cumulative, 103);
     }
 
     #[test]

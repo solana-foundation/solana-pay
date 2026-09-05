@@ -8,6 +8,7 @@ use axum::body::Body;
 use axum::http::{HeaderMap, Request, StatusCode, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
+use http_body::Body as _;
 use pay_kit::mpp::AUTHORIZATION_HEADER;
 
 use crate::PaymentState;
@@ -215,9 +216,42 @@ async fn gate_adapter<S: PaymentState>(state: S, req: Request<Body>, next: Next)
             // for a response that actually served. A failure drops the outcome,
             // leaving the client uncharged and free to retry it.
             if let Some(bf) = batch {
-                let served_ok = response.status().is_success();
+                let mut served_ok = response.status().is_success();
+                let mut cached = None;
+                if served_ok {
+                    let cacheable = response.body().size_hint().upper().is_some_and(|length| {
+                        length <= crate::server::gate::MAX_BATCH_CACHED_RESPONSE_BYTES as u64
+                    });
+                    if cacheable {
+                        let (mut parts, body) = response.into_parts();
+                        match axum::body::to_bytes(
+                            body,
+                            crate::server::gate::MAX_BATCH_CACHED_RESPONSE_BYTES,
+                        )
+                        .await
+                        {
+                            Ok(bytes) => {
+                                cached = Some(crate::server::gate::batch_cached_response(
+                                    parts.status,
+                                    &parts.headers,
+                                    &bytes,
+                                ));
+                                parts.headers.remove(header::CONTENT_LENGTH);
+                                response = Response::from_parts(parts, Body::from(bytes));
+                            }
+                            Err(error) => {
+                                tracing::warn!(
+                                    %error,
+                                    "failed to buffer x402 batch response; releasing authorization"
+                                );
+                                served_ok = false;
+                                response = StatusCode::BAD_GATEWAY.into_response();
+                            }
+                        }
+                    }
+                }
                 if let Some((n, v)) =
-                    crate::server::gate::settle_batch(&state, *bf, served_ok).await
+                    crate::server::gate::settle_batch(&state, *bf, served_ok, cached).await
                 {
                     response.headers_mut().append(n, v);
                 }
