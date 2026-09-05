@@ -6,11 +6,12 @@ import type { Reference } from './types.js';
 /**
  * A machine-readable reason for a {@link FindReferenceError}.
  *
- * `'not found'` means the RPC returned no signatures for the reference, which is
- * inconclusive: the customer may never have paid, the transaction may not be
- * indexed by this node yet, or it may have aged out of a non-archival node's
- * history. `'aborted'` means the subscription was cancelled before any
- * transaction was seen.
+ * `'not found'` means no transaction was seen: `findReference` got an RPC
+ * response with no signatures, or a `watchReference` subscription ended
+ * before any notification arrived. Both reads are inconclusive: the customer
+ * may never have paid, the transaction may not be indexed by this node yet,
+ * or it may have aged out of a non-archival node's history. `'aborted'` means
+ * a `watchReference` subscription was cancelled before a transaction was seen.
  */
 export type FindReferenceErrorCode = 'aborted' | 'not found';
 
@@ -20,12 +21,16 @@ export type FindReferenceErrorCode = 'aborted' | 'not found';
 export class FindReferenceError extends Error {
     name = 'FindReferenceError';
 
-    /** Machine-readable reason, so callers can branch without string-matching {@link Error.message}. */
-    readonly code: FindReferenceErrorCode;
+    /**
+     * Machine-readable reason, so callers can branch without string-matching {@link Error.message}.
+     * Only set when the library itself threw the error; instances constructed with any other
+     * message carry no code.
+     */
+    readonly code: FindReferenceErrorCode | undefined;
 
-    constructor(message: FindReferenceErrorCode) {
-        super(message);
-        this.code = message;
+    constructor(message?: string, options?: ErrorOptions) {
+        super(message, options);
+        this.code = message === 'not found' || message === 'aborted' ? message : undefined;
     }
 }
 

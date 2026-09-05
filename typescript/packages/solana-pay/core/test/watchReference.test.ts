@@ -172,4 +172,17 @@ describe('watchReference', () => {
         // An abort is a caller action, not an inconclusive read; it must not read as 'not found'.
         expect((error as FindReferenceError).code).toBe('aborted');
     });
+
+    it('should set code to "not found" when the subscription ends without a notification', async () => {
+        expect.assertions(2);
+
+        const rpcSubscriptions = createMockRpcSubscriptions([]);
+
+        const error = await watchReference(rpcSubscriptions, reference).catch((thrown: unknown) => thrown);
+
+        expect(error).toBeInstanceOf(FindReferenceError);
+        // A subscription that ends normally saw no transaction; it is the same inconclusive read as
+        // an empty getSignaturesForAddress response, not a caller abort.
+        expect((error as FindReferenceError).code).toBe('not found');
+    });
 });

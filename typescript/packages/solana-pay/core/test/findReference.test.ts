@@ -48,3 +48,28 @@ describe('findReference', () => {
         expect((error as FindReferenceError).code).toBe('not found');
     });
 });
+
+describe('FindReferenceError', () => {
+    it('should keep the Error-compatible constructor surface', () => {
+        const noArg = new FindReferenceError();
+        const customMessage = new FindReferenceError('terminal offline, retry later');
+        const withCause = new FindReferenceError('rpc down', { cause: new Error('socket closed') });
+        class RetriedFindReferenceError extends FindReferenceError {
+            attempts: number;
+            constructor(attempts: number) {
+                super(`gave up after ${attempts} attempts`);
+                this.attempts = attempts;
+            }
+        }
+        const subclass = new RetriedFindReferenceError(3);
+
+        expect(noArg.message).toBe('');
+        expect(customMessage.code).toBeUndefined();
+        expect((withCause.cause as Error).message).toBe('socket closed');
+        expect(subclass).toBeInstanceOf(FindReferenceError);
+        expect(subclass.attempts).toBe(3);
+        expect(subclass.code).toBeUndefined();
+        expect(new FindReferenceError('not found').code).toBe('not found');
+        expect(new FindReferenceError('aborted').code).toBe('aborted');
+    });
+});
