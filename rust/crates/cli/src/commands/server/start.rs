@@ -38,6 +38,7 @@ const DEFAULT_X402_SETTLEMENT_MAX_IDLE_SECONDS: u64 = 300;
 const DEFAULT_X402_RECONCILIATION_STARTUP_DELAY_SECONDS: u64 = 0;
 const DEFAULT_X402_RECONCILIATION_CONCURRENCY: usize = 64;
 const DEFAULT_X402_RECONCILIATION_MAX_PER_CYCLE: usize = 4_096;
+const DEFAULT_X402_DISTRIBUTION_MAX_PER_CYCLE: usize = 2_048;
 const DEFAULT_X402_SETTLEMENT_CONFIRMATION_TIMEOUT_SECONDS: u64 = 90;
 const DEFAULT_X402_SETTLEMENT_SEND_CONCURRENCY: usize = 64;
 const DEFAULT_X402_SETTLEMENT_SEND_INTERVAL_MICROS: u64 = 1_000;
@@ -182,6 +183,7 @@ struct BatchLifecycleConfig {
     max_idle: Duration,
     concurrency: usize,
     max_per_cycle: usize,
+    distribution_max_per_cycle: usize,
     confirmation_timeout: Duration,
     send_concurrency: usize,
     send_interval: Duration,
@@ -221,6 +223,10 @@ fn batch_lifecycle_config() -> pay_core::Result<BatchLifecycleConfig> {
         "PAY_X402_SETTLEMENT_SEND_CONCURRENCY",
         DEFAULT_X402_SETTLEMENT_SEND_CONCURRENCY as u64,
     )?;
+    let distribution_max_per_cycle = positive_env_u64(
+        "PAY_X402_DISTRIBUTION_MAX_PER_CYCLE",
+        DEFAULT_X402_DISTRIBUTION_MAX_PER_CYCLE as u64,
+    )?;
     Ok(BatchLifecycleConfig {
         interval: Duration::from_secs(positive_env_u64(
             "PAY_X402_RECONCILIATION_INTERVAL_SECONDS",
@@ -240,6 +246,8 @@ fn batch_lifecycle_config() -> pay_core::Result<BatchLifecycleConfig> {
         )?),
         concurrency: usize::try_from(concurrency).unwrap_or(usize::MAX),
         max_per_cycle: usize::try_from(max_per_cycle).unwrap_or(usize::MAX),
+        distribution_max_per_cycle: usize::try_from(distribution_max_per_cycle)
+            .unwrap_or(usize::MAX),
         confirmation_timeout: Duration::from_secs(positive_env_u64(
             "PAY_X402_SETTLEMENT_CONFIRMATION_TIMEOUT_SECONDS",
             DEFAULT_X402_SETTLEMENT_CONFIRMATION_TIMEOUT_SECONDS,
@@ -270,9 +278,34 @@ fn batch_settlement_due(
             || now.saturating_sub(state.last_activity_at) >= config.max_idle.as_secs())
 }
 
+fn batch_distribution_due(state: &pay_kit::mpp::store::ChannelState) -> bool {
+    !state.sealed
+        && state.close_requested_at.is_none()
+        && state.pending_setup.is_none()
+        && state.settled_on_chain > state.distributed_on_chain
+}
+
+fn select_distribution_batch(
+    mut channel_ids: Vec<String>,
+    max_per_cycle: usize,
+    cursor: &mut usize,
+) -> (usize, Vec<String>) {
+    channel_ids.sort_unstable();
+    let available = channel_ids.len();
+    if available > max_per_cycle {
+        channel_ids.rotate_left(*cursor % available);
+        channel_ids.truncate(max_per_cycle);
+        *cursor = (*cursor + max_per_cycle) % available;
+    } else {
+        *cursor = 0;
+    }
+    (available, channel_ids)
+}
+
 #[derive(Clone, Copy)]
 enum BatchLifecycleAction {
-    Settle,
+    Claim,
+    Distribute,
     FinalizeClose,
     Reclaim,
 }
@@ -414,10 +447,10 @@ async fn run_batch_lifecycle_chunks(
             let batch = batch.clone();
             async move {
                 let result = match action {
-                    BatchLifecycleAction::Settle => match batch.claim(&channel_ids).await {
-                        Ok(_) => batch.settle(&channel_ids).await.map(|_| ()),
-                        Err(error) => Err(error),
-                    },
+                    BatchLifecycleAction::Claim => batch.claim(&channel_ids).await.map(|_| ()),
+                    BatchLifecycleAction::Distribute => {
+                        batch.settle(&channel_ids).await.map(|_| ())
+                    }
                     BatchLifecycleAction::FinalizeClose => {
                         batch.finalize_close(&channel_ids).await.map(|_| ())
                     }
@@ -446,6 +479,7 @@ fn spawn_batch_lifecycle(
         // make the first full store snapshot part of gateway startup.
         interval.tick().await;
         let mut cursor = 0usize;
+        let mut distribution_cursor = 0usize;
         let mut value_inventory = BatchValueInventory::default();
         loop {
             interval.tick().await;
@@ -471,6 +505,7 @@ fn spawn_batch_lifecycle(
                 .as_secs();
             let channels_scanned = channel_ids.len();
             let mut due = Vec::new();
+            let mut distributable = Vec::new();
             let mut closing = Vec::new();
             let mut sealed = Vec::new();
             for channel_id in channel_ids {
@@ -485,6 +520,7 @@ fn spawn_batch_lifecycle(
                                 state.map(|state| {
                                     (
                                         batch_settlement_due(state, now, config),
+                                        batch_distribution_due(state),
                                         !state.sealed
                                             && state.close_requested_at.is_some()
                                             && state.pending_setup.is_none(),
@@ -504,11 +540,17 @@ fn spawn_batch_lifecycle(
                     .lock()
                     .unwrap_or_else(|error| error.into_inner())
                     .take();
-                if let Some((is_due, is_closing, is_sealed, snapshot)) = classification {
+                if let Some((is_due, is_distributable, is_closing, is_sealed, snapshot)) =
+                    classification
+                {
                     value_inventory.observe(channel_id.clone(), snapshot);
                     if is_due {
-                        due.push(channel_id);
-                    } else if is_closing {
+                        due.push(channel_id.clone());
+                    }
+                    if is_distributable {
+                        distributable.push(channel_id.clone());
+                    }
+                    if is_closing {
                         closing.push(channel_id);
                     } else if is_sealed {
                         sealed.push(channel_id);
@@ -516,8 +558,15 @@ fn spawn_batch_lifecycle(
                 }
             }
             let due_count = due.len();
+            let (distributable_available, distributable) = select_distribution_batch(
+                distributable,
+                config.distribution_max_per_cycle,
+                &mut distribution_cursor,
+            );
+            let distribution_count = distributable.len();
             let lifecycle_channels = due
                 .iter()
+                .chain(&distributable)
                 .chain(&closing)
                 .chain(&sealed)
                 .cloned()
@@ -530,6 +579,9 @@ fn spawn_batch_lifecycle(
                 gauge.pay_x402_batch_lifecycle_channels_available = channels_available as u64,
                 gauge.pay_x402_batch_lifecycle_channels_scanned = channels_scanned as u64,
                 gauge.pay_x402_batch_lifecycle_channels_due = due_count as u64,
+                gauge.pay_x402_batch_lifecycle_channels_distributable =
+                    distributable_available as u64,
+                gauge.pay_x402_batch_lifecycle_channels_distributing = distribution_count as u64,
                 gauge.pay_x402_batch_lifecycle_channels_closing = closing.len() as u64,
                 gauge.pay_x402_batch_lifecycle_channels_reclaimable = sealed.len() as u64,
                 gauge.pay_x402_batch_lifecycle_failures = 0_u64,
@@ -539,10 +591,20 @@ fn spawn_batch_lifecycle(
                 "embedded x402 batch-settlement metrics"
             );
             record_batch_value_inventory(&value_inventory);
-            let failures =
-                run_batch_lifecycle_chunks(&batch, due, config, BatchLifecycleAction::Settle).await;
-            for error in &failures {
-                tracing::warn!(%error, "embedded batch settlement chunk failed");
+            let claim_failures =
+                run_batch_lifecycle_chunks(&batch, due, config, BatchLifecycleAction::Claim).await;
+            for error in &claim_failures {
+                tracing::warn!(%error, "embedded batch claim chunk failed");
+            }
+            let distribution_failures = run_batch_lifecycle_chunks(
+                &batch,
+                distributable,
+                config,
+                BatchLifecycleAction::Distribute,
+            )
+            .await;
+            for error in &distribution_failures {
+                tracing::warn!(%error, "embedded batch distribution chunk failed");
             }
             let close_count = closing.len();
             let close_failures = run_batch_lifecycle_chunks(
@@ -562,7 +624,10 @@ fn spawn_batch_lifecycle(
             for error in &reclaim_failures {
                 tracing::warn!(%error, "embedded batch rent-reclaim chunk failed");
             }
-            let failure_count = failures.len() + close_failures.len() + reclaim_failures.len();
+            let failure_count = claim_failures.len()
+                + distribution_failures.len()
+                + close_failures.len()
+                + reclaim_failures.len();
             // Lifecycle operations update the in-memory watermarks. Refresh
             // affected snapshots so the completion event reflects this sweep,
             // rather than the state observed before it began.
@@ -600,6 +665,9 @@ fn spawn_batch_lifecycle(
                 gauge.pay_x402_batch_lifecycle_channels_available = channels_available as u64,
                 gauge.pay_x402_batch_lifecycle_channels_scanned = channels_scanned as u64,
                 gauge.pay_x402_batch_lifecycle_channels_due = due_count as u64,
+                gauge.pay_x402_batch_lifecycle_channels_distributable =
+                    distributable_available as u64,
+                gauge.pay_x402_batch_lifecycle_channels_distributing = distribution_count as u64,
                 gauge.pay_x402_batch_lifecycle_channels_closing = close_count as u64,
                 gauge.pay_x402_batch_lifecycle_channels_reclaimable = reclaim_count as u64,
                 gauge.pay_x402_batch_lifecycle_failures = failure_count as u64,
@@ -614,6 +682,8 @@ fn spawn_batch_lifecycle(
                 channels_available,
                 channels_scanned,
                 channels_due = due_count,
+                channels_distributable = distributable_available,
+                channels_distributing = distribution_count,
                 channels_closing = close_count,
                 channels_reclaimable = reclaim_count,
                 failures = failure_count,
@@ -2192,6 +2262,8 @@ impl StartCommand {
                                         max_idle_seconds = lifecycle_config.max_idle.as_secs(),
                                         concurrency = lifecycle_config.concurrency,
                                         max_per_cycle = lifecycle_config.max_per_cycle,
+                                        distribution_max_per_cycle =
+                                            lifecycle_config.distribution_max_per_cycle,
                                         confirmation_timeout_seconds =
                                             lifecycle_config.confirmation_timeout.as_secs(),
                                         send_concurrency = lifecycle_config.send_concurrency,
@@ -3805,8 +3877,8 @@ mod tests {
         batch_lifecycle_reconciliation, build_pdb_config, default_bind,
         delegated_session_channel_payout, ensure_session_currencies_usd_pegged,
         payout_recipient_pubkeys, payout_recipient_targets, resolve_operator_currencies,
-        session_lifecycle_reconciliation, validate_browser_rpc_request, x402_currency_configs,
-        x402_upto_beneficiary_pubkey, x402_upto_payout_for_recipient,
+        select_distribution_batch, session_lifecycle_reconciliation, validate_browser_rpc_request,
+        x402_currency_configs, x402_upto_beneficiary_pubkey, x402_upto_payout_for_recipient,
     };
     use crate::network::SolanaNetwork;
     use serial_test::serial;
@@ -3864,6 +3936,27 @@ mod tests {
         assert_eq!(inventory.totals.authorized, 0);
         assert_eq!(inventory.totals.settled, 2_000);
         assert_eq!(inventory.totals.distributed, 8_000);
+    }
+
+    #[test]
+    fn distribution_batch_rotates_fairly_across_cycles() {
+        let channels = (0..5).map(|index| format!("channel-{index}")).collect();
+        let mut cursor = 0;
+
+        let (available, first) = select_distribution_batch(channels, 2, &mut cursor);
+        assert_eq!(available, 5);
+        assert_eq!(first, ["channel-0", "channel-1"]);
+        assert_eq!(cursor, 2);
+
+        let channels = (0..5).map(|index| format!("channel-{index}")).collect();
+        let (_, second) = select_distribution_batch(channels, 2, &mut cursor);
+        assert_eq!(second, ["channel-2", "channel-3"]);
+        assert_eq!(cursor, 4);
+
+        let channels = (0..5).map(|index| format!("channel-{index}")).collect();
+        let (_, third) = select_distribution_batch(channels, 2, &mut cursor);
+        assert_eq!(third, ["channel-4", "channel-0"]);
+        assert_eq!(cursor, 1);
     }
 
     #[test]
