@@ -323,6 +323,29 @@ fn parse_batch_challenge(
     Ok(requirements)
 }
 
+fn corrected_cumulative_from_challenge(status: u16, header: Option<&str>) -> Option<u64> {
+    if status != StatusCode::PAYMENT_REQUIRED.as_u16() {
+        return None;
+    }
+    let header_value = header?;
+    let (requirements, error) = parse_challenge(
+        &[(
+            PAYMENT_REQUIRED_HEADER.to_string(),
+            header_value.to_string(),
+        )],
+        None,
+    )?;
+    if error.as_deref() != Some(errors::INVALID_CUMULATIVE_AMOUNT_MISMATCH) {
+        return None;
+    }
+    requirements
+        .extra
+        .voucher_state
+        .as_ref()?
+        .signed_max_claimable()
+        .ok()
+}
+
 /// The construction hints a fresh open needs: a blockhash and slot. The
 /// challenge carries them as `extra.recentBlockhash` / `extra.recentSlot`.
 fn open_hints(requirements: &BatchRequirements) -> Result<(Hash, u64)> {
@@ -468,11 +491,11 @@ impl BenchScheme for BatchSettlement {
             let channel = Pubkey::from_str(&reused.channel_id)
                 .map_err(|e| anyhow::anyhow!("reuse: bad channel id {}: {e}", reused.channel_id))?;
             let config = Self::config_for_reuse(&requirements, &payer, &reused);
-            let charged_cumulative = reused
+            let mut charged_cumulative = reused
                 .settled
                 .checked_add(base)
                 .context("reuse: cumulative voucher overflow")?;
-            let header = batch_header_sync(
+            let mut header = batch_header_sync(
                 &voucher_key,
                 &channel,
                 charged_cumulative,
@@ -500,6 +523,11 @@ impl BenchScheme for BatchSettlement {
                     Ok(resp) => {
                         let status = resp.status();
                         let has_receipt = resp.headers().contains_key(PAYMENT_RESPONSE_HEADER);
+                        let corrective_header = resp
+                            .headers()
+                            .get(PAYMENT_REQUIRED_HEADER)
+                            .and_then(|value| value.to_str().ok())
+                            .map(str::to_owned);
                         let body = resp
                             .bytes()
                             .await
@@ -509,7 +537,24 @@ impl BenchScheme for BatchSettlement {
                                 last_error = None;
                                 break;
                             }
-                            Err(error) => last_error = Some(error),
+                            Err(error) => {
+                                if let Some(corrected) = corrected_cumulative_from_challenge(
+                                    status.as_u16(),
+                                    corrective_header.as_deref(),
+                                ) {
+                                    charged_cumulative = corrected
+                                        .checked_add(base)
+                                        .context("reuse: corrected cumulative voucher overflow")?;
+                                    header = batch_header_sync(
+                                        &voucher_key,
+                                        &channel,
+                                        charged_cumulative,
+                                        &config,
+                                        &requirements,
+                                    )?;
+                                }
+                                last_error = Some(error);
+                            }
                         }
                     }
                     Err(error) => {
@@ -1003,28 +1048,7 @@ impl RequestSource for BatchSource {
     /// against our own `payerAuthorizer` key, since the gateway under test is
     /// already trusted infrastructure here.
     fn on_response(&mut self, status: u16, header: Option<&str>) {
-        if status != 402 {
-            return;
-        }
-        let Some(header_value) = header else {
-            return;
-        };
-        let Some((requirements, error)) = parse_challenge(
-            &[(
-                PAYMENT_REQUIRED_HEADER.to_string(),
-                header_value.to_string(),
-            )],
-            None,
-        ) else {
-            return;
-        };
-        if error.as_deref() != Some(errors::INVALID_CUMULATIVE_AMOUNT_MISMATCH) {
-            return;
-        }
-        let Some(voucher_state) = requirements.extra.voucher_state.as_ref() else {
-            return;
-        };
-        let Ok(corrected) = voucher_state.signed_max_claimable() else {
+        let Some(corrected) = corrected_cumulative_from_challenge(status, header) else {
             return;
         };
         match &self.state {
@@ -1044,7 +1068,12 @@ impl RequestSource for BatchSource {
 
 #[cfg(test)]
 mod tests {
-    use super::{BatchSettlement, ReusableChannel, token_funding_base, validate_open_response};
+    use super::{
+        BatchSettlement, ReusableChannel, corrected_cumulative_from_challenge, token_funding_base,
+        validate_open_response,
+    };
+    use base64::Engine as _;
+    use base64::engine::general_purpose::STANDARD;
     use pay_kit::core::payment_channels as pc;
     use pay_kit::x402::protocol::schemes::batch_settlement::{
         BatchExtra, BatchRequirements, derive_channel_id,
@@ -1056,6 +1085,42 @@ mod tests {
     fn reuse_does_not_refund_wallets_that_already_escrowed_their_deposit() {
         assert_eq!(token_funding_base(5_000_000, false, true), 0);
         assert_eq!(token_funding_base(5_000_000, false, false), 5_000_000);
+    }
+
+    #[test]
+    fn reuse_warmup_reads_corrective_cumulative() {
+        let envelope = serde_json::json!({
+            "x402Version": 2,
+            "error": "invalid_batch_settlement_svm_cumulative_amount_mismatch",
+            "accepts": [{
+                "scheme": "batch-settlement",
+                "network": "solana:devnet",
+                "amount": "1",
+                "asset": Pubkey::from([4_u8; 32]).to_string(),
+                "payTo": Pubkey::from([5_u8; 32]).to_string(),
+                "maxTimeoutSeconds": 60,
+                "extra": {
+                    "feePayer": Pubkey::from([3_u8; 32]).to_string(),
+                    "withdrawDelay": 3600,
+                    "tokenProgram": Pubkey::from([6_u8; 32]).to_string(),
+                    "voucherState": {
+                        "signedMaxClaimable": "43551",
+                        "expiresAt": 0,
+                        "signature": "benchmark-trusts-the-gateway"
+                    }
+                }
+            }]
+        });
+        let header = STANDARD.encode(serde_json::to_vec(&envelope).unwrap());
+
+        assert_eq!(
+            corrected_cumulative_from_challenge(402, Some(&header)),
+            Some(43_551)
+        );
+        assert_eq!(
+            corrected_cumulative_from_challenge(200, Some(&header)),
+            None
+        );
     }
 
     #[test]
