@@ -381,7 +381,7 @@ struct BatchRuntime {
     redis_url: String,
     store: RedisChannelStore,
     settle_active_channels: bool,
-    distribute_settled_funds: bool,
+    distribution_threshold_base_units: Option<u64>,
     settlement_max_idle: Duration,
     reconciliation_concurrency: usize,
 }
@@ -452,8 +452,8 @@ impl SettlementRuntime {
             .await
             .map_err(|error| JobError::Config(format!("batch Redis: {error}")))?;
             let settle_active_channels = parse_bool_env("PAY_X402_SETTLE_ACTIVE_CHANNELS", false)?;
-            let distribute_settled_funds =
-                parse_bool_env("PAY_X402_DISTRIBUTE_SETTLED_FUNDS", false)?;
+            let distribution_threshold_base_units =
+                parse_optional_positive_u64_env("PAY_X402_DISTRIBUTION_THRESHOLD_BASE_UNITS")?;
             let settlement_max_idle = Duration::from_secs(parse_u64_env(
                 "PAY_X402_SETTLEMENT_MAX_IDLE_SECONDS",
                 DEFAULT_X402_SETTLEMENT_MAX_IDLE_SECONDS,
@@ -474,7 +474,7 @@ impl SettlementRuntime {
                 redis_url,
                 store,
                 settle_active_channels,
-                distribute_settled_funds,
+                distribution_threshold_base_units,
                 settlement_max_idle,
                 reconciliation_concurrency,
             })
@@ -874,7 +874,7 @@ async fn run_batch(runtime: &SettlementRuntime) -> Result<SettleSessionsMetrics,
         channels = channels.len(),
         operator = %runtime.operator,
         settle_active_channels = batch.settle_active_channels,
-        distribute_settled_funds = batch.distribute_settled_funds,
+        distribution_threshold_base_units = batch.distribution_threshold_base_units,
         settlement_max_idle_seconds = batch.settlement_max_idle.as_secs(),
         reconciliation_concurrency = batch.reconciliation_concurrency,
         "x402 batch-settlement reconciliation starting"
@@ -915,6 +915,7 @@ async fn run_batch(runtime: &SettlementRuntime) -> Result<SettleSessionsMetrics,
             now,
             batch.settlement_max_idle,
             batch.settle_active_channels,
+            batch.distribution_threshold_base_units,
         ) {
             metrics.skipped += 1;
             continue;
@@ -993,7 +994,7 @@ async fn run_batch(runtime: &SettlementRuntime) -> Result<SettleSessionsMetrics,
             &runtime.operator,
             &runtime.treasury_owner,
             &token_programs,
-            batch.distribute_settled_funds,
+            batch.distribution_threshold_base_units,
         )
     }))
     .buffer_unordered(batch.reconciliation_concurrency)
@@ -1412,8 +1413,18 @@ fn batch_reconciliation_due(
     now: i64,
     max_idle: Duration,
     settle_active: bool,
+    distribution_threshold_base_units: Option<u64>,
 ) -> bool {
     if state.sealed || state.close_requested_at.is_some() {
+        return true;
+    }
+    if distribution_threshold_base_units.is_some_and(|threshold| {
+        distribution_threshold_reached(
+            state.settled_on_chain,
+            state.distributed_on_chain,
+            threshold,
+        )
+    }) {
         return true;
     }
     let unsettled = state.cumulative > state.settled_on_chain;
@@ -1532,7 +1543,7 @@ async fn reconcile_batch_channel(
     operator: &Pubkey,
     treasury_owner: &Pubkey,
     token_programs: &HashMap<Pubkey, Pubkey>,
-    distribute_settled_funds: bool,
+    distribution_threshold_base_units: Option<u64>,
 ) -> Result<BatchReconcileResult, JobError> {
     let state_channel_id = state.channel_id.clone();
     let Some(onchain) = onchain else {
@@ -1610,13 +1621,26 @@ async fn reconcile_batch_channel(
                     .map_err(|error| JobError::TxBuild(format!("settle instruction: {error}")))?,
                 );
                 target_settled = state.cumulative;
-                kind = if distribute_settled_funds {
+                kind = if distribution_threshold_base_units.is_some_and(|threshold| {
+                    distribution_threshold_reached(
+                        target_settled,
+                        onchain.channel.settlement.payout_watermark,
+                        threshold,
+                    )
+                }) {
                     BatchCandidateKind::ClaimAndPayout
                 } else {
                     BatchCandidateKind::Claim
                 };
             }
-            if !distribute_settled_funds {
+            let should_distribute = distribution_threshold_base_units.is_some_and(|threshold| {
+                distribution_threshold_reached(
+                    target_settled,
+                    onchain.channel.settlement.payout_watermark,
+                    threshold,
+                )
+            });
+            if !should_distribute {
                 if kind == BatchCandidateKind::Payout {
                     return Ok(BatchReconcileResult {
                         channel_id: state_channel_id,
@@ -2270,6 +2294,29 @@ fn parse_u64_env(name: &str, default: u64) -> Result<u64, JobError> {
     }
 }
 
+fn parse_optional_positive_u64_env(name: &str) -> Result<Option<u64>, JobError> {
+    let Some(value) = optional_env(name) else {
+        return Ok(None);
+    };
+    let value = value
+        .parse::<u64>()
+        .map_err(|_| JobError::Config(format!("{name} must be an integer")))?;
+    if value == 0 {
+        return Err(JobError::Config(format!(
+            "{name} must be greater than zero when set"
+        )));
+    }
+    Ok(Some(value))
+}
+
+fn distribution_threshold_reached(
+    target_settled: u64,
+    distributed: u64,
+    threshold_base_units: u64,
+) -> bool {
+    target_settled.saturating_sub(distributed) >= threshold_base_units
+}
+
 fn unix_now() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -2340,12 +2387,14 @@ mod tests {
             1_000,
             Duration::from_secs(300),
             false,
+            None,
         ));
         assert!(batch_reconciliation_due(
             &state,
             1_000,
             Duration::from_secs(300),
             true,
+            None,
         ));
 
         state.settled_on_chain = 1;
@@ -2354,6 +2403,7 @@ mod tests {
             1_000,
             Duration::from_secs(300),
             true,
+            None,
         ));
     }
 
@@ -2367,6 +2417,7 @@ mod tests {
             1_000,
             Duration::from_secs(300),
             false,
+            None,
         ));
 
         state.cumulative = 0;
@@ -2376,7 +2427,40 @@ mod tests {
             1_000,
             Duration::from_secs(300),
             false,
+            None,
         ));
+    }
+
+    #[test]
+    fn batch_reconciliation_includes_threshold_distribution_without_a_new_claim() {
+        let mut state = channel_state();
+        state.cumulative = 2_000;
+        state.settled_on_chain = 2_000;
+        state.distributed_on_chain = 999;
+
+        assert!(batch_reconciliation_due(
+            &state,
+            1_000,
+            Duration::from_secs(300),
+            false,
+            Some(1_000),
+        ));
+        state.distributed_on_chain = 1_001;
+        assert!(!batch_reconciliation_due(
+            &state,
+            1_000,
+            Duration::from_secs(300),
+            false,
+            Some(1_000),
+        ));
+    }
+
+    #[test]
+    fn batch_distribution_threshold_uses_only_the_undistributed_delta() {
+        assert!(!distribution_threshold_reached(999, 0, 1_000));
+        assert!(distribution_threshold_reached(1_000, 0, 1_000));
+        assert!(!distribution_threshold_reached(1_500, 501, 1_000));
+        assert!(distribution_threshold_reached(1_501, 501, 1_000));
     }
 
     #[test]

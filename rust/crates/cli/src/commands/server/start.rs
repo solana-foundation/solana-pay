@@ -178,7 +178,7 @@ struct BatchLifecycleConfig {
     startup_delay: Duration,
     active_settlement_interval: Option<Duration>,
     idle_settlement_delay_seconds: u64,
-    distribute_settled_funds: bool,
+    distribution_threshold_base_units: Option<u64>,
     concurrency: usize,
     max_per_cycle: usize,
     distribution_max_per_cycle: usize,
@@ -228,6 +228,12 @@ fn batch_lifecycle_config(
         "PAY_X402_DISTRIBUTION_MAX_PER_CYCLE",
         DEFAULT_X402_DISTRIBUTION_MAX_PER_CYCLE as u64,
     )?;
+    if policy.distribution_threshold_base_units == Some(0) {
+        return Err(pay_core::Error::Config(
+            "batch_settlement.distribution_threshold_base_units must be greater than zero when set"
+                .to_string(),
+        ));
+    }
     Ok(BatchLifecycleConfig {
         interval: Duration::from_secs(positive_env_u64(
             "PAY_X402_RECONCILIATION_INTERVAL_SECONDS",
@@ -240,7 +246,7 @@ fn batch_lifecycle_config(
         active_settlement_interval: (policy.settlement_interval_ms > 0)
             .then(|| Duration::from_millis(policy.settlement_interval_ms)),
         idle_settlement_delay_seconds: policy.idle_settlement_delay_ms.div_ceil(1_000),
-        distribute_settled_funds: policy.distribute_settled_funds,
+        distribution_threshold_base_units: policy.distribution_threshold_base_units,
         concurrency: usize::try_from(concurrency).unwrap_or(usize::MAX),
         max_per_cycle: usize::try_from(max_per_cycle).unwrap_or(usize::MAX),
         distribution_max_per_cycle: usize::try_from(distribution_max_per_cycle)
@@ -275,11 +281,26 @@ fn batch_settlement_due(
             || now.saturating_sub(state.last_activity_at) >= idle_settlement_delay_seconds)
 }
 
-fn batch_distribution_due(state: &pay_kit::mpp::store::ChannelState) -> bool {
+fn batch_distribution_due(
+    state: &pay_kit::mpp::store::ChannelState,
+    threshold_base_units: u64,
+) -> bool {
     !state.sealed
         && state.close_requested_at.is_none()
         && state.pending_setup.is_none()
-        && state.settled_on_chain > state.distributed_on_chain
+        && distribution_threshold_reached(
+            state.settled_on_chain,
+            state.distributed_on_chain,
+            threshold_base_units,
+        )
+}
+
+fn distribution_threshold_reached(
+    target_settled: u64,
+    distributed: u64,
+    threshold_base_units: u64,
+) -> bool {
+    target_settled.saturating_sub(distributed) >= threshold_base_units
 }
 
 fn select_rotating_batch(
@@ -500,8 +521,9 @@ fn spawn_batch_lifecycle(
                                             config.idle_settlement_delay_seconds,
                                             settle_active,
                                         ),
-                                        config.distribute_settled_funds
-                                            && batch_distribution_due(state),
+                                        config.distribution_threshold_base_units.is_some_and(
+                                            |threshold| batch_distribution_due(state, threshold),
+                                        ),
                                         !state.sealed
                                             && state.close_requested_at.is_some()
                                             && state.pending_setup.is_none(),
@@ -2231,8 +2253,8 @@ impl StartCommand {
                                             .map(|period| period.as_millis()),
                                         idle_settlement_delay_seconds =
                                             lifecycle_config.idle_settlement_delay_seconds,
-                                        distribute_settled_funds =
-                                            lifecycle_config.distribute_settled_funds,
+                                        distribution_threshold_base_units = lifecycle_config
+                                            .distribution_threshold_base_units,
                                         concurrency = lifecycle_config.concurrency,
                                         max_per_cycle = lifecycle_config.max_per_cycle,
                                         distribution_max_per_cycle =
@@ -3847,10 +3869,11 @@ mod tests {
     };
     use super::{
         BatchLifecycleReconciliation, batch_lifecycle_reconciliation, build_pdb_config,
-        default_bind, delegated_session_channel_payout, ensure_session_currencies_usd_pegged,
-        payout_recipient_pubkeys, payout_recipient_targets, resolve_operator_currencies,
-        select_rotating_batch, session_lifecycle_reconciliation, validate_browser_rpc_request,
-        x402_currency_configs, x402_upto_beneficiary_pubkey, x402_upto_payout_for_recipient,
+        default_bind, delegated_session_channel_payout, distribution_threshold_reached,
+        ensure_session_currencies_usd_pegged, payout_recipient_pubkeys, payout_recipient_targets,
+        resolve_operator_currencies, select_rotating_batch, session_lifecycle_reconciliation,
+        validate_browser_rpc_request, x402_currency_configs, x402_upto_beneficiary_pubkey,
+        x402_upto_payout_for_recipient,
     };
     use crate::network::SolanaNetwork;
     use serial_test::serial;
@@ -3900,6 +3923,14 @@ mod tests {
         let (_, third) = select_rotating_batch(channels, 2, &mut cursor);
         assert_eq!(third, ["channel-4", "channel-0"]);
         assert_eq!(cursor, 1);
+    }
+
+    #[test]
+    fn distribution_threshold_uses_only_the_undistributed_delta() {
+        assert!(!distribution_threshold_reached(999, 0, 1_000));
+        assert!(distribution_threshold_reached(1_000, 0, 1_000));
+        assert!(!distribution_threshold_reached(1_500, 501, 1_000));
+        assert!(distribution_threshold_reached(1_501, 501, 1_000));
     }
 
     #[test]

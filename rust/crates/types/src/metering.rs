@@ -939,11 +939,12 @@ pub struct BatchSettlementSpec {
     /// is eligible for the normal production settlement loop.
     #[serde(default = "default_batch_idle_settlement_delay_ms")]
     pub idle_settlement_delay_ms: u64,
-    /// Whether the lifecycle loop should move already-settled funds out of
-    /// escrow. Disabled by default so claiming and distribution remain
-    /// independently observable and schedulable.
-    #[serde(default)]
-    pub distribute_settled_funds: bool,
+    /// Minimum per-channel claimed-but-undistributed balance that triggers an
+    /// open-channel distribution, expressed in the configured token's base
+    /// units. Unset by default, so intermediate claims remain in escrow until
+    /// the channel closes. Must be greater than zero when set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub distribution_threshold_base_units: Option<u64>,
 }
 
 impl Default for BatchSettlementSpec {
@@ -951,7 +952,7 @@ impl Default for BatchSettlementSpec {
         Self {
             settlement_interval_ms: 0,
             idle_settlement_delay_ms: default_batch_idle_settlement_delay_ms(),
-            distribute_settled_funds: false,
+            distribution_threshold_base_units: None,
         }
     }
 }
@@ -1727,6 +1728,18 @@ pub fn validate_api_spec(spec: &ApiSpec) -> Vec<String> {
                     .to_string(),
             );
         }
+    }
+
+    if spec
+        .batch_settlement
+        .as_ref()
+        .and_then(|policy| policy.distribution_threshold_base_units)
+        == Some(0)
+    {
+        errs.push(
+            "batch_settlement.distribution_threshold_base_units must be greater than zero when set"
+                .to_string(),
+        );
     }
 
     errs
@@ -2624,13 +2637,28 @@ mod tests {
             policy.idle_settlement_delay_ms,
             DEFAULT_BATCH_IDLE_SETTLEMENT_DELAY_MS
         );
-        assert!(!policy.distribute_settled_funds);
+        assert_eq!(policy.distribution_threshold_base_units, None);
 
         let benchmark: BatchSettlementSpec = serde_json::from_str(
             r#"{"settlement_interval_ms":240000,"idle_settlement_delay_ms":300000}"#,
         )
         .unwrap();
         assert_eq!(benchmark.settlement_interval_ms, 240_000);
+    }
+
+    #[test]
+    fn batch_distribution_threshold_must_be_positive() {
+        let mut api = test_spec(vec![]);
+        api.batch_settlement = Some(BatchSettlementSpec {
+            distribution_threshold_base_units: Some(0),
+            ..BatchSettlementSpec::default()
+        });
+
+        assert!(
+            validate_api_spec(&api).iter().any(|error| {
+                error.contains("batch_settlement.distribution_threshold_base_units")
+            })
+        );
     }
 
     #[test]
