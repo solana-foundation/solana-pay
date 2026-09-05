@@ -1934,11 +1934,7 @@ async fn reconcile_channel(
             state.channel_id
         )));
     }
-    let signature: [u8; 64] = bs58::decode(signature)
-        .into_vec()
-        .map_err(|error| JobError::TxBuild(format!("voucher signature: {error}")))?
-        .try_into()
-        .map_err(|_| JobError::TxBuild("voucher signature is not 64 bytes".into()))?;
+    let signature = decode_voucher_signature(signature)?;
     let instructions = payment_channels::build_settle_instructions(
         &channel_id,
         &authorized_signer,
@@ -2138,11 +2134,10 @@ fn close_voucher(
 }
 
 fn decode_voucher_signature(signature: &str) -> Result<[u8; 64], JobError> {
-    bs58::decode(signature)
-        .into_vec()
-        .map_err(|error| JobError::TxBuild(format!("voucher signature: {error}")))?
-        .try_into()
-        .map_err(|_| JobError::TxBuild("voucher signature is not 64 bytes".into()))
+    let mut out = [0u8; 64];
+    five8::decode_64(signature, &mut out)
+        .map_err(|error| JobError::TxBuild(format!("voucher signature: {error}")))?;
+    Ok(out)
 }
 
 struct SettlementLock {

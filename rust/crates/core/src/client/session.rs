@@ -181,7 +181,7 @@ impl SessionHandle {
         let message = data
             .message_bytes()
             .map_err(|e| Error::Mpp(format!("Failed to encode close voucher: {e}")))?;
-        let signature = bs58::encode(key.sign(&message).to_bytes()).into_string();
+        let signature = crate::b58::encode_64(&key.sign(&message).to_bytes());
         Ok(SignedVoucher {
             data,
             signer: session.authorized_signer(),
@@ -404,7 +404,7 @@ pub fn open_payment_channel_session_header_with_override(
         let signature = rt
             .block_on(signer.sign_message(&message))
             .map_err(|e| Error::Mpp(format!("failed to sign session proof: {e}")))?;
-        proof.signature = bs58::encode(signature.as_ref()).into_string();
+        proof.signature = crate::b58::encode_64(&<[u8; 64]>::from(signature));
         Some(proof)
     } else {
         None

@@ -1598,7 +1598,7 @@ impl SessionMpp {
                 voucher: SignedVoucher {
                     data,
                     signer: operator.to_string(),
-                    signature: bs58::encode(signature.as_ref()).into_string(),
+                    signature: crate::b58::encode_64(&<[u8; 64]>::from(signature)),
                     signature_type: VoucherSignatureType::Ed25519,
                 },
             })
@@ -2266,12 +2266,8 @@ fn payment_channel_treasury_owner(network: &str) -> Result<solana_pubkey::Pubkey
 }
 
 fn decode_voucher_signature(signature: &str) -> Result<[u8; 64]> {
-    let bytes = bs58::decode(signature)
-        .into_vec()
-        .map_err(|e| Error::Mpp(format!("invalid voucher signature encoding: {e}")))?;
-    bytes
-        .try_into()
-        .map_err(|_| Error::Mpp("voucher signature is not 64 bytes".to_string()))
+    crate::b58::decode_64(signature)
+        .map_err(|e| Error::Mpp(format!("invalid voucher signature encoding: {e}")))
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────────

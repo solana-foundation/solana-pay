@@ -690,12 +690,9 @@ async fn build_sign_send(
     instructions: &[Instruction],
 ) -> Result<Signature, JobError> {
     let blockhash_b58 = rpc.get_latest_blockhash(rpc_url).await?;
-    let blockhash_bytes = bs58::decode(&blockhash_b58)
-        .into_vec()
+    let mut blockhash_arr = [0u8; 32];
+    five8::decode_32(&blockhash_b58, &mut blockhash_arr)
         .map_err(|e| JobError::TxBuild(format!("blockhash decode: {e}")))?;
-    let blockhash_arr: [u8; 32] = blockhash_bytes
-        .try_into()
-        .map_err(|_| JobError::TxBuild("blockhash is not 32 bytes".into()))?;
 
     let mut message = Message::new(instructions, Some(&fee_payer));
     message.recent_blockhash = solana_message::Hash::from(blockhash_arr);

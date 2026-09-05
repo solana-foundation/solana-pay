@@ -60,6 +60,7 @@ ed25519-dalek = { workspace = true }
 rand = { workspace = true }
 uuid = { workspace = true }
 bs58 = { workspace = true }
+five8 = { workspace = true }
 blake3 = { workspace = true }
 dashmap = "5.5"
 reqwest = { workspace = true, features = ["json"] }

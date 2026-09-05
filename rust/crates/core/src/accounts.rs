@@ -314,9 +314,9 @@ impl Account {
         if self.keystore != Keystore::Ephemeral {
             return None;
         }
-        bs58::decode(self.secret_key_b58.as_deref()?)
-            .into_vec()
+        crate::b58::decode_64(self.secret_key_b58.as_deref()?)
             .ok()
+            .map(|bytes| bytes.to_vec())
     }
 }
 
@@ -797,18 +797,18 @@ pub fn load_or_create_exact_ephemeral_for_network_as(
 fn generate_ephemeral_account() -> Account {
     let signing_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
     let verifying_key = signing_key.verifying_key();
-    let mut full = Vec::with_capacity(64);
-    full.extend_from_slice(&signing_key.to_bytes());
-    full.extend_from_slice(&verifying_key.to_bytes());
+    let mut full = [0u8; 64];
+    full[..32].copy_from_slice(&signing_key.to_bytes());
+    full[32..].copy_from_slice(&verifying_key.to_bytes());
     Account {
         keystore: Keystore::Ephemeral,
         active: false,
         auth_required: Some(false),
-        pubkey: Some(bs58::encode(verifying_key.to_bytes()).into_string()),
+        pubkey: Some(crate::b58::encode_32(&verifying_key.to_bytes())),
         vault: None,
         account: None,
         path: None,
-        secret_key_b58: Some(bs58::encode(&full).into_string()),
+        secret_key_b58: Some(crate::b58::encode_64(&full)),
         created_at: Some(now_rfc3339()),
         subscriptions: BTreeMap::new(),
     }
