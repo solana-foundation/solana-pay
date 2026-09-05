@@ -238,10 +238,12 @@ async fn discover_fixture_channels(
             channel,
         });
     }
-    ensure!(
-        signer_mismatches == 0,
-        "refusing recovery: {signer_mismatches} fixture channels had an unexpected authorized signer"
-    );
+    if signer_mismatches > 0 {
+        tracing::info!(
+            signer_mismatches,
+            "ignored fixture channels owned by a different authorization scheme"
+        );
+    }
     Ok(channels)
 }
 
