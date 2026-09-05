@@ -36,7 +36,7 @@ describe('findReference', () => {
         await expect(findReference(rpc, unknownRef)).rejects.toThrow('not found');
     });
 
-    it('should set code to "not found" when the RPC returns no signatures', async () => {
+    it('should set code to "inconclusive" when the RPC returns no signatures', async () => {
         expect.assertions(2);
 
         const unknownRef = address('2jDmYQMRCBnXUQeFRvQABcU6hLcvjVTdG7AoHravxWJX');
@@ -44,8 +44,8 @@ describe('findReference', () => {
         const error = await findReference(rpc, unknownRef).catch((thrown: unknown) => thrown);
 
         expect(error).toBeInstanceOf(FindReferenceError);
-        // An empty result is inconclusive, but it is reported as 'not found', never as 'aborted'.
-        expect((error as FindReferenceError).code).toBe('not found');
+        // An empty result carries no verdict on why: never paid, not indexed yet, or aged out.
+        expect((error as FindReferenceError).code).toBe('inconclusive');
     });
 });
 
@@ -69,7 +69,7 @@ describe('FindReferenceError', () => {
         expect(subclass).toBeInstanceOf(FindReferenceError);
         expect(subclass.attempts).toBe(3);
         expect(subclass.code).toBeUndefined();
-        expect(new FindReferenceError('not found').code).toBe('not found');
+        expect(new FindReferenceError('not found').code).toBe('inconclusive');
         expect(new FindReferenceError('aborted').code).toBe('aborted');
     });
 });

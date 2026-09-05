@@ -240,7 +240,7 @@ If a transaction with the given reference can't be found, the `findReference` fu
 -   Customer is yet to approve/complete the transaction
 -   The transaction has aged out of a non-archival RPC node's history
 
-An empty result is inconclusive: it can't distinguish a customer who never paid from a payment this node hasn't indexed yet, or no longer serves. Treat the error as "not found yet" and decide on your own timeout, not on the error itself. To branch on the reason programmatically, read the machine-readable `code` property of `FindReferenceError`: it is `'not found'` here and from a `watchReference` subscription that ends before a transaction is seen, and `'aborted'` when a `watchReference` subscription is cancelled.
+An empty result is inconclusive: it can't distinguish a customer who never paid from a payment this node hasn't indexed yet, or no longer serves. Treat the error as "not found yet" and decide on your own timeout, not on the error itself. To branch on the reason programmatically, read the machine-readable `code` property of `FindReferenceError`: it is `'inconclusive'` here and from a `watchReference` subscription that ends before a transaction is seen — the error message is still `'not found'`, but the code names what the read actually established — and `'aborted'` when a `watchReference` subscription is cancelled.
 
 <details>
     <summary>
