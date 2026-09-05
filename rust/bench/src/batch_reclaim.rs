@@ -24,7 +24,7 @@ use std::collections::HashMap;
 use std::str::FromStr;
 use std::time::Duration;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use pay_kit::core::payment_channels as pc;
 use solana_pubkey::Pubkey;
 
@@ -62,6 +62,7 @@ pub async fn recover_batch(
     concurrency: usize,
     yes: bool,
 ) -> Result<()> {
+    ensure!(concurrency > 0, "batch-reclaim concurrency must be > 0");
     if !yes {
         bail!("batch-reclaim submits real on-chain transactions; pass --yes to confirm");
     }

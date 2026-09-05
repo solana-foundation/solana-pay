@@ -32,6 +32,16 @@ use clap::{Parser, Subcommand};
 use crate::config::{Network, RunConfig};
 use crate::journal::Journal;
 
+fn parse_positive_usize(value: &str) -> std::result::Result<usize, String> {
+    let parsed = value
+        .parse::<usize>()
+        .map_err(|error| format!("invalid positive integer: {error}"))?;
+    if parsed == 0 {
+        return Err("value must be greater than zero".to_string());
+    }
+    Ok(parsed)
+}
+
 #[derive(Parser)]
 #[command(name = "bench", about = "Pay mainnet scaling harness", version)]
 struct Cli {
@@ -178,7 +188,11 @@ enum Cmd {
         /// The channels' distribution recipient (payTo), base58.
         #[arg(long)]
         receiver: String,
-        #[arg(long, default_value_t = 100)]
+        #[arg(
+            long,
+            default_value_t = 100,
+            value_parser = parse_positive_usize
+        )]
         concurrency: usize,
         #[arg(long)]
         yes: bool,
@@ -484,5 +498,16 @@ fn warn_incomplete() {
                 "outstanding real-money runs may hold funds — `bench list-runs` / `bench recover`"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_positive_usize;
+
+    #[test]
+    fn positive_usize_parser_rejects_zero() {
+        assert!(parse_positive_usize("0").is_err());
+        assert_eq!(parse_positive_usize("1").unwrap(), 1);
     }
 }
