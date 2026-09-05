@@ -504,18 +504,15 @@ fn spawn_batch_lifecycle(
                     .lock()
                     .unwrap_or_else(|error| error.into_inner())
                     .take();
-                match classification {
-                    Some((is_due, is_closing, is_sealed, snapshot)) => {
-                        value_inventory.observe(channel_id.clone(), snapshot);
-                        if is_due {
-                            due.push(channel_id);
-                        } else if is_closing {
-                            closing.push(channel_id);
-                        } else if is_sealed {
-                            sealed.push(channel_id);
-                        }
+                if let Some((is_due, is_closing, is_sealed, snapshot)) = classification {
+                    value_inventory.observe(channel_id.clone(), snapshot);
+                    if is_due {
+                        due.push(channel_id);
+                    } else if is_closing {
+                        closing.push(channel_id);
+                    } else if is_sealed {
+                        sealed.push(channel_id);
                     }
-                    _ => {}
                 }
             }
             let due_count = due.len();
@@ -2173,13 +2170,14 @@ impl StartCommand {
                             match batch_lifecycle_reconciliation(durable_batch_store) {
                                 BatchLifecycleReconciliation::Embedded => {
                                     let lifecycle_config = batch_lifecycle_config()?;
-                                    let mut pipeline_config =
-                                        pay_kit::core::tx_pipeline::TxPipelineConfig::default();
-                                    pipeline_config.confirmation_timeout =
-                                        lifecycle_config.confirmation_timeout;
-                                    pipeline_config.max_send_concurrency =
-                                        lifecycle_config.send_concurrency;
-                                    pipeline_config.send_interval = lifecycle_config.send_interval;
+                                    let pipeline_config =
+                                        pay_kit::core::tx_pipeline::TxPipelineConfig {
+                                            confirmation_timeout: lifecycle_config
+                                                .confirmation_timeout,
+                                            max_send_concurrency: lifecycle_config.send_concurrency,
+                                            send_interval: lifecycle_config.send_interval,
+                                            ..Default::default()
+                                        };
                                     b = b.with_tx_pipeline(
                                         pay_kit::core::tx_pipeline::TxPipeline::new(
                                             rpc_url.clone(),
