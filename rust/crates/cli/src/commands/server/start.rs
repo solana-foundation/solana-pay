@@ -1,6 +1,5 @@
 //! `pay gate api` — start a payment gateway proxy.
 
-use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -179,6 +178,7 @@ struct BatchLifecycleConfig {
     startup_delay: Duration,
     active_settlement_interval: Option<Duration>,
     idle_settlement_delay_seconds: u64,
+    distribute_settled_funds: bool,
     concurrency: usize,
     max_per_cycle: usize,
     distribution_max_per_cycle: usize,
@@ -240,6 +240,7 @@ fn batch_lifecycle_config(
         active_settlement_interval: (policy.settlement_interval_ms > 0)
             .then(|| Duration::from_millis(policy.settlement_interval_ms)),
         idle_settlement_delay_seconds: policy.idle_settlement_delay_ms.div_ceil(1_000),
+        distribute_settled_funds: policy.distribute_settled_funds,
         concurrency: usize::try_from(concurrency).unwrap_or(usize::MAX),
         max_per_cycle: usize::try_from(max_per_cycle).unwrap_or(usize::MAX),
         distribution_max_per_cycle: usize::try_from(distribution_max_per_cycle)
@@ -329,37 +330,7 @@ impl BatchChannelValueSnapshot {
 
 #[derive(Default)]
 struct BatchValueInventory {
-    channels: HashMap<String, BatchChannelValueSnapshot>,
     totals: BatchChannelValueSnapshot,
-}
-
-impl BatchValueInventory {
-    fn observe(&mut self, channel_id: String, snapshot: BatchChannelValueSnapshot) {
-        let previous = self
-            .channels
-            .insert(channel_id, snapshot)
-            .unwrap_or_default();
-        self.totals.escrowed = self
-            .totals
-            .escrowed
-            .saturating_sub(previous.escrowed)
-            .saturating_add(snapshot.escrowed);
-        self.totals.authorized = self
-            .totals
-            .authorized
-            .saturating_sub(previous.authorized)
-            .saturating_add(snapshot.authorized);
-        self.totals.settled = self
-            .totals
-            .settled
-            .saturating_sub(previous.settled)
-            .saturating_add(snapshot.settled);
-        self.totals.distributed = self
-            .totals
-            .distributed
-            .saturating_sub(previous.distributed)
-            .saturating_add(snapshot.distributed);
-    }
 }
 
 fn record_batch_value_inventory(inventory: &BatchValueInventory) {
@@ -406,10 +377,7 @@ async fn collect_batch_value_inventory(
             .map_err(|error| error.to_string())?;
     }
     let totals = *totals.lock().unwrap_or_else(|error| error.into_inner());
-    Ok(BatchValueInventory {
-        channels: HashMap::new(),
-        totals,
-    })
+    Ok(BatchValueInventory { totals })
 }
 
 fn spawn_batch_value_metrics(batch: pay_kit::x402::server::X402BatchSettlement, period: Duration) {
@@ -479,7 +447,6 @@ fn spawn_batch_lifecycle(
             .map(|period| Instant::now() + period);
         let mut cursor = 0usize;
         let mut distribution_cursor = 0usize;
-        let mut value_inventory = BatchValueInventory::default();
         loop {
             interval.tick().await;
             let started = Instant::now();
@@ -533,12 +500,12 @@ fn spawn_batch_lifecycle(
                                             config.idle_settlement_delay_seconds,
                                             settle_active,
                                         ),
-                                        batch_distribution_due(state),
+                                        config.distribute_settled_funds
+                                            && batch_distribution_due(state),
                                         !state.sealed
                                             && state.close_requested_at.is_some()
                                             && state.pending_setup.is_none(),
                                         state.sealed && state.pending_setup.is_none(),
-                                        BatchChannelValueSnapshot::from_state(state),
                                     )
                                 });
                             Ok(())
@@ -553,10 +520,7 @@ fn spawn_batch_lifecycle(
                     .lock()
                     .unwrap_or_else(|error| error.into_inner())
                     .take();
-                if let Some((is_due, is_distributable, is_closing, is_sealed, snapshot)) =
-                    classification
-                {
-                    value_inventory.observe(channel_id.clone(), snapshot);
+                if let Some((is_due, is_distributable, is_closing, is_sealed)) = classification {
                     if is_due {
                         due.push(channel_id.clone());
                     }
@@ -577,13 +541,6 @@ fn spawn_batch_lifecycle(
                 &mut distribution_cursor,
             );
             let distribution_count = distributable.len();
-            let lifecycle_channels = due
-                .iter()
-                .chain(&distributable)
-                .chain(&closing)
-                .chain(&sealed)
-                .cloned()
-                .collect::<Vec<_>>();
             // Publish the scan immediately. A 100k-channel redemption can take
             // minutes; dashboards must distinguish an active sweep from a
             // worker that never started.
@@ -604,7 +561,6 @@ fn spawn_batch_lifecycle(
                 metric_group = "pay_x402_batch_lifecycle",
                 "embedded x402 batch-settlement metrics"
             );
-            record_batch_value_inventory(&value_inventory);
             let claim_started = Instant::now();
             let claim_failures =
                 run_batch_lifecycle_chunks(&batch, due, config, BatchLifecycleAction::Claim).await;
@@ -666,32 +622,6 @@ fn spawn_batch_lifecycle(
                 + distribution_failures.len()
                 + close_failures.len()
                 + reclaim_failures.len();
-            // Lifecycle operations update the in-memory watermarks. Refresh
-            // affected snapshots so the completion event reflects this sweep,
-            // rather than the state observed before it began.
-            for channel_id in lifecycle_channels {
-                let snapshot = Arc::new(Mutex::new(None));
-                let out = Arc::clone(&snapshot);
-                if batch
-                    .store()
-                    .read_channel(
-                        &channel_id,
-                        Box::new(move |state| {
-                            *out.lock().unwrap_or_else(|error| error.into_inner()) =
-                                state.map(BatchChannelValueSnapshot::from_state);
-                            Ok(())
-                        }),
-                    )
-                    .await
-                    .is_ok()
-                    && let Some(snapshot) = snapshot
-                        .lock()
-                        .unwrap_or_else(|error| error.into_inner())
-                        .take()
-                {
-                    value_inventory.observe(channel_id, snapshot);
-                }
-            }
             let outcome = if failure_count == 0 {
                 "succeeded"
             } else {
@@ -715,7 +645,6 @@ fn spawn_batch_lifecycle(
                 metric_group = "pay_x402_batch_lifecycle",
                 "embedded x402 batch-settlement metrics"
             );
-            record_batch_value_inventory(&value_inventory);
             tracing::info!(
                 channels_available,
                 channels_scanned,
@@ -2302,6 +2231,8 @@ impl StartCommand {
                                             .map(|period| period.as_millis()),
                                         idle_settlement_delay_seconds =
                                             lifecycle_config.idle_settlement_delay_seconds,
+                                        distribute_settled_funds =
+                                            lifecycle_config.distribute_settled_funds,
                                         concurrency = lifecycle_config.concurrency,
                                         max_per_cycle = lifecycle_config.max_per_cycle,
                                         distribution_max_per_cycle =
@@ -3915,9 +3846,8 @@ mod tests {
         stable_token_account_requirements, surfpool_funding_targets, surfpool_prep_notice_body,
     };
     use super::{
-        BatchChannelValueSnapshot, BatchLifecycleReconciliation, BatchValueInventory,
-        batch_lifecycle_reconciliation, build_pdb_config, default_bind,
-        delegated_session_channel_payout, ensure_session_currencies_usd_pegged,
+        BatchLifecycleReconciliation, batch_lifecycle_reconciliation, build_pdb_config,
+        default_bind, delegated_session_channel_payout, ensure_session_currencies_usd_pegged,
         payout_recipient_pubkeys, payout_recipient_targets, resolve_operator_currencies,
         select_rotating_batch, session_lifecycle_reconciliation, validate_browser_rpc_request,
         x402_currency_configs, x402_upto_beneficiary_pubkey, x402_upto_payout_for_recipient,
@@ -3949,35 +3879,6 @@ mod tests {
             batch_lifecycle_reconciliation(true),
             BatchLifecycleReconciliation::External
         );
-    }
-
-    #[test]
-    fn batch_value_inventory_replaces_a_channels_previous_snapshot() {
-        let mut inventory = BatchValueInventory::default();
-        inventory.observe(
-            "channel-a".to_string(),
-            BatchChannelValueSnapshot {
-                escrowed: 5_000_000,
-                authorized: 10_000,
-                settled: 0,
-                distributed: 0,
-            },
-        );
-        inventory.observe(
-            "channel-a".to_string(),
-            BatchChannelValueSnapshot {
-                escrowed: 5_000_000,
-                authorized: 0,
-                settled: 2_000,
-                distributed: 8_000,
-            },
-        );
-
-        assert_eq!(inventory.channels.len(), 1);
-        assert_eq!(inventory.totals.escrowed, 5_000_000);
-        assert_eq!(inventory.totals.authorized, 0);
-        assert_eq!(inventory.totals.settled, 2_000);
-        assert_eq!(inventory.totals.distributed, 8_000);
     }
 
     #[test]

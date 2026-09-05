@@ -939,6 +939,11 @@ pub struct BatchSettlementSpec {
     /// is eligible for the normal production settlement loop.
     #[serde(default = "default_batch_idle_settlement_delay_ms")]
     pub idle_settlement_delay_ms: u64,
+    /// Whether the lifecycle loop should move already-settled funds out of
+    /// escrow. Disabled by default so claiming and distribution remain
+    /// independently observable and schedulable.
+    #[serde(default)]
+    pub distribute_settled_funds: bool,
 }
 
 impl Default for BatchSettlementSpec {
@@ -946,6 +951,7 @@ impl Default for BatchSettlementSpec {
         Self {
             settlement_interval_ms: 0,
             idle_settlement_delay_ms: default_batch_idle_settlement_delay_ms(),
+            distribute_settled_funds: false,
         }
     }
 }
@@ -2618,6 +2624,7 @@ mod tests {
             policy.idle_settlement_delay_ms,
             DEFAULT_BATCH_IDLE_SETTLEMENT_DELAY_MS
         );
+        assert!(!policy.distribute_settled_funds);
 
         let benchmark: BatchSettlementSpec = serde_json::from_str(
             r#"{"settlement_interval_ms":240000,"idle_settlement_delay_ms":300000}"#,

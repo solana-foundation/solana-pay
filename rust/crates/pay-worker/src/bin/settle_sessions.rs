@@ -381,6 +381,7 @@ struct BatchRuntime {
     redis_url: String,
     store: RedisChannelStore,
     settle_active_channels: bool,
+    distribute_settled_funds: bool,
     settlement_max_idle: Duration,
     reconciliation_concurrency: usize,
 }
@@ -451,6 +452,8 @@ impl SettlementRuntime {
             .await
             .map_err(|error| JobError::Config(format!("batch Redis: {error}")))?;
             let settle_active_channels = parse_bool_env("PAY_X402_SETTLE_ACTIVE_CHANNELS", false)?;
+            let distribute_settled_funds =
+                parse_bool_env("PAY_X402_DISTRIBUTE_SETTLED_FUNDS", false)?;
             let settlement_max_idle = Duration::from_secs(parse_u64_env(
                 "PAY_X402_SETTLEMENT_MAX_IDLE_SECONDS",
                 DEFAULT_X402_SETTLEMENT_MAX_IDLE_SECONDS,
@@ -471,6 +474,7 @@ impl SettlementRuntime {
                 redis_url,
                 store,
                 settle_active_channels,
+                distribute_settled_funds,
                 settlement_max_idle,
                 reconciliation_concurrency,
             })
@@ -870,6 +874,7 @@ async fn run_batch(runtime: &SettlementRuntime) -> Result<SettleSessionsMetrics,
         channels = channels.len(),
         operator = %runtime.operator,
         settle_active_channels = batch.settle_active_channels,
+        distribute_settled_funds = batch.distribute_settled_funds,
         settlement_max_idle_seconds = batch.settlement_max_idle.as_secs(),
         reconciliation_concurrency = batch.reconciliation_concurrency,
         "x402 batch-settlement reconciliation starting"
@@ -988,6 +993,7 @@ async fn run_batch(runtime: &SettlementRuntime) -> Result<SettleSessionsMetrics,
             &runtime.operator,
             &runtime.treasury_owner,
             &token_programs,
+            batch.distribute_settled_funds,
         )
     }))
     .buffer_unordered(batch.reconciliation_concurrency)
@@ -1049,7 +1055,12 @@ async fn run_batch(runtime: &SettlementRuntime) -> Result<SettleSessionsMetrics,
 
     metrics.claims = candidates
         .iter()
-        .filter(|candidate| candidate.kind == BatchCandidateKind::ClaimAndPayout)
+        .filter(|candidate| {
+            matches!(
+                candidate.kind,
+                BatchCandidateKind::Claim | BatchCandidateKind::ClaimAndPayout
+            )
+        })
         .count();
     metrics.payouts = candidates
         .iter()
@@ -1360,6 +1371,7 @@ struct BatchReconcileResult {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BatchCandidateKind {
+    Claim,
     ClaimAndPayout,
     Payout,
     FinalizeClose,
@@ -1369,6 +1381,7 @@ enum BatchCandidateKind {
 impl BatchCandidateKind {
     fn label(self) -> &'static str {
         match self {
+            Self::Claim => "claim",
             Self::ClaimAndPayout => "claim_and_payout",
             Self::Payout => "payout",
             Self::FinalizeClose => "finalize_close",
@@ -1519,6 +1532,7 @@ async fn reconcile_batch_channel(
     operator: &Pubkey,
     treasury_owner: &Pubkey,
     token_programs: &HashMap<Pubkey, Pubkey>,
+    distribute_settled_funds: bool,
 ) -> Result<BatchReconcileResult, JobError> {
     let state_channel_id = state.channel_id.clone();
     let Some(onchain) = onchain else {
@@ -1596,7 +1610,50 @@ async fn reconcile_batch_channel(
                     .map_err(|error| JobError::TxBuild(format!("settle instruction: {error}")))?,
                 );
                 target_settled = state.cumulative;
-                kind = BatchCandidateKind::ClaimAndPayout;
+                kind = if distribute_settled_funds {
+                    BatchCandidateKind::ClaimAndPayout
+                } else {
+                    BatchCandidateKind::Claim
+                };
+            }
+            if !distribute_settled_funds {
+                if kind == BatchCandidateKind::Payout {
+                    return Ok(BatchReconcileResult {
+                        channel_id: state_channel_id,
+                        candidate: None,
+                        delete_absent: false,
+                        snapshot,
+                        stablecoin_settled_base_units: settled_metric,
+                        stablecoin_distributed_base_units: distributed_metric,
+                        escrow_active: Some(true),
+                        observed_settled_on_chain: Some(onchain.channel.settlement.settled),
+                    });
+                }
+                return Ok(BatchReconcileResult {
+                    channel_id: state_channel_id.clone(),
+                    candidate: Some(BatchCandidate {
+                        channel_id: state_channel_id,
+                        instructions,
+                        kind,
+                        store_action: BatchStoreAction::Keep,
+                        before: snapshot,
+                        after: inventory_snapshot(
+                            state.sealed,
+                            STATUS_OPEN,
+                            target_settled,
+                            onchain.channel.settlement.payout_watermark,
+                            state.cumulative,
+                            &onchain.mint(),
+                        ),
+                        settled_on_chain: target_settled,
+                    }),
+                    delete_absent: false,
+                    snapshot,
+                    stablecoin_settled_base_units: settled_metric,
+                    stablecoin_distributed_base_units: distributed_metric,
+                    escrow_active: Some(true),
+                    observed_settled_on_chain: Some(onchain.channel.settlement.settled),
+                });
             }
             if target_settled <= onchain.channel.settlement.payout_watermark {
                 return Ok(BatchReconcileResult {

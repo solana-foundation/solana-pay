@@ -1266,6 +1266,7 @@ mod tests {
             operator: None,
             recipients: Default::default(),
             session: None,
+            batch_settlement: None,
         };
         let doc = synthesize_from_spec(
             &api,

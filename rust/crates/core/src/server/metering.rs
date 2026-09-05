@@ -1159,6 +1159,7 @@ mod tests {
             notes: None,
             operator: None,
             session: None,
+            batch_settlement: None,
             recipients: std::collections::HashMap::new(),
         }
     }
