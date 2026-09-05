@@ -463,13 +463,27 @@ fn spawn_batch_lifecycle(
         // Construction happens after provisioning-related startup work. Do not
         // make the first full store snapshot part of gateway startup.
         interval.tick().await;
-        let mut next_active_settlement = config
-            .active_settlement_interval
-            .map(|period| Instant::now() + period);
+        let mut active_interval = config.active_settlement_interval.map(|period| {
+            let mut interval = tokio::time::interval_at(Instant::now() + period, period);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            interval
+        });
         let mut cursor = 0usize;
         let mut distribution_cursor = 0usize;
         loop {
-            interval.tick().await;
+            // Active sweeps have their own anchored timer. Sampling their
+            // deadline from the operational reconciliation timer can miss by
+            // one complete tick when both clocks meet at the same instant.
+            let settle_active = if let Some(active_interval) = active_interval.as_mut() {
+                tokio::select! {
+                    biased;
+                    _ = active_interval.tick() => true,
+                    _ = interval.tick() => false,
+                }
+            } else {
+                interval.tick().await;
+                false
+            };
             let started = Instant::now();
             let channel_ids = match batch.store().list_channel_ids().await {
                 Ok(channel_ids) => channel_ids,
@@ -479,12 +493,7 @@ fn spawn_batch_lifecycle(
                 }
             };
             let channels_available = channel_ids.len();
-            let settle_active =
-                next_active_settlement.is_some_and(|deadline| Instant::now() >= deadline);
             if settle_active {
-                next_active_settlement = config
-                    .active_settlement_interval
-                    .map(|period| Instant::now() + period);
                 cursor = 0;
             }
             // Production ticks inspect a bounded rotating page and only flush
