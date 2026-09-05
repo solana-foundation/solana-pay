@@ -43,12 +43,12 @@ hand-copied program logic or account layout.
 | `PAY_MPP_FINALIZED_RETENTION_SECONDS` | no | `604800` (7 days) | Retain a fully finalized MPP session record for reconciliation/debugging before Redis expires it. |
 | `PAY_X402_REDIS_URL` | no | MPP Redis URL | x402 Redis URL shared with the gateway. |
 | `PAY_X402_REDIS_PREFIX` | no | `pay:batch:v1:` | x402 batch channel key namespace; must match the gateway. |
-| `PAY_X402_SETTLEMENT_MIN_DELTA_BASE_UNITS` | no | `10000` | Defer an active x402 claim until its unsettled cumulative delta reaches this threshold. |
-| `PAY_X402_SETTLEMENT_MAX_IDLE_SECONDS` | no | `300` | Settle a nonzero residual below the delta threshold after this much inactivity. Closing and sealed channels are never deferred. |
+| `PAY_X402_SETTLE_ACTIVE_CHANNELS` | no | `false` | Include active channels with positive off-chain watermarks in every worker run. Keep false for idle-only production reconciliation; enable it for an explicitly scheduled full-fleet sweep. |
+| `PAY_X402_SETTLEMENT_MAX_IDLE_SECONDS` | no | `300` | Settle a positive residual after the channel has remained untouched for this long. Closing and sealed channels are never deferred. |
 | `PAY_X402_RECONCILIATION_CONCURRENCY` | no | `64` | Maximum concurrent x402 on-chain reconciliation plans. Work is streamed through this bound rather than spawned all at once. |
 | `SETTLEMENT_LOCK_TTL_SECONDS` | no | `300` | TTL for each scheme's independent reconciliation lease. |
 | `RUN_ONCE` | no | `true` | Keep one-shot behavior for manual Cloud Run Job executions. Set to `false` for the continuous worker. |
-| `SETTLEMENT_INTERVAL_SECONDS` | no | `10` | Delay between continuous reconciliation iterations when `RUN_ONCE=false`. |
+| `SETTLEMENT_INTERVAL_SECONDS` | no | `10` | Delay between complete MPP and x402 reconciliation sweeps when `RUN_ONCE=false`. Set this to `240` for a four-minute x402 settlement clock. |
 
 The fee-payer keys intentionally share pay-api's `send.fee_payer.*` env names so
 a single Doppler config drives both. Job-specific overrides use the `JOBS_`

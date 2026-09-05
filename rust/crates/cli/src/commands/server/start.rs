@@ -32,9 +32,7 @@ use crate::network::SolanaNetwork;
 const BROWSER_RPC_PROXY_PATH: &str = "/__402/rpc";
 const FEE_PAYER_BALANCE_OBSERVE_INTERVAL: Duration = Duration::from_secs(300);
 const DEFAULT_SERVER_BIND: &str = "0.0.0.0:1402";
-const DEFAULT_X402_SETTLEMENT_INTERVAL_SECONDS: u64 = 10;
-const DEFAULT_X402_SETTLEMENT_MIN_DELTA_BASE_UNITS: u64 = 10_000;
-const DEFAULT_X402_SETTLEMENT_MAX_IDLE_SECONDS: u64 = 300;
+const DEFAULT_X402_RECONCILIATION_INTERVAL_SECONDS: u64 = 10;
 const DEFAULT_X402_RECONCILIATION_STARTUP_DELAY_SECONDS: u64 = 0;
 const DEFAULT_X402_RECONCILIATION_CONCURRENCY: usize = 64;
 const DEFAULT_X402_RECONCILIATION_MAX_PER_CYCLE: usize = 4_096;
@@ -179,8 +177,8 @@ fn batch_lifecycle_reconciliation(durable_store: bool) -> BatchLifecycleReconcil
 struct BatchLifecycleConfig {
     interval: Duration,
     startup_delay: Duration,
-    min_delta_base_units: u64,
-    max_idle: Duration,
+    active_settlement_interval: Option<Duration>,
+    idle_settlement_delay_seconds: u64,
     concurrency: usize,
     max_per_cycle: usize,
     distribution_max_per_cycle: usize,
@@ -210,7 +208,10 @@ fn positive_env_u64(name: &str, default: u64) -> pay_core::Result<u64> {
     Ok(value)
 }
 
-fn batch_lifecycle_config() -> pay_core::Result<BatchLifecycleConfig> {
+fn batch_lifecycle_config(
+    policy: Option<&pay_types::metering::BatchSettlementSpec>,
+) -> pay_core::Result<BatchLifecycleConfig> {
+    let policy = policy.cloned().unwrap_or_default();
     let concurrency = positive_env_u64(
         "PAY_X402_RECONCILIATION_CONCURRENCY",
         DEFAULT_X402_RECONCILIATION_CONCURRENCY as u64,
@@ -230,20 +231,15 @@ fn batch_lifecycle_config() -> pay_core::Result<BatchLifecycleConfig> {
     Ok(BatchLifecycleConfig {
         interval: Duration::from_secs(positive_env_u64(
             "PAY_X402_RECONCILIATION_INTERVAL_SECONDS",
-            DEFAULT_X402_SETTLEMENT_INTERVAL_SECONDS,
+            DEFAULT_X402_RECONCILIATION_INTERVAL_SECONDS,
         )?),
         startup_delay: Duration::from_secs(env_u64(
             "PAY_X402_RECONCILIATION_STARTUP_DELAY_SECONDS",
             DEFAULT_X402_RECONCILIATION_STARTUP_DELAY_SECONDS,
         )?),
-        min_delta_base_units: positive_env_u64(
-            "PAY_X402_SETTLEMENT_MIN_DELTA_BASE_UNITS",
-            DEFAULT_X402_SETTLEMENT_MIN_DELTA_BASE_UNITS,
-        )?,
-        max_idle: Duration::from_secs(positive_env_u64(
-            "PAY_X402_SETTLEMENT_MAX_IDLE_SECONDS",
-            DEFAULT_X402_SETTLEMENT_MAX_IDLE_SECONDS,
-        )?),
+        active_settlement_interval: (policy.settlement_interval_ms > 0)
+            .then(|| Duration::from_millis(policy.settlement_interval_ms)),
+        idle_settlement_delay_seconds: policy.idle_settlement_delay_ms.div_ceil(1_000),
         concurrency: usize::try_from(concurrency).unwrap_or(usize::MAX),
         max_per_cycle: usize::try_from(max_per_cycle).unwrap_or(usize::MAX),
         distribution_max_per_cycle: usize::try_from(distribution_max_per_cycle)
@@ -267,15 +263,15 @@ fn batch_lifecycle_config() -> pay_core::Result<BatchLifecycleConfig> {
 fn batch_settlement_due(
     state: &pay_kit::mpp::store::ChannelState,
     now: u64,
-    config: BatchLifecycleConfig,
+    idle_settlement_delay_seconds: u64,
+    settle_active: bool,
 ) -> bool {
     if state.sealed || state.close_requested_at.is_some() || state.pending_setup.is_some() {
         return false;
     }
-    let unsettled = state.cumulative.saturating_sub(state.settled_on_chain);
-    unsettled > 0
-        && (unsettled >= config.min_delta_base_units
-            || now.saturating_sub(state.last_activity_at) >= config.max_idle.as_secs())
+    state.cumulative > state.settled_on_chain
+        && (settle_active
+            || now.saturating_sub(state.last_activity_at) >= idle_settlement_delay_seconds)
 }
 
 fn batch_distribution_due(state: &pay_kit::mpp::store::ChannelState) -> bool {
@@ -285,7 +281,7 @@ fn batch_distribution_due(state: &pay_kit::mpp::store::ChannelState) -> bool {
         && state.settled_on_chain > state.distributed_on_chain
 }
 
-fn select_distribution_batch(
+fn select_rotating_batch(
     mut channel_ids: Vec<String>,
     max_per_cycle: usize,
     cursor: &mut usize,
@@ -478,13 +474,16 @@ fn spawn_batch_lifecycle(
         // Construction happens after provisioning-related startup work. Do not
         // make the first full store snapshot part of gateway startup.
         interval.tick().await;
+        let mut next_active_settlement = config
+            .active_settlement_interval
+            .map(|period| Instant::now() + period);
         let mut cursor = 0usize;
         let mut distribution_cursor = 0usize;
         let mut value_inventory = BatchValueInventory::default();
         loop {
             interval.tick().await;
             let started = Instant::now();
-            let mut channel_ids = match batch.store().list_channel_ids().await {
+            let channel_ids = match batch.store().list_channel_ids().await {
                 Ok(channel_ids) => channel_ids,
                 Err(error) => {
                     tracing::warn!(%error, "failed to enumerate embedded batch lifecycle state");
@@ -492,13 +491,22 @@ fn spawn_batch_lifecycle(
                 }
             };
             let channels_available = channel_ids.len();
-            if channel_ids.len() > config.max_per_cycle {
-                channel_ids.rotate_left(cursor % channels_available);
-                channel_ids.truncate(config.max_per_cycle);
-                cursor = (cursor + config.max_per_cycle) % channels_available;
-            } else {
+            let settle_active =
+                next_active_settlement.is_some_and(|deadline| Instant::now() >= deadline);
+            if settle_active {
+                next_active_settlement = config
+                    .active_settlement_interval
+                    .map(|period| Instant::now() + period);
                 cursor = 0;
             }
+            // Production ticks inspect a bounded rotating page and only flush
+            // idle residuals. An explicitly configured active-settlement clock
+            // snapshots the complete fleet, matching MPP session behavior.
+            let channel_ids = if settle_active {
+                channel_ids
+            } else {
+                select_rotating_batch(channel_ids, config.max_per_cycle, &mut cursor).1
+            };
             let now = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
@@ -519,7 +527,12 @@ fn spawn_batch_lifecycle(
                             *out.lock().unwrap_or_else(|error| error.into_inner()) =
                                 state.map(|state| {
                                     (
-                                        batch_settlement_due(state, now, config),
+                                        batch_settlement_due(
+                                            state,
+                                            now,
+                                            config.idle_settlement_delay_seconds,
+                                            settle_active,
+                                        ),
                                         batch_distribution_due(state),
                                         !state.sealed
                                             && state.close_requested_at.is_some()
@@ -558,7 +571,7 @@ fn spawn_batch_lifecycle(
                 }
             }
             let due_count = due.len();
-            let (distributable_available, distributable) = select_distribution_batch(
+            let (distributable_available, distributable) = select_rotating_batch(
                 distributable,
                 config.distribution_max_per_cycle,
                 &mut distribution_cursor,
@@ -586,6 +599,7 @@ fn spawn_batch_lifecycle(
                 gauge.pay_x402_batch_lifecycle_channels_reclaimable = sealed.len() as u64,
                 gauge.pay_x402_batch_lifecycle_failures = 0_u64,
                 protocol = "x402/batch",
+                settlement_sweep = if settle_active { "active" } else { "idle" },
                 outcome = "running",
                 metric_group = "pay_x402_batch_lifecycle",
                 "embedded x402 batch-settlement metrics"
@@ -2263,7 +2277,8 @@ impl StartCommand {
                         Ok(mut b) => {
                             match batch_lifecycle_reconciliation(durable_batch_store) {
                                 BatchLifecycleReconciliation::Embedded => {
-                                    let lifecycle_config = batch_lifecycle_config()?;
+                                    let lifecycle_config =
+                                        batch_lifecycle_config(api.batch_settlement.as_ref())?;
                                     let pipeline_config =
                                         pay_kit::core::tx_pipeline::TxPipelineConfig {
                                             confirmation_timeout: lifecycle_config
@@ -2282,8 +2297,11 @@ impl StartCommand {
                                         interval_seconds = lifecycle_config.interval.as_secs(),
                                         startup_delay_seconds =
                                             lifecycle_config.startup_delay.as_secs(),
-                                        min_delta_base_units = lifecycle_config.min_delta_base_units,
-                                        max_idle_seconds = lifecycle_config.max_idle.as_secs(),
+                                        active_settlement_interval_ms = lifecycle_config
+                                            .active_settlement_interval
+                                            .map(|period| period.as_millis()),
+                                        idle_settlement_delay_seconds =
+                                            lifecycle_config.idle_settlement_delay_seconds,
                                         concurrency = lifecycle_config.concurrency,
                                         max_per_cycle = lifecycle_config.max_per_cycle,
                                         distribution_max_per_cycle =
@@ -3901,7 +3919,7 @@ mod tests {
         batch_lifecycle_reconciliation, build_pdb_config, default_bind,
         delegated_session_channel_payout, ensure_session_currencies_usd_pegged,
         payout_recipient_pubkeys, payout_recipient_targets, resolve_operator_currencies,
-        select_distribution_batch, session_lifecycle_reconciliation, validate_browser_rpc_request,
+        select_rotating_batch, session_lifecycle_reconciliation, validate_browser_rpc_request,
         x402_currency_configs, x402_upto_beneficiary_pubkey, x402_upto_payout_for_recipient,
     };
     use crate::network::SolanaNetwork;
@@ -3967,18 +3985,18 @@ mod tests {
         let channels = (0..5).map(|index| format!("channel-{index}")).collect();
         let mut cursor = 0;
 
-        let (available, first) = select_distribution_batch(channels, 2, &mut cursor);
+        let (available, first) = select_rotating_batch(channels, 2, &mut cursor);
         assert_eq!(available, 5);
         assert_eq!(first, ["channel-0", "channel-1"]);
         assert_eq!(cursor, 2);
 
         let channels = (0..5).map(|index| format!("channel-{index}")).collect();
-        let (_, second) = select_distribution_batch(channels, 2, &mut cursor);
+        let (_, second) = select_rotating_batch(channels, 2, &mut cursor);
         assert_eq!(second, ["channel-2", "channel-3"]);
         assert_eq!(cursor, 4);
 
         let channels = (0..5).map(|index| format!("channel-{index}")).collect();
-        let (_, third) = select_distribution_batch(channels, 2, &mut cursor);
+        let (_, third) = select_rotating_batch(channels, 2, &mut cursor);
         assert_eq!(third, ["channel-4", "channel-0"]);
         assert_eq!(cursor, 1);
     }

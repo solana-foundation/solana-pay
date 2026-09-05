@@ -37,7 +37,6 @@ const DEFAULT_BATCH_REDIS_PREFIX: &str = "pay:batch:v1:";
 const SESSION_SETTLEMENT_LOCK_KEY: &str = "pay:jobs:settle-sessions:lock";
 const BATCH_SETTLEMENT_LOCK_KEY: &str = "pay:jobs:settle-batch:lock";
 const DEFAULT_RECONCILIATION_INTERVAL_SECONDS: u64 = 10;
-const DEFAULT_X402_SETTLEMENT_MIN_DELTA_BASE_UNITS: u64 = 10_000;
 const DEFAULT_X402_SETTLEMENT_MAX_IDLE_SECONDS: u64 = 300;
 const DEFAULT_X402_RECONCILIATION_CONCURRENCY: u64 = 64;
 const DEFAULT_PORT: u64 = 8080;
@@ -381,7 +380,7 @@ struct ChannelRuntime {
 struct BatchRuntime {
     redis_url: String,
     store: RedisChannelStore,
-    settlement_min_delta_base_units: u64,
+    settle_active_channels: bool,
     settlement_max_idle: Duration,
     reconciliation_concurrency: usize,
 }
@@ -451,15 +450,7 @@ impl SettlementRuntime {
             )
             .await
             .map_err(|error| JobError::Config(format!("batch Redis: {error}")))?;
-            let settlement_min_delta_base_units = parse_u64_env(
-                "PAY_X402_SETTLEMENT_MIN_DELTA_BASE_UNITS",
-                DEFAULT_X402_SETTLEMENT_MIN_DELTA_BASE_UNITS,
-            )?;
-            if settlement_min_delta_base_units == 0 {
-                return Err(JobError::Config(
-                    "PAY_X402_SETTLEMENT_MIN_DELTA_BASE_UNITS must be greater than zero".into(),
-                ));
-            }
+            let settle_active_channels = parse_bool_env("PAY_X402_SETTLE_ACTIVE_CHANNELS", false)?;
             let settlement_max_idle = Duration::from_secs(parse_u64_env(
                 "PAY_X402_SETTLEMENT_MAX_IDLE_SECONDS",
                 DEFAULT_X402_SETTLEMENT_MAX_IDLE_SECONDS,
@@ -479,7 +470,7 @@ impl SettlementRuntime {
             Some(BatchRuntime {
                 redis_url,
                 store,
-                settlement_min_delta_base_units,
+                settle_active_channels,
                 settlement_max_idle,
                 reconciliation_concurrency,
             })
@@ -878,7 +869,7 @@ async fn run_batch(runtime: &SettlementRuntime) -> Result<SettleSessionsMetrics,
         network = runtime.network,
         channels = channels.len(),
         operator = %runtime.operator,
-        settlement_min_delta_base_units = batch.settlement_min_delta_base_units,
+        settle_active_channels = batch.settle_active_channels,
         settlement_max_idle_seconds = batch.settlement_max_idle.as_secs(),
         reconciliation_concurrency = batch.reconciliation_concurrency,
         "x402 batch-settlement reconciliation starting"
@@ -909,16 +900,16 @@ async fn run_batch(runtime: &SettlementRuntime) -> Result<SettleSessionsMetrics,
         channels_scanned: channels.len(),
         ..SettleSessionsMetrics::default()
     };
-    let now = unix_now();
     let mut candidates = Vec::new();
     let mut inventory = LifecycleInventory::default();
     let mut due_channels = Vec::new();
+    let now = unix_now();
     for state in channels {
         if !batch_reconciliation_due(
             &state,
             now,
-            batch.settlement_min_delta_base_units,
             batch.settlement_max_idle,
+            batch.settle_active_channels,
         ) {
             metrics.skipped += 1;
             continue;
@@ -1406,21 +1397,17 @@ struct BatchCandidate {
 fn batch_reconciliation_due(
     state: &ChannelState,
     now: i64,
-    min_delta_base_units: u64,
     max_idle: Duration,
+    settle_active: bool,
 ) -> bool {
     if state.sealed || state.close_requested_at.is_some() {
         return true;
     }
-    let unsettled = state.cumulative.saturating_sub(state.settled_on_chain);
-    if unsettled == 0 {
-        return false;
-    }
-    if unsettled >= min_delta_base_units {
-        return true;
-    }
+    let unsettled = state.cumulative > state.settled_on_chain;
     let now_seconds = u64::try_from(now).unwrap_or_default();
-    now_seconds.saturating_sub(state.last_activity_at) >= max_idle.as_secs()
+    unsettled
+        && (settle_active
+            || now_seconds.saturating_sub(state.last_activity_at) >= max_idle.as_secs())
 }
 
 async fn update_batch_settled_watermark(
@@ -2287,24 +2274,29 @@ mod tests {
     }
 
     #[test]
-    fn batch_reconciliation_coalesces_small_active_vouchers() {
+    fn batch_reconciliation_sweeps_every_positive_watermark() {
         let mut state = channel_state();
-        state.cumulative = 9_999;
+        state.cumulative = 1;
         state.last_activity_at = 999;
-
         assert!(!batch_reconciliation_due(
             &state,
             1_000,
-            10_000,
             Duration::from_secs(300),
+            false,
         ));
-
-        state.cumulative = 10_000;
         assert!(batch_reconciliation_due(
             &state,
             1_000,
-            10_000,
             Duration::from_secs(300),
+            true,
+        ));
+
+        state.settled_on_chain = 1;
+        assert!(!batch_reconciliation_due(
+            &state,
+            1_000,
+            Duration::from_secs(300),
+            true,
         ));
     }
 
@@ -2316,8 +2308,8 @@ mod tests {
         assert!(batch_reconciliation_due(
             &state,
             1_000,
-            10_000,
             Duration::from_secs(300),
+            false,
         ));
 
         state.cumulative = 0;
@@ -2325,8 +2317,8 @@ mod tests {
         assert!(batch_reconciliation_due(
             &state,
             1_000,
-            10_000,
             Duration::from_secs(300),
+            false,
         ));
     }
 
