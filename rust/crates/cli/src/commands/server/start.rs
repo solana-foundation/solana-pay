@@ -1,5 +1,6 @@
 //! `pay gate api` — start a payment gateway proxy.
 
+use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -334,6 +335,7 @@ struct BatchChannelValueSnapshot {
     authorized: u64,
     settled: u64,
     distributed: u64,
+    settled_watermark: u64,
 }
 
 impl BatchChannelValueSnapshot {
@@ -345,6 +347,7 @@ impl BatchChannelValueSnapshot {
                 .settled_on_chain
                 .saturating_sub(state.distributed_on_chain),
             distributed: state.distributed_on_chain,
+            settled_watermark: state.settled_on_chain,
         }
     }
 }
@@ -352,14 +355,59 @@ impl BatchChannelValueSnapshot {
 #[derive(Default)]
 struct BatchValueInventory {
     totals: BatchChannelValueSnapshot,
+    channels: HashMap<String, BatchChannelValueSnapshot>,
 }
 
-fn record_batch_value_inventory(inventory: &BatchValueInventory) {
+#[derive(Debug, Default, PartialEq, Eq)]
+struct BatchValueTransitions {
+    claimed: u64,
+    distributed: u64,
+}
+
+#[derive(Default)]
+struct BatchValueTracker {
+    previous: HashMap<String, BatchChannelValueSnapshot>,
+}
+
+impl BatchValueTracker {
+    fn observe(
+        &mut self,
+        current: HashMap<String, BatchChannelValueSnapshot>,
+    ) -> BatchValueTransitions {
+        let mut transitions = BatchValueTransitions::default();
+        for (channel_id, snapshot) in &current {
+            let Some(previous) = self.previous.get(channel_id) else {
+                // A reused channel enters the in-memory store carrying lifetime
+                // on-chain watermarks. Baseline it instead of reporting that
+                // historical value as work performed by this gateway run.
+                continue;
+            };
+            transitions.claimed = transitions.claimed.saturating_add(
+                snapshot
+                    .settled_watermark
+                    .saturating_sub(previous.settled_watermark),
+            );
+            transitions.distributed = transitions
+                .distributed
+                .saturating_add(snapshot.distributed.saturating_sub(previous.distributed));
+        }
+        self.previous = current;
+        transitions
+    }
+}
+
+fn record_batch_value_inventory(
+    inventory: &BatchValueInventory,
+    transitions: &BatchValueTransitions,
+) {
     tracing::info!(
         gauge.pay_x402_batch_value_escrowed_base_units = inventory.totals.escrowed,
         gauge.pay_x402_batch_value_authorized_base_units = inventory.totals.authorized,
         gauge.pay_x402_batch_value_settled_base_units = inventory.totals.settled,
         gauge.pay_x402_batch_value_distributed_base_units = inventory.totals.distributed,
+        monotonic_counter.pay_x402_batch_value_claimed_base_units_total = transitions.claimed,
+        monotonic_counter.pay_x402_batch_value_distributed_base_units_total =
+            transitions.distributed,
         protocol = "x402/batch",
         metric_group = "pay_x402_batch_value",
         "embedded x402 batch-settlement value inventory"
@@ -374,41 +422,56 @@ async fn collect_batch_value_inventory(
         .list_channel_ids()
         .await
         .map_err(|error| error.to_string())?;
-    let totals = Arc::new(Mutex::new(BatchChannelValueSnapshot::default()));
+    let mut inventory = BatchValueInventory::default();
     for channel_id in channel_ids {
-        let out = Arc::clone(&totals);
+        let out = Arc::new(Mutex::new(None));
+        let callback_out = Arc::clone(&out);
         batch
             .store()
             .read_channel(
                 &channel_id,
                 Box::new(move |state| {
                     if let Some(state) = state {
-                        let snapshot = BatchChannelValueSnapshot::from_state(state);
-                        let mut totals = out.lock().unwrap_or_else(|error| error.into_inner());
-                        totals.escrowed = totals.escrowed.saturating_add(snapshot.escrowed);
-                        totals.authorized = totals.authorized.saturating_add(snapshot.authorized);
-                        totals.settled = totals.settled.saturating_add(snapshot.settled);
-                        totals.distributed =
-                            totals.distributed.saturating_add(snapshot.distributed);
+                        *callback_out
+                            .lock()
+                            .unwrap_or_else(|error| error.into_inner()) =
+                            Some(BatchChannelValueSnapshot::from_state(state));
                     }
                     Ok(())
                 }),
             )
             .await
             .map_err(|error| error.to_string())?;
+        let snapshot = out.lock().unwrap_or_else(|error| error.into_inner()).take();
+        if let Some(snapshot) = snapshot {
+            inventory.totals.escrowed = inventory.totals.escrowed.saturating_add(snapshot.escrowed);
+            inventory.totals.authorized = inventory
+                .totals
+                .authorized
+                .saturating_add(snapshot.authorized);
+            inventory.totals.settled = inventory.totals.settled.saturating_add(snapshot.settled);
+            inventory.totals.distributed = inventory
+                .totals
+                .distributed
+                .saturating_add(snapshot.distributed);
+            inventory.channels.insert(channel_id, snapshot);
+        }
     }
-    let totals = *totals.lock().unwrap_or_else(|error| error.into_inner());
-    Ok(BatchValueInventory { totals })
+    Ok(inventory)
 }
 
 fn spawn_batch_value_metrics(batch: pay_kit::x402::server::X402BatchSettlement, period: Duration) {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(period);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut tracker = BatchValueTracker::default();
         loop {
             interval.tick().await;
             match collect_batch_value_inventory(&batch).await {
-                Ok(inventory) => record_batch_value_inventory(&inventory),
+                Ok(mut inventory) => {
+                    let transitions = tracker.observe(std::mem::take(&mut inventory.channels));
+                    record_batch_value_inventory(&inventory, &transitions);
+                }
                 Err(error) => {
                     tracing::warn!(%error, "failed to collect embedded batch value inventory")
                 }
@@ -3877,8 +3940,9 @@ mod tests {
         stable_token_account_requirements, surfpool_funding_targets, surfpool_prep_notice_body,
     };
     use super::{
-        BatchLifecycleReconciliation, batch_lifecycle_reconciliation, build_pdb_config,
-        default_bind, delegated_session_channel_payout, distribution_threshold_reached,
+        BatchChannelValueSnapshot, BatchLifecycleReconciliation, BatchValueTracker,
+        BatchValueTransitions, batch_lifecycle_reconciliation, build_pdb_config, default_bind,
+        delegated_session_channel_payout, distribution_threshold_reached,
         ensure_session_currencies_usd_pegged, payout_recipient_pubkeys, payout_recipient_targets,
         resolve_operator_currencies, select_rotating_batch, session_lifecycle_reconciliation,
         validate_browser_rpc_request, x402_currency_configs, x402_upto_beneficiary_pubkey,
@@ -3887,6 +3951,7 @@ mod tests {
     use crate::network::SolanaNetwork;
     use serial_test::serial;
     use solana_pubkey::Pubkey;
+    use std::collections::HashMap;
     use std::str::FromStr;
 
     #[test]
@@ -3940,6 +4005,34 @@ mod tests {
         assert!(distribution_threshold_reached(1_000, 0, 1_000));
         assert!(!distribution_threshold_reached(1_500, 501, 1_000));
         assert!(distribution_threshold_reached(1_501, 501, 1_000));
+    }
+
+    #[test]
+    fn batch_value_tracker_ignores_reused_watermarks_then_records_transitions() {
+        let mut tracker = BatchValueTracker::default();
+        let snapshot = |settled_watermark, distributed| BatchChannelValueSnapshot {
+            settled_watermark,
+            distributed,
+            ..BatchChannelValueSnapshot::default()
+        };
+
+        assert_eq!(
+            tracker.observe(HashMap::from([(
+                "reused-channel".to_string(),
+                snapshot(10_000, 8_000),
+            )])),
+            BatchValueTransitions::default(),
+        );
+        assert_eq!(
+            tracker.observe(HashMap::from([(
+                "reused-channel".to_string(),
+                snapshot(12_500, 9_500),
+            )])),
+            BatchValueTransitions {
+                claimed: 2_500,
+                distributed: 1_500,
+            },
+        );
     }
 
     #[test]
