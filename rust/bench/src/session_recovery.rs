@@ -24,6 +24,8 @@ use crate::wallet::{self, Wallet};
 
 const CHANNEL_STATUS_OPEN: u8 = 0;
 const CHANNEL_STATUS_SEALED: u8 = 1;
+const REUSE_DISCOVERY_MAX_ATTEMPTS: usize = 5;
+const REUSE_DISCOVERY_RETRY_BASE_DELAY_MS: u64 = 250;
 
 struct RecoverableChannel {
     address: Pubkey,
@@ -155,7 +157,24 @@ pub(crate) async fn discover_reuse_map(
     expected: &HashMap<Pubkey, (u32, Wallet, Pubkey)>,
 ) -> Result<HashMap<u32, crate::scheme::ReusableChannel>> {
     let rpc = pay_api_core::RpcClient::new(Duration::from_secs(30))?;
-    let channels = discover_fixture_channels(&rpc, rpc_url, CHANNEL_STATUS_OPEN, expected).await?;
+    let mut attempt = 1usize;
+    let channels = loop {
+        match discover_fixture_channels(&rpc, rpc_url, CHANNEL_STATUS_OPEN, expected).await {
+            Ok(channels) => break channels,
+            Err(error) if attempt < REUSE_DISCOVERY_MAX_ATTEMPTS => {
+                tracing::warn!(
+                    attempt,
+                    max_attempts = REUSE_DISCOVERY_MAX_ATTEMPTS,
+                    %error,
+                    "retrying reusable-channel discovery"
+                );
+                let delay = REUSE_DISCOVERY_RETRY_BASE_DELAY_MS << (attempt - 1);
+                tokio::time::sleep(Duration::from_millis(delay)).await;
+                attempt += 1;
+            }
+            Err(error) => return Err(error),
+        }
+    };
     let mut map: HashMap<u32, crate::scheme::ReusableChannel> = HashMap::new();
     for channel in channels {
         let settled = channel.channel.settlement.settled;
