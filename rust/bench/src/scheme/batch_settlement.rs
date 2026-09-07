@@ -128,7 +128,7 @@ pub struct BatchSettlement {
     close_after_run: bool,
     /// Live channel state, keyed by user index.
     handles: Mutex<HashMap<u32, BatchHandle>>,
-    /// Reuse mode: user index → (existing channel address, on-chain settled).
+    /// Reuse mode: user index → existing channel state needed to resume.
     reuse_channels: Mutex<HashMap<u32, ReusableChannel>>,
     /// Opens whose payload was constructed and is about to be sent; retained so
     /// an ambiguous transport failure still yields the deterministic channel ID.
@@ -544,7 +544,7 @@ impl BenchScheme for BatchSettlement {
                                         channel,
                                         config.clone(),
                                         charged_cumulative,
-                                        self.deposit_base,
+                                        reused.deposit,
                                     );
                                     let corrected = proof_channel
                                         .adopt_corrective_state(&corrective)
@@ -1321,6 +1321,7 @@ mod tests {
         .expect("original channel derives");
         let reused = ReusableChannel {
             channel_id: pc::pubkey_string(&channel_id),
+            deposit: 1_000,
             settled: 42,
             salt: 987_654_321,
             open_slot: 123_456,

@@ -150,8 +150,8 @@ pub async fn recover(
 
 /// Discover one reusable open channel per fixture wallet, including the PDA
 /// salt/open slot needed to reconstruct an x402 batch channel config. When a
-/// wallet owns several open channels the most-settled one is chosen so a reuse
-/// run resumes from the furthest-progressed watermark. Used by `session.reuse`.
+/// wallet owns several open channels, exhausted channels are ignored and the
+/// one with the most remaining capacity is chosen. Used by `session.reuse`.
 pub(crate) async fn discover_reuse_map(
     rpc_url: &str,
     expected: &HashMap<Pubkey, (u32, Wallet, Pubkey)>,
@@ -178,24 +178,34 @@ pub(crate) async fn discover_reuse_map(
     let mut map: HashMap<u32, crate::scheme::ReusableChannel> = HashMap::new();
     for channel in channels {
         let settled = channel.channel.settlement.settled;
+        let deposit = channel.channel.deposit;
+        if settled >= deposit {
+            continue;
+        }
+        let candidate = crate::scheme::ReusableChannel {
+            channel_id: channel.address.to_string(),
+            deposit,
+            settled,
+            salt: channel.channel.salt,
+            open_slot: channel.channel.open_slot,
+        };
         let entry = map
             .entry(channel.index)
-            .or_insert_with(|| crate::scheme::ReusableChannel {
-                channel_id: channel.address.to_string(),
-                settled,
-                salt: channel.channel.salt,
-                open_slot: channel.channel.open_slot,
-            });
-        if settled > entry.settled {
-            *entry = crate::scheme::ReusableChannel {
-                channel_id: channel.address.to_string(),
-                settled,
-                salt: channel.channel.salt,
-                open_slot: channel.channel.open_slot,
-            };
+            .or_insert_with(|| candidate.clone());
+        if reusable_candidate_is_better(&candidate, entry) {
+            *entry = candidate;
         }
     }
     Ok(map)
+}
+
+fn reusable_candidate_is_better(
+    candidate: &crate::scheme::ReusableChannel,
+    current: &crate::scheme::ReusableChannel,
+) -> bool {
+    candidate.remaining_capacity() > current.remaining_capacity()
+        || (candidate.remaining_capacity() == current.remaining_capacity()
+            && candidate.settled > current.settled)
 }
 
 async fn discover_fixture_channels(
@@ -740,6 +750,31 @@ pub async fn top_up(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn reusable(deposit: u64, settled: u64) -> crate::scheme::ReusableChannel {
+        crate::scheme::ReusableChannel {
+            channel_id: Pubkey::new_unique().to_string(),
+            deposit,
+            settled,
+            salt: 0,
+            open_slot: 0,
+        }
+    }
+
+    #[test]
+    fn reuse_prefers_remaining_capacity_over_highest_watermark() {
+        let nearly_exhausted = reusable(500_000, 499_999);
+        let usable = reusable(5_000_000, 200_000);
+
+        assert!(reusable_candidate_is_better(&usable, &nearly_exhausted));
+        assert!(!reusable_candidate_is_better(&nearly_exhausted, &usable));
+    }
+
+    #[test]
+    fn reuse_capacity_uses_the_channels_actual_deposit() {
+        assert_eq!(reusable(500_000, 499_999).remaining_capacity(), 1);
+        assert_eq!(reusable(5_000_000, 200_000).remaining_capacity(), 4_800_000);
+    }
 
     #[test]
     fn rent_reclaim_accepts_sponsored_operator() {

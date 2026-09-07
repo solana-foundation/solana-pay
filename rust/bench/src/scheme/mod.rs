@@ -76,9 +76,18 @@ pub struct UserSetup {
 #[derive(Clone, Debug)]
 pub struct ReusableChannel {
     pub channel_id: String,
+    /// Actual on-chain deposit cap. Reused channels can predate the current
+    /// benchmark config, so voucher generation must not assume today's cap.
+    pub deposit: u64,
     pub settled: u64,
     pub salt: u64,
     pub open_slot: u64,
+}
+
+impl ReusableChannel {
+    pub fn remaining_capacity(&self) -> u64 {
+        self.deposit.saturating_sub(self.settled)
+    }
 }
 
 /// A fully-formed request, built off-chain during prepare, fired during unleash.
