@@ -9,6 +9,9 @@ pub use profiles::{ApiProfile, OpenAiSurface, XtreamSurface};
 /// block.
 pub const X_PAY_METERING_EXTENSION: &str = "x-pay-metering";
 
+/// Default idle delay before an x402 batch-settlement residual is reconciled.
+pub const DEFAULT_BATCH_IDLE_SETTLEMENT_DELAY_MS: u64 = 300_000;
+
 // =============================================================================
 // Provider & API
 // =============================================================================
@@ -59,24 +62,28 @@ pub struct ApiSpec {
     /// per-request charges.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session: Option<SessionSpec>,
+    /// x402 batch-settlement lifecycle parameters. Unlike a per-cycle sample,
+    /// each settlement tick snapshots and reconciles the complete channel
+    /// fleet; pay-kit packs up to four claims into each Solana transaction.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub batch_settlement: Option<BatchSettlementSpec>,
 }
 
 impl ApiSpec {
     /// Fill in per-endpoint scheme defaults for endpoints that omit `schemes`.
     ///
     /// The base default is `[MppCharge]`. A spec that declares a top-level
-    /// `session:` block additionally gets `MppSession`, so existing session
-    /// deployments keep accepting `intent=session` credentials without having
-    /// to enumerate `schemes` on every endpoint — otherwise the charge-only
-    /// fallback in [`Metering::accepted_schemes`] would silently re-challenge
-    /// session clients with charge-only options. Endpoints that set `schemes`
-    /// explicitly are left untouched (explicit config is a restriction).
+    /// `session:` block additionally gets `MppSession`; a top-level
+    /// `batch_settlement:` block additionally gets `X402BatchSettlement`.
+    /// Endpoints that set `schemes` explicitly are left untouched (explicit
+    /// config is a restriction).
     ///
     /// Resolving here (once, at load) keeps every consumer — the payment gate,
     /// the OpenAPI offer builder, and the x402-backend probe in `gate api` —
     /// reading the same scheme set.
     pub fn apply_scheme_defaults(&mut self) {
         let has_session = self.session.is_some();
+        let has_batch_settlement = self.batch_settlement.is_some();
         for endpoint in &mut self.endpoints {
             if let Some(metering) = endpoint.metering.as_mut()
                 && metering.schemes.is_none()
@@ -84,6 +91,9 @@ impl ApiSpec {
                 let mut schemes = vec![Scheme::MppCharge];
                 if has_session {
                     schemes.push(Scheme::MppSession);
+                }
+                if has_batch_settlement {
+                    schemes.push(Scheme::X402BatchSettlement);
                 }
                 metering.schemes = Some(schemes);
             }
@@ -914,6 +924,43 @@ pub struct SessionSpec {
     pub reuse_from_chain: bool,
 }
 
+/// Server-side lifecycle policy for x402 batch-settlement channels.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct BatchSettlementSpec {
+    /// Interval between complete active-channel settlement sweeps.
+    ///
+    /// Defaults to `0`, leaving active channels untouched. Set this to a
+    /// nonzero cadence (for example `240000` in the 100k benchmark) to bound
+    /// the amount held only in off-chain vouchers.
+    #[serde(default)]
+    pub settlement_interval_ms: u64,
+    /// How long a channel must remain untouched before its positive residual
+    /// is eligible for the normal production settlement loop.
+    #[serde(default = "default_batch_idle_settlement_delay_ms")]
+    pub idle_settlement_delay_ms: u64,
+    /// Minimum per-channel claimed-but-undistributed balance that triggers an
+    /// open-channel distribution, expressed in the configured token's base
+    /// units. Unset by default, so intermediate claims remain in escrow until
+    /// the channel closes. Must be greater than zero when set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub distribution_threshold_base_units: Option<u64>,
+}
+
+impl Default for BatchSettlementSpec {
+    fn default() -> Self {
+        Self {
+            settlement_interval_ms: 0,
+            idle_settlement_delay_ms: default_batch_idle_settlement_delay_ms(),
+            distribution_threshold_base_units: None,
+        }
+    }
+}
+
+fn default_batch_idle_settlement_delay_ms() -> u64 {
+    DEFAULT_BATCH_IDLE_SETTLEMENT_DELAY_MS
+}
+
 /// Idle grace period restarted by each channel touch. The resulting deadline
 /// is rounded separately by `close_batch_interval_ms`.
 fn default_session_close_delay_ms() -> u64 {
@@ -1681,6 +1728,18 @@ pub fn validate_api_spec(spec: &ApiSpec) -> Vec<String> {
                     .to_string(),
             );
         }
+    }
+
+    if spec
+        .batch_settlement
+        .as_ref()
+        .and_then(|policy| policy.distribution_threshold_base_units)
+        == Some(0)
+    {
+        errs.push(
+            "batch_settlement.distribution_threshold_base_units must be greater than zero when set"
+                .to_string(),
+        );
     }
 
     errs
@@ -2571,6 +2630,38 @@ mod tests {
     }
 
     #[test]
+    fn batch_settlement_policy_defaults_to_idle_only() {
+        let policy: BatchSettlementSpec = serde_json::from_str("{}").unwrap();
+        assert_eq!(policy.settlement_interval_ms, 0);
+        assert_eq!(
+            policy.idle_settlement_delay_ms,
+            DEFAULT_BATCH_IDLE_SETTLEMENT_DELAY_MS
+        );
+        assert_eq!(policy.distribution_threshold_base_units, None);
+
+        let benchmark: BatchSettlementSpec = serde_json::from_str(
+            r#"{"settlement_interval_ms":240000,"idle_settlement_delay_ms":300000}"#,
+        )
+        .unwrap();
+        assert_eq!(benchmark.settlement_interval_ms, 240_000);
+    }
+
+    #[test]
+    fn batch_distribution_threshold_must_be_positive() {
+        let mut api = test_spec(vec![]);
+        api.batch_settlement = Some(BatchSettlementSpec {
+            distribution_threshold_base_units: Some(0),
+            ..BatchSettlementSpec::default()
+        });
+
+        assert!(
+            validate_api_spec(&api).iter().any(|error| {
+                error.contains("batch_settlement.distribution_threshold_base_units")
+            })
+        );
+    }
+
+    #[test]
     fn compare_op_serde() {
         let json = serde_json::to_string(&CompareOp::Lte).unwrap();
         assert_eq!(json, r#""<=""#);
@@ -2911,6 +3002,7 @@ mod tests {
             operator: None,
             recipients: std::collections::HashMap::new(),
             session: None,
+            batch_settlement: None,
         };
         let json = serde_json::to_string(&spec).unwrap();
         let back: ApiSpec = serde_json::from_str(&json).unwrap();
@@ -3322,6 +3414,7 @@ value_from_env: PAY_SIGNER_KEYPAIR
             operator: None,
             recipients,
             session: None,
+            batch_settlement: None,
         }
     }
 
@@ -3373,6 +3466,21 @@ value_from_env: PAY_SIGNER_KEYPAIR
         assert_eq!(
             api.endpoints[1].metering.as_ref().unwrap().schemes,
             Some(vec![Scheme::X402Exact]),
+        );
+    }
+
+    #[test]
+    fn apply_scheme_defaults_adds_batch_when_batch_policy_is_configured() {
+        let mut api = test_spec(vec![metered_endpoint(None)]);
+        api.batch_settlement = Some(BatchSettlementSpec {
+            settlement_interval_ms: 240_000,
+            ..BatchSettlementSpec::default()
+        });
+        api.apply_scheme_defaults();
+
+        assert_eq!(
+            api.endpoints[0].metering.as_ref().unwrap().schemes,
+            Some(vec![Scheme::MppCharge, Scheme::X402BatchSettlement]),
         );
     }
 

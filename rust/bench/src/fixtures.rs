@@ -65,6 +65,7 @@ struct SetupWindow<'a> {
     wallet_set_id: &'a str,
     sol_lamports: u64,
     assets: &'a [FixtureAsset],
+    allow_existing_above_target: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -108,6 +109,12 @@ pub struct SetupMeta {
     pub users: usize,
     #[serde(default)]
     pub sol_lamports_per_user: u64,
+    /// Leave balances above the requested target untouched. This is useful
+    /// when additively refreshing a long-lived benchmark cohort whose wallets
+    /// may have received tokens from earlier runs. The default remains strict
+    /// so a new fixture cannot silently mix unexpected funds.
+    #[serde(default)]
+    pub allow_existing_above_target: bool,
     /// Hard ceiling for the SOL allocation plus estimated ATA rent. This is
     /// checked before the first transaction is submitted.
     pub max_total_sol: f64,
@@ -322,6 +329,7 @@ pub async fn setup(config_path: &str, id: Option<&str>, yes: bool) -> Result<()>
         config.setup.users,
         &seed,
         wallet_set_id,
+        config.setup.allow_existing_above_target,
     )
     .await?;
 
@@ -354,6 +362,7 @@ pub async fn setup(config_path: &str, id: Option<&str>, yes: bool) -> Result<()>
                     wallet_set_id,
                     sol_lamports: config.setup.sol_lamports_per_user,
                     assets: &assets,
+                    allow_existing_above_target: config.setup.allow_existing_above_target,
                 },
                 window_start,
                 window_end,
@@ -755,6 +764,7 @@ async fn verify_funder_balances(
     users: usize,
     seed: &[u8; 32],
     wallet_set_id: &str,
+    allow_existing_above_target: bool,
 ) -> Result<()> {
     for asset in assets {
         let ata = associated_token_address(&funder.pubkey, asset)?;
@@ -775,14 +785,13 @@ async fn verify_funder_balances(
                 .with_context(|| format!("fetching existing {} fixture balances", asset.label))?;
             for account in accounts {
                 let current = token_amount(account.as_ref())?;
-                ensure!(
-                    current <= asset.amount_base,
-                    "derived wallet already has {current} {} base units (fixture target is {}); refuse to mix funds",
-                    asset.label,
-                    asset.amount_base
-                );
                 needed = needed
-                    .checked_add(asset.amount_base - current)
+                    .checked_add(
+                        balance_deficit(current, asset.amount_base, allow_existing_above_target)
+                            .with_context(|| {
+                                format!("derived wallet has an unexpected {} balance", asset.label)
+                            })?,
+                    )
                     .context("asset funding total overflow")?;
             }
         }
@@ -811,6 +820,7 @@ async fn prepare_setup_window(
                     &user,
                     window.sol_lamports,
                     window.assets,
+                    window.allow_existing_above_target,
                 )
                 .await?;
                 Ok::<_, anyhow::Error>(PreparedUser {
@@ -832,32 +842,42 @@ async fn prepare_setup_user(
     user: &Wallet,
     sol_lamports: u64,
     assets: &[FixtureAsset],
+    allow_existing_above_target: bool,
 ) -> Result<Vec<Instruction>> {
     let mut instructions = Vec::new();
-    let current_sol = rpc_balance(rpc, &user.pubkey).await?;
-    if current_sol < sol_lamports {
-        instructions.push(system_instruction::transfer(
-            &funder.pubkey,
-            &user.pubkey,
-            sol_lamports - current_sol,
-        ));
+    // Asset-only overlays deliberately set the SOL target to zero. Avoid an
+    // otherwise pointless per-wallet balance RPC: on large retained cohorts
+    // it doubles reconciliation traffic and cuts token refresh throughput in
+    // half without changing the resulting instruction set.
+    if sol_lamports > 0 {
+        let current_sol = rpc_balance(rpc, &user.pubkey).await?;
+        if current_sol < sol_lamports {
+            instructions.push(system_instruction::transfer(
+                &funder.pubkey,
+                &user.pubkey,
+                sol_lamports - current_sol,
+            ));
+        }
     }
     for asset in assets {
         let user_ata = associated_token_address(&user.pubkey, asset)?;
         let current = token_balance(rpc, &user_ata).await?;
         let current_amount = current.unwrap_or(0);
-        ensure!(
-            current_amount <= asset.amount_base,
-            "derived wallet {} already has {} {} base units (fixture target is {}); refuse to mix funds",
-            user.pubkey,
+        let deficit = balance_deficit(
             current_amount,
-            asset.label,
-            asset.amount_base
-        );
+            asset.amount_base,
+            allow_existing_above_target,
+        )
+        .with_context(|| {
+            format!(
+                "derived wallet {} has an unexpected {} balance",
+                user.pubkey, asset.label
+            )
+        })?;
         if current.is_none() {
             instructions.push(create_ata_ix(&funder.pubkey, &user.pubkey, asset)?);
         }
-        if current_amount < asset.amount_base {
+        if deficit > 0 {
             let funder_ata = associated_token_address(&funder.pubkey, asset)?;
             if current.is_some() {
                 instructions.push(create_ata_ix(&funder.pubkey, &user.pubkey, asset)?);
@@ -870,7 +890,7 @@ async fn prepare_setup_user(
                     &user_ata,
                     &funder.pubkey,
                     &[],
-                    asset.amount_base - current_amount,
+                    deficit,
                     asset.decimals,
                 )
                 .map_err(|error| anyhow::anyhow!("building {} transfer: {error}", asset.label))?,
@@ -878,6 +898,18 @@ async fn prepare_setup_user(
         }
     }
     Ok(instructions)
+}
+
+fn balance_deficit(current: u64, target: u64, allow_existing_above_target: bool) -> Result<u64> {
+    if current > target {
+        ensure!(
+            allow_existing_above_target,
+            "existing balance {current} exceeds fixture target {target}; refuse to mix funds"
+        );
+        Ok(0)
+    } else {
+        Ok(target - current)
+    }
 }
 
 async fn prepare_teardown_window(
@@ -1369,7 +1401,17 @@ fn decimal_to_base(value: &str, decimals: u8) -> Result<u64> {
 
 #[cfg(test)]
 mod tests {
-    use super::{FixturePhase, RunConfig, SetupConfig, decimal_to_base, setup_resume_index};
+    use super::{
+        FixturePhase, RunConfig, SetupConfig, balance_deficit, decimal_to_base, setup_resume_index,
+    };
+
+    #[test]
+    fn additive_refresh_leaves_above_target_balances_untouched() {
+        assert_eq!(balance_deficit(4, 10, false).unwrap(), 6);
+        assert_eq!(balance_deficit(10, 10, false).unwrap(), 0);
+        assert!(balance_deficit(11, 10, false).is_err());
+        assert_eq!(balance_deficit(11, 10, true).unwrap(), 0);
+    }
 
     #[test]
     fn decimal_amounts_are_exact() {

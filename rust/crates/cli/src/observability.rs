@@ -10,6 +10,7 @@ use opentelemetry_semantic_conventions::SCHEMA_URL;
 use opentelemetry_semantic_conventions::attribute::SERVICE_VERSION;
 use tracing_opentelemetry::{MetricsLayer, OpenTelemetryLayer};
 use tracing_subscriber::EnvFilter;
+use tracing_subscriber::Layer;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
@@ -44,13 +45,20 @@ pub(crate) fn init_otlp(sidecar: &str, filter: EnvFilter) -> Result<OtelGuard, S
     let tracer_provider = init_tracer_provider(&endpoints)?;
     let meter_provider = init_meter_provider(&endpoints)?;
     let tracer = tracer_provider.tracer("pay-server");
+    let console_filter = std::env::var("PAY_CONSOLE_LOG")
+        .map(EnvFilter::new)
+        .unwrap_or_else(|_| EnvFilter::new(filter.to_string()))
+        // Metric carrier events must reach `MetricsLayer`, but serializing them
+        // to stderr adds several synchronous writes to every paid request.
+        .add_directive("pay::metrics=off".parse().expect("valid log directive"));
 
     tracing_subscriber::registry()
         .with(filter)
         .with(
             tracing_subscriber::fmt::layer()
                 .json()
-                .with_writer(std::io::stderr),
+                .with_writer(std::io::stderr)
+                .with_filter(console_filter),
         )
         .with(MetricsLayer::new(meter_provider.clone()))
         .with(OpenTelemetryLayer::new(tracer))
@@ -92,9 +100,10 @@ fn init_tracer_provider(endpoints: &OtlpEndpoints) -> Result<SdkTracerProvider, 
         .build()
         .map_err(|e| format!("failed to create OTLP span exporter: {e}"))?;
 
+    let sample_ratio = trace_sample_ratio()?;
     let provider = SdkTracerProvider::builder()
         .with_sampler(Sampler::ParentBased(Box::new(Sampler::TraceIdRatioBased(
-            1.0,
+            sample_ratio,
         ))))
         .with_id_generator(RandomIdGenerator::default())
         .with_resource(resource())
@@ -103,6 +112,22 @@ fn init_tracer_provider(endpoints: &OtlpEndpoints) -> Result<SdkTracerProvider, 
 
     global::set_tracer_provider(provider.clone());
     Ok(provider)
+}
+
+fn trace_sample_ratio() -> Result<f64, String> {
+    let value = std::env::var("PAY_OTEL_TRACE_SAMPLE_RATIO").ok();
+    parse_trace_sample_ratio(value.as_deref())
+}
+
+fn parse_trace_sample_ratio(value: Option<&str>) -> Result<f64, String> {
+    let Some(value) = value else { return Ok(1.0) };
+    let ratio = value.parse::<f64>().map_err(|error| {
+        format!("PAY_OTEL_TRACE_SAMPLE_RATIO must be a number from 0 to 1: {error}")
+    })?;
+    if !(0.0..=1.0).contains(&ratio) {
+        return Err("PAY_OTEL_TRACE_SAMPLE_RATIO must be between 0 and 1".to_string());
+    }
+    Ok(ratio)
 }
 
 fn init_meter_provider(endpoints: &OtlpEndpoints) -> Result<SdkMeterProvider, String> {
@@ -184,5 +209,13 @@ mod tests {
                 metrics: "http://collector:4318/v1/metrics".to_string(),
             }
         );
+    }
+
+    #[test]
+    fn trace_sample_ratio_is_validated() {
+        assert_eq!(parse_trace_sample_ratio(None).unwrap(), 1.0);
+        assert_eq!(parse_trace_sample_ratio(Some("0.001")).unwrap(), 0.001);
+        assert!(parse_trace_sample_ratio(Some("1.1")).is_err());
+        assert!(parse_trace_sample_ratio(Some("not-a-number")).is_err());
     }
 }

@@ -1,11 +1,14 @@
 //! `pay gate api` — start a payment gateway proxy.
 
+use std::collections::HashMap;
 use std::str::FromStr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::middleware;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{any, get, post};
+use futures_util::StreamExt;
 use owo_colors::OwoColorize;
 use pay_core::PaymentState;
 use pay_core::accounts::AccountsStore;
@@ -29,6 +32,16 @@ use crate::network::SolanaNetwork;
 const BROWSER_RPC_PROXY_PATH: &str = "/__402/rpc";
 const FEE_PAYER_BALANCE_OBSERVE_INTERVAL: Duration = Duration::from_secs(300);
 const DEFAULT_SERVER_BIND: &str = "0.0.0.0:1402";
+const DEFAULT_X402_RECONCILIATION_INTERVAL_SECONDS: u64 = 10;
+const DEFAULT_X402_RECONCILIATION_STARTUP_DELAY_SECONDS: u64 = 0;
+const DEFAULT_X402_RECONCILIATION_CONCURRENCY: usize = 64;
+const DEFAULT_X402_RECONCILIATION_MAX_PER_CYCLE: usize = 4_096;
+const DEFAULT_X402_DISTRIBUTION_MAX_PER_CYCLE: usize = 2_048;
+const DEFAULT_X402_SETTLEMENT_CONFIRMATION_TIMEOUT_SECONDS: u64 = 90;
+const DEFAULT_X402_SETTLEMENT_SEND_CONCURRENCY: usize = 64;
+const DEFAULT_X402_SETTLEMENT_SEND_INTERVAL_MICROS: u64 = 1_000;
+const DEFAULT_X402_VALUE_METRICS_INTERVAL_SECONDS: u64 = 15;
+const X402_RECONCILIATION_CHUNK_SIZE: usize = 100;
 const BROWSER_RPC_ALLOWED_METHODS: &[&str] = &[
     "getLatestBlockhash",
     "surfnet_setAccount",
@@ -49,10 +62,22 @@ fn default_bind() -> String {
     }
 }
 
-async fn session_channel_store()
--> pay_core::Result<(Arc<dyn pay_kit::mpp::store::ChannelStore>, bool)> {
-    let redis_url = std::env::var("PAY_SESSION_REDIS_URL")
-        .ok()
+/// Resolve a payment-channel store: durable Redis when an URL is configured,
+/// otherwise in-memory.
+///
+/// `url_vars` are tried in order, so a scheme can take its own URL and fall
+/// back to a shared one. `default_prefix` namespaces the keys — every scheme
+/// stores `ChannelState` rows keyed by channel id, so two sharing a prefix
+/// would read each other's channels.
+async fn channel_store(
+    url_vars: &[&str],
+    prefix_var: &str,
+    default_prefix: &str,
+    label: &str,
+) -> pay_core::Result<(Arc<dyn pay_kit::mpp::store::ChannelStore>, bool)> {
+    let redis_url = url_vars
+        .iter()
+        .find_map(|var| std::env::var(var).ok())
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty());
 
@@ -65,29 +90,60 @@ async fn session_channel_store()
 
     #[cfg(feature = "redis-session-store")]
     {
-        let prefix = std::env::var("PAY_SESSION_REDIS_PREFIX")
+        let prefix = std::env::var(prefix_var)
             .ok()
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty())
-            .unwrap_or_else(|| "pay:session:v1:".to_string());
+            .unwrap_or_else(|| default_prefix.to_string());
         let store = pay_kit::mpp::store::RedisChannelStore::connect(&redis_url, prefix)
             .await
             .map_err(|error| {
-                pay_core::Error::Config(format!("failed to connect session Redis store: {error}"))
+                pay_core::Error::Config(format!(
+                    "failed to connect {label} Redis channel store: {error}"
+                ))
             })?;
-        tracing::info!("using durable Redis channel store for MPP sessions");
+        tracing::info!("using durable Redis channel store for {label}");
         Ok((Arc::new(store), true))
     }
 
     #[cfg(not(feature = "redis-session-store"))]
     {
-        let _ = redis_url;
-        Err(pay_core::Error::Config(
-            "PAY_SESSION_REDIS_URL is set, but this pay binary was built without the \
+        let _ = (redis_url, prefix_var, default_prefix);
+        Err(pay_core::Error::Config(format!(
+            "a {label} Redis URL is set, but this pay binary was built without the \
              redis-session-store feature"
-                .to_string(),
-        ))
+        )))
     }
+}
+
+async fn session_channel_store()
+-> pay_core::Result<(Arc<dyn pay_kit::mpp::store::ChannelStore>, bool)> {
+    channel_store(
+        &["PAY_MPP_REDIS_URL"],
+        "PAY_MPP_REDIS_PREFIX",
+        "pay:session:v1:",
+        "MPP sessions",
+    )
+    .await
+}
+
+/// Resolve the channel store backing x402 `batch-settlement`.
+///
+/// The store holds the only record of what a client has been charged: an
+/// accepted voucher and its cumulative watermark cannot be reconstructed from
+/// the chain, so losing it means the operator either forfeits the revenue or
+/// invents a charge. Memory is fine for a local `pay serve`; a deployment that
+/// takes real money wants `PAY_X402_REDIS_URL` (falling back to the MPP
+/// Redis URL).
+async fn batch_channel_store()
+-> pay_core::Result<(Arc<dyn pay_kit::mpp::store::ChannelStore>, bool)> {
+    channel_store(
+        &["PAY_X402_REDIS_URL", "PAY_MPP_REDIS_URL"],
+        "PAY_X402_REDIS_PREFIX",
+        "pay:batch:v1:",
+        "x402 batch-settlement",
+    )
+    .await
 }
 
 /// The gateway owns session close/settlement until a separately deployed
@@ -98,6 +154,605 @@ fn session_lifecycle_reconciliation(
     _durable_session_store: bool,
 ) -> SessionLifecycleReconciliation {
     SessionLifecycleReconciliation::Embedded
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BatchLifecycleReconciliation {
+    Embedded,
+    External,
+}
+
+/// Memory-backed batch channels cannot be seen by `pay-worker`, so the
+/// gateway owns their settlement clock. A Redis-backed gateway leaves the
+/// clock to the externally leased worker, avoiding two competing reconcilers.
+fn batch_lifecycle_reconciliation(durable_store: bool) -> BatchLifecycleReconciliation {
+    if durable_store {
+        BatchLifecycleReconciliation::External
+    } else {
+        BatchLifecycleReconciliation::Embedded
+    }
+}
+
+#[derive(Clone, Copy)]
+struct BatchLifecycleConfig {
+    interval: Duration,
+    startup_delay: Duration,
+    active_settlement_interval: Option<Duration>,
+    idle_settlement_delay_seconds: u64,
+    distribution_threshold_base_units: Option<u64>,
+    concurrency: usize,
+    max_per_cycle: usize,
+    distribution_max_per_cycle: usize,
+    confirmation_timeout: Duration,
+    send_concurrency: usize,
+    send_interval: Duration,
+    value_metrics_interval: Duration,
+}
+
+fn env_u64(name: &str, default: u64) -> pay_core::Result<u64> {
+    let value = std::env::var(name)
+        .ok()
+        .map(|value| value.trim().parse::<u64>())
+        .transpose()
+        .map_err(|error| pay_core::Error::Config(format!("invalid {name}: {error}")))?
+        .unwrap_or(default);
+    Ok(value)
+}
+
+fn positive_env_u64(name: &str, default: u64) -> pay_core::Result<u64> {
+    let value = env_u64(name, default)?;
+    if value == 0 {
+        return Err(pay_core::Error::Config(format!(
+            "{name} must be greater than zero"
+        )));
+    }
+    Ok(value)
+}
+
+fn batch_lifecycle_config(
+    policy: Option<&pay_types::metering::BatchSettlementSpec>,
+) -> pay_core::Result<BatchLifecycleConfig> {
+    let policy = policy.cloned().unwrap_or_default();
+    let concurrency = positive_env_u64(
+        "PAY_X402_RECONCILIATION_CONCURRENCY",
+        DEFAULT_X402_RECONCILIATION_CONCURRENCY as u64,
+    )?;
+    let max_per_cycle = positive_env_u64(
+        "PAY_X402_RECONCILIATION_MAX_PER_CYCLE",
+        DEFAULT_X402_RECONCILIATION_MAX_PER_CYCLE as u64,
+    )?;
+    let send_concurrency = positive_env_u64(
+        "PAY_X402_SETTLEMENT_SEND_CONCURRENCY",
+        DEFAULT_X402_SETTLEMENT_SEND_CONCURRENCY as u64,
+    )?;
+    let distribution_max_per_cycle = positive_env_u64(
+        "PAY_X402_DISTRIBUTION_MAX_PER_CYCLE",
+        DEFAULT_X402_DISTRIBUTION_MAX_PER_CYCLE as u64,
+    )?;
+    if policy.distribution_threshold_base_units == Some(0) {
+        return Err(pay_core::Error::Config(
+            "batch_settlement.distribution_threshold_base_units must be greater than zero when set"
+                .to_string(),
+        ));
+    }
+    Ok(BatchLifecycleConfig {
+        interval: Duration::from_secs(positive_env_u64(
+            "PAY_X402_RECONCILIATION_INTERVAL_SECONDS",
+            DEFAULT_X402_RECONCILIATION_INTERVAL_SECONDS,
+        )?),
+        startup_delay: Duration::from_secs(env_u64(
+            "PAY_X402_RECONCILIATION_STARTUP_DELAY_SECONDS",
+            DEFAULT_X402_RECONCILIATION_STARTUP_DELAY_SECONDS,
+        )?),
+        active_settlement_interval: (policy.settlement_interval_ms > 0)
+            .then(|| Duration::from_millis(policy.settlement_interval_ms)),
+        idle_settlement_delay_seconds: policy.idle_settlement_delay_ms.div_ceil(1_000),
+        distribution_threshold_base_units: policy.distribution_threshold_base_units,
+        concurrency: usize::try_from(concurrency).unwrap_or(usize::MAX),
+        max_per_cycle: usize::try_from(max_per_cycle).unwrap_or(usize::MAX),
+        distribution_max_per_cycle: usize::try_from(distribution_max_per_cycle)
+            .unwrap_or(usize::MAX),
+        confirmation_timeout: Duration::from_secs(positive_env_u64(
+            "PAY_X402_SETTLEMENT_CONFIRMATION_TIMEOUT_SECONDS",
+            DEFAULT_X402_SETTLEMENT_CONFIRMATION_TIMEOUT_SECONDS,
+        )?),
+        send_concurrency: usize::try_from(send_concurrency).unwrap_or(usize::MAX),
+        send_interval: Duration::from_micros(env_u64(
+            "PAY_X402_SETTLEMENT_SEND_INTERVAL_MICROS",
+            DEFAULT_X402_SETTLEMENT_SEND_INTERVAL_MICROS,
+        )?),
+        value_metrics_interval: Duration::from_secs(positive_env_u64(
+            "PAY_X402_VALUE_METRICS_INTERVAL_SECONDS",
+            DEFAULT_X402_VALUE_METRICS_INTERVAL_SECONDS,
+        )?),
+    })
+}
+
+fn batch_settlement_due(
+    state: &pay_kit::mpp::store::ChannelState,
+    now: u64,
+    idle_settlement_delay_seconds: u64,
+    settle_active: bool,
+) -> bool {
+    if state.sealed || state.close_requested_at.is_some() || state.pending_setup.is_some() {
+        return false;
+    }
+    state.cumulative > state.settled_on_chain
+        && (settle_active
+            || now.saturating_sub(state.last_activity_at) >= idle_settlement_delay_seconds)
+}
+
+fn batch_distribution_due(
+    state: &pay_kit::mpp::store::ChannelState,
+    threshold_base_units: u64,
+) -> bool {
+    !state.sealed
+        && state.close_requested_at.is_none()
+        && state.pending_setup.is_none()
+        && distribution_threshold_reached(
+            state.settled_on_chain,
+            state.distributed_on_chain,
+            threshold_base_units,
+        )
+}
+
+fn distribution_threshold_reached(
+    target_settled: u64,
+    distributed: u64,
+    threshold_base_units: u64,
+) -> bool {
+    target_settled.saturating_sub(distributed) >= threshold_base_units
+}
+
+fn select_rotating_batch(
+    mut channel_ids: Vec<String>,
+    max_per_cycle: usize,
+    cursor: &mut usize,
+) -> (usize, Vec<String>) {
+    channel_ids.sort_unstable();
+    let available = channel_ids.len();
+    if available > max_per_cycle {
+        channel_ids.rotate_left(*cursor % available);
+        channel_ids.truncate(max_per_cycle);
+        *cursor = (*cursor + max_per_cycle) % available;
+    } else {
+        *cursor = 0;
+    }
+    (available, channel_ids)
+}
+
+#[derive(Clone, Copy)]
+enum BatchLifecycleAction {
+    Claim,
+    Distribute,
+    FinalizeClose,
+    Reclaim,
+}
+
+#[derive(Clone, Copy, Default)]
+struct BatchChannelValueSnapshot {
+    escrowed: u64,
+    authorized: u64,
+    settled: u64,
+    distributed: u64,
+    settled_watermark: u64,
+}
+
+impl BatchChannelValueSnapshot {
+    fn from_state(state: &pay_kit::mpp::store::ChannelState) -> Self {
+        Self {
+            escrowed: if state.sealed { 0 } else { state.deposit },
+            authorized: state.cumulative.saturating_sub(state.settled_on_chain),
+            settled: state
+                .settled_on_chain
+                .saturating_sub(state.distributed_on_chain),
+            distributed: state.distributed_on_chain,
+            settled_watermark: state.settled_on_chain,
+        }
+    }
+}
+
+#[derive(Default)]
+struct BatchValueInventory {
+    totals: BatchChannelValueSnapshot,
+    channels: HashMap<String, BatchChannelValueSnapshot>,
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct BatchValueTransitions {
+    claimed: u64,
+    distributed: u64,
+}
+
+#[derive(Default)]
+struct BatchValueTracker {
+    previous: HashMap<String, BatchChannelValueSnapshot>,
+}
+
+impl BatchValueTracker {
+    fn observe(
+        &mut self,
+        current: HashMap<String, BatchChannelValueSnapshot>,
+    ) -> BatchValueTransitions {
+        let mut transitions = BatchValueTransitions::default();
+        for (channel_id, snapshot) in &current {
+            let Some(previous) = self.previous.get(channel_id) else {
+                // A reused channel enters the in-memory store carrying lifetime
+                // on-chain watermarks. Baseline it instead of reporting that
+                // historical value as work performed by this gateway run.
+                continue;
+            };
+            transitions.claimed = transitions.claimed.saturating_add(
+                snapshot
+                    .settled_watermark
+                    .saturating_sub(previous.settled_watermark),
+            );
+            transitions.distributed = transitions
+                .distributed
+                .saturating_add(snapshot.distributed.saturating_sub(previous.distributed));
+        }
+        self.previous = current;
+        transitions
+    }
+}
+
+fn record_batch_value_inventory(
+    inventory: &BatchValueInventory,
+    transitions: &BatchValueTransitions,
+) {
+    tracing::info!(
+        gauge.pay_x402_batch_value_escrowed_base_units = inventory.totals.escrowed,
+        gauge.pay_x402_batch_value_authorized_base_units = inventory.totals.authorized,
+        gauge.pay_x402_batch_value_settled_base_units = inventory.totals.settled,
+        gauge.pay_x402_batch_value_distributed_base_units = inventory.totals.distributed,
+        monotonic_counter.pay_x402_batch_value_claimed_base_units_total = transitions.claimed,
+        monotonic_counter.pay_x402_batch_value_distributed_base_units_total =
+            transitions.distributed,
+        protocol = "x402/batch",
+        metric_group = "pay_x402_batch_value",
+        "embedded x402 batch-settlement value inventory"
+    );
+}
+
+async fn collect_batch_value_inventory(
+    batch: &pay_kit::x402::server::X402BatchSettlement,
+) -> Result<BatchValueInventory, String> {
+    let channel_ids = batch
+        .store()
+        .list_channel_ids()
+        .await
+        .map_err(|error| error.to_string())?;
+    let mut inventory = BatchValueInventory::default();
+    for channel_id in channel_ids {
+        let out = Arc::new(Mutex::new(None));
+        let callback_out = Arc::clone(&out);
+        batch
+            .store()
+            .read_channel(
+                &channel_id,
+                Box::new(move |state| {
+                    if let Some(state) = state {
+                        *callback_out
+                            .lock()
+                            .unwrap_or_else(|error| error.into_inner()) =
+                            Some(BatchChannelValueSnapshot::from_state(state));
+                    }
+                    Ok(())
+                }),
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        let snapshot = out.lock().unwrap_or_else(|error| error.into_inner()).take();
+        if let Some(snapshot) = snapshot {
+            inventory.totals.escrowed = inventory.totals.escrowed.saturating_add(snapshot.escrowed);
+            inventory.totals.authorized = inventory
+                .totals
+                .authorized
+                .saturating_add(snapshot.authorized);
+            inventory.totals.settled = inventory.totals.settled.saturating_add(snapshot.settled);
+            inventory.totals.distributed = inventory
+                .totals
+                .distributed
+                .saturating_add(snapshot.distributed);
+            inventory.channels.insert(channel_id, snapshot);
+        }
+    }
+    Ok(inventory)
+}
+
+fn spawn_batch_value_metrics(batch: pay_kit::x402::server::X402BatchSettlement, period: Duration) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(period);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut tracker = BatchValueTracker::default();
+        loop {
+            interval.tick().await;
+            match collect_batch_value_inventory(&batch).await {
+                Ok(mut inventory) => {
+                    let transitions = tracker.observe(std::mem::take(&mut inventory.channels));
+                    record_batch_value_inventory(&inventory, &transitions);
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "failed to collect embedded batch value inventory")
+                }
+            }
+        }
+    });
+}
+
+async fn run_batch_lifecycle_chunks(
+    batch: &pay_kit::x402::server::X402BatchSettlement,
+    channel_ids: Vec<String>,
+    config: BatchLifecycleConfig,
+    action: BatchLifecycleAction,
+) -> Vec<String> {
+    let chunks: Vec<Vec<String>> = channel_ids
+        .chunks(X402_RECONCILIATION_CHUNK_SIZE)
+        .map(<[String]>::to_vec)
+        .collect();
+    futures_util::stream::iter(chunks)
+        .map(|channel_ids| {
+            let batch = batch.clone();
+            async move {
+                let result = match action {
+                    BatchLifecycleAction::Claim => batch.claim(&channel_ids).await.map(|_| ()),
+                    BatchLifecycleAction::Distribute => {
+                        batch.settle(&channel_ids).await.map(|_| ())
+                    }
+                    BatchLifecycleAction::FinalizeClose => {
+                        batch.finalize_close(&channel_ids).await.map(|_| ())
+                    }
+                    BatchLifecycleAction::Reclaim => batch.reclaim(&channel_ids).await.map(|_| ()),
+                };
+                result.err().map(|error| error.to_string())
+            }
+        })
+        .buffer_unordered(config.concurrency)
+        .filter_map(|error| async move { error })
+        .collect()
+        .await
+}
+
+fn spawn_batch_lifecycle(
+    batch: pay_kit::x402::server::X402BatchSettlement,
+    config: BatchLifecycleConfig,
+) {
+    tokio::spawn(async move {
+        if !config.startup_delay.is_zero() {
+            tokio::time::sleep(config.startup_delay).await;
+        }
+        let mut interval = tokio::time::interval(config.interval);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // Construction happens after provisioning-related startup work. Do not
+        // make the first full store snapshot part of gateway startup.
+        interval.tick().await;
+        let mut active_interval = config.active_settlement_interval.map(|period| {
+            let mut interval = tokio::time::interval_at(Instant::now() + period, period);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            interval
+        });
+        let mut cursor = 0usize;
+        let mut distribution_cursor = 0usize;
+        loop {
+            // Active sweeps have their own anchored timer. Sampling their
+            // deadline from the operational reconciliation timer can miss by
+            // one complete tick when both clocks meet at the same instant.
+            let settle_active = if let Some(active_interval) = active_interval.as_mut() {
+                tokio::select! {
+                    biased;
+                    _ = active_interval.tick() => true,
+                    _ = interval.tick() => false,
+                }
+            } else {
+                interval.tick().await;
+                false
+            };
+            let started = Instant::now();
+            let channel_ids = match batch.store().list_channel_ids().await {
+                Ok(channel_ids) => channel_ids,
+                Err(error) => {
+                    tracing::warn!(%error, "failed to enumerate embedded batch lifecycle state");
+                    continue;
+                }
+            };
+            let channels_available = channel_ids.len();
+            if settle_active {
+                cursor = 0;
+            }
+            // Production ticks inspect a bounded rotating page and only flush
+            // idle residuals. An explicitly configured active-settlement clock
+            // snapshots the complete fleet, matching MPP session behavior.
+            let channel_ids = if settle_active {
+                channel_ids
+            } else {
+                select_rotating_batch(channel_ids, config.max_per_cycle, &mut cursor).1
+            };
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            let channels_scanned = channel_ids.len();
+            let mut due = Vec::new();
+            let mut distributable = Vec::new();
+            let mut closing = Vec::new();
+            let mut sealed = Vec::new();
+            for channel_id in channel_ids {
+                let classification = Arc::new(Mutex::new(None));
+                let out = Arc::clone(&classification);
+                if let Err(error) = batch
+                    .store()
+                    .read_channel(
+                        &channel_id,
+                        Box::new(move |state| {
+                            *out.lock().unwrap_or_else(|error| error.into_inner()) =
+                                state.map(|state| {
+                                    (
+                                        batch_settlement_due(
+                                            state,
+                                            now,
+                                            config.idle_settlement_delay_seconds,
+                                            settle_active,
+                                        ),
+                                        config.distribution_threshold_base_units.is_some_and(
+                                            |threshold| batch_distribution_due(state, threshold),
+                                        ),
+                                        !state.sealed
+                                            && state.close_requested_at.is_some()
+                                            && state.pending_setup.is_none(),
+                                        state.sealed && state.pending_setup.is_none(),
+                                    )
+                                });
+                            Ok(())
+                        }),
+                    )
+                    .await
+                {
+                    tracing::warn!(%error, %channel_id, "failed to inspect embedded batch lifecycle state");
+                    continue;
+                }
+                let classification = classification
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .take();
+                if let Some((is_due, is_distributable, is_closing, is_sealed)) = classification {
+                    if is_due {
+                        due.push(channel_id.clone());
+                    }
+                    if is_distributable {
+                        distributable.push(channel_id.clone());
+                    }
+                    if is_closing {
+                        closing.push(channel_id);
+                    } else if is_sealed {
+                        sealed.push(channel_id);
+                    }
+                }
+            }
+            let due_count = due.len();
+            let (distributable_available, distributable) = select_rotating_batch(
+                distributable,
+                config.distribution_max_per_cycle,
+                &mut distribution_cursor,
+            );
+            let distribution_count = distributable.len();
+            // Publish the scan immediately. A 100k-channel redemption can take
+            // minutes; dashboards must distinguish an active sweep from a
+            // worker that never started.
+            tracing::info!(
+                gauge.pay_x402_batch_lifecycle_last_run_unixtime = now,
+                gauge.pay_x402_batch_lifecycle_channels_available = channels_available as u64,
+                gauge.pay_x402_batch_lifecycle_channels_scanned = channels_scanned as u64,
+                gauge.pay_x402_batch_lifecycle_channels_due = due_count as u64,
+                gauge.pay_x402_batch_lifecycle_channels_distributable =
+                    distributable_available as u64,
+                gauge.pay_x402_batch_lifecycle_channels_distributing = distribution_count as u64,
+                gauge.pay_x402_batch_lifecycle_channels_closing = closing.len() as u64,
+                gauge.pay_x402_batch_lifecycle_channels_reclaimable = sealed.len() as u64,
+                gauge.pay_x402_batch_lifecycle_failures = 0_u64,
+                protocol = "x402/batch",
+                settlement_sweep = if settle_active { "active" } else { "idle" },
+                outcome = "running",
+                metric_group = "pay_x402_batch_lifecycle",
+                "embedded x402 batch-settlement metrics"
+            );
+            let claim_started = Instant::now();
+            let claim_failures =
+                run_batch_lifecycle_chunks(&batch, due, config, BatchLifecycleAction::Claim).await;
+            let claim_duration = claim_started.elapsed();
+            for error in &claim_failures {
+                tracing::warn!(%error, "embedded batch claim chunk failed");
+            }
+            tracing::info!(
+                histogram.pay_x402_batch_lifecycle_claim_duration_seconds =
+                    claim_duration.as_secs_f64(),
+                channels = due_count,
+                failures = claim_failures.len(),
+                protocol = "x402/batch",
+                phase = "claim",
+                metric_group = "pay_x402_batch_lifecycle_phase",
+                "embedded batch lifecycle phase completed"
+            );
+            let distribution_started = Instant::now();
+            let distribution_failures = run_batch_lifecycle_chunks(
+                &batch,
+                distributable,
+                config,
+                BatchLifecycleAction::Distribute,
+            )
+            .await;
+            let distribution_duration = distribution_started.elapsed();
+            for error in &distribution_failures {
+                tracing::warn!(%error, "embedded batch distribution chunk failed");
+            }
+            tracing::info!(
+                histogram.pay_x402_batch_lifecycle_distribution_duration_seconds =
+                    distribution_duration.as_secs_f64(),
+                channels = distribution_count,
+                failures = distribution_failures.len(),
+                protocol = "x402/batch",
+                phase = "distribution",
+                metric_group = "pay_x402_batch_lifecycle_phase",
+                "embedded batch lifecycle phase completed"
+            );
+            let close_count = closing.len();
+            let close_failures = run_batch_lifecycle_chunks(
+                &batch,
+                closing,
+                config,
+                BatchLifecycleAction::FinalizeClose,
+            )
+            .await;
+            for error in &close_failures {
+                tracing::warn!(%error, "embedded batch close-finalization chunk failed");
+            }
+            let reclaim_count = sealed.len();
+            let reclaim_failures =
+                run_batch_lifecycle_chunks(&batch, sealed, config, BatchLifecycleAction::Reclaim)
+                    .await;
+            for error in &reclaim_failures {
+                tracing::warn!(%error, "embedded batch rent-reclaim chunk failed");
+            }
+            let failure_count = claim_failures.len()
+                + distribution_failures.len()
+                + close_failures.len()
+                + reclaim_failures.len();
+            let outcome = if failure_count == 0 {
+                "succeeded"
+            } else {
+                "failed"
+            };
+            let duration_seconds = started.elapsed().as_secs_f64();
+            tracing::info!(
+                gauge.pay_x402_batch_lifecycle_last_run_unixtime = now,
+                gauge.pay_x402_batch_lifecycle_channels_available = channels_available as u64,
+                gauge.pay_x402_batch_lifecycle_channels_scanned = channels_scanned as u64,
+                gauge.pay_x402_batch_lifecycle_channels_due = due_count as u64,
+                gauge.pay_x402_batch_lifecycle_channels_distributable =
+                    distributable_available as u64,
+                gauge.pay_x402_batch_lifecycle_channels_distributing = distribution_count as u64,
+                gauge.pay_x402_batch_lifecycle_channels_closing = close_count as u64,
+                gauge.pay_x402_batch_lifecycle_channels_reclaimable = reclaim_count as u64,
+                gauge.pay_x402_batch_lifecycle_failures = failure_count as u64,
+                histogram.pay_x402_batch_lifecycle_duration_seconds = duration_seconds,
+                protocol = "x402/batch",
+                outcome,
+                metric_group = "pay_x402_batch_lifecycle",
+                "embedded x402 batch-settlement metrics"
+            );
+            tracing::info!(
+                channels_available,
+                channels_scanned,
+                channels_due = due_count,
+                channels_distributable = distributable_available,
+                channels_distributing = distribution_count,
+                channels_closing = close_count,
+                channels_reclaimable = reclaim_count,
+                failures = failure_count,
+                duration_seconds,
+                "embedded x402 batch-settlement reconciliation completed"
+            );
+        }
+    });
 }
 
 /// Start the payment gateway proxy.
@@ -178,6 +833,7 @@ struct AppState {
     fee_payer_signer: Option<Arc<dyn SolanaSigner>>,
     x402: Option<pay_kit::x402::server::X402>,
     x402_upto: Option<pay_kit::x402::server::X402Upto>,
+    x402_batch: Option<pay_kit::x402::server::X402BatchSettlement>,
     pdb: Option<pay_pdb::PdbState>,
 }
 
@@ -217,6 +873,9 @@ impl PaymentState for AppState {
     }
     fn x402_upto(&self) -> Option<&pay_kit::x402::server::X402Upto> {
         self.x402_upto.as_ref()
+    }
+    fn x402_batch(&self) -> Option<&pay_kit::x402::server::X402BatchSettlement> {
+        self.x402_batch.as_ref()
     }
     fn records_http_exchanges(&self) -> bool {
         self.pdb.is_some()
@@ -1111,7 +1770,7 @@ impl StartCommand {
                     &rpc_url,
                 )?;
 
-                let session_secret = std::env::var("PAY_SESSION_SECRET")
+                let session_secret = std::env::var("PAY_MPP_SECRET")
                     .unwrap_or_else(|_| challenge_binding_secret.clone());
                 let channel_program_id = std::env::var("PAY_PAYMENT_CHANNELS_PROGRAM_ID")
                     .ok()
@@ -1571,6 +2230,139 @@ impl StartCommand {
                 _ => None,
             };
 
+            // x402 `batch-settlement` backend — one channel, many cheap
+            // requests. Like `upto` it needs the operator signer (it sponsors
+            // channel rent, co-signs the client's `open`, and signs redemption),
+            // but unlike `upto` it is stateful across requests, so it also needs
+            // a channel store that outlives the process to be safe in
+            // production.
+            let wants_batch = api.endpoints.iter().any(|e| {
+                e.metering.as_ref().is_some_and(|m| {
+                    m.accepted_schemes()
+                        .iter()
+                        .any(|s| matches!(s, pay_types::metering::Scheme::X402BatchSettlement))
+                })
+            });
+            let x402_batch = match (wants_batch, fee_payer_signer.clone()) {
+                (true, Some(signer)) => {
+                    let (batch_store, durable_batch_store) = batch_channel_store().await?;
+                    if !durable_batch_store {
+                        eprintln!(
+                            "{}",
+                            "warning: x402 batch-settlement is using an in-memory channel store; \
+                             set PAY_X402_REDIS_URL before taking real payments, or a restart \
+                             forfeits every unclaimed voucher"
+                                .yellow()
+                        );
+                    }
+                    let primary = x402_currencies
+                        .first()
+                        .expect("x402 currency configs are never empty");
+                    let cfg = pay_kit::x402::server::BatchConfig {
+                        pay_to: recipient.clone(),
+                        currency: primary.currency.clone(),
+                        decimals: primary.decimals,
+                        token_program: primary.token_program.clone(),
+                        cluster: network.slug().to_string(),
+                        rpc_url: Some(rpc_url.clone()),
+                        resource: api.subdomain.clone(),
+                        description: None,
+                        max_timeout_seconds: 300,
+                        // The client's escape hatch: it can force-close and
+                        // recover unspent escrow after this long. The scheme
+                        // bounds it to 15 minutes .. 30 days, never shorter than
+                        // the HTTP completion window above.
+                        withdraw_delay:
+                            pay_kit::x402::batch_settlement::MIN_WITHDRAW_DELAY_SECONDS,
+                        memo: None,
+                        // Advertised only when a server wants signed cooperative
+                        // closes; this build refuses them, so it stays unset.
+                        receiver_authorizer: None,
+                        fee_payer_signer: signer,
+                        program_id: None,
+                        // How long a confirmed channel snapshot is trusted
+                        // before the scheme re-reads it. The scheme requires
+                        // the channel to be confirmed open before a voucher is
+                        // accepted; kit's default keeps that off the hot path
+                        // without letting the snapshot go stale. Overridable via
+                        // PAY_X402_SNAPSHOT_MAX_AGE_SECS — raise it for
+                        // throughput benchmarks where channels are known-open and
+                        // per-refresh reconciles would otherwise add on-chain
+                        // reads to the measured window.
+                        channel_snapshot_max_age_seconds: std::env::var(
+                            "PAY_X402_SNAPSHOT_MAX_AGE_SECS",
+                        )
+                        .ok()
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(30),
+                    };
+                    match pay_kit::x402::server::X402BatchSettlement::with_store(cfg, batch_store) {
+                        Ok(mut b) => {
+                            match batch_lifecycle_reconciliation(durable_batch_store) {
+                                BatchLifecycleReconciliation::Embedded => {
+                                    let lifecycle_config =
+                                        batch_lifecycle_config(api.batch_settlement.as_ref())?;
+                                    let pipeline_config =
+                                        pay_kit::core::tx_pipeline::TxPipelineConfig {
+                                            confirmation_timeout: lifecycle_config
+                                                .confirmation_timeout,
+                                            max_send_concurrency: lifecycle_config.send_concurrency,
+                                            send_interval: lifecycle_config.send_interval,
+                                            ..Default::default()
+                                        };
+                                    b = b.with_tx_pipeline(
+                                        pay_kit::core::tx_pipeline::TxPipeline::new(
+                                            rpc_url.clone(),
+                                            pipeline_config,
+                                        ),
+                                    );
+                                    tracing::info!(
+                                        interval_seconds = lifecycle_config.interval.as_secs(),
+                                        startup_delay_seconds =
+                                            lifecycle_config.startup_delay.as_secs(),
+                                        active_settlement_interval_ms = lifecycle_config
+                                            .active_settlement_interval
+                                            .map(|period| period.as_millis()),
+                                        idle_settlement_delay_seconds =
+                                            lifecycle_config.idle_settlement_delay_seconds,
+                                        distribution_threshold_base_units = lifecycle_config
+                                            .distribution_threshold_base_units,
+                                        concurrency = lifecycle_config.concurrency,
+                                        max_per_cycle = lifecycle_config.max_per_cycle,
+                                        distribution_max_per_cycle =
+                                            lifecycle_config.distribution_max_per_cycle,
+                                        confirmation_timeout_seconds =
+                                            lifecycle_config.confirmation_timeout.as_secs(),
+                                        send_concurrency = lifecycle_config.send_concurrency,
+                                        send_interval_micros =
+                                            lifecycle_config.send_interval.as_micros(),
+                                        value_metrics_interval_seconds =
+                                            lifecycle_config.value_metrics_interval.as_secs(),
+                                        "gateway owns x402 batch-settlement reconciliation"
+                                    );
+                                    spawn_batch_value_metrics(
+                                        b.clone(),
+                                        lifecycle_config.value_metrics_interval,
+                                    );
+                                    spawn_batch_lifecycle(b.clone(), lifecycle_config);
+                                }
+                                BatchLifecycleReconciliation::External => {
+                                    tracing::info!(
+                                        "pay-worker owns x402 batch-settlement reconciliation"
+                                    );
+                                }
+                            }
+                            Some(b)
+                        }
+                        Err(e) => {
+                            eprintln!("x402 batch-settlement backend disabled ({e})");
+                            None
+                        }
+                    }
+                }
+                _ => None,
+            };
+
             let pdb_state = if debugger {
                 let pdb_config = build_pdb_config(&api, &recipient, network.slug(), &rpc_url);
                 let pdb = pay_pdb::PdbState::new(pdb_config);
@@ -1626,6 +2418,7 @@ impl StartCommand {
                 fee_payer_signer: fee_payer_signer.clone(),
                 x402,
                 x402_upto,
+                x402_batch,
                 // The gate calls `record_exchange` per proxied request to feed PDB.
                 pdb: pdb_state.clone(),
             };
@@ -3147,15 +3940,18 @@ mod tests {
         stable_token_account_requirements, surfpool_funding_targets, surfpool_prep_notice_body,
     };
     use super::{
-        build_pdb_config, default_bind, delegated_session_channel_payout,
+        BatchChannelValueSnapshot, BatchLifecycleReconciliation, BatchValueTracker,
+        BatchValueTransitions, batch_lifecycle_reconciliation, build_pdb_config, default_bind,
+        delegated_session_channel_payout, distribution_threshold_reached,
         ensure_session_currencies_usd_pegged, payout_recipient_pubkeys, payout_recipient_targets,
-        resolve_operator_currencies, session_lifecycle_reconciliation,
+        resolve_operator_currencies, select_rotating_batch, session_lifecycle_reconciliation,
         validate_browser_rpc_request, x402_currency_configs, x402_upto_beneficiary_pubkey,
         x402_upto_payout_for_recipient,
     };
     use crate::network::SolanaNetwork;
     use serial_test::serial;
     use solana_pubkey::Pubkey;
+    use std::collections::HashMap;
     use std::str::FromStr;
 
     #[test]
@@ -3167,6 +3963,75 @@ mod tests {
         assert_eq!(
             session_lifecycle_reconciliation(true),
             super::SessionLifecycleReconciliation::Embedded
+        );
+    }
+
+    #[test]
+    fn batch_lifecycle_owner_follows_store_durability() {
+        assert_eq!(
+            batch_lifecycle_reconciliation(false),
+            BatchLifecycleReconciliation::Embedded
+        );
+        assert_eq!(
+            batch_lifecycle_reconciliation(true),
+            BatchLifecycleReconciliation::External
+        );
+    }
+
+    #[test]
+    fn distribution_batch_rotates_fairly_across_cycles() {
+        let channels = (0..5).map(|index| format!("channel-{index}")).collect();
+        let mut cursor = 0;
+
+        let (available, first) = select_rotating_batch(channels, 2, &mut cursor);
+        assert_eq!(available, 5);
+        assert_eq!(first, ["channel-0", "channel-1"]);
+        assert_eq!(cursor, 2);
+
+        let channels = (0..5).map(|index| format!("channel-{index}")).collect();
+        let (_, second) = select_rotating_batch(channels, 2, &mut cursor);
+        assert_eq!(second, ["channel-2", "channel-3"]);
+        assert_eq!(cursor, 4);
+
+        let channels = (0..5).map(|index| format!("channel-{index}")).collect();
+        let (_, third) = select_rotating_batch(channels, 2, &mut cursor);
+        assert_eq!(third, ["channel-4", "channel-0"]);
+        assert_eq!(cursor, 1);
+    }
+
+    #[test]
+    fn distribution_threshold_uses_only_the_undistributed_delta() {
+        assert!(!distribution_threshold_reached(999, 0, 1_000));
+        assert!(distribution_threshold_reached(1_000, 0, 1_000));
+        assert!(!distribution_threshold_reached(1_500, 501, 1_000));
+        assert!(distribution_threshold_reached(1_501, 501, 1_000));
+    }
+
+    #[test]
+    fn batch_value_tracker_ignores_reused_watermarks_then_records_transitions() {
+        let mut tracker = BatchValueTracker::default();
+        let snapshot = |settled_watermark, distributed| BatchChannelValueSnapshot {
+            settled_watermark,
+            distributed,
+            ..BatchChannelValueSnapshot::default()
+        };
+
+        assert_eq!(
+            tracker.observe(HashMap::from([(
+                "reused-channel".to_string(),
+                snapshot(10_000, 8_000),
+            )])),
+            BatchValueTransitions::default(),
+        );
+        assert_eq!(
+            tracker.observe(HashMap::from([(
+                "reused-channel".to_string(),
+                snapshot(12_500, 9_500),
+            )])),
+            BatchValueTransitions {
+                claimed: 2_500,
+                distributed: 1_500,
+            },
         );
     }
 

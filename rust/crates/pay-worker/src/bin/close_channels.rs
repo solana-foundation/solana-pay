@@ -20,7 +20,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use pay_api_core::rpc::RpcClient;
-use pay_kit::core::payment_channels::MAX_RECLAIMS_PER_TX;
+use pay_kit::core::payment_channels::{self, MAX_RECLAIMS_PER_TX};
 use pay_kit::core::settlement::packing::{ChannelInstructionGroup, MAX_TX_BYTES, pack, tx_size};
 use pay_kit::mpp::solana_keychain::SolanaSigner;
 use pay_worker::channel::{
@@ -215,8 +215,8 @@ async fn run() -> Result<usize, JobError> {
     let redis_url = if dry_run {
         None
     } else {
-        Some(std::env::var("PAY_SESSION_REDIS_URL").map_err(|_| {
-            JobError::Config("PAY_SESSION_REDIS_URL is required when DRY_RUN=false".into())
+        Some(std::env::var("PAY_MPP_REDIS_URL").map_err(|_| {
+            JobError::Config("PAY_MPP_REDIS_URL is required when DRY_RUN=false".into())
         })?)
     };
     let network = std::env::var("NETWORK")
@@ -227,9 +227,13 @@ async fn run() -> Result<usize, JobError> {
 
     let config = Config::load(&network)?;
     let rpc_url = config.rpc_url_for(&network)?.to_string();
-    let treasury_owner = Pubkey::from_str(config.treasury_owner.trim()).map_err(|_| {
-        JobError::Config(format!("invalid treasury_owner: {}", config.treasury_owner))
-    })?;
+    let treasury_owner = if config.treasury_owner.trim().is_empty() {
+        payment_channels::treasury_owner_for_cluster(&network)
+    } else {
+        Pubkey::from_str(config.treasury_owner.trim()).map_err(|_| {
+            JobError::Config(format!("invalid treasury_owner: {}", config.treasury_owner))
+        })?
+    };
 
     let rpc = RpcClient::new(Duration::from_millis(config.rpc_timeout_ms))?;
     let current_slot = rpc.get_slot(&rpc_url).await?;
@@ -686,12 +690,9 @@ async fn build_sign_send(
     instructions: &[Instruction],
 ) -> Result<Signature, JobError> {
     let blockhash_b58 = rpc.get_latest_blockhash(rpc_url).await?;
-    let blockhash_bytes = bs58::decode(&blockhash_b58)
-        .into_vec()
+    let mut blockhash_arr = [0u8; 32];
+    five8::decode_32(&blockhash_b58, &mut blockhash_arr)
         .map_err(|e| JobError::TxBuild(format!("blockhash decode: {e}")))?;
-    let blockhash_arr: [u8; 32] = blockhash_bytes
-        .try_into()
-        .map_err(|_| JobError::TxBuild("blockhash is not 32 bytes".into()))?;
 
     let mut message = Message::new(instructions, Some(&fee_payer));
     message.recent_blockhash = solana_message::Hash::from(blockhash_arr);

@@ -58,6 +58,7 @@ pub enum PaymentLimit {
 enum PaymentAmountKind {
     Exact,
     Maximum,
+    Escrow,
 }
 
 impl PaymentAmountKind {
@@ -65,6 +66,7 @@ impl PaymentAmountKind {
         match self {
             Self::Exact => "authorize a payment.",
             Self::Maximum => "authorize a series of payments.",
+            Self::Escrow => "authorize a channel escrow deposit.",
         }
     }
 
@@ -72,6 +74,7 @@ impl PaymentAmountKind {
         match self {
             Self::Exact => "amount",
             Self::Maximum => "total allowance",
+            Self::Escrow => "escrow deposit",
         }
     }
 }
@@ -161,6 +164,26 @@ impl AuthIntent {
         Self::AuthorizePayment {
             message: payment_authorization_message(
                 PaymentAmountKind::Exact,
+                amount,
+                Some(reason),
+                operator,
+            ),
+            limit: PaymentLimit::from_amount(amount),
+        }
+    }
+
+    /// Authorize a payment-channel escrow deposit.
+    ///
+    /// `amount` is the canonical monetary value of the deposit (e.g. `$25.00`),
+    /// used both to derive the amount-specific spend limit and to display the
+    /// deposit being signed. It must stay a bare amount — the "escrow" framing
+    /// comes from the headline, not from a prefix on `amount`, so that
+    /// [`PaymentLimit::from_amount`] can still parse it and select an
+    /// amount-specific authorization action instead of the generic fallback.
+    pub fn authorize_channel_escrow(amount: &str, reason: &str, operator: &str) -> Self {
+        Self::AuthorizePayment {
+            message: payment_authorization_message(
+                PaymentAmountKind::Escrow,
                 amount,
                 Some(reason),
                 operator,
@@ -433,9 +456,16 @@ fn batch_authorization_message(
 
 fn payment_message_with_account(message: &str, account: &str) -> String {
     let trimmed = message.trim_start();
+    // Recognizes every current `PaymentAmountKind` headline plus one older,
+    // no-longer-produced phrasing kept for defensiveness. A headline added
+    // here without a matching arm silently drops the funding account from
+    // the approval prompt — as `Escrow`'s did until this fix — so match
+    // against the enum's own headline constants rather than duplicating the
+    // wording as an independent literal.
     if !trimmed.starts_with("authorize a payment of ")
-        && !trimmed.starts_with("authorize a payment.")
-        && !trimmed.starts_with("authorize a series of payments.")
+        && !trimmed.starts_with(PaymentAmountKind::Exact.headline())
+        && !trimmed.starts_with(PaymentAmountKind::Maximum.headline())
+        && !trimmed.starts_with(PaymentAmountKind::Escrow.headline())
     {
         return message.to_string();
     }
@@ -808,5 +838,40 @@ mod tests {
             panic!("expected AuthorizePayment");
         };
         assert!(message.contains("operator: api.example.com"));
+    }
+
+    #[test]
+    fn authorize_channel_escrow_keeps_amount_specific_limit() {
+        // Regression: the escrow framing must not be folded into the amount, or
+        // `PaymentLimit::from_amount` fails to parse it and the authorization
+        // silently drops to the generic (no-limit) action. A bare "$25.00" must
+        // still resolve to the Usd25 bucket.
+        let intent = AuthIntent::authorize_channel_escrow("$25.00", "channel", "api.example.com");
+        assert_eq!(intent.payment_limit(), Some(PaymentLimit::Usd25));
+        let AuthIntent::AuthorizePayment { message, .. } = intent else {
+            panic!("expected AuthorizePayment");
+        };
+        assert!(
+            message.contains("escrow deposit: $25.00"),
+            "escrow context should be in the headline/field, not the amount; got: {message:?}"
+        );
+    }
+
+    #[test]
+    fn authorize_channel_escrow_identifies_the_funding_account() {
+        // Regression: payment_message_with_account's headline allowlist did
+        // not include Escrow's, so with_account_context silently dropped the
+        // funding account from every channel-escrow approval prompt — a
+        // payer could not see which account was being drained before
+        // approving.
+        let intent = AuthIntent::authorize_channel_escrow("$25.00", "channel", "api.example.com")
+            .with_account_context("trading");
+        let AuthIntent::AuthorizePayment { message, .. } = intent else {
+            panic!("expected AuthorizePayment");
+        };
+        assert!(
+            message.contains("from trading"),
+            "escrow approval should name the funding account; got: {message:?}"
+        );
     }
 }

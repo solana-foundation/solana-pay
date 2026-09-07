@@ -69,7 +69,9 @@ impl Config {
     /// honor a top-level `RPC_URL` override for the chosen network.
     pub fn load(network: &str) -> Result<Self, ConfigError> {
         let figment = Figment::new()
-            .merge(Yaml::file("config/default.yaml"))
+            // A deployed worker binary must not depend on its launch cwd or
+            // on a source-tree config file being present beside it.
+            .merge(Yaml::string(include_str!("../config/default.yaml")))
             // pay-api's send.fee_payer.* keys, shared verbatim so one Doppler
             // secret set drives both services.
             .merge(Env::prefixed("PAY_API_").split("__"))
@@ -118,9 +120,6 @@ impl Config {
             return Err(ConfigError::Invalid(format!(
                 "networks.{network}.rpc_url is empty"
             )));
-        }
-        if self.treasury_owner.trim().is_empty() {
-            return Err(ConfigError::Invalid("treasury_owner is empty".into()));
         }
         Ok(())
     }

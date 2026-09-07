@@ -8,6 +8,7 @@ use axum::body::Body;
 use axum::http::{HeaderMap, Request, StatusCode, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
+use http_body::Body as _;
 use pay_kit::mpp::AUTHORIZATION_HEADER;
 
 use crate::PaymentState;
@@ -91,6 +92,7 @@ async fn gate_adapter<S: PaymentState>(state: S, req: Request<Body>, next: Next)
             session,
             receipt,
             upto,
+            batch,
             paid_request,
         } => {
             let mut req = req;
@@ -206,6 +208,50 @@ async fn gate_adapter<S: PaymentState>(state: S, req: Request<Body>, next: Next)
                     uf.telemetry,
                 )
                 .await
+                {
+                    response.headers_mut().append(n, v);
+                }
+            }
+            // x402 `batch-settlement`: the voucher commits only now, and only
+            // for a response that actually served. A failure drops the outcome,
+            // leaving the client uncharged and free to retry it.
+            if let Some(bf) = batch {
+                let mut served_ok = response.status().is_success();
+                let mut cached = None;
+                if served_ok {
+                    let cacheable = response.body().size_hint().upper().is_some_and(|length| {
+                        length <= crate::server::gate::MAX_BATCH_CACHED_RESPONSE_BYTES as u64
+                    });
+                    if cacheable {
+                        let (mut parts, body) = response.into_parts();
+                        match axum::body::to_bytes(
+                            body,
+                            crate::server::gate::MAX_BATCH_CACHED_RESPONSE_BYTES,
+                        )
+                        .await
+                        {
+                            Ok(bytes) => {
+                                cached = Some(crate::server::gate::batch_cached_response(
+                                    parts.status,
+                                    &parts.headers,
+                                    &bytes,
+                                ));
+                                parts.headers.remove(header::CONTENT_LENGTH);
+                                response = Response::from_parts(parts, Body::from(bytes));
+                            }
+                            Err(error) => {
+                                tracing::warn!(
+                                    %error,
+                                    "failed to buffer x402 batch response; releasing authorization"
+                                );
+                                served_ok = false;
+                                response = StatusCode::BAD_GATEWAY.into_response();
+                            }
+                        }
+                    }
+                }
+                if let Some((n, v)) =
+                    crate::server::gate::settle_batch(&state, *bf, served_ok, cached).await
                 {
                     response.headers_mut().append(n, v);
                 }
@@ -593,6 +639,123 @@ pub(crate) fn extract_variant_hint(path: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const SPLIT_RECIPIENT: &str = "CNR1b172rotbSG6kCpfR76KB2ios2y7X4p8yEEc7pjLu";
+
+    fn configured_charge_splits() -> (pay_types::metering::ApiSpec, pay_types::metering::Metering) {
+        let spec: pay_types::metering::ProviderSpec = serde_yml::from_str(&format!(
+            r#"
+provider: test
+generated_at: "2026-09-02T00:00:00Z"
+apis:
+  - name: split-test
+    subdomain: split-test
+    title: "Split test"
+    description: "Exercises configured MPP charge splits."
+    category: ai_ml
+    version: v1
+    routing:
+      type: respond
+    recipients:
+      rounding:
+        account: "{SPLIT_RECIPIENT}"
+        label: "Rounding leg"
+      platform:
+        account: "{SPLIT_RECIPIENT}"
+        label: "Platform leg"
+    endpoints:
+      - method: POST
+        path: v1/test
+        metering:
+          dimensions:
+            - direction: usage
+              unit: requests
+              scale: 1
+              tiers:
+                - price_usd: 0.0015
+          splits:
+            # This rounds to zero USDC base units at six decimals.
+            - recipient: rounding
+              amount: 0.0000004
+              memo: "Rounding adjustment"
+            # A second leg to the same account is valid when its memo differs.
+            - recipient: platform
+              percent: 5
+              memo: "Platform fee"
+"#
+        ))
+        .expect("test YAML should parse");
+        let api = spec.apis.into_iter().next().expect("test API should exist");
+        let meter = api.endpoints[0]
+            .metering
+            .clone()
+            .expect("test endpoint should be metered");
+        (api, meter)
+    }
+
+    fn test_mpp() -> pay_kit::mpp::server::Mpp {
+        pay_kit::mpp::server::Mpp::new(pay_kit::mpp::server::Config {
+            recipient: SPLIT_RECIPIENT.to_string(),
+            // An unreachable local RPC keeps challenge construction offline.
+            rpc_url: Some("http://127.0.0.1:1".to_string()),
+            challenge_binding_secret: Some(
+                "test-challenge-binding-secret-must-be-32-bytes".to_string(),
+            ),
+            ..Default::default()
+        })
+        .expect("test MPP server should initialize")
+    }
+
+    fn challenge_splits_from_config() -> serde_json::Value {
+        let (api, meter) = configured_charge_splits();
+        let mpp = test_mpp();
+        let uri: axum::http::Uri = "/v1/test".parse().unwrap();
+        let splits = resolve_charge_splits(&mpp, &meter, &api, &uri, "0.0015");
+
+        let challenge = mpp
+            .charge_with_options(
+                "0.0015",
+                pay_kit::mpp::server::ChargeOptions {
+                    splits,
+                    ..Default::default()
+                },
+            )
+            .expect("PayKit should accept resolved charge splits");
+        let request: pay_kit::mpp::ChargeRequest = challenge
+            .request
+            .decode()
+            .expect("PayKit challenge should decode");
+        request
+            .method_details
+            .expect("PayKit charge challenge should include method details")
+    }
+
+    #[test]
+    fn configured_charge_split_that_rounds_to_zero_reaches_pay_kit() {
+        let details = challenge_splits_from_config();
+        let splits = details["splits"]
+            .as_array()
+            .expect("PayKit challenge should include splits");
+
+        assert_eq!(splits.len(), 2);
+        assert_eq!(splits[0]["recipient"], SPLIT_RECIPIENT);
+        assert_eq!(splits[0]["amount"], "0");
+        assert_eq!(splits[0]["memo"], "Rounding adjustment");
+    }
+
+    #[test]
+    fn configured_charge_splits_allow_same_recipient_with_distinct_memos() {
+        let details = challenge_splits_from_config();
+        let splits = details["splits"]
+            .as_array()
+            .expect("PayKit challenge should include splits");
+
+        assert_eq!(splits[0]["recipient"], splits[1]["recipient"]);
+        assert_eq!(splits[0]["memo"], "Rounding adjustment");
+        assert_eq!(splits[1]["memo"], "Platform fee");
+        assert_eq!(splits[1]["amount"], "75");
+    }
+
     #[test]
     fn extract_variant_hint_models() {
         assert_eq!(

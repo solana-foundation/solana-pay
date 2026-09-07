@@ -171,7 +171,9 @@ pub enum SessionOutcome {
     /// `open` or `topup` — channel state after the action and the on-chain
     /// transaction signature that authorized it.
     Active {
-        state: ChannelState,
+        /// Boxed: this is by far the largest payload in the enum, and every
+        /// other variant would otherwise be moved around at its size.
+        state: Box<ChannelState>,
         signature: Option<String>,
     },
     /// `voucher` accepted — channel id + new settled cumulative (base units).
@@ -179,7 +181,9 @@ pub enum SessionOutcome {
     /// `close` accepted — `SealParams` carries what's needed to submit the
     /// on-chain settle+seal + distribute transactions.
     Closed {
-        params: SealParams,
+        /// Boxed for the same reason as `Active`'s state: it is large enough
+        /// that carrying it inline would size the whole enum by it.
+        params: Box<SealParams>,
         signature: Option<String>,
     },
 }
@@ -1594,7 +1598,7 @@ impl SessionMpp {
                 voucher: SignedVoucher {
                     data,
                     signer: operator.to_string(),
-                    signature: bs58::encode(signature.as_ref()).into_string(),
+                    signature: crate::b58::encode_64(&<[u8; 64]>::from(signature)),
                     signature_type: VoucherSignatureType::Ed25519,
                 },
             })
@@ -1605,6 +1609,12 @@ impl SessionMpp {
             self.currency(),
             self.network(),
             accepted.cumulative,
+        );
+        telemetry::record_payment_channel_voucher_accepted_for_protocol(
+            "mpp/session",
+            self.currency(),
+            self.network(),
+            accepted.charged,
         );
         self.record_committed_watermark(channel_id.to_string(), accepted.cumulative);
         self.touch_channel(channel_id.to_string()).await?;
@@ -1855,7 +1865,10 @@ impl SessionMpp {
 
                 self.record_committed_watermark(state.channel_id.clone(), state.cumulative);
                 self.touch_channel(state.channel_id.clone()).await?;
-                Ok(SessionOutcome::Active { state, signature })
+                Ok(SessionOutcome::Active {
+                    state: Box::new(state),
+                    signature,
+                })
             }
 
             SessionAction::Use(p) => {
@@ -1863,7 +1876,7 @@ impl SessionMpp {
                 self.record_committed_watermark(state.channel_id.clone(), state.cumulative);
                 self.touch_channel(state.channel_id.clone()).await?;
                 Ok(SessionOutcome::Active {
-                    state,
+                    state: Box::new(state),
                     signature: None,
                 })
             }
@@ -1874,18 +1887,24 @@ impl SessionMpp {
                 // instead of rejected as unknown.
                 self.ensure_channel_loaded(&p.voucher.data.channel_id)
                     .await?;
-                let cumulative = self
+                let acceptance = self
                     .server
                     .verify_voucher(p)
                     .await
-                    .map_err(|e| Error::PaymentRejected(e.to_string()))?
-                    .cumulative;
+                    .map_err(|e| Error::PaymentRejected(e.to_string()))?;
+                let cumulative = acceptance.cumulative;
                 let channel_id = p.voucher.data.channel_id.clone();
                 telemetry::record_payment_channel_voucher_cumulative(
                     &channel_id,
                     self.currency(),
                     self.network(),
                     cumulative,
+                );
+                telemetry::record_payment_channel_voucher_accepted_for_protocol(
+                    "mpp/session",
+                    self.currency(),
+                    self.network(),
+                    acceptance.charged,
                 );
                 self.record_committed_watermark(channel_id.clone(), cumulative);
                 self.touch_channel(channel_id.clone()).await?;
@@ -1905,7 +1924,10 @@ impl SessionMpp {
                 let state = acceptance.state;
                 self.record_committed_watermark(state.channel_id.clone(), state.cumulative);
                 self.touch_channel(state.channel_id.clone()).await?;
-                Ok(SessionOutcome::Active { state, signature })
+                Ok(SessionOutcome::Active {
+                    state: Box::new(state),
+                    signature,
+                })
             }
 
             SessionAction::Close(p) => {
@@ -1969,7 +1991,10 @@ impl SessionMpp {
                         &params.channel_id.to_string(),
                     );
                 }
-                Ok(SessionOutcome::Closed { params, signature })
+                Ok(SessionOutcome::Closed {
+                    params: Box::new(params),
+                    signature,
+                })
             }
         }
     }
@@ -2079,11 +2104,14 @@ impl SessionMpp {
             last_activity_at: unix_millis(),
             spent_amount: 0,
             settled_on_chain: settled,
+            distributed_on_chain: chan.settlement.payout_watermark,
             processed_uses: vec![],
             processed_topup_signatures: vec![],
             next_delivery_sequence: 0,
             pending_deliveries: vec![],
-            committed_deliveries: vec![],
+            committed_deliveries: Default::default(),
+            pending_setup: None,
+            onchain_checked_at: 0,
             lifecycle: None,
             schema_version: pay_kit::mpp::CHANNEL_STATE_SCHEMA_VERSION,
             extra: Default::default(),
@@ -2213,11 +2241,14 @@ pub fn test_channel_state(
         last_activity_at: unix_millis(),
         spent_amount: 0,
         settled_on_chain: 0,
+        distributed_on_chain: 0,
         processed_uses: vec![],
         processed_topup_signatures: vec![],
         next_delivery_sequence: 0,
         pending_deliveries: vec![],
-        committed_deliveries: vec![],
+        committed_deliveries: Default::default(),
+        pending_setup: None,
+        onchain_checked_at: 0,
         lifecycle: None,
         schema_version: pay_kit::mpp::CHANNEL_STATE_SCHEMA_VERSION,
         extra: Default::default(),
@@ -2235,12 +2266,8 @@ fn payment_channel_treasury_owner(network: &str) -> Result<solana_pubkey::Pubkey
 }
 
 fn decode_voucher_signature(signature: &str) -> Result<[u8; 64]> {
-    let bytes = bs58::decode(signature)
-        .into_vec()
-        .map_err(|e| Error::Mpp(format!("invalid voucher signature encoding: {e}")))?;
-    bytes
-        .try_into()
-        .map_err(|_| Error::Mpp("voucher signature is not 64 bytes".to_string()))
+    crate::b58::decode_64(signature)
+        .map_err(|e| Error::Mpp(format!("invalid voucher signature encoding: {e}")))
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────────

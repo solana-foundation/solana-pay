@@ -9,26 +9,23 @@ use futures::stream::{self, StreamExt};
 use pay_core::client::session::SessionHandle;
 use pay_kit::generated::payment_channels::generated::accounts::Channel;
 use pay_kit::mpp::program::payment_channels::{default_program_id, from_address};
-use pay_kit::mpp::solana_keychain::SolanaSigner;
 use pay_kit::mpp::solana_keychain::memory::MemorySigner;
 use pay_worker::channel::STATUS_DISTRIBUTED;
 use sha2::{Digest, Sha256};
-use solana_hash::Hash;
-use solana_instruction::Instruction;
-use solana_message::Message;
 use solana_pubkey::Pubkey;
-use solana_signature::Signature;
-use solana_transaction::Transaction;
 
+use crate::channel_recovery::{
+    CHANNEL_ACCOUNT_SIZE, CHANNEL_STATUS_OFFSET, signed_transaction, submit_transactions,
+};
 use crate::config::{Network, RunConfig, Scheme};
 use crate::fixture_rpc::{ExecutionConfig, FixtureRpc};
 use crate::scheme::{build_request, validate_payment_transport, www_authenticate};
 use crate::wallet::{self, Wallet};
 
-const CHANNEL_ACCOUNT_SIZE: usize = 256;
-const CHANNEL_STATUS_OFFSET: usize = 3;
 const CHANNEL_STATUS_OPEN: u8 = 0;
 const CHANNEL_STATUS_SEALED: u8 = 1;
+const REUSE_DISCOVERY_MAX_ATTEMPTS: usize = 5;
+const REUSE_DISCOVERY_RETRY_BASE_DELAY_MS: u64 = 250;
 
 struct RecoverableChannel {
     address: Pubkey,
@@ -151,27 +148,64 @@ pub async fn recover(
     Ok(())
 }
 
-/// Discover one reusable open channel per fixture wallet, returning
-/// `user index → (channel address, on-chain settled watermark)`. When a wallet
-/// owns several open channels the most-settled one is chosen so a reuse run
-/// resumes from the furthest-progressed watermark. Used by `session.reuse`.
+/// Discover one reusable open channel per fixture wallet, including the PDA
+/// salt/open slot needed to reconstruct an x402 batch channel config. When a
+/// wallet owns several open channels, exhausted channels are ignored and the
+/// one with the most remaining capacity is chosen. Used by `session.reuse`.
 pub(crate) async fn discover_reuse_map(
     rpc_url: &str,
     expected: &HashMap<Pubkey, (u32, Wallet, Pubkey)>,
-) -> Result<HashMap<u32, (String, u64)>> {
+) -> Result<HashMap<u32, crate::scheme::ReusableChannel>> {
     let rpc = pay_api_core::RpcClient::new(Duration::from_secs(30))?;
-    let channels = discover_fixture_channels(&rpc, rpc_url, CHANNEL_STATUS_OPEN, expected).await?;
-    let mut map: HashMap<u32, (String, u64)> = HashMap::new();
+    let mut attempt = 1usize;
+    let channels = loop {
+        match discover_fixture_channels(&rpc, rpc_url, CHANNEL_STATUS_OPEN, expected).await {
+            Ok(channels) => break channels,
+            Err(error) if attempt < REUSE_DISCOVERY_MAX_ATTEMPTS => {
+                tracing::warn!(
+                    attempt,
+                    max_attempts = REUSE_DISCOVERY_MAX_ATTEMPTS,
+                    %error,
+                    "retrying reusable-channel discovery"
+                );
+                let delay = REUSE_DISCOVERY_RETRY_BASE_DELAY_MS << (attempt - 1);
+                tokio::time::sleep(Duration::from_millis(delay)).await;
+                attempt += 1;
+            }
+            Err(error) => return Err(error),
+        }
+    };
+    let mut map: HashMap<u32, crate::scheme::ReusableChannel> = HashMap::new();
     for channel in channels {
         let settled = channel.channel.settlement.settled;
+        let deposit = channel.channel.deposit;
+        if settled >= deposit {
+            continue;
+        }
+        let candidate = crate::scheme::ReusableChannel {
+            channel_id: channel.address.to_string(),
+            deposit,
+            settled,
+            salt: channel.channel.salt,
+            open_slot: channel.channel.open_slot,
+        };
         let entry = map
             .entry(channel.index)
-            .or_insert_with(|| (channel.address.to_string(), settled));
-        if settled > entry.1 {
-            *entry = (channel.address.to_string(), settled);
+            .or_insert_with(|| candidate.clone());
+        if reusable_candidate_is_better(&candidate, entry) {
+            *entry = candidate;
         }
     }
     Ok(map)
+}
+
+fn reusable_candidate_is_better(
+    candidate: &crate::scheme::ReusableChannel,
+    current: &crate::scheme::ReusableChannel,
+) -> bool {
+    candidate.remaining_capacity() > current.remaining_capacity()
+        || (candidate.remaining_capacity() == current.remaining_capacity()
+            && candidate.settled > current.settled)
 }
 
 async fn discover_fixture_channels(
@@ -214,10 +248,12 @@ async fn discover_fixture_channels(
             channel,
         });
     }
-    ensure!(
-        signer_mismatches == 0,
-        "refusing recovery: {signer_mismatches} fixture channels had an unexpected authorized signer"
-    );
+    if signer_mismatches > 0 {
+        tracing::info!(
+            signer_mismatches,
+            "ignored fixture channels owned by a different authorization scheme"
+        );
+    }
     Ok(channels)
 }
 
@@ -270,8 +306,12 @@ async fn recover_without_gateway_state(
             for channel in batch {
                 let instruction =
                     pay_worker::channel::build_settle_and_seal_ix(&channel.address, &channel.payee);
-                let transaction = signed_transaction(funder, vec![instruction], blockhash).await?;
-                transactions.push((channel.index, channel.address, transaction));
+                let transaction =
+                    signed_transaction(funder, &[], vec![instruction], blockhash).await?;
+                transactions.push((
+                    format!("user {} channel {}", channel.index, channel.address),
+                    transaction,
+                ));
             }
             submit_transactions(
                 &rpc,
@@ -324,8 +364,12 @@ async fn recover_without_gateway_state(
                     &token_program,
                     &empty_preimage,
                 );
-                let transaction = signed_transaction(funder, vec![instruction], blockhash).await?;
-                transactions.push((channel.index, channel.address, transaction));
+                let transaction =
+                    signed_transaction(funder, &[], vec![instruction], blockhash).await?;
+                transactions.push((
+                    format!("user {} channel {}", channel.index, channel.address),
+                    transaction,
+                ));
             }
             submit_transactions(
                 &rpc,
@@ -378,8 +422,12 @@ async fn recover_without_gateway_state(
                 let rent_payer = from_address(&channel.channel.rent_payer);
                 let instruction =
                     pay_worker::channel::build_reclaim_ix(&channel.address, &rent_payer);
-                let transaction = signed_transaction(funder, vec![instruction], blockhash).await?;
-                transactions.push((channel.index, channel.address, transaction));
+                let transaction =
+                    signed_transaction(funder, &[], vec![instruction], blockhash).await?;
+                transactions.push((
+                    format!("user {} channel {}", channel.index, channel.address),
+                    transaction,
+                ));
             }
             submit_transactions(
                 &rpc,
@@ -473,62 +521,6 @@ fn validate_rent_reclaim_destination(channel: Pubkey, rent_payer: Pubkey) -> Res
         rent_payer != Pubkey::default(),
         "refusing rent reclaim: channel {channel} has an invalid zero rent payer"
     );
-    Ok(())
-}
-
-async fn signed_transaction(
-    fee_payer: &Wallet,
-    instructions: Vec<Instruction>,
-    blockhash: Hash,
-) -> Result<Transaction> {
-    let message = Message::new_with_blockhash(&instructions, Some(&fee_payer.pubkey), &blockhash);
-    let mut transaction = Transaction::new_unsigned(message);
-    let signer = MemorySigner::from_bytes(&fee_payer.keypair).context("loading recovery signer")?;
-    let signature = signer
-        .sign_message(&transaction.message_data())
-        .await
-        .context("signing recovery transaction")?;
-    let index = transaction
-        .message
-        .account_keys
-        .iter()
-        .position(|key| *key == fee_payer.pubkey)
-        .context("recovery signer is absent from transaction")?;
-    transaction.signatures[index] = Signature::from(<[u8; 64]>::from(signature));
-    Ok(transaction)
-}
-
-async fn submit_transactions(
-    rpc: &FixtureRpc,
-    transactions: Vec<(u32, Pubkey, Transaction)>,
-    concurrency: usize,
-    operation: &str,
-) -> Result<()> {
-    let mut submitting = stream::iter(transactions.into_iter().map(
-        |(index, channel, tx)| async move { (index, channel, rpc.submit_and_confirm(&tx).await) },
-    ))
-    .buffer_unordered(concurrency);
-    let mut confirmed = 0usize;
-    let mut failures = Vec::new();
-    while let Some((index, channel, result)) = submitting.next().await {
-        match result {
-            Ok(_) => confirmed += 1,
-            Err(error) => failures.push(format!("user {index} channel {channel}: {error:#}")),
-        }
-    }
-    println!(
-        "{operation}: {confirmed} confirmed, {} failed",
-        failures.len()
-    );
-    if !failures.is_empty() {
-        let shown = failures.iter().take(20).cloned().collect::<Vec<_>>();
-        bail!(
-            "{operation} failed for {} channels (first {}):\n{}",
-            failures.len(),
-            shown.len(),
-            shown.join("\n")
-        );
-    }
     Ok(())
 }
 
@@ -719,7 +711,7 @@ pub async fn top_up(
                 delta,
             );
             let transaction =
-                signed_transaction(&channel.wallet, vec![instruction], blockhash).await?;
+                signed_transaction(&channel.wallet, &[], vec![instruction], blockhash).await?;
             transactions.push((channel.index, channel.address, transaction));
         }
         let rpc_ref = &rpc;
@@ -758,6 +750,31 @@ pub async fn top_up(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn reusable(deposit: u64, settled: u64) -> crate::scheme::ReusableChannel {
+        crate::scheme::ReusableChannel {
+            channel_id: Pubkey::new_unique().to_string(),
+            deposit,
+            settled,
+            salt: 0,
+            open_slot: 0,
+        }
+    }
+
+    #[test]
+    fn reuse_prefers_remaining_capacity_over_highest_watermark() {
+        let nearly_exhausted = reusable(500_000, 499_999);
+        let usable = reusable(5_000_000, 200_000);
+
+        assert!(reusable_candidate_is_better(&usable, &nearly_exhausted));
+        assert!(!reusable_candidate_is_better(&nearly_exhausted, &usable));
+    }
+
+    #[test]
+    fn reuse_capacity_uses_the_channels_actual_deposit() {
+        assert_eq!(reusable(500_000, 499_999).remaining_capacity(), 1);
+        assert_eq!(reusable(5_000_000, 200_000).remaining_capacity(), 4_800_000);
+    }
 
     #[test]
     fn rent_reclaim_accepts_sponsored_operator() {

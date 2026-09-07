@@ -5,8 +5,9 @@ Operator maintenance jobs for pay-kit payment-channel deployments.
 The crate ships two binaries:
 
 - **`close-channels`** handles explicit maintenance and scheduled rent reclaim.
-- **`settle-sessions`** scans durable Redis session vouchers, compares them to
-  on-chain state, and batches both newer watermarks and due idle closes.
+- **`settle-sessions`** reconciles both durable MPP-session and x402
+  batch-settlement channels. Sessions push watermarks and close on idle;
+  batch channels claim, pay out, finalize forced closes, and reclaim rent.
 
 `close-channels` closes a list of on-chain payment channels (the MPP payment-channels program,
 `CHNLxYvVA28MJP9PrFuDXccuoGXAx7jBacfLEkahyGsX`) by driving each through the
@@ -37,17 +38,27 @@ hand-copied program logic or account layout.
 | `PAY_API_SEND__FEE_PAYER__PUBKEY` | prod | — | Base58 pubkey of that KMS key. |
 | `LOCAL_FEE_PAYER_PRIVATE_KEY` | local | — | Escape hatch: base58 secret key or `[1,2,…]` keypair JSON. Signs in-process, bypassing KMS. |
 | `RUST_LOG` | no | `info` | `tracing` env-filter (e.g. `pay_worker=debug`). |
-| `PAY_SESSION_REDIS_URL` | settle only | — | Redis URL shared with the proxy services. |
-| `PAY_SESSION_REDIS_PREFIX` | no | `pay:session:v1:` | Session channel key namespace. |
-| `PAY_SESSION_FINALIZED_RETENTION_SECONDS` | no | `604800` (7 days) | Retain a fully finalized session record for reconciliation/debugging before Redis expires it. |
-| `SETTLEMENT_LOCK_TTL_SECONDS` | no | `300` | TTL for the singleton reconciliation lease. |
+| `PAY_MPP_REDIS_URL` | one settlement store | — | MPP Redis URL shared with the gateway. At least this or `PAY_X402_REDIS_URL` is required. |
+| `PAY_MPP_REDIS_PREFIX` | no | `pay:session:v1:` | MPP session channel key namespace. |
+| `PAY_MPP_FINALIZED_RETENTION_SECONDS` | no | `604800` (7 days) | Retain a fully finalized MPP session record for reconciliation/debugging before Redis expires it. |
+| `PAY_X402_REDIS_URL` | no | MPP Redis URL | x402 Redis URL shared with the gateway. |
+| `PAY_X402_REDIS_PREFIX` | no | `pay:batch:v1:` | x402 batch channel key namespace; must match the gateway. |
+| `PAY_X402_SETTLE_ACTIVE_CHANNELS` | no | `false` | Include active channels with positive off-chain watermarks in every worker run. Keep false for idle-only production reconciliation; enable it for an explicitly scheduled full-fleet sweep. |
+| `PAY_X402_DISTRIBUTION_THRESHOLD_BASE_UNITS` | no | unset | Per-channel claimed-but-undistributed token balance that triggers distribution from an open channel. Must be greater than zero. Unset keeps intermediate claims in escrow; closing and sealed channels are still finalized regardless. |
+| `PAY_X402_SETTLEMENT_MAX_IDLE_SECONDS` | no | `300` | Settle a positive residual after the channel has remained untouched for this long. Closing and sealed channels are never deferred. |
+| `PAY_X402_RECONCILIATION_CONCURRENCY` | no | `64` | Maximum concurrent x402 on-chain reconciliation plans. Work is streamed through this bound rather than spawned all at once. |
+| `SETTLEMENT_LOCK_TTL_SECONDS` | no | `300` | TTL for each scheme's independent reconciliation lease. |
 | `RUN_ONCE` | no | `true` | Keep one-shot behavior for manual Cloud Run Job executions. Set to `false` for the continuous worker. |
-| `SETTLEMENT_INTERVAL_SECONDS` | no | `10` | Delay between continuous reconciliation iterations when `RUN_ONCE=false`. |
+| `SETTLEMENT_INTERVAL_SECONDS` | no | `10` | Delay between complete MPP and x402 reconciliation sweeps when `RUN_ONCE=false`. Set this to `240` for a four-minute x402 settlement clock. |
 
 The fee-payer keys intentionally share pay-api's `send.fee_payer.*` env names so
 a single Doppler config drives both. Job-specific overrides use the `JOBS_`
 prefix (e.g. `JOBS_TREASURY_OWNER`, `JOBS_NETWORKS__SANDBOX__RPC_URL`), applied
 on top of `config/default.yaml`.
+
+The treasury owner defaults to pay-kit's deployed-program value for the active
+cluster; devnet and mainnet intentionally differ. Set `JOBS_TREASURY_OWNER`
+only for a custom payment-channels deployment.
 
 `me` below = the fee-payer / KMS signer pubkey.
 
@@ -92,18 +103,27 @@ isolated per channel; a failed atomic reclaim transaction marks every channel
 in that batch as failed and the job continues with later batches. When not in
 dry-run, any hard failure makes the process exit non-zero.
 
-## Durable session settlement
+## Durable channel settlement
 
-`settle-sessions` takes a Redis lease so a rolling deployment or manual
-execution cannot duplicate work. It cursor-scans the configured channel
-namespace, skips sealed and pull-mode records, and fetches every candidate
-channel from Solana. If a push-channel account is already absent at confirmed
-commitment, the worker deletes its terminal Redis record immediately.
-For active channels it submits a voucher only when the stored cumulative
-amount is strictly greater than the on-chain watermark. For idle channels it
-atomically claims the still-due Redis deadline, settles the latest voucher,
-seals, and distributes the channel. pay-kit's settlement worker packs as many
-channel instruction groups as fit in each transaction.
+`settle-sessions` takes a separate Redis lease per scheme so a rolling
+deployment or manual execution cannot duplicate work while unrelated session
+and batch namespaces can progress independently.
+
+For MPP sessions it cursor-scans the session namespace, skips sealed and
+pull-mode records, and fetches every candidate channel from Solana. If a
+push-channel account is already absent at confirmed commitment, the worker
+deletes its terminal Redis record immediately. For active channels it submits
+a voucher only when the stored cumulative amount is strictly greater than the
+on-chain watermark. For idle channels it atomically claims the still-due Redis
+deadline, settles the latest voucher, seals, and distributes the channel.
+
+For x402 batch settlement it uses the same one-fetch/one-candidate pipeline:
+claim every newer stored voucher and distribute the delta committed by the
+channel's on-chain distribution hash, finalize payer-forced closes after their
+grace period, then reclaim eligible channel rent. No duplicate payout setting
+is needed in the worker—the opening transaction is recovered and checked
+against that hash before a distribution is built. `DRY_RUN=true` builds and
+reports these candidates without submitting them.
 
 Deployed as one continuously-running instance reconciling on an interval (see
 `RUN_ONCE` / `SETTLEMENT_INTERVAL_SECONDS`); a one-shot invocation is also

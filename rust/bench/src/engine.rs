@@ -137,10 +137,13 @@ pub async fn run_pipeline(p: PipelineParams<'_>) -> Result<ReportJson> {
         let expected: HashMap<Pubkey, (u32, wallet::Wallet, Pubkey)> = ctxs
             .iter()
             .map(|ctx| {
-                let session = wallet::subkey(&ctx.wallet.seed(), "session");
+                let authorized_signer = match cfg.run.scheme {
+                    Scheme::X402BatchSettlement => ctx.wallet.pubkey,
+                    _ => wallet::subkey(&ctx.wallet.seed(), "session").pubkey,
+                };
                 (
                     ctx.wallet.pubkey,
-                    (ctx.index, ctx.wallet.clone(), session.pubkey),
+                    (ctx.index, ctx.wallet.clone(), authorized_signer),
                 )
             })
             .collect();

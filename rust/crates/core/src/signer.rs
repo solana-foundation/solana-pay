@@ -590,13 +590,9 @@ fn parse_private_key_string(input: &str) -> std::result::Result<Vec<u8>, String>
         return Ok(bytes);
     }
 
-    let bytes = bs58::decode(trimmed)
-        .into_vec()
-        .map_err(|e| format!("Invalid base58 private key: {e}"))?;
-    if bytes.len() != 64 {
-        return Err(format!("Expected 64 bytes, got {}", bytes.len()));
-    }
-    Ok(bytes)
+    let bytes = crate::b58::decode_64(trimmed)
+        .map_err(|e| format!("Invalid base58 private key (expected 64 bytes): {e}"))?;
+    Ok(bytes.to_vec())
 }
 
 fn load_from_keystore_backend(

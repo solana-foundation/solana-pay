@@ -1,5 +1,6 @@
 pub mod authenticate;
 pub mod balance;
+pub mod batch;
 pub mod fetch;
 pub mod mpp;
 pub(crate) mod prompt;

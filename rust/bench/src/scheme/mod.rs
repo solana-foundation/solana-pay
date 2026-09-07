@@ -5,6 +5,7 @@
 //! driver fires [`PreparedRequest`]s generically, so the hot path is identical
 //! across schemes — only how a request is *built* differs.
 
+pub mod batch_settlement;
 pub mod mpp_charge;
 pub mod mpp_session;
 pub mod selftest;
@@ -68,6 +69,27 @@ pub struct UserSetup {
     pub open_sig: Option<String>,
 }
 
+/// Immutable on-chain information needed to resume a fixture channel without
+/// paying to open another one. MPP needs only the address and watermark;
+/// x402 batch settlement also reconstructs the PDA-bound channel config from
+/// the original salt and open slot.
+#[derive(Clone, Debug)]
+pub struct ReusableChannel {
+    pub channel_id: String,
+    /// Actual on-chain deposit cap. Reused channels can predate the current
+    /// benchmark config, so voucher generation must not assume today's cap.
+    pub deposit: u64,
+    pub settled: u64,
+    pub salt: u64,
+    pub open_slot: u64,
+}
+
+impl ReusableChannel {
+    pub fn remaining_capacity(&self) -> u64 {
+        self.deposit.saturating_sub(self.settled)
+    }
+}
+
 /// A fully-formed request, built off-chain during prepare, fired during unleash.
 #[derive(Clone, Debug)]
 pub struct PreparedRequest {
@@ -87,6 +109,20 @@ pub struct PreparedRequest {
 pub trait RequestSource: Send {
     fn user_index(&self) -> u32;
     async fn next_request(&mut self) -> Result<PreparedRequest>;
+
+    /// Response header name this source wants captured on a non-2xx status
+    /// (e.g. a scheme's corrective-challenge header), so it can resynchronize
+    /// signing state that drifted from the server. `None` by default — most
+    /// schemes don't carry state that can desync this way.
+    fn resync_header(&self) -> Option<&'static str> {
+        None
+    }
+
+    /// Report a completed response. `header` is the value of
+    /// `resync_header()`'s named header when present on this response.
+    /// Default no-op; only sources that override `resync_header` need to act
+    /// on this.
+    fn on_response(&mut self, _status: u16, _header: Option<&str>) {}
 }
 
 /// RAII handle for a scheme's background hot-path pipeline (e.g. the session
@@ -157,11 +193,10 @@ pub trait BenchScheme: Send + Sync {
     /// How much to fund each user, given the load and resolved price.
     fn funding_plan(&self, load: &Load, price: &ResolvedPrice) -> PerUserFunding;
 
-    /// Supply pre-discovered reusable channels (user index → (channel address,
-    /// on-chain settled watermark)) so `provision_user` can drive an existing
-    /// channel instead of opening a new one. Called once before provisioning
-    /// when `session.reuse` is set. Default: ignored.
-    fn set_reuse_channels(&self, _channels: HashMap<u32, (String, u64)>) {}
+    /// Supply pre-discovered reusable channels so `provision_user` can drive an
+    /// existing channel instead of opening a new one. Called once before
+    /// provisioning when `session.reuse` is set. Default: ignored.
+    fn set_reuse_channels(&self, _channels: HashMap<u32, ReusableChannel>) {}
 
     /// On-chain (or registration) setup for one user. Charge: no-op.
     async fn provision_user(&self, ctx: &UserCtx) -> Result<UserSetup>;
@@ -203,6 +238,9 @@ pub fn build(cfg: &crate::config::RunConfig) -> Box<dyn BenchScheme> {
         crate::config::Scheme::MppCharge => Box::new(mpp_charge::MppCharge),
         crate::config::Scheme::MppSession => Box::new(mpp_session::MppSession::new(cfg)),
         crate::config::Scheme::X402Exact => Box::new(x402::X402Exact),
+        crate::config::Scheme::X402BatchSettlement => {
+            Box::new(batch_settlement::BatchSettlement::new(cfg))
+        }
         crate::config::Scheme::SelfTest => Box::new(selftest::SelfTest),
     }
 }

@@ -353,9 +353,15 @@ impl FixtureRpc {
     }
 }
 
+/// Checks the whole cause chain, not just the top message: `anyhow!(error)`
+/// wraps library errors (reqwest/hyper/io) whose own transient-ness (a reset
+/// connection, a timeout) is often several `.source()` levels below the
+/// wrapper's own Display text (e.g. reqwest's outer message is just "error
+/// sending request for url (...)", with "connection"/"timeout" appearing only
+/// in an inner cause) — checking only the top level under-retries real
+/// transient errors as if they were permanent.
 fn retryable(error: &anyhow::Error) -> bool {
-    let text = error.to_string().to_ascii_lowercase();
-    [
+    const NEEDLES: [&str; 13] = [
         "429",
         "500",
         "502",
@@ -369,9 +375,11 @@ fn retryable(error: &anyhow::Error) -> bool {
         "account in use",
         "blockhash not found",
         "service unavailable",
-    ]
-    .iter()
-    .any(|needle| text.contains(needle))
+    ];
+    error.chain().any(|cause| {
+        let text = cause.to_string().to_ascii_lowercase();
+        NEEDLES.iter().any(|needle| text.contains(needle))
+    })
 }
 
 #[cfg(test)]
@@ -397,5 +405,20 @@ mod tests {
         assert!(retryable(&anyhow::anyhow!("HTTP 429 rate limited")));
         assert!(retryable(&anyhow::anyhow!("request timed out")));
         assert!(!retryable(&anyhow::anyhow!("insufficient funds")));
+    }
+
+    #[test]
+    fn retry_classification_checks_the_full_cause_chain() {
+        // Mirrors a real reqwest/hyper/io chain: the outer message alone
+        // ("error sending request for url (...)") carries none of the
+        // retryable keywords — only a deeper cause ("connection error",
+        // "Connection reset by peer") does.
+        let io_error = std::io::Error::other("Connection reset by peer (os error 104)");
+        let hyper_layer = anyhow::Error::new(io_error).context("connection error");
+        let outer = hyper_layer.context("error sending request for url (https://example.com)");
+        assert!(retryable(&outer));
+        assert!(!retryable(
+            &anyhow::anyhow!("insufficient funds").context("request failed")
+        ));
     }
 }

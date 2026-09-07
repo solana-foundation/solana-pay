@@ -950,9 +950,9 @@ dependencies = [
 
 [[package]]
 name = "async-compression"
-version = "0.4.43"
+version = "0.4.44"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3976abdc8fe7d1133d43d304afd42abdf5bc3e1319d263d223bde07b5efc4be8"
+checksum = "515a1f282e33d55983c499d7e9e87082e81cbc32974825bf9032f928392d5844"
 dependencies = [
  "compression-codecs",
  "compression-core",
@@ -1137,9 +1137,9 @@ checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
 
 [[package]]
 name = "aws-lc-rs"
-version = "1.18.0"
+version = "1.18.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ce2b2dcc879c3bae0d371e77c99f2238400ef24ec001394befa67b6e543add9e"
+checksum = "b281d307588d634de920874890732659e2e7672f72b5e10e81badc1a8a83621e"
 dependencies = [
  "aws-lc-sys",
  "untrusted 0.7.1",
@@ -1148,9 +1148,9 @@ dependencies = [
 
 [[package]]
 name = "aws-lc-sys"
-version = "0.44.0"
+version = "0.45.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f09fae7be8bb3174e05c6afdb34199e6dc0c7c04ba9fa237b1967adfbde27483"
+checksum = "9bff6c3b54fad79a2e60b8102caf565819711497c1f5f092f49508e2f5c31b27"
 dependencies = [
  "cc",
  "cmake",
@@ -1925,9 +1925,9 @@ dependencies = [
 
 [[package]]
 name = "compression-codecs"
-version = "0.4.38"
+version = "0.4.39"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ce2548391e9c1929c21bf6aa2680af86fe4c1b33e6cea9ac1cfeec0bd11218cf"
+checksum = "2fe67f2944eef52fc7b106b8c9450d243a88701a0c065f7f57235e76abaed7df"
 dependencies = [
  "brotli 8.0.4",
  "compression-core",
@@ -1937,9 +1937,9 @@ dependencies = [
 
 [[package]]
 name = "compression-core"
-version = "0.4.32"
+version = "0.4.33"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cc14f565cf027a105f7a44ccf9e5b424348421a1d8952a8fc9d499d313107789"
+checksum = "6e8ccc4ea9f6acc32d102c0f6d471d11d913ad15f20c04de743374861fa1d414"
 
 [[package]]
 name = "concurrent-queue"
@@ -2157,7 +2157,7 @@ checksum = "829d955a0bb380ef178a640b91779e3987da38c9aea133b20614cfed8cdea9c6"
 dependencies = [
  "bitflags 2.13.1",
  "crossterm_winapi",
- "mio 1.2.2",
+ "mio 1.2.3",
  "parking_lot 0.12.5",
  "rustix 0.38.44",
  "signal-hook 0.3.18",
@@ -4437,7 +4437,7 @@ dependencies = [
  "js-sys",
  "log",
  "wasm-bindgen",
- "windows-core 0.62.2",
+ "windows-core",
 ]
 
 [[package]]
@@ -4749,7 +4749,7 @@ dependencies = [
  "fnv",
  "lazy_static",
  "libc",
- "mio 1.2.2",
+ "mio 1.2.3",
  "rand 0.8.8",
  "serde",
  "tempfile",
@@ -5253,10 +5253,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b6d2cec3eae94f9f509c767b45932f1ada8350c4bdb85af2fcab4a3c14807981"
 
 [[package]]
-name = "libredox"
-version = "0.1.21"
+name = "libmimalloc-sys"
+version = "0.1.49"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d7955dfc218a8afb29dfeffd540e3a6e96baeb94fe7138228dd7cc6937fbbf96"
+checksum = "6a45a52f43e1c16f667ccfe4dd8c85b7f7c204fd5e3bf46c5b0db9a5c3c0b8e9"
+dependencies = [
+ "cc",
+]
+
+[[package]]
+name = "libredox"
+version = "0.1.23"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8d8f1ea3f21fd3405dcaf6c9b5c1630af9afc422d9073ea39c5f6d6c772e08ed"
 dependencies = [
  "libc",
 ]
@@ -5669,6 +5678,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "mimalloc"
+version = "0.1.52"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2d4139bb28d14ad1facf21d5eb8825051b326e172d216b39f6d31df53cc97862"
+dependencies = [
+ "libmimalloc-sys",
+]
+
+[[package]]
 name = "mime"
 version = "0.3.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5730,9 +5748,9 @@ dependencies = [
 
 [[package]]
 name = "mio"
-version = "1.2.2"
+version = "1.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "30d65c71f1ce40ab09135ce117d742b9f8a19ff91a41a8b57ed50bc2de59c427"
+checksum = "4b18443e9c262bfe8fa82f51666e2642c53393f7e5c27b3e1aeab922cff5b9d8"
 dependencies = [
  "libc",
  "log",
@@ -6608,7 +6626,7 @@ checksum = "2ee67f1008b1ba2321834326597b8e186293b049a023cdef258527550b9935b4"
 
 [[package]]
 name = "pay"
-version = "0.28.0"
+version = "0.29.0"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -6624,6 +6642,7 @@ dependencies = [
  "futures-util",
  "glob",
  "indicatif 0.17.11",
+ "mimalloc",
  "opentelemetry 0.31.0",
  "opentelemetry-otlp",
  "opentelemetry-semantic-conventions 0.31.0",
@@ -6636,6 +6655,8 @@ dependencies = [
  "pay-pdb",
  "pay-proxy",
  "pay-types",
+ "pyroscope",
+ "pyroscope_pprofrs",
  "qrcode",
  "rand 0.8.8",
  "ratatui",
@@ -6666,7 +6687,7 @@ dependencies = [
 
 [[package]]
 name = "pay-acp"
-version = "0.28.0"
+version = "0.29.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -6675,7 +6696,7 @@ dependencies = [
 
 [[package]]
 name = "pay-api"
-version = "0.28.0"
+version = "0.29.0"
 dependencies = [
  "axum",
  "base64 0.22.1",
@@ -6718,7 +6739,7 @@ dependencies = [
 
 [[package]]
 name = "pay-api-core"
-version = "0.28.0"
+version = "0.29.0"
 dependencies = [
  "base64 0.22.1",
  "bincode",
@@ -6746,7 +6767,7 @@ dependencies = [
 
 [[package]]
 name = "pay-api-types"
-version = "0.28.0"
+version = "0.29.0"
 dependencies = [
  "schemars 0.8.22",
  "serde",
@@ -6756,11 +6777,12 @@ dependencies = [
 
 [[package]]
 name = "pay-bench"
-version = "0.28.0"
+version = "0.29.0"
 dependencies = [
  "anyhow",
  "async-trait",
  "axum",
+ "base64 0.22.1",
  "bincode",
  "bs58",
  "bytes 1.12.1",
@@ -6820,7 +6842,7 @@ dependencies = [
 
 [[package]]
 name = "pay-core"
-version = "0.28.0"
+version = "0.29.0"
 dependencies = [
  "async-stream",
  "axum",
@@ -6835,10 +6857,12 @@ dependencies = [
  "dashmap",
  "ed25519-dalek 2.2.0",
  "figment",
+ "five8 1.0.0",
  "five8_core 0.1.2",
  "futures-util",
  "hmac 0.12.1",
  "http 1.5.0",
+ "http-body 1.1.0",
  "libc",
  "md-5",
  "mime_guess",
@@ -6880,7 +6904,7 @@ dependencies = [
 
 [[package]]
 name = "pay-integration"
-version = "0.28.0"
+version = "0.29.0"
 dependencies = [
  "base64 0.22.1",
  "pay-core",
@@ -6891,7 +6915,7 @@ dependencies = [
 
 [[package]]
 name = "pay-keystore"
-version = "0.28.0"
+version = "0.29.0"
 dependencies = [
  "bs58",
  "secret-service",
@@ -6901,14 +6925,14 @@ dependencies = [
  "thiserror 2.0.20",
  "tokio",
  "windows",
- "windows-core 0.58.0",
+ "windows-core",
  "zbus",
  "zeroize",
 ]
 
 [[package]]
 name = "pay-mcp"
-version = "0.28.0"
+version = "0.29.0"
 dependencies = [
  "base64 0.22.1",
  "crc32fast",
@@ -6933,7 +6957,7 @@ dependencies = [
 
 [[package]]
 name = "pay-pdb"
-version = "0.28.0"
+version = "0.29.0"
 dependencies = [
  "async-stream",
  "axum",
@@ -6955,7 +6979,7 @@ dependencies = [
 
 [[package]]
 name = "pay-proxy"
-version = "0.28.0"
+version = "0.29.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -6976,7 +7000,7 @@ dependencies = [
 
 [[package]]
 name = "pay-types"
-version = "0.28.0"
+version = "0.29.0"
 dependencies = [
  "schemars 0.8.22",
  "serde",
@@ -6987,13 +7011,15 @@ dependencies = [
 
 [[package]]
 name = "pay-worker"
-version = "0.28.0"
+version = "0.29.0"
 dependencies = [
  "axum",
  "base64 0.22.1",
  "bincode",
  "bs58",
  "figment",
+ "five8 1.0.0",
+ "futures 0.3.34",
  "opentelemetry 0.31.0",
  "opentelemetry-otlp",
  "opentelemetry-semantic-conventions 0.31.0",
@@ -8469,9 +8495,9 @@ dependencies = [
 
 [[package]]
 name = "rust_decimal"
-version = "1.42.1"
+version = "1.43.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "be2a24f50780bc85f09cc6ac299bdf1424302742d77221106859c9d8b102126a"
+checksum = "7653272e75dcac41dc199fbea6f5797633994fafd339943c06c9af16bf29cd3a"
 dependencies = [
  "arrayvec",
  "num-traits",
@@ -9286,7 +9312,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b75a19a7a740b25bc7944bdee6172368f988763b744e3d4dfe753f6b4ece40cc"
 dependencies = [
  "libc",
- "mio 1.2.2",
+ "mio 1.2.3",
  "signal-hook 0.3.18",
 ]
 
@@ -9368,9 +9394,9 @@ checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
 
 [[package]]
 name = "smallvec"
-version = "1.15.2"
+version = "1.16.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8ed6a63f02c8539c91a8685a86f4099661ba3da017932f6ebbea6de3f0fa7c90"
+checksum = "b9be42f50aa861c555654aa3a37f52f4b1074bacf4e48fe0ef7fa584e80f1f0f"
 dependencies = [
  "serde",
 ]
@@ -11294,7 +11320,7 @@ dependencies = [
 [[package]]
 name = "solana-pay-kit"
 version = "0.6.0"
-source = "git+https://github.com/solana-foundation/pay-kit.git?rev=39d7978f6a0e96680e65a0bc11a750419829fac5#39d7978f6a0e96680e65a0bc11a750419829fac5"
+source = "git+https://github.com/solana-foundation/pay-kit.git?rev=c143bfab#c143bfabef82dbdf01dcff7a52ab29bf166d7eb4"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -11302,8 +11328,10 @@ dependencies = [
  "borsh 1.8.1",
  "bs58",
  "bytemuck",
+ "curve25519-dalek 4.1.3",
  "dashmap",
  "ed25519-dalek 2.2.0",
+ "five8 1.0.0",
  "five8_core 0.1.2",
  "getrandom 0.3.4",
  "hmac 0.12.1",
@@ -14116,9 +14144,9 @@ dependencies = [
 
 [[package]]
 name = "spl-tlv-account-resolution"
-version = "0.11.2"
+version = "0.11.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6e6d30e733473322925a374c2603466a52c95077c574917bd02b788052d2f01d"
+checksum = "4378fa824c41a21856eb5347fbff48bc613456179de02ba51f667bce9acb18f6"
 dependencies = [
  "bytemuck",
  "num-derive",
@@ -14942,7 +14970,7 @@ checksum = "202caea871b69668250d242070849eb495be178ed697a3e98aebce5bc81a0bed"
 dependencies = [
  "bytes 1.12.1",
  "libc",
- "mio 1.2.2",
+ "mio 1.2.3",
  "parking_lot 0.12.5",
  "pin-project-lite",
  "signal-hook-registry",
@@ -16006,7 +16034,7 @@ version = "0.58.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dd04d41d93c4992d421894c18c8b43496aa748dd4c081bac0dc93eb0489272b6"
 dependencies = [
- "windows-core 0.58.0",
+ "windows-core",
  "windows-targets 0.52.6",
 ]
 
@@ -16016,24 +16044,11 @@ version = "0.58.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6ba6d44ec8c2591c134257ce647b7ea6b20335bf6379a27dac5f1641fcf59f99"
 dependencies = [
- "windows-implement 0.58.0",
- "windows-interface 0.58.0",
+ "windows-implement",
+ "windows-interface",
  "windows-result 0.2.0",
  "windows-strings 0.1.0",
  "windows-targets 0.52.6",
-]
-
-[[package]]
-name = "windows-core"
-version = "0.62.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b8e83a14d34d0623b51dce9581199302a221863196a1dde71a7663a4c2be9deb"
-dependencies = [
- "windows-implement 0.60.2",
- "windows-interface 0.59.3",
- "windows-link",
- "windows-result 0.4.1",
- "windows-strings 0.5.1",
 ]
 
 [[package]]
@@ -16048,32 +16063,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "windows-implement"
-version = "0.60.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "053e2e040ab57b9dc951b72c264860db7eb3b0200ba345b4e4c3b14f67855ddf"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.119",
-]
-
-[[package]]
 name = "windows-interface"
 version = "0.58.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "053c4c462dc91d3b1504c6fe5a726dd15e216ba718e84a0e46a88fbe5ded3515"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.119",
-]
-
-[[package]]
-name = "windows-interface"
-version = "0.59.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3f316c4a2570ba26bbec722032c4099d8c8bc095efccdc15688708623367e358"
 dependencies = [
  "proc-macro2",
  "quote",

@@ -41,7 +41,7 @@ pub async fn setup_sandbox_keypair(rpc_url: &str) -> Result<SandboxKeypair> {
     let path = file.path().to_string_lossy().to_string();
 
     // Derive pubkey (base58)
-    let pubkey = bs58::encode(&verifying_key.to_bytes()).into_string();
+    let pubkey = crate::b58::encode_32(&verifying_key.to_bytes());
 
     info!(pubkey = %pubkey, "Generated sandbox keypair");
 

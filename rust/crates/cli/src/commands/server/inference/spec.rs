@@ -85,6 +85,7 @@ pub fn provider_spec(provider: &DiscoveredProvider, pricing: Option<&SpecPricing
         operator: pricing.map(|p| sandbox_operator(&p.recipient)),
         recipients: Default::default(),
         session: None,
+        batch_settlement: None,
     };
     // Resolve per-endpoint scheme defaults so the gate, challenge builder, and
     // verifier all read the same scheme set — same as `gate api` does right

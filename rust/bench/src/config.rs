@@ -18,6 +18,10 @@ pub enum Scheme {
     MppSession,
     /// x402 `exact` fixed-amount scheme.
     X402Exact,
+    /// x402 `batch-settlement` scheme: open one escrow channel, stream cumulative
+    /// off-chain vouchers, server batch-settles on-chain later. The x402 wire
+    /// analogue of `mpp_session`.
+    X402BatchSettlement,
     /// Generator ceiling check: no on-chain work — fires plain requests at a
     /// free proxy path to measure how many users/req-s the bench + proxy can
     /// sustain, decoupled from settlement.
@@ -206,8 +210,9 @@ pub struct SessionCfg {
     /// provisioning, the engine discovers each fixture wallet's open channel and
     /// the scheme drives it by address (resuming from its on-chain settled
     /// watermark), skipping the open. Wallets with no existing channel fall back
-    /// to opening one (bootstrap). Avoids re-paying channel rent every run.
-    /// Requires the gateway to run with `session.load_from_chain: true`.
+    /// to opening one (bootstrap). Avoids re-paying channel rent every run. MPP
+    /// requires `session.load_from_chain: true`; x402 batch settlement rebuilds
+    /// a missing gateway record from the confirmed channel on first use.
     #[serde(default)]
     pub reuse: bool,
     /// Pure off-chain benchmark mode (no surfpool/fork): deterministic,
@@ -392,8 +397,12 @@ impl RunConfig {
                 bail!("safety.{label} must be a finite number >= 0");
             }
         }
-        if self.run.scheme == Scheme::MppSession && self.session.is_none() {
-            bail!("scheme `mpp_session` requires a `session:` block");
+        if matches!(
+            self.run.scheme,
+            Scheme::MppSession | Scheme::X402BatchSettlement
+        ) && self.session.is_none()
+        {
+            bail!("scheme requires a `session:` block");
         }
         if let Some(session) = &self.session
             && session.offline

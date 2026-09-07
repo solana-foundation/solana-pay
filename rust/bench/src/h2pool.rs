@@ -113,15 +113,19 @@ impl StableH2Pool {
     }
 
     /// Send one request over the next connection (round-robin) as a new h2
-    /// stream, returning the response status. Ok/Err mirror the driver's
-    /// existing status/error accounting.
+    /// stream, returning the response status and — on a non-2xx status only —
+    /// the named response header's value (e.g. a scheme's corrective-challenge
+    /// header), so a scheme can resynchronize without the cost of capturing it
+    /// on every successful response. Ok/Err mirror the driver's existing
+    /// status/error accounting.
     pub async fn send(
         &self,
         method: &str,
         url: &str,
         body: &str,
         headers: &[(String, String)],
-    ) -> Result<u16, String> {
+        capture_header_on_error: &str,
+    ) -> Result<(u16, Option<String>), String> {
         let idx = self.next.fetch_add(1, Ordering::Relaxed) % self.senders.len();
         let mut sender = self.senders[idx].clone();
         // Blocks until the connection has stream capacity — this is what bounds
@@ -139,9 +143,14 @@ impl StableH2Pool {
 
         let resp = sender.send_request(req).await.map_err(|e| classify(&e))?;
         let status = resp.status().as_u16();
+        let captured = (!(200..300).contains(&status))
+            .then(|| resp.headers().get(capture_header_on_error))
+            .flatten()
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned);
         // Drain the body so the stream is released promptly for reuse.
         let _ = resp.into_body().collect().await;
-        Ok(status)
+        Ok((status, captured))
     }
 }
 

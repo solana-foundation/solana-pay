@@ -13,8 +13,10 @@ default = []
 gcp_kms = ["pay-kit/gcp_kms"]
 vendored-openssl = ["pay-core/vendored-openssl"]
 redis-session-store = ["pay-core/redis-session-store", "pay-kit/redis-store"]
+profiling = ["dep:pyroscope", "dep:pyroscope_pprofrs"]
 
 [dependencies]
+mimalloc = "0.1"
 async-trait = "0.1"
 axum = { workspace = true }
 pay-core = { workspace = true, features = ["server", "otel"] }
@@ -69,6 +71,8 @@ uuid = { workspace = true }
 webbrowser = { workspace = true }
 # Payer proxy: incremental OpenAI→Anthropic SSE translation stream.
 async-stream = "0.3"
+pyroscope = { version = "0.5", optional = true }
+pyroscope_pprofrs = { version = "0.2", optional = true }
 
 [dev-dependencies]
 serial_test = "3"

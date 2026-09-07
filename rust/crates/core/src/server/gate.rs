@@ -24,7 +24,9 @@ use pay_kit::mpp::{
     format_www_authenticate, format_www_authenticate_many, parse_authorization,
 };
 use pay_kit::x402::PAYMENT_RESPONSE_HEADER;
-use pay_kit::x402::server::{ExactOptions, VerifiedUptoOpen, X402, X402BatchSettlement, X402Upto};
+use pay_kit::x402::server::{
+    BatchAccess, BatchOutcome, ExactOptions, VerifiedUptoOpen, X402, X402BatchSettlement, X402Upto,
+};
 use pay_types::metering::Scheme;
 use serde_json::json;
 
@@ -44,6 +46,11 @@ const PAYMENT_PAGE_CSP: &str = "\
     img-src 'self' data: blob: https:; \
     connect-src 'self' http://localhost:* http://127.0.0.1:* https:; \
     worker-src 'self'";
+
+/// Match pay-kit's bounded representation cache. Larger or streaming bodies
+/// keep settlement-only replay semantics instead of growing channel state
+/// without bound.
+pub const MAX_BATCH_CACHED_RESPONSE_BYTES: usize = 1024 * 1024;
 
 /// Everything the gate needs from a request. No body — the decision is made
 /// from metadata alone, so the body can stream straight to the upstream.
@@ -290,6 +297,30 @@ pub struct UptoForward {
     pub telemetry: UptoPaymentTelemetry,
 }
 
+/// An x402 `batch-settlement` payment verified before the resource is served,
+/// carried to the adapter's post-response hook for commitment.
+///
+/// The scheme's `authorization` flow is verify-then-serve-then-commit:
+/// verification only reserves the channel, and the cumulative watermark
+/// advances — and any deposit transaction broadcasts — only after the upstream
+/// succeeds. A failed serve therefore leaves the client uncharged and free to
+/// retry the same voucher.
+///
+/// Holds the `!Clone` [`BatchOutcome`], whose in-flight guard serializes the
+/// channel until it is dropped or settled.
+pub struct BatchForward {
+    /// Boxed to keep the `GateDecision::Forward` variant small.
+    pub outcome: Box<BatchOutcome>,
+    /// Stable context for attributing the amount actually charged.
+    pub telemetry: BatchPaymentTelemetry,
+}
+
+pub struct BatchPaymentTelemetry {
+    pub subdomain: String,
+    pub path: String,
+    pub payment: Option<telemetry::PaymentAmount>,
+}
+
 pub struct UptoPaymentTelemetry {
     pub subdomain: String,
     pub path: String,
@@ -305,11 +336,13 @@ pub enum GateDecision {
     /// session credential opened/advanced a channel, `session` carries the
     /// stream-metering context the adapter attaches to the upstream request;
     /// `receipt` is applied to the response. For x402 `upto`, `upto` carries the
-    /// opened channel the adapter settles *after* the response.
+    /// opened channel the adapter settles *after* the response; `batch` does the
+    /// same for x402 `batch-settlement`, whose voucher commits post-serve.
     Forward {
         session: Option<Box<SessionForward>>,
         receipt: Option<ReceiptAnnotation>,
         upto: Option<Box<UptoForward>>,
+        batch: Option<Box<BatchForward>>,
         paid_request: Option<PaidRequestTelemetry>,
     },
     /// Not gated (discovery / free / unknown) — let normal routing handle it
@@ -516,8 +549,9 @@ impl<S: PaymentState> PaymentGate<S> {
             if accepted.contains(&Scheme::X402BatchSettlement)
                 && let Some(batch) = self.state.x402_batch()
             {
+                let resource = endpoint.and_then(|e| e.resource.as_deref());
                 return self
-                    .x402_batch_verify(batch, meter, req, path, pay_header, subdomain)
+                    .x402_batch_verify(batch, meter, req, path, pay_header, subdomain, resource)
                     .await;
             }
             if accepted.contains(&Scheme::X402Upto)
@@ -732,7 +766,7 @@ impl<S: PaymentState> PaymentGate<S> {
             && let Some(batch) = self.state.x402_batch()
         {
             let amount = crate::server::payment::charge_amount_from_price(price.as_ref());
-            match batch.payment_required_header(&amount) {
+            match batch.payment_required_header(&amount, resource) {
                 Ok((name, value)) => {
                     if let (Ok(n), Ok(v)) = (
                         HeaderName::from_bytes(name.as_bytes()),
@@ -892,6 +926,7 @@ impl<S: PaymentState> PaymentGate<S> {
                         reference: Some(reference),
                     }),
                     upto: None,
+                    batch: None,
                     paid_request: Some(PaidRequestTelemetry {
                         protocol: "x402/exact",
                         subdomain: subdomain.to_string(),
@@ -940,6 +975,7 @@ impl<S: PaymentState> PaymentGate<S> {
                 GateDecision::Forward {
                     session: None,
                     receipt: None,
+                    batch: None,
                     upto: Some(Box::new(UptoForward {
                         open: Box::new(open),
                         settle_amount,
@@ -976,10 +1012,17 @@ impl<S: PaymentState> PaymentGate<S> {
         }
     }
 
-    /// Verify an x402 `batch-settlement` payment. On `serve`, forward with the
-    /// settlement header; on a cooperative refund, acknowledge (200) without
-    /// serving; on failure, re-challenge. On-chain settlement is batched out of
-    /// band by the operator.
+    /// Verify an x402 `batch-settlement` payment before the resource is served.
+    ///
+    /// Verification is read-only: it checks the cumulative voucher and reserves
+    /// the channel, but does not charge. The commitment is made by
+    /// [`settle_batch`] after the upstream responds, so a failed serve leaves
+    /// the client uncharged and able to retry the same voucher. On-chain
+    /// redemption is batched out of band by the operator.
+    ///
+    /// A `refund` bypasses the upstream entirely — a channel close is a
+    /// payment-control operation, not a paid request.
+    #[allow(clippy::too_many_arguments)]
     async fn x402_batch_verify(
         &self,
         batch: &X402BatchSettlement,
@@ -988,6 +1031,7 @@ impl<S: PaymentState> PaymentGate<S> {
         path: &str,
         pay_header: &str,
         subdomain: &str,
+        resource: Option<&str>,
     ) -> GateDecision {
         let props = metering::RequestProperties {
             body_size: req.content_length,
@@ -1004,68 +1048,148 @@ impl<S: PaymentState> PaymentGate<S> {
                 currency: "USD".to_string(),
                 ui_amount,
             });
-        match batch.verify_payment(pay_header, &amount).await {
-            Ok(outcome) => {
-                let mut headers = Vec::new();
-                if let Ok((name, value)) = batch.settlement_header(&outcome.response)
-                    && let (Ok(n), Ok(v)) = (
-                        HeaderName::from_bytes(name.as_bytes()),
-                        HeaderValue::from_str(&value),
-                    )
-                {
-                    headers.push((n, v));
-                }
-                let reference = outcome
-                    .response
-                    .channel_state
-                    .as_ref()
-                    .map(|c| c.channel_id.clone());
-                if outcome.serve {
-                    if let Some(r) = &reference {
-                        telemetry::record_payment_collected(
-                            "x402/batch",
-                            subdomain,
-                            path,
-                            payment.as_ref(),
-                            r,
-                        );
-                    }
-                    GateDecision::Forward {
-                        session: None,
-                        receipt: Some(ReceiptAnnotation { headers, reference }),
-                        upto: None,
-                        paid_request: Some(PaidRequestTelemetry {
-                            protocol: "x402/batch",
-                            subdomain: subdomain.to_string(),
-                            payment,
-                        }),
-                    }
-                } else {
-                    // Cooperative refund / channel close — acknowledge, don't serve.
-                    let mut resp = GateResponse::json(
-                        StatusCode::OK,
-                        Bytes::from_static(br#"{"status":"channel_closed"}"#),
-                    );
-                    resp.headers.extend(headers);
-                    GateDecision::Respond(resp)
-                }
-            }
+
+        let access = match batch.verify_and_reserve_payment(pay_header, &amount).await {
+            Ok(access) => access,
             Err(e) => {
-                telemetry::record_settlement_error(
-                    "x402/batch",
-                    subdomain,
-                    path,
-                    &e.to_string(),
-                    true,
-                );
-                GateDecision::Respond(GateResponse::json(
+                telemetry::record_challenge_error("x402/batch", subdomain, &e.to_string());
+                // A cumulative mismatch comes back as a corrective 402 carrying
+                // the server's snapshot plus the client's own signed voucher, so
+                // the client can resynchronize and retry rather than be stuck.
+                let mut resp = GateResponse::json(
                     StatusCode::PAYMENT_REQUIRED,
                     serde_json::to_vec(
                         &json!({"error":"verification_failed","message":e.to_string()}),
                     )
                     .unwrap_or_default(),
-                ))
+                );
+                if let Ok((name, value)) = batch
+                    .challenge_for_failure(pay_header, &amount, &e, resource)
+                    .await
+                    && let (Ok(n), Ok(v)) = (
+                        HeaderName::from_bytes(name.as_bytes()),
+                        HeaderValue::from_str(&value),
+                    )
+                {
+                    resp.headers.push((n, v));
+                }
+                return GateDecision::Respond(resp);
             }
+        };
+
+        let outcome = match access {
+            // Already charged and served. The client lost the response, not
+            // the payment, so it gets the original settlement result back
+            // rather than a conflict — the scheme requires the recorded
+            // response for this commitment, and refusing it would leave a paid
+            // request unrecoverable.
+            BatchAccess::Replay(settlement, cached) => {
+                return GateDecision::Respond(batch_replay_response(
+                    batch,
+                    &settlement,
+                    cached.as_ref(),
+                ));
+            }
+            // Another in-flight request owns this authorization. This is the
+            // one case that is genuinely a conflict, and it is retryable.
+            BatchAccess::InProgress => {
+                let mut resp = GateResponse::json(
+                    StatusCode::CONFLICT,
+                    serde_json::to_vec(&json!({
+                        "error": "duplicate_settlement",
+                        "message": "payment authorization is already in flight",
+                    }))
+                    .unwrap_or_default(),
+                );
+                if let Ok(v) = HeaderValue::from_str("1") {
+                    resp.headers
+                        .push((HeaderName::from_static("retry-after"), v));
+                }
+                return GateDecision::Respond(resp);
+            }
+            // A previous attempt served this request but never charged it.
+            // Finishing that charge is the only safe continuation; the
+            // upstream must not run again.
+            BatchAccess::Resume(outcome) => {
+                return match batch.finish_commit(&outcome).await {
+                    Ok(settlement) => {
+                        GateDecision::Respond(batch_replay_response(batch, &settlement, None))
+                    }
+                    Err(e) => {
+                        telemetry::record_settlement_error(
+                            "x402/batch",
+                            subdomain,
+                            path,
+                            &e.to_string(),
+                            true,
+                        );
+                        GateDecision::Respond(GateResponse::json(
+                            StatusCode::BAD_GATEWAY,
+                            serde_json::to_vec(
+                                &json!({"error":"settlement_failed","message":e.to_string()}),
+                            )
+                            .unwrap_or_default(),
+                        ))
+                    }
+                };
+            }
+            BatchAccess::Serve(outcome) | BatchAccess::Control(outcome) => outcome,
+        };
+
+        // A channel close: commit it now and acknowledge without serving.
+        if !outcome.serve {
+            let mut resp = GateResponse::json(
+                StatusCode::OK,
+                Bytes::from_static(br#"{"status":"channel_closing"}"#),
+            );
+            match batch.settle_payment(outcome).await {
+                Ok(settlement) => {
+                    if let Ok((name, value)) = batch.settlement_header(&settlement)
+                        && let (Ok(n), Ok(v)) = (
+                            HeaderName::from_bytes(name.as_bytes()),
+                            HeaderValue::from_str(&value),
+                        )
+                    {
+                        resp.headers.push((n, v));
+                    }
+                }
+                Err(e) => {
+                    telemetry::record_settlement_error(
+                        "x402/batch",
+                        subdomain,
+                        path,
+                        &e.to_string(),
+                        true,
+                    );
+                    return GateDecision::Respond(GateResponse::json(
+                        StatusCode::BAD_GATEWAY,
+                        serde_json::to_vec(
+                            &json!({"error":"close_failed","message":e.to_string()}),
+                        )
+                        .unwrap_or_default(),
+                    ));
+                }
+            }
+            return GateDecision::Respond(resp);
+        }
+
+        GateDecision::Forward {
+            session: None,
+            receipt: None,
+            upto: None,
+            batch: Some(Box::new(BatchForward {
+                outcome: Box::new(outcome),
+                telemetry: BatchPaymentTelemetry {
+                    subdomain: subdomain.to_string(),
+                    path: path.to_string(),
+                    payment: payment.clone(),
+                },
+            })),
+            paid_request: Some(PaidRequestTelemetry {
+                protocol: "x402/batch",
+                subdomain: subdomain.to_string(),
+                payment,
+            }),
         }
     }
 
@@ -1211,6 +1335,7 @@ impl<S: PaymentState> PaymentGate<S> {
                     session: None,
                     receipt: None,
                     upto: None,
+                    batch: None,
                     paid_request: Some(PaidRequestTelemetry {
                         protocol: "mpp/subscription",
                         subdomain: subdomain.to_string(),
@@ -1260,6 +1385,7 @@ impl<S: PaymentState> PaymentGate<S> {
                         reference: Some(receipt_kind.base().reference.clone()),
                     }),
                     upto: None,
+                    batch: None,
                     paid_request: Some(PaidRequestTelemetry {
                         protocol: "mpp/subscription",
                         subdomain: subdomain.to_string(),
@@ -1420,6 +1546,7 @@ impl<S: PaymentState> PaymentGate<S> {
                             reference: Some(reference),
                         }),
                         upto: None,
+                        batch: None,
                         paid_request: Some(PaidRequestTelemetry {
                             protocol: "mpp/charge",
                             subdomain: subdomain.to_string(),
@@ -1471,6 +1598,302 @@ fn upto_settle_amount(min_usd: Option<f64>, ceiling_usd: f64, max_amount: u64) -
             ((min_usd * units_per_usd).round() as u64).min(max_amount)
         }
         _ => max_amount,
+    }
+}
+
+/// Answer a batch request whose authorization was already charged and served.
+///
+/// The settlement result is returned verbatim, so a client that lost the
+/// original response learns what it was charged and can carry on from the
+/// right cumulative base.
+fn batch_replay_response(
+    batch: &X402BatchSettlement,
+    settlement: &pay_kit::x402::batch_settlement::BatchSettlementResponse,
+    cached: Option<&pay_kit::core::store::CachedUpstreamResponse>,
+) -> GateResponse {
+    let mut resp = if let Some(cached) = cached {
+        let mut response =
+            GateResponse::new(StatusCode::from_u16(cached.status).unwrap_or(StatusCode::OK))
+                .body(cached.body.clone());
+        if let Some(content_type) = &cached.content_type {
+            response = response.header(header::CONTENT_TYPE, content_type);
+        }
+        for (name, value) in &cached.headers {
+            if let (Ok(name), Ok(value)) = (
+                HeaderName::from_bytes(name.as_bytes()),
+                HeaderValue::from_str(value),
+            ) {
+                response.headers.push((name, value));
+            }
+        }
+        response
+    } else {
+        GateResponse::json(
+            StatusCode::OK,
+            serde_json::to_vec(&json!({
+                "status": "already_settled",
+                "message": "this authorization was already charged; its payment result is attached",
+            }))
+            .unwrap_or_default(),
+        )
+    };
+    if let Ok(v) = HeaderValue::from_str("true") {
+        resp.headers
+            .push((HeaderName::from_static("payment-replay"), v));
+    }
+    if let Ok((name, value)) = batch.settlement_header(settlement)
+        && let (Ok(n), Ok(v)) = (
+            HeaderName::from_bytes(name.as_bytes()),
+            HeaderValue::from_str(&value),
+        )
+    {
+        resp.headers.push((n, v));
+    }
+    resp
+}
+
+/// Build the bounded, end-to-end portion of an upstream response that is safe
+/// to reproduce for an idempotent batch authorization replay.
+pub fn batch_cached_response(
+    status: StatusCode,
+    headers: &HeaderMap,
+    body: &[u8],
+) -> pay_kit::core::store::CachedUpstreamResponse {
+    let content_type = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(ToOwned::to_owned);
+    let headers = headers
+        .iter()
+        .filter(|(name, _)| is_replayable_batch_response_header(name))
+        .filter_map(|(name, value)| {
+            value
+                .to_str()
+                .ok()
+                .map(|value| (name.as_str().to_owned(), value.to_owned()))
+        })
+        .collect();
+    pay_kit::core::store::CachedUpstreamResponse {
+        status: status.as_u16(),
+        content_type,
+        headers,
+        body: body.to_vec(),
+    }
+}
+
+fn is_replayable_batch_response_header(name: &HeaderName) -> bool {
+    matches!(
+        name.as_str(),
+        "accept-ranges"
+            | "cache-control"
+            | "content-security-policy"
+            | "content-security-policy-report-only"
+            | "content-disposition"
+            | "content-encoding"
+            | "content-language"
+            | "content-location"
+            | "content-range"
+            | "cross-origin-embedder-policy"
+            | "cross-origin-opener-policy"
+            | "cross-origin-resource-policy"
+            | "etag"
+            | "expires"
+            | "last-modified"
+            | "location"
+            | "permissions-policy"
+            | "referrer-policy"
+            | "reporting-endpoints"
+            | "strict-transport-security"
+            | "vary"
+            | "x-content-type-options"
+            | "x-frame-options"
+            | "x-permitted-cross-domain-policies"
+            | "x-xss-protection"
+    )
+}
+
+/// Commit an x402 `batch-settlement` voucher after the resource was served
+/// (the adapter's post-response hook).
+///
+/// This is the step that charges the client, so it runs only on a successful
+/// serve. On failure the outcome is dropped instead: the watermark never
+/// advances, the channel's in-flight guard is released, and the client may
+/// retry the identical voucher.
+///
+/// No on-chain transaction is involved for a steady-state voucher — the
+/// operator redeems accumulated vouchers in batches out of band. A `deposit`
+/// broadcasts its `open`/`top_up` here, which is why this can fail after the
+/// resource was already served; that loss is logged, not surfaced.
+pub async fn settle_batch<S: PaymentState>(
+    state: &S,
+    forward: BatchForward,
+    served_ok: bool,
+    cached: Option<pay_kit::core::store::CachedUpstreamResponse>,
+) -> Option<(HeaderName, HeaderValue)> {
+    if !served_ok {
+        release_batch(state, forward).await;
+        return None;
+    }
+    let header = commit_batch(state, &forward).await;
+    if let Some(cached) = cached {
+        cache_batch_response(state, &forward, cached).await;
+    }
+    header
+}
+
+/// Commit a successfully served batch authorization while retaining its
+/// outcome long enough for a streaming adapter to cache the completed body.
+pub async fn commit_batch<S: PaymentState>(
+    state: &S,
+    forward: &BatchForward,
+) -> Option<(HeaderName, HeaderValue)> {
+    let batch = state.x402_batch()?;
+    let telemetry_context = &forward.telemetry;
+    let channel_id = forward.outcome.channel_id.clone();
+    let channel_config = forward.outcome.payload().channel_config();
+    let currency = channel_config.token.clone();
+    let client_id = channel_config.payer.clone();
+    let opens_channel = match forward.outcome.payload() {
+        pay_kit::x402::batch_settlement::BatchPayload::Deposit { deposit, .. } => {
+            matches!(
+                pay_kit::x402::batch_settlement::setup_form_from_transaction(
+                    &deposit.transaction,
+                    &pay_kit::core::payment_channels::default_program_id(),
+                ),
+                Ok(pay_kit::x402::batch_settlement::SetupForm::Open)
+            )
+        }
+        _ => false,
+    };
+    // The crash boundary: recorded before the charge so a retry can only
+    // finish it, never serve again. A failure to record is not a reason to
+    // abandon the charge — the upstream already answered — so it is logged and
+    // the charge attempted regardless.
+    if let Err(e) = batch.mark_handler_succeeded(&forward.outcome).await {
+        telemetry::record_settlement_error(
+            "x402/batch",
+            &telemetry_context.subdomain,
+            &telemetry_context.path,
+            &e.to_string(),
+            false,
+        );
+    }
+    match batch.finish_commit(&forward.outcome).await {
+        Ok(settlement) => {
+            telemetry::record_payment_collected(
+                "x402/batch",
+                &telemetry_context.subdomain,
+                &telemetry_context.path,
+                telemetry_context.payment.as_ref(),
+                &channel_id,
+            );
+            if let Some(channel_state) = settlement
+                .extra
+                .as_ref()
+                .and_then(|extra| extra.channel_state.as_ref())
+            {
+                if let Some(cumulative) = channel_state
+                    .charged_cumulative_amount
+                    .as_deref()
+                    .and_then(|value| value.parse().ok())
+                {
+                    telemetry::record_payment_channel_voucher_cumulative_for_protocol(
+                        "x402/batch",
+                        &channel_id,
+                        &currency,
+                        &settlement.network,
+                        cumulative,
+                    );
+                }
+                if let Some(charged) = settlement
+                    .extra
+                    .as_ref()
+                    .and_then(|extra| extra.charged_amount.as_deref())
+                    .and_then(|value| value.parse().ok())
+                {
+                    telemetry::record_payment_channel_voucher_accepted_for_protocol(
+                        "x402/batch",
+                        &currency,
+                        &settlement.network,
+                        charged,
+                    );
+                }
+                if opens_channel && let Ok(escrowed) = channel_state.balance.parse() {
+                    telemetry::record_payment_channel_opened_for_protocol(
+                        "x402/batch",
+                        &settlement.transaction,
+                        &channel_id,
+                        &client_id,
+                        &currency,
+                        &settlement.network,
+                        escrowed,
+                    );
+                }
+            }
+            match batch.settlement_header(&settlement) {
+                Ok((name, value)) => Some((
+                    HeaderName::from_bytes(name.as_bytes()).ok()?,
+                    HeaderValue::from_str(&value).ok()?,
+                )),
+                Err(e) => {
+                    telemetry::record_settlement_error(
+                        "x402/batch",
+                        &telemetry_context.subdomain,
+                        &telemetry_context.path,
+                        &e.to_string(),
+                        true,
+                    );
+                    None
+                }
+            }
+        }
+        Err(e) => {
+            // The resource was already served; the uncommitted charge is the
+            // operator's loss and worth alerting on.
+            telemetry::record_settlement_error(
+                "x402/batch",
+                &telemetry_context.subdomain,
+                &telemetry_context.path,
+                &e.to_string(),
+                true,
+            );
+            None
+        }
+    }
+}
+
+/// Release an authorization whose resource response was unsuccessful.
+pub async fn release_batch<S: PaymentState>(state: &S, forward: BatchForward) {
+    let Some(batch) = state.x402_batch() else {
+        return;
+    };
+    if let Err(e) = batch.release_authorization(*forward.outcome).await {
+        telemetry::record_settlement_error(
+            "x402/batch",
+            &forward.telemetry.subdomain,
+            &forward.telemetry.path,
+            &e.to_string(),
+            false,
+        );
+    }
+}
+
+/// Persist a completed upstream representation after its payment commitment.
+/// This is best effort: the client already received the original response.
+pub async fn cache_batch_response<S: PaymentState>(
+    state: &S,
+    forward: &BatchForward,
+    cached: pay_kit::core::store::CachedUpstreamResponse,
+) {
+    let Some(batch) = state.x402_batch() else {
+        return;
+    };
+    if let Err(error) = batch.cache_response(&forward.outcome, cached).await {
+        tracing::warn!(
+            %error,
+            channel_id = %forward.outcome.channel_id,
+            "failed to cache x402 batch response"
+        );
     }
 }
 
@@ -1791,6 +2214,7 @@ async fn session_authorized(
                 receipt: signature
                     .map(|reference| session_receipt_annotation(sm.network(), reference)),
                 upto: None,
+                batch: None,
                 paid_request: Some(PaidRequestTelemetry {
                     protocol: "mpp/session",
                     subdomain: subdomain.to_string(),
@@ -1814,6 +2238,7 @@ async fn session_authorized(
             }),
             receipt: None,
             upto: None,
+            batch: None,
             paid_request: Some(PaidRequestTelemetry {
                 protocol: "mpp/session",
                 subdomain: subdomain.to_string(),
@@ -1867,6 +2292,153 @@ mod tests {
     // Ceiling $0.10 at 6 decimals == 100_000 base units (USDC).
     const CEILING_USD: f64 = 0.10;
     const CEILING_BASE: u64 = 100_000;
+
+    /// A client that lost a successful batch response gets the payment result
+    /// back, not a conflict.
+    ///
+    /// The scheme requires the recorded response for an already-accepted
+    /// commitment; answering `409` instead would leave a paid request
+    /// permanently unrecoverable, since the client cannot re-present the
+    /// voucher for a charge that already landed.
+    #[test]
+    fn a_replayed_batch_authorization_returns_its_payment_result() {
+        use pay_kit::x402::batch_settlement::{BatchSettlementExtra, BatchSettlementResponse};
+
+        let settlement = BatchSettlementResponse {
+            success: true,
+            error_reason: None,
+            payer: Some("Ez3nFYs9GJMDRnHNRSFRDNvJqHUCLxLHJ9YnHLnPUxxx".to_string()),
+            transaction: String::new(),
+            network: "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp".to_string(),
+            amount: String::new(),
+            extra: Some(BatchSettlementExtra {
+                commitment_id: Some("chan:5000".to_string()),
+                charged_amount: Some("1000".to_string()),
+                channel_state: None,
+            }),
+        };
+        let batch = match test_batch_handler() {
+            Some(batch) => batch,
+            // The handler needs a signer; without one there is nothing to
+            // format a settlement header with.
+            None => return,
+        };
+
+        let resp = batch_replay_response(&batch, &settlement, None);
+
+        assert_eq!(
+            resp.status,
+            StatusCode::OK,
+            "a replay is the original outcome, not a conflict"
+        );
+        assert_ne!(resp.status, StatusCode::CONFLICT);
+        let header = |name: &str| {
+            resp.headers
+                .iter()
+                .find(|(n, _)| n.as_str().eq_ignore_ascii_case(name))
+                .map(|(_, v)| v.to_str().unwrap_or_default().to_string())
+        };
+        // The charged amount travels back so the client can resynchronize.
+        let encoded = header("payment-response").expect("settlement header attached");
+        let decoded = base64::Engine::decode(
+            &base64::engine::general_purpose::STANDARD,
+            encoded.as_bytes(),
+        )
+        .expect("base64 settlement header");
+        let parsed: serde_json::Value = serde_json::from_slice(&decoded).expect("settlement json");
+        assert_eq!(parsed["extra"]["chargedAmount"], "1000");
+        assert_eq!(parsed["extra"]["commitmentId"], "chan:5000");
+        // And the client is told the body is not the resource.
+        assert_eq!(header("payment-replay").as_deref(), Some("true"));
+    }
+
+    #[test]
+    fn a_replayed_batch_authorization_restores_the_cached_resource() {
+        use pay_kit::core::store::CachedUpstreamResponse;
+        use pay_kit::x402::batch_settlement::BatchSettlementResponse;
+
+        let Some(batch) = test_batch_handler() else {
+            return;
+        };
+        let settlement = BatchSettlementResponse {
+            success: true,
+            error_reason: None,
+            payer: None,
+            transaction: String::new(),
+            network: "solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1".to_string(),
+            amount: "1".to_string(),
+            extra: None,
+        };
+        let cached = CachedUpstreamResponse {
+            status: 201,
+            content_type: Some("application/json".to_string()),
+            headers: vec![
+                (
+                    "content-security-policy".to_string(),
+                    "default-src 'none'".to_string(),
+                ),
+                ("etag".to_string(), "\"result-42\"".to_string()),
+            ],
+            body: br#"{"result":42}"#.to_vec(),
+        };
+
+        let resp = batch_replay_response(&batch, &settlement, Some(&cached));
+
+        assert_eq!(resp.status, StatusCode::CREATED);
+        assert_eq!(resp.body, Bytes::from_static(br#"{"result":42}"#));
+        assert!(resp.headers.iter().any(|(name, value)| {
+            name == header::CONTENT_TYPE && value == HeaderValue::from_static("application/json")
+        }));
+        assert!(resp.headers.iter().any(|(name, value)| {
+            name == header::CONTENT_SECURITY_POLICY
+                && value == HeaderValue::from_static("default-src 'none'")
+        }));
+        assert!(resp.headers.iter().any(|(name, value)| {
+            name == header::ETAG && value == HeaderValue::from_static("\"result-42\"")
+        }));
+    }
+
+    #[test]
+    fn cached_batch_response_keeps_end_to_end_headers_only() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        );
+        headers.insert(header::ETAG, HeaderValue::from_static("\"v1\""));
+        headers.insert(header::CONNECTION, HeaderValue::from_static("keep-alive"));
+        headers.insert(
+            HeaderName::from_static("payment-response"),
+            HeaderValue::from_static("attempt-specific"),
+        );
+
+        let cached = batch_cached_response(StatusCode::CREATED, &headers, b"resource");
+
+        assert_eq!(cached.status, StatusCode::CREATED.as_u16());
+        assert_eq!(cached.content_type.as_deref(), Some("application/json"));
+        assert_eq!(
+            cached.headers,
+            vec![("etag".to_string(), "\"v1\"".to_string())]
+        );
+        assert_eq!(cached.body, b"resource");
+    }
+
+    /// A batch handler over an in-memory store, or `None` when this build
+    /// cannot make a signer for one.
+    fn test_batch_handler() -> Option<X402BatchSettlement> {
+        let sk = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
+        let mut keypair = [0u8; 64];
+        keypair[..32].copy_from_slice(sk.as_bytes());
+        keypair[32..].copy_from_slice(sk.verifying_key().as_bytes());
+        let signer = pay_kit::solana_keychain::MemorySigner::from_bytes(&keypair).ok()?;
+        let mut cfg = pay_kit::x402::server::BatchConfig::new(
+            "CXhrFZJLKqjzmP3sjYLcF4dTeXWKCy9e2SXXZ2Yo6MPY",
+            "devnet",
+            std::sync::Arc::new(signer),
+        );
+        cfg.withdraw_delay = 900;
+        X402BatchSettlement::new(cfg).ok()
+    }
 
     #[test]
     fn session_receipt_links_to_the_authorizing_transaction() {

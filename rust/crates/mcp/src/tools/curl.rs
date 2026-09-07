@@ -23,6 +23,14 @@ use std::time::SystemTime;
 pub(crate) struct SessionCache {
     authorizations: Mutex<HashMap<String, String>>,
     request_lock: Mutex<()>,
+    /// Open x402 `batch-settlement` channels for this connection.
+    ///
+    /// Batch-settlement is stateful in the same way an MPP session is: one
+    /// escrow channel backs many requests and the client tracks the cumulative
+    /// amount the server has confirmed charging. Holding it here is what lets a
+    /// long-lived MCP connection amortize a single deposit over many calls
+    /// instead of opening a channel per request.
+    pub(crate) batch_channels: pay_core::client::batch::BatchChannelCache,
 }
 
 impl SessionCache {
@@ -1081,6 +1089,77 @@ fn do_paid_fetch(
             );
             interpret_retry(fetch_request(&headers)?)
         }
+        RunOutcome::X402BatchChallenge { challenge, .. } => {
+            let built = pay_core::client::x402::build_batch_payment(
+                &challenge,
+                &store,
+                &session_cache.batch_channels,
+                None,
+                network_override.as_deref(),
+                account_override.as_deref(),
+                Some(url),
+                make_auth_override(),
+            )?;
+            let mut headers = extra_headers.to_vec();
+            headers.extend(
+                built
+                    .payment
+                    .headers
+                    .into_iter()
+                    .map(|(name, value)| (name.to_string(), value)),
+            );
+            let outcome = fetch_request(&headers)?;
+
+            // A corrective 402 means the server's watermark is ahead of ours
+            // (a previous response was lost in flight). It proves where it is
+            // with a voucher we signed ourselves, so we can resynchronize and
+            // retry once rather than re-sending a stale amount forever.
+            if let RunOutcome::X402BatchChallenge {
+                challenge: corrective,
+                ..
+            } = &outcome
+                && corrective.error.is_some()
+                && session_cache
+                    .batch_channels
+                    .adopt_corrective(&corrective.requirements)
+                    .is_ok_and(|adopted| adopted.is_some())
+            {
+                let retry = pay_core::client::x402::build_batch_payment(
+                    corrective,
+                    &store,
+                    &session_cache.batch_channels,
+                    None,
+                    network_override.as_deref(),
+                    account_override.as_deref(),
+                    Some(url),
+                    make_auth_override(),
+                )?;
+                let mut headers = extra_headers.to_vec();
+                headers.extend(
+                    retry
+                        .payment
+                        .headers
+                        .into_iter()
+                        .map(|(name, value)| (name.to_string(), value)),
+                );
+                let outcome = fetch_request(&headers)?;
+                commit_batch_settlement(
+                    session_cache,
+                    &corrective.requirements,
+                    &retry.voucher,
+                    &outcome,
+                );
+                return interpret_retry(outcome);
+            }
+
+            commit_batch_settlement(
+                session_cache,
+                &challenge.requirements,
+                &built.voucher,
+                &outcome,
+            );
+            interpret_retry(outcome)
+        }
         RunOutcome::X402SignInChallenge {
             challenge,
             payment_fallback,
@@ -1289,6 +1368,34 @@ fn pay_error_to_tool_result(err: pay_core::Error) -> CallToolResult {
 /// See `signer::rejection_source` for the matching producer.
 fn is_user_rejection(reason: &str) -> bool {
     reason.starts_with("rejected by user")
+}
+
+/// Advance the cached channel watermark from a served response's settlement
+/// receipt.
+///
+/// Only a response that actually completed can confirm a charge. A missing or
+/// mismatched receipt leaves the watermark alone, so the next request re-signs
+/// the same cumulative amount and the server treats it as an idempotent retry
+/// rather than a new charge.
+fn commit_batch_settlement(
+    session_cache: &SessionCache,
+    requirements: &pay_core::client::batch::Requirements,
+    voucher: &pay_core::client::batch::Voucher,
+    outcome: &pay_core::client::runner::RunOutcome,
+) {
+    let pay_core::client::runner::RunOutcome::Completed {
+        response_headers, ..
+    } = outcome
+    else {
+        return;
+    };
+    if let Err(error) = session_cache.batch_channels.apply_settlement_from_headers(
+        requirements,
+        voucher,
+        response_headers,
+    ) {
+        tracing::warn!(%error, "batch-settlement receipt not adopted; the next request retries the same voucher");
+    }
 }
 
 fn interpret_retry(

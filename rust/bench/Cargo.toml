@@ -83,3 +83,6 @@ pyroscope_pprofrs = "0.2"
 # Embedded validator for rehearsal (fork) runs. Same pinned rev as pay-core's
 # dev-dependency so the lock resolves to a single copy.
 surfpool-sdk = { git = "https://github.com/solana-foundation/surfpool", rev = "b46c47e06c28ed1aa31e119215b479b70e72d4c3" }
+
+[dev-dependencies]
+base64.workspace = true

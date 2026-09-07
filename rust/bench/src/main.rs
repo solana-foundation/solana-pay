@@ -9,6 +9,8 @@
 //!
 //! See `bench/README.md` and the approved plan for the design.
 
+mod batch_reclaim;
+mod channel_recovery;
 mod config;
 mod driver;
 mod engine;
@@ -29,6 +31,16 @@ use clap::{Parser, Subcommand};
 
 use crate::config::{Network, RunConfig};
 use crate::journal::Journal;
+
+fn parse_positive_usize(value: &str) -> std::result::Result<usize, String> {
+    let parsed = value
+        .parse::<usize>()
+        .map_err(|error| format!("invalid positive integer: {error}"))?;
+    if parsed == 0 {
+        return Err("value must be greater than zero".to_string());
+    }
+    Ok(parsed)
+}
 
 #[derive(Parser)]
 #[command(name = "bench", about = "Pay mainnet scaling harness", version)]
@@ -161,6 +173,30 @@ enum Cmd {
         #[arg(long)]
         yes: bool,
     },
+    /// Recover x402 batch-settlement channels a run left open: request_close
+    /// -> wait for the grace period -> finalize_close -> wait for the
+    /// open-slot window -> reclaim. Returns the operator's escrowed rent.
+    /// Plain on-chain instructions — the gateway does not need to be running.
+    BatchReclaim {
+        config: String,
+        /// Reusable fixture whose deterministic wallets opened the channels.
+        #[arg(long)]
+        fixture_id: String,
+        /// Number of fixture wallets to scan (0..users).
+        #[arg(long)]
+        users: usize,
+        /// The channels' distribution recipient (payTo), base58.
+        #[arg(long)]
+        receiver: String,
+        #[arg(
+            long,
+            default_value_t = 100,
+            value_parser = parse_positive_usize
+        )]
+        concurrency: usize,
+        #[arg(long)]
+        yes: bool,
+    },
     /// Validate a config and print the parsed settings.
     Estimate { config: String },
     /// Spin only the proxy (+ fork) and block, so it can be profiled in
@@ -286,6 +322,17 @@ async fn run(cmd: Cmd) -> Result<()> {
             target_usdc,
             yes,
         } => session_recovery::top_up(&config, &fixture_id, target_usdc, yes).await,
+        Cmd::BatchReclaim {
+            config,
+            fixture_id,
+            users,
+            receiver,
+            concurrency,
+            yes,
+        } => {
+            batch_reclaim::recover_batch(&config, &fixture_id, users, &receiver, concurrency, yes)
+                .await
+        }
         Cmd::Serve { config } => {
             let cfg = RunConfig::from_yaml_path(&config)?;
             rehearsal::serve_proxy(cfg).await
@@ -451,5 +498,16 @@ fn warn_incomplete() {
                 "outstanding real-money runs may hold funds — `bench list-runs` / `bench recover`"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_positive_usize;
+
+    #[test]
+    fn positive_usize_parser_rejects_zero() {
+        assert!(parse_positive_usize("0").is_err());
+        assert_eq!(parse_positive_usize("1").unwrap(), 1);
     }
 }

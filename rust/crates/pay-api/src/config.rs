@@ -745,7 +745,7 @@ impl Config {
         }
 
         if self.redemption.claim_store_url.is_empty()
-            && let Ok(url) = std::env::var("PAY_SESSION_REDIS_URL")
+            && let Ok(url) = std::env::var("PAY_MPP_REDIS_URL")
         {
             let url = url.trim();
             if !url.is_empty() {
